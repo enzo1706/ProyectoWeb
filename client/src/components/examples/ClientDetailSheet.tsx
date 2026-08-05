@@ -4,11 +4,10 @@ import { Button } from "@/components/ui/button";
 import type { Client } from "../ClientCard";
 
 const mockClient: Client = {
-  id: "1",
+  id: 1,
   name: "María García López",
-  phone: "+52 555 123 4567",
+  phone: "5551234567",
   email: "maria.garcia@email.com",
-  category: "vip",
   totalPurchases: 2450.00,
   lastPurchase: "15 Nov 2025",
   birthday: "1990-03-15",

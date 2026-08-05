@@ -5,11 +5,11 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent } from "@/components/ui/card";
 import { Phone, Mail, MapPin, Calendar, Edit, ShoppingCart, Gift } from "lucide-react";
+import { formatPrice } from "@/lib/currency";
 import type { Client } from "./ClientCard";
 
 interface ClientDetailSheetProps {
@@ -18,20 +18,6 @@ interface ClientDetailSheetProps {
   client: Client | null;
   onEdit: (client: Client) => void;
 }
-
-const categoryColors: Record<Client["category"], string> = {
-  nueva: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200",
-  frecuente: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200",
-  vip: "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200",
-  inactiva: "bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-200",
-};
-
-const categoryLabels: Record<Client["category"], string> = {
-  nueva: "Nueva",
-  frecuente: "Frecuente",
-  vip: "VIP",
-  inactiva: "Inactiva",
-};
 
 // todo: remove mock functionality
 const mockPurchaseHistory = [
@@ -43,17 +29,24 @@ const mockPurchaseHistory = [
 export function ClientDetailSheet({ open, onOpenChange, client, onEdit }: ClientDetailSheetProps) {
   if (!client) return null;
 
-  const initials = client.name
+  const displayName = client.name?.trim() || client.phone;
+  const initials = displayName
     .split(" ")
     .map((n) => n[0])
     .join("")
     .toUpperCase()
     .slice(0, 2);
 
-  const formatBirthday = (date?: string) => {
+  const formatBirthday = (date?: string | null) => {
     if (!date) return null;
     const d = new Date(date);
     return d.toLocaleDateString("es-MX", { day: "numeric", month: "long" });
+  };
+
+  const formatLastPurchase = (date?: string | null) => {
+    if (!date) return "-";
+    const [year, month, day] = date.split("-").map(Number);
+    return new Date(year, month - 1, day).toLocaleDateString("es-MX", { day: "numeric", month: "short", year: "numeric" });
   };
 
   return (
@@ -67,10 +60,7 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit }: Client
               </AvatarFallback>
             </Avatar>
             <div className="flex-1 min-w-0">
-              <SheetTitle className="text-xl">{client.name}</SheetTitle>
-              <Badge className={`mt-1 ${categoryColors[client.category]}`}>
-                {categoryLabels[client.category]}
-              </Badge>
+              <SheetTitle className="text-xl">{displayName}</SheetTitle>
             </div>
           </div>
         </SheetHeader>
@@ -103,13 +93,13 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit }: Client
         <div className="mt-6 grid grid-cols-2 gap-4">
           <Card>
             <CardContent className="pt-4 text-center">
-              <p className="text-2xl font-bold tabular-nums">${client.totalPurchases.toFixed(2)}</p>
+              <p className="text-2xl font-bold tabular-nums">{formatPrice(client.totalPurchases)}</p>
               <p className="text-xs text-muted-foreground">Total Compras</p>
             </CardContent>
           </Card>
           <Card>
             <CardContent className="pt-4 text-center">
-              <p className="text-2xl font-bold">{client.lastPurchase || "-"}</p>
+              <p className="text-2xl font-bold">{formatLastPurchase(client.lastPurchase)}</p>
               <p className="text-xs text-muted-foreground">Última Compra</p>
             </CardContent>
           </Card>

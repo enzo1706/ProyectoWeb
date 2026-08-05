@@ -19,22 +19,15 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { PHONE_REGEX, PHONE_ERROR_MESSAGE } from "@shared/schema";
 import type { Client } from "./ClientCard";
 
 const clientSchema = z.object({
-  name: z.string().min(1, "El nombre es requerido"),
-  phone: z.string().min(1, "El teléfono es requerido"),
-  email: z.string().email("Email inválido").or(z.literal("")),
+  name: z.string().optional(),
+  phone: z.string().regex(PHONE_REGEX, PHONE_ERROR_MESSAGE),
+  email: z.string().email("Email inválido").or(z.literal("")).optional(),
   birthday: z.string().optional(),
   address: z.string().optional(),
-  category: z.enum(["nueva", "frecuente", "vip", "inactiva"]),
   notes: z.string().optional(),
 });
 
@@ -56,7 +49,6 @@ export function ClientDialog({ open, onOpenChange, client, onSave }: ClientDialo
       email: "",
       birthday: "",
       address: "",
-      category: "nueva",
       notes: "",
     },
   });
@@ -64,12 +56,11 @@ export function ClientDialog({ open, onOpenChange, client, onSave }: ClientDialo
   useEffect(() => {
     if (client) {
       form.reset({
-        name: client.name,
+        name: client.name || "",
         phone: client.phone,
         email: client.email || "",
         birthday: client.birthday || "",
         address: client.address || "",
-        category: client.category,
         notes: client.notes || "",
       });
     } else {
@@ -79,14 +70,20 @@ export function ClientDialog({ open, onOpenChange, client, onSave }: ClientDialo
         email: "",
         birthday: "",
         address: "",
-        category: "nueva",
         notes: "",
       });
     }
   }, [client, form]);
 
   const onSubmit = (data: ClientFormData) => {
-    onSave(data);
+    onSave({
+      name: data.name || null,
+      phone: data.phone,
+      email: data.email || null,
+      birthday: data.birthday || null,
+      address: data.address || null,
+      notes: data.notes || null,
+    });
     form.reset();
   };
 
@@ -97,29 +94,65 @@ export function ClientDialog({ open, onOpenChange, client, onSave }: ClientDialo
           <DialogTitle>{client ? "Editar Clienta" : "Nueva Clienta"}</DialogTitle>
         </DialogHeader>
         <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-            <FormField
-              control={form.control}
-              name="name"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Nombre Completo</FormLabel>
-                  <FormControl>
-                    <Input {...field} data-testid="input-client-name" />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <div className="grid grid-cols-2 gap-4">
+          <form onSubmit={form.handleSubmit(onSubmit)} className="flex flex-1 flex-col min-h-0">
+            <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain space-y-4 px-1 -mx-1">
               <FormField
                 control={form.control}
-                name="phone"
+                name="name"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Teléfono</FormLabel>
+                    <FormLabel>Nombre Completo (opcional)</FormLabel>
                     <FormControl>
-                      <Input {...field} data-testid="input-client-phone" />
+                      <Input {...field} data-testid="input-client-name" />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <FormField
+                  control={form.control}
+                  name="phone"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Teléfono *</FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          type="tel"
+                          inputMode="numeric"
+                          maxLength={10}
+                          placeholder="2616570560"
+                          onChange={(e) => field.onChange(e.target.value.replace(/\D/g, "").slice(0, 10))}
+                          data-testid="input-client-phone"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={form.control}
+                  name="birthday"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Cumpleaños (opcional)</FormLabel>
+                      <FormControl>
+                        <Input type="date" {...field} data-testid="input-client-birthday" />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+              <FormField
+                control={form.control}
+                name="email"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Email (opcional)</FormLabel>
+                    <FormControl>
+                      <Input type="email" {...field} data-testid="input-client-email" />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
@@ -127,86 +160,37 @@ export function ClientDialog({ open, onOpenChange, client, onSave }: ClientDialo
               />
               <FormField
                 control={form.control}
-                name="birthday"
+                name="address"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Cumpleaños</FormLabel>
+                    <FormLabel>Dirección (opcional)</FormLabel>
                     <FormControl>
-                      <Input type="date" {...field} data-testid="input-client-birthday" />
+                      <Input {...field} data-testid="input-client-address" />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="notes"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Notas (opcional)</FormLabel>
+                    <FormControl>
+                      <Textarea
+                        {...field}
+                        rows={3}
+                        placeholder="Preferencias, productos favoritos, etc."
+                        data-testid="input-client-notes"
+                      />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
                 )}
               />
             </div>
-            <FormField
-              control={form.control}
-              name="email"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Email</FormLabel>
-                  <FormControl>
-                    <Input type="email" {...field} data-testid="input-client-email" />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="address"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Dirección</FormLabel>
-                  <FormControl>
-                    <Input {...field} data-testid="input-client-address" />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="category"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Categoría</FormLabel>
-                  <Select onValueChange={field.onChange} value={field.value}>
-                    <FormControl>
-                      <SelectTrigger data-testid="select-client-category">
-                        <SelectValue placeholder="Seleccionar" />
-                      </SelectTrigger>
-                    </FormControl>
-                    <SelectContent>
-                      <SelectItem value="nueva">Nueva</SelectItem>
-                      <SelectItem value="frecuente">Frecuente</SelectItem>
-                      <SelectItem value="vip">VIP</SelectItem>
-                      <SelectItem value="inactiva">Inactiva</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="notes"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Notas</FormLabel>
-                  <FormControl>
-                    <Textarea 
-                      {...field} 
-                      rows={3}
-                      placeholder="Preferencias, productos favoritos, etc."
-                      data-testid="input-client-notes"
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <div className="flex justify-end gap-2 pt-4">
+            <div className="flex justify-end gap-2 pt-4 shrink-0 border-t">
               <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
                 Cancelar
               </Button>

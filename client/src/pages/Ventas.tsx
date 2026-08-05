@@ -1,8 +1,9 @@
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SaleCard, type Sale } from "@/components/SaleCard";
-import { SaleDialog } from "@/components/SaleDialog";
+import { NewSaleDialog } from "@/components/NewSaleDialog";
 import { Plus, Search, Filter } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -12,16 +13,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-
-// todo: remove mock functionality
-const initialSales: Sale[] = [
-  { id: "1", clientId: "c1", clientName: "María García López", date: "28 Nov 2025", items: [{ productId: "p1", productName: "TimeWise Repair Serum", quantity: 1, price: 85.00 }, { productId: "p2", productName: "Gel Limpiador 3D", quantity: 1, price: 26.00 }], total: 111.00, profit: 55.50, status: "pagado" },
-  { id: "2", clientId: "c2", clientName: "Ana Martínez Ruiz", date: "27 Nov 2025", items: [{ productId: "p3", productName: "Base CC Cream SPF 15", quantity: 1, price: 35.00 }], total: 35.00, profit: 17.50, status: "entregado" },
-  { id: "3", clientId: "c3", clientName: "Laura Hernández", date: "26 Nov 2025", items: [{ productId: "p4", productName: "Labial Gel Semi-Shine Berry", quantity: 2, price: 18.00 }, { productId: "p5", productName: "Máscara Lash Love", quantity: 1, price: 16.00 }], total: 52.00, profit: 26.00, status: "pendiente" },
-  { id: "4", clientId: "c4", clientName: "Patricia Ruiz Sánchez", date: "25 Nov 2025", items: [{ productId: "p6", productName: "Fragancia Journey", quantity: 1, price: 45.00 }], total: 45.00, profit: 22.50, status: "pagado" },
-  { id: "5", clientId: "c5", clientName: "Carmen Flores", date: "24 Nov 2025", items: [{ productId: "p1", productName: "TimeWise Repair Serum", quantity: 1, price: 85.00 }], total: 85.00, profit: 42.50, status: "pagado" },
-  { id: "6", clientId: "c7", clientName: "Guadalupe Torres", date: "23 Nov 2025", items: [{ productId: "p2", productName: "Set Brochas Esenciales", quantity: 1, price: 55.00 }, { productId: "p3", productName: "Base CC Cream SPF 15", quantity: 2, price: 35.00 }], total: 125.00, profit: 62.50, status: "pagado" },
-];
+import { apiRequest } from "@/lib/queryClient";
+import { formatPrice } from "@/lib/currency";
+import type { Product } from "@shared/schema";
+import type { TopProductByCategory } from "@/components/CategoryProductsDialog";
 
 const statusFilters = [
   { value: "todos", label: "Todos" },
@@ -31,10 +26,19 @@ const statusFilters = [
 ];
 
 export default function Ventas() {
-  const [sales, setSales] = useState<Sale[]>(initialSales);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("todos");
   const [dialogOpen, setDialogOpen] = useState(false);
+
+  const { data: sales = [] } = useQuery<Sale[]>({ queryKey: ["/api/sales"] });
+  const { data: products = [] } = useQuery<Product[]>({ queryKey: ["/api/products"] });
+  const { data: topProducts = [] } = useQuery<TopProductByCategory[]>({
+    queryKey: ["/api/sales/top-products", "top5"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/sales/top-products?limit=5");
+      return res.json();
+    },
+  });
 
   const filteredSales = sales.filter((s) => {
     const matchesSearch = s.clientName.toLowerCase().includes(search.toLowerCase());
@@ -44,16 +48,7 @@ export default function Ventas() {
 
   const totalSales = sales.reduce((sum, s) => sum + s.total, 0);
   const totalProfit = sales.reduce((sum, s) => sum + s.profit, 0);
-  const pendingCount = sales.filter(s => s.status === "pendiente").length;
-
-  const handleNewSale = (sale: Omit<Sale, "id">) => {
-    const newSale: Sale = {
-      ...sale,
-      id: `s${Date.now()}`,
-    };
-    setSales([newSale, ...sales]);
-    setDialogOpen(false);
-  };
+  const pendingCount = sales.filter((s) => s.status === "pendiente").length;
 
   return (
     <div className="p-6 space-y-6" data-testid="page-ventas">
@@ -78,7 +73,7 @@ export default function Ventas() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold tabular-nums">${totalSales.toFixed(2)}</p>
+            <p className="text-2xl font-bold tabular-nums">{formatPrice(totalSales)}</p>
           </CardContent>
         </Card>
         <Card>
@@ -89,20 +84,38 @@ export default function Ventas() {
           </CardHeader>
           <CardContent>
             <p className="text-2xl font-bold text-green-600 dark:text-green-400 tabular-nums">
-              ${totalProfit.toFixed(2)}
+              {formatPrice(totalProfit)}
             </p>
           </CardContent>
         </Card>
-        <Card>
+        <Card data-testid="card-top-products">
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium text-muted-foreground">
-              Margen Promedio
+              Productos Más Vendidos
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold tabular-nums">
-              {((totalProfit / totalSales) * 100).toFixed(1)}%
-            </p>
+            {topProducts.length === 0 ? (
+              <p className="text-sm text-muted-foreground">Todavía no hay ventas registradas</p>
+            ) : (
+              <ol className="space-y-1.5">
+                {topProducts.map((p, i) => (
+                  <li
+                    key={p.productId ?? p.productName}
+                    className="flex items-center justify-between gap-2 text-sm"
+                    data-testid={`top-product-row-${i}`}
+                  >
+                    <span className="flex items-center gap-2 min-w-0">
+                      <span className="text-xs text-muted-foreground w-4 shrink-0">{i + 1}.</span>
+                      <span className="truncate">{p.productName}</span>
+                    </span>
+                    <span className="text-right shrink-0 tabular-nums text-xs text-muted-foreground">
+                      {p.quantitySold}u · {formatPrice(p.totalSales)}
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            )}
           </CardContent>
         </Card>
       </div>
@@ -143,10 +156,10 @@ export default function Ventas() {
         </div>
       )}
 
-      <SaleDialog
+      <NewSaleDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
-        onSave={handleNewSale}
+        products={products}
       />
     </div>
   );

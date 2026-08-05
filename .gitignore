@@ -1,6 +1,16 @@
 node_modules
 dist
+.env
 .DS_Store
+Thumbs.db
 server/public
 vite.config.ts.*
 *.tar.gz
+
+# Editor / local tool state
+.vscode/
+.local/
+
+# Notas locales sueltas (no forman parte del código del proyecto)
+Cambios web mary kay.txt
+resumen_proyecto.txt

@@ -98,38 +98,89 @@ export function AppointmentDialog({ open, onOpenChange, onSave, defaultDate }: A
           <DialogTitle>Nueva Cita</DialogTitle>
         </DialogHeader>
         <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-            <FormField
-              control={form.control}
-              name="clientId"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Clienta</FormLabel>
-                  <Select onValueChange={field.onChange} value={field.value}>
-                    <FormControl>
-                      <SelectTrigger data-testid="select-appointment-client">
-                        <SelectValue placeholder="Seleccionar clienta" />
-                      </SelectTrigger>
-                    </FormControl>
-                    <SelectContent>
-                      {mockClients.map((client) => (
-                        <SelectItem key={client.id} value={client.id}>{client.name}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <div className="grid grid-cols-2 gap-4">
+          <form onSubmit={form.handleSubmit(onSubmit)} className="flex flex-1 flex-col min-h-0">
+            <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain space-y-4 px-1 -mx-1">
               <FormField
                 control={form.control}
-                name="date"
+                name="clientId"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Fecha</FormLabel>
+                    <FormLabel>Clienta</FormLabel>
+                    <Select onValueChange={field.onChange} value={field.value}>
+                      <FormControl>
+                        <SelectTrigger data-testid="select-appointment-client">
+                          <SelectValue placeholder="Seleccionar clienta" />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        {mockClients.map((client) => (
+                          <SelectItem key={client.id} value={client.id}>{client.name}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <FormField
+                  control={form.control}
+                  name="date"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Fecha</FormLabel>
+                      <FormControl>
+                        <Input type="date" {...field} data-testid="input-appointment-date" />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={form.control}
+                  name="time"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Hora</FormLabel>
+                      <FormControl>
+                        <Input type="time" {...field} data-testid="input-appointment-time" />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+              <FormField
+                control={form.control}
+                name="type"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Tipo de Cita</FormLabel>
+                    <Select onValueChange={field.onChange} value={field.value}>
+                      <FormControl>
+                        <SelectTrigger data-testid="select-appointment-type">
+                          <SelectValue />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        <SelectItem value="seguimiento">Seguimiento</SelectItem>
+                        <SelectItem value="venta">Venta</SelectItem>
+                        <SelectItem value="demostracion">Demostración</SelectItem>
+                        <SelectItem value="entrega">Entrega</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="location"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Ubicación (opcional)</FormLabel>
                     <FormControl>
-                      <Input type="date" {...field} data-testid="input-appointment-date" />
+                      <Input {...field} placeholder="Dirección o lugar" data-testid="input-appointment-location" />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
@@ -137,73 +188,24 @@ export function AppointmentDialog({ open, onOpenChange, onSave, defaultDate }: A
               />
               <FormField
                 control={form.control}
-                name="time"
+                name="notes"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Hora</FormLabel>
+                    <FormLabel>Notas (opcional)</FormLabel>
                     <FormControl>
-                      <Input type="time" {...field} data-testid="input-appointment-time" />
+                      <Textarea
+                        {...field}
+                        rows={2}
+                        placeholder="Detalles adicionales"
+                        data-testid="input-appointment-notes"
+                      />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
                 )}
               />
             </div>
-            <FormField
-              control={form.control}
-              name="type"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Tipo de Cita</FormLabel>
-                  <Select onValueChange={field.onChange} value={field.value}>
-                    <FormControl>
-                      <SelectTrigger data-testid="select-appointment-type">
-                        <SelectValue />
-                      </SelectTrigger>
-                    </FormControl>
-                    <SelectContent>
-                      <SelectItem value="seguimiento">Seguimiento</SelectItem>
-                      <SelectItem value="venta">Venta</SelectItem>
-                      <SelectItem value="demostracion">Demostración</SelectItem>
-                      <SelectItem value="entrega">Entrega</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="location"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Ubicación (opcional)</FormLabel>
-                  <FormControl>
-                    <Input {...field} placeholder="Dirección o lugar" data-testid="input-appointment-location" />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="notes"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Notas (opcional)</FormLabel>
-                  <FormControl>
-                    <Textarea
-                      {...field}
-                      rows={2}
-                      placeholder="Detalles adicionales"
-                      data-testid="input-appointment-notes"
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <div className="flex justify-end gap-2 pt-4">
+            <div className="flex justify-end gap-2 pt-4 shrink-0 border-t">
               <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
                 Cancelar
               </Button>

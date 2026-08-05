@@ -87,7 +87,7 @@ export default function Reportes() {
           <p className="text-muted-foreground">Análisis detallado de tu negocio</p>
         </div>
         <Select value={period} onValueChange={setPeriod}>
-          <SelectTrigger className="w-[180px]" data-testid="select-period">
+          <SelectTrigger className="w-full sm:w-[180px]" data-testid="select-period">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>

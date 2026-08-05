@@ -18,14 +18,14 @@ interface AppointmentCardProps {
   onClick?: (appointment: Appointment) => void;
 }
 
-const typeColors: Record<Appointment["type"], string> = {
+export const typeColors: Record<Appointment["type"], string> = {
   seguimiento: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200",
   venta: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200",
   demostracion: "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200",
   entrega: "bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200",
 };
 
-const typeLabels: Record<Appointment["type"], string> = {
+export const typeLabels: Record<Appointment["type"], string> = {
   seguimiento: "Seguimiento",
   venta: "Venta",
   demostracion: "Demostración",

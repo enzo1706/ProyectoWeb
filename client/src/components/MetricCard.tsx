@@ -11,11 +11,17 @@ interface MetricCardProps {
     isPositive: boolean;
   };
   subtitle?: string;
+  onClick?: () => void;
 }
 
-export function MetricCard({ title, value, icon: Icon, trend, subtitle }: MetricCardProps) {
+export function MetricCard({ title, value, icon: Icon, trend, subtitle, onClick }: MetricCardProps) {
   return (
-    <Card data-testid={`card-metric-${title.toLowerCase().replace(/\s+/g, '-')}`}>
+    <Card
+      className={onClick ? "hover-elevate cursor-pointer" : undefined}
+      onClick={onClick}
+      role={onClick ? "button" : undefined}
+      data-testid={`card-metric-${title.toLowerCase().replace(/\s+/g, '-')}`}
+    >
       <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0 pb-2">
         <CardTitle className="text-sm font-medium text-muted-foreground">
           {title}

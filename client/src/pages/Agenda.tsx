@@ -73,7 +73,7 @@ export default function Agenda() {
   };
 
   return (
-    <div className="p-6 space-y-6" data-testid="page-agenda">
+    <div className="p-4 sm:p-6 space-y-6" data-testid="page-agenda">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold">Agenda</h1>
@@ -102,7 +102,7 @@ export default function Agenda() {
               </Button>
             </div>
           </CardHeader>
-          <CardContent>
+          <CardContent className="p-3 sm:p-6 pt-0">
             <div className="grid grid-cols-7 gap-1">
               {daysOfWeek.map((day) => (
                 <div key={day} className="text-center text-xs font-medium text-muted-foreground py-2">
@@ -111,7 +111,7 @@ export default function Agenda() {
               ))}
               {calendarDays.map((day, index) => {
                 if (day === null) {
-                  return <div key={`empty-${index}`} className="p-2" />;
+                  return <div key={`empty-${index}`} className="p-1 sm:p-2" />;
                 }
                 const dateStr = formatDateString(day);
                 const dayAppointments = getAppointmentsForDay(day);
@@ -122,7 +122,7 @@ export default function Agenda() {
                   <button
                     key={day}
                     onClick={() => setSelectedDate(dateStr)}
-                    className={`p-2 rounded-md text-sm hover-elevate relative min-h-[60px] flex flex-col items-center ${
+                    className={`p-1 sm:p-2 rounded-md text-sm hover-elevate active-elevate-2 relative min-h-[60px] flex flex-col items-center ${
                       isSelected ? "bg-primary text-primary-foreground" : ""
                     } ${today && !isSelected ? "ring-2 ring-primary" : ""}`}
                     data-testid={`button-day-${day}`}

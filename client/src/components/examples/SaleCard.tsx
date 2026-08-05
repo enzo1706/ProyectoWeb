@@ -1,17 +1,23 @@
 import { SaleCard, type Sale } from "../SaleCard";
 
 const mockSale: Sale = {
-  id: "1",
-  clientId: "c1",
+  id: 1,
+  clientId: 1,
   clientName: "Laura Hernández",
-  date: "28 Nov 2025",
-  items: [
-    { productId: "p1", productName: "TimeWise Serum", quantity: 1, price: 65.00 },
-    { productId: "p2", productName: "Labial Gel Semi-Shine", quantity: 2, price: 18.00 },
-  ],
-  total: 101.00,
-  profit: 45.50,
+  date: "2025-11-28",
+  subtotal: 10100,
+  orderDiscountType: null,
+  orderDiscountValue: null,
+  orderSurchargeType: null,
+  orderSurchargeValue: null,
+  shippingCost: null,
+  total: 10100,
+  profit: 4550,
+  paymentMethod: "efectivo",
+  installmentsCount: 1,
+  installmentFrequency: null,
   status: "pagado",
+  itemCount: 3,
 };
 
 export default function SaleCardExample() {

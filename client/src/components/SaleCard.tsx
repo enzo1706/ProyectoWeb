@@ -1,23 +1,13 @@
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { User, Calendar, Package } from "lucide-react";
+import { formatPrice } from "@/lib/currency";
+import type { Sale as BaseSale, SaleItem } from "@shared/schema";
 
-export interface SaleItem {
-  productId: string;
-  productName: string;
-  quantity: number;
-  price: number;
-}
+export type { SaleItem };
 
-export interface Sale {
-  id: string;
-  clientId: string;
-  clientName: string;
-  date: string;
-  items: SaleItem[];
-  total: number;
-  profit: number;
-  status: "pendiente" | "entregado" | "pagado";
+export interface Sale extends BaseSale {
+  itemCount: number;
 }
 
 interface SaleCardProps {
@@ -25,21 +15,24 @@ interface SaleCardProps {
   onClick?: (sale: Sale) => void;
 }
 
-const statusColors: Record<Sale["status"], string> = {
+const statusColors: Record<string, string> = {
   pendiente: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200",
   entregado: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200",
   pagado: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200",
 };
 
-const statusLabels: Record<Sale["status"], string> = {
+const statusLabels: Record<string, string> = {
   pendiente: "Pendiente",
   entregado: "Entregado",
   pagado: "Pagado",
 };
 
-export function SaleCard({ sale, onClick }: SaleCardProps) {
-  const totalItems = sale.items.reduce((sum, item) => sum + item.quantity, 0);
+function formatSaleDate(date: string): string {
+  const [year, month, day] = date.split("-").map(Number);
+  return new Date(year, month - 1, day).toLocaleDateString("es-MX", { day: "numeric", month: "short", year: "numeric" });
+}
 
+export function SaleCard({ sale, onClick }: SaleCardProps) {
   return (
     <Card
       className="hover-elevate cursor-pointer"
@@ -56,25 +49,25 @@ export function SaleCard({ sale, onClick }: SaleCardProps) {
             <div className="flex items-center gap-4 mt-2 text-sm text-muted-foreground">
               <div className="flex items-center gap-1">
                 <Calendar className="h-3 w-3" />
-                <span>{sale.date}</span>
+                <span>{formatSaleDate(sale.date)}</span>
               </div>
               <div className="flex items-center gap-1">
                 <Package className="h-3 w-3" />
-                <span>{totalItems} productos</span>
+                <span>{sale.itemCount} producto{sale.itemCount !== 1 ? "s" : ""}</span>
               </div>
             </div>
           </div>
-          <Badge className={statusColors[sale.status]}>
-            {statusLabels[sale.status]}
+          <Badge className={statusColors[sale.status] ?? statusColors.pendiente}>
+            {statusLabels[sale.status] ?? sale.status}
           </Badge>
         </div>
         <div className="mt-3 pt-3 border-t flex items-center justify-between">
           <div>
-            <p className="text-lg font-bold tabular-nums">${sale.total.toFixed(2)}</p>
+            <p className="text-lg font-bold tabular-nums">{formatPrice(sale.total)}</p>
           </div>
           <div className="text-right">
             <p className="text-sm font-medium text-green-600 dark:text-green-400">
-              +${sale.profit.toFixed(2)}
+              +{formatPrice(sale.profit)}
             </p>
             <p className="text-xs text-muted-foreground">ganancia</p>
           </div>

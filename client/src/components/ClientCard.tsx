@@ -1,19 +1,12 @@
 import { Card, CardContent } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Phone, Mail, Calendar, ShoppingBag } from "lucide-react";
+import { formatPrice } from "@/lib/currency";
+import type { Client as BaseClient } from "@shared/schema";
 
-export interface Client {
-  id: string;
-  name: string;
-  phone: string;
-  email: string;
-  birthday?: string;
-  address?: string;
-  category: "nueva" | "frecuente" | "vip" | "inactiva";
+export interface Client extends BaseClient {
   totalPurchases: number;
-  lastPurchase?: string;
-  notes?: string;
+  lastPurchase?: string | null;
 }
 
 interface ClientCardProps {
@@ -21,22 +14,9 @@ interface ClientCardProps {
   onClick?: (client: Client) => void;
 }
 
-const categoryColors: Record<Client["category"], string> = {
-  nueva: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200",
-  frecuente: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200",
-  vip: "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200",
-  inactiva: "bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-200",
-};
-
-const categoryLabels: Record<Client["category"], string> = {
-  nueva: "Nueva",
-  frecuente: "Frecuente",
-  vip: "VIP",
-  inactiva: "Inactiva",
-};
-
 export function ClientCard({ client, onClick }: ClientCardProps) {
-  const initials = client.name
+  const displayName = client.name?.trim() || client.phone;
+  const initials = displayName
     .split(" ")
     .map((n) => n[0])
     .join("")
@@ -59,11 +39,8 @@ export function ClientCard({ client, onClick }: ClientCardProps) {
           <div className="flex-1 min-w-0">
             <div className="flex items-center justify-between gap-2 flex-wrap">
               <h3 className="font-medium truncate" data-testid={`text-client-name-${client.id}`}>
-                {client.name}
+                {displayName}
               </h3>
-              <Badge className={categoryColors[client.category]} data-testid={`badge-category-${client.id}`}>
-                {categoryLabels[client.category]}
-              </Badge>
             </div>
             <div className="mt-2 space-y-1">
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -82,7 +59,7 @@ export function ClientCard({ client, onClick }: ClientCardProps) {
         <div className="mt-4 pt-3 border-t flex items-center justify-between text-sm">
           <div className="flex items-center gap-1 text-muted-foreground">
             <ShoppingBag className="h-3 w-3" />
-            <span>${client.totalPurchases.toFixed(2)}</span>
+            <span>{formatPrice(client.totalPurchases)}</span>
           </div>
           {client.lastPurchase && (
             <div className="flex items-center gap-1 text-muted-foreground">

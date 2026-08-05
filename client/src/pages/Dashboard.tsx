@@ -1,15 +1,18 @@
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { apiRequest } from "@/lib/queryClient";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { MetricCard } from "@/components/MetricCard";
-import { StockAlert } from "@/components/StockAlert";
-import { AppointmentCard, type Appointment } from "@/components/AppointmentCard";
-import { SaleCard, type Sale } from "@/components/SaleCard";
-import type { Product } from "@/components/ProductCard";
+import { AppointmentCard, typeLabels, type Appointment as CardAppointment } from "@/components/AppointmentCard";
+import { LowStockDialog } from "@/components/LowStockDialog";
+import { AppointmentDetailDialog } from "@/components/AppointmentDetailDialog";
+import { TopClientsDialog, type TopClient } from "@/components/TopClientsDialog";
+import { CategoryProductsDialog, type TopProductByCategory } from "@/components/CategoryProductsDialog";
+import type { Product, Appointment } from "@shared/schema";
 import {
   DollarSign,
   Package,
   Users,
-  TrendingUp,
   Calendar,
 } from "lucide-react";
 import {
@@ -25,26 +28,6 @@ import {
   Pie,
   Cell,
 } from "recharts";
-
-// todo: remove mock functionality
-const mockProducts: Product[] = [
-  { id: "1", name: "TimeWise Repair Serum", sku: "MK-TW-001", category: "Cuidado de la Piel", price: 85, cost: 42.5, stock: 0, minStock: 3 },
-  { id: "2", name: "Labial Ultimate", sku: "MK-LU-002", category: "Maquillaje", price: 22, cost: 11, stock: 2, minStock: 5 },
-  { id: "3", name: "Base CC Cream", sku: "MK-CC-003", category: "Maquillaje", price: 35, cost: 17.5, stock: 1, minStock: 3 },
-];
-
-// todo: remove mock functionality
-const mockAppointments: Appointment[] = [
-  { id: "1", clientName: "María García", clientId: "c1", date: "2025-11-29", time: "10:00 AM", type: "demostracion", location: "Colonia Roma" },
-  { id: "2", clientName: "Ana Martínez", clientId: "c2", date: "2025-11-29", time: "3:00 PM", type: "entrega" },
-  { id: "3", clientName: "Laura Hernández", clientId: "c3", date: "2025-11-30", time: "11:00 AM", type: "seguimiento" },
-];
-
-// todo: remove mock functionality
-const mockRecentSales: Sale[] = [
-  { id: "1", clientId: "c1", clientName: "Patricia Ruiz", date: "28 Nov", items: [{ productId: "p1", productName: "Serum", quantity: 1, price: 65 }], total: 165, profit: 72, status: "pagado" },
-  { id: "2", clientId: "c2", clientName: "Carmen Flores", date: "27 Nov", items: [{ productId: "p2", productName: "Labial", quantity: 2, price: 22 }], total: 88, profit: 44, status: "entregado" },
-];
 
 // todo: remove mock functionality
 const monthlySalesData = [
@@ -72,13 +55,80 @@ const topProductsData = [
   { name: "Gel Limpiador", ventas: 12 },
 ];
 
+function parseLocalDate(dateStr: string): Date {
+  const [year, month, day] = dateStr.split("-").map(Number);
+  return new Date(year, month - 1, day);
+}
+
+function formatAppointmentShort(appointment: Appointment): string {
+  const date = parseLocalDate(appointment.date);
+  const dd = String(date.getDate()).padStart(2, "0");
+  const mm = String(date.getMonth() + 1).padStart(2, "0");
+  return `${dd}/${mm} - ${appointment.time}`;
+}
+
+const cardAppointmentTypes = ["seguimiento", "venta", "demostracion", "entrega"] as const;
+
+function toCardAppointment(appointment: Appointment): CardAppointment {
+  return {
+    id: String(appointment.id),
+    clientName: appointment.clientName,
+    clientId: appointment.clientId !== null ? String(appointment.clientId) : "",
+    date: appointment.date,
+    time: appointment.time,
+    type: (cardAppointmentTypes as readonly string[]).includes(appointment.type)
+      ? (appointment.type as CardAppointment["type"])
+      : "seguimiento",
+    notes: appointment.notes ?? undefined,
+    location: appointment.location ?? undefined,
+  };
+}
+
 export default function Dashboard() {
+  const [lowStockOpen, setLowStockOpen] = useState(false);
+  const [appointmentDetailOpen, setAppointmentDetailOpen] = useState(false);
   const [selectedAppointment, setSelectedAppointment] = useState<Appointment | null>(null);
+  const [topClientsOpen, setTopClientsOpen] = useState(false);
+  const [categoryDialogOpen, setCategoryDialogOpen] = useState(false);
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+
+  const { data: lowStockProducts = [] } = useQuery<Product[]>({
+    queryKey: ["/api/products/low-stock"],
+  });
+
+  const { data: upcomingAppointments = [] } = useQuery<Appointment[]>({
+    queryKey: ["/api/appointments/upcoming"],
+  });
+
+  const { data: topClients = [] } = useQuery<TopClient[]>({
+    queryKey: ["/api/clients/top"],
+  });
+
+  const { data: categoryProducts = [] } = useQuery<TopProductByCategory[]>({
+    queryKey: ["/api/sales/top-products", selectedCategory],
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/sales/top-products?category=${encodeURIComponent(selectedCategory ?? "")}`);
+      return res.json();
+    },
+    enabled: categoryDialogOpen && !!selectedCategory,
+  });
+
+  const nextAppointment = upcomingAppointments[0];
+
+  const openAppointmentDetail = (appointment: Appointment) => {
+    setSelectedAppointment(appointment);
+    setAppointmentDetailOpen(true);
+  };
+
+  const handleCategoryClick = (categoryName: string) => {
+    setSelectedCategory(categoryName);
+    setCategoryDialogOpen(true);
+  };
 
   return (
     <div className="p-6 space-y-6" data-testid="page-dashboard">
       <div>
-        <h1 className="text-3xl font-bold">Dashboard</h1>
+        <h1 className="text-3xl font-bold">Inicio</h1>
         <p className="text-muted-foreground">Resumen de tu negocio Mary Kay</p>
       </div>
 
@@ -90,22 +140,23 @@ export default function Dashboard() {
           trend={{ value: 12.5, isPositive: true }}
         />
         <MetricCard
-          title="Productos en Stock"
-          value="48"
+          title="Productos con bajo Stock"
+          value={lowStockProducts.length}
           icon={Package}
-          subtitle="3 con stock bajo"
+          onClick={() => setLowStockOpen(true)}
         />
         <MetricCard
-          title="Total Clientas"
-          value="32"
+          title="Próximas Citas"
+          value={nextAppointment ? formatAppointmentShort(nextAppointment) : "No hay próximas citas"}
+          subtitle={nextAppointment ? typeLabels[nextAppointment.type as keyof typeof typeLabels] ?? nextAppointment.type : undefined}
+          icon={Calendar}
+          onClick={nextAppointment ? () => openAppointmentDetail(nextAppointment) : undefined}
+        />
+        <MetricCard
+          title="Mejores Clientes"
+          value={topClients.length}
           icon={Users}
-          trend={{ value: 8, isPositive: true }}
-        />
-        <MetricCard
-          title="Ganancia del Mes"
-          value="$1,890.00"
-          icon={TrendingUp}
-          trend={{ value: 15.2, isPositive: true }}
+          onClick={() => setTopClientsOpen(true)}
         />
       </div>
 
@@ -157,6 +208,8 @@ export default function Dashboard() {
                     outerRadius={70}
                     paddingAngle={4}
                     dataKey="value"
+                    cursor="pointer"
+                    onClick={(entry) => handleCategoryClick(entry.name)}
                   >
                     {categoryData.map((entry, index) => (
                       <Cell key={`cell-${index}`} fill={entry.color} />
@@ -173,19 +226,24 @@ export default function Dashboard() {
                 </PieChart>
               </ResponsiveContainer>
             </div>
-            <div className="flex flex-wrap justify-center gap-3 mt-2">
+            <div className="flex flex-wrap justify-center gap-2.5 mt-2">
               {categoryData.map((cat) => (
-                <div key={cat.name} className="flex items-center gap-1.5 text-xs">
-                  <div className="w-2 h-2 rounded-full" style={{ backgroundColor: cat.color }} />
+                <button
+                  key={cat.name}
+                  type="button"
+                  onClick={() => handleCategoryClick(cat.name)}
+                  className="flex items-center gap-1.5 text-xs hover-elevate active-elevate-2 rounded-md px-2.5 py-2"
+                >
+                  <div className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: cat.color }} />
                   <span className="text-muted-foreground">{cat.name}</span>
-                </div>
+                </button>
               ))}
             </div>
           </CardContent>
         </Card>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <Card data-testid="card-top-products">
           <CardHeader>
             <CardTitle className="text-lg">Productos Más Vendidos</CardTitle>
@@ -202,6 +260,7 @@ export default function Dashboard() {
                     fontSize={11}
                     width={100}
                     tickLine={false}
+                    tickFormatter={(value: string) => (value.length > 16 ? `${value.slice(0, 15)}…` : value)}
                   />
                   <Tooltip
                     contentStyle={{
@@ -225,30 +284,34 @@ export default function Dashboard() {
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-2">
-            {mockAppointments.slice(0, 3).map((apt) => (
-              <AppointmentCard
-                key={apt.id}
-                appointment={apt}
-                onClick={setSelectedAppointment}
-              />
-            ))}
+            {upcomingAppointments.length === 0 ? (
+              <p className="text-center text-muted-foreground py-8">No hay próximas citas</p>
+            ) : (
+              upcomingAppointments.slice(0, 3).map((apt) => (
+                <AppointmentCard
+                  key={apt.id}
+                  appointment={toCardAppointment(apt)}
+                  onClick={() => openAppointmentDetail(apt)}
+                />
+              ))
+            )}
           </CardContent>
         </Card>
-
-        <div className="space-y-4">
-          <StockAlert products={mockProducts} />
-          <Card data-testid="card-recent-sales">
-            <CardHeader>
-              <CardTitle className="text-lg">Ventas Recientes</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              {mockRecentSales.map((sale) => (
-                <SaleCard key={sale.id} sale={sale} />
-              ))}
-            </CardContent>
-          </Card>
-        </div>
       </div>
+
+      <LowStockDialog open={lowStockOpen} onOpenChange={setLowStockOpen} products={lowStockProducts} />
+      <AppointmentDetailDialog
+        open={appointmentDetailOpen}
+        onOpenChange={setAppointmentDetailOpen}
+        appointment={selectedAppointment}
+      />
+      <TopClientsDialog open={topClientsOpen} onOpenChange={setTopClientsOpen} clients={topClients} />
+      <CategoryProductsDialog
+        open={categoryDialogOpen}
+        onOpenChange={setCategoryDialogOpen}
+        category={selectedCategory}
+        products={categoryProducts}
+      />
     </div>
   );
 }
