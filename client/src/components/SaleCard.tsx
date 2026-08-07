@@ -2,12 +2,18 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { User, Calendar, Package } from "lucide-react";
 import { formatPrice } from "@/lib/currency";
-import type { Sale as BaseSale, SaleItem } from "@shared/schema";
+import type { Sale as BaseSale, SaleItem, SaleInstallment } from "@shared/schema";
 
-export type { SaleItem };
+export type { SaleItem, SaleInstallment };
 
 export interface Sale extends BaseSale {
   itemCount: number;
+}
+
+/** Venta con el detalle completo (ítems + cuotas), tal como la devuelve GET /api/sales/:id. */
+export interface SaleDetails extends BaseSale {
+  items: SaleItem[];
+  installments: SaleInstallment[];
 }
 
 interface SaleCardProps {
@@ -19,12 +25,14 @@ const statusColors: Record<string, string> = {
   pendiente: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200",
   entregado: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200",
   pagado: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200",
+  cancelada: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200",
 };
 
 const statusLabels: Record<string, string> = {
   pendiente: "Pendiente",
   entregado: "Entregado",
   pagado: "Pagado",
+  cancelada: "Cancelada",
 };
 
 function formatSaleDate(date: string): string {
@@ -33,9 +41,10 @@ function formatSaleDate(date: string): string {
 }
 
 export function SaleCard({ sale, onClick }: SaleCardProps) {
+  const isCancelled = sale.status === "cancelada";
   return (
     <Card
-      className="hover-elevate cursor-pointer"
+      className={`hover-elevate cursor-pointer ${isCancelled ? "opacity-60" : ""}`}
       onClick={() => onClick?.(sale)}
       data-testid={`card-sale-${sale.id}`}
     >

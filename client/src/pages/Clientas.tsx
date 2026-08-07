@@ -1,15 +1,17 @@
 import { useEffect, useState } from "react";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
+import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ClientCard, type Client } from "@/components/ClientCard";
 import { ClientDialog } from "@/components/ClientDialog";
 import { ClientDetailSheet } from "@/components/ClientDetailSheet";
+import { NewSaleDialog } from "@/components/NewSaleDialog";
 import { Plus, Search } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { formatPrice } from "@/lib/currency";
-import type { InsertClient } from "@shared/schema";
+import type { InsertClient, Product } from "@shared/schema";
 
 export default function Clientas() {
   const { toast } = useToast();
@@ -19,6 +21,8 @@ export default function Clientas() {
   const [editingClient, setEditingClient] = useState<Client | null>(null);
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
+  const [saleDialogOpen, setSaleDialogOpen] = useState(false);
+  const [saleClient, setSaleClient] = useState<Client | null>(null);
 
   useEffect(() => {
     const timeout = setTimeout(() => setDebouncedSearch(search), 300);
@@ -35,7 +39,9 @@ export default function Clientas() {
     },
   });
 
-  const createMutation = useMutation({
+  const { data: products = [] } = useQuery<Product[]>({ queryKey: ["/api/products"] });
+
+  const createMutation = useGuardedMutation({
     mutationFn: async (data: Partial<InsertClient>) => {
       const res = await apiRequest("POST", "/api/clients", data);
       return res.json() as Promise<Client>;
@@ -51,7 +57,7 @@ export default function Clientas() {
     },
   });
 
-  const updateMutation = useMutation({
+  const updateMutation = useGuardedMutation({
     mutationFn: async ({ id, data }: { id: number; data: Partial<InsertClient> }) => {
       const res = await apiRequest("PATCH", `/api/clients/${id}`, data);
       return res.json() as Promise<Client>;
@@ -67,7 +73,7 @@ export default function Clientas() {
     },
   });
 
-  const handleSave = (client: Omit<Client, "id" | "totalPurchases" | "lastPurchase">) => {
+  const handleSave = (client: Omit<Client, "id" | "totalPurchases" | "lastPurchase" | "consultantId">) => {
     if (editingClient) {
       updateMutation.mutate({ id: editingClient.id, data: client });
     } else {
@@ -89,6 +95,12 @@ export default function Clientas() {
   const handleNewClient = () => {
     setEditingClient(null);
     setDialogOpen(true);
+  };
+
+  const handleNewSale = (client: Client) => {
+    setSaleClient(client);
+    setSaleDialogOpen(true);
+    setDetailOpen(false);
   };
 
   const totalRevenue = clients.reduce((sum, c) => sum + c.totalPurchases, 0);
@@ -144,6 +156,7 @@ export default function Clientas() {
         onOpenChange={setDialogOpen}
         client={editingClient}
         onSave={handleSave}
+        existingClients={clients}
       />
 
       <ClientDetailSheet
@@ -151,6 +164,14 @@ export default function Clientas() {
         onOpenChange={setDetailOpen}
         client={selectedClient}
         onEdit={handleEdit}
+        onNewSale={handleNewSale}
+      />
+
+      <NewSaleDialog
+        open={saleDialogOpen}
+        onOpenChange={setSaleDialogOpen}
+        products={products}
+        preselectedClient={saleClient}
       />
     </div>
   );

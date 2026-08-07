@@ -2,6 +2,7 @@ import { SaleCard, type Sale } from "../SaleCard";
 
 const mockSale: Sale = {
   id: 1,
+  consultantId: 1,
   clientId: 1,
   clientName: "Laura Hernández",
   date: "2025-11-28",
@@ -17,6 +18,7 @@ const mockSale: Sale = {
   installmentsCount: 1,
   installmentFrequency: null,
   status: "pagado",
+  notes: null,
   itemCount: 3,
 };
 

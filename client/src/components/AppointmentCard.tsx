@@ -1,31 +1,24 @@
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Clock, User, MapPin } from "lucide-react";
-
-export interface Appointment {
-  id: string;
-  clientName: string;
-  clientId: string;
-  date: string;
-  time: string;
-  type: "seguimiento" | "venta" | "demostracion" | "entrega";
-  notes?: string;
-  location?: string;
-}
+import type { Appointment } from "@shared/schema";
 
 interface AppointmentCardProps {
   appointment: Appointment;
   onClick?: (appointment: Appointment) => void;
 }
 
-export const typeColors: Record<Appointment["type"], string> = {
+const FALLBACK_TYPE_COLOR = "bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-200";
+const FALLBACK_TYPE_LABEL = "Cita";
+
+export const typeColors: Record<string, string> = {
   seguimiento: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200",
   venta: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200",
   demostracion: "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200",
   entrega: "bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200",
 };
 
-export const typeLabels: Record<Appointment["type"], string> = {
+export const typeLabels: Record<string, string> = {
   seguimiento: "Seguimiento",
   venta: "Venta",
   demostracion: "Demostración",
@@ -33,6 +26,9 @@ export const typeLabels: Record<Appointment["type"], string> = {
 };
 
 export function AppointmentCard({ appointment, onClick }: AppointmentCardProps) {
+  const typeColor = typeColors[appointment.type] ?? FALLBACK_TYPE_COLOR;
+  const typeLabel = typeLabels[appointment.type] ?? FALLBACK_TYPE_LABEL;
+
   return (
     <Card
       className="hover-elevate cursor-pointer"
@@ -57,8 +53,8 @@ export function AppointmentCard({ appointment, onClick }: AppointmentCardProps) 
               </div>
             )}
           </div>
-          <Badge className={typeColors[appointment.type]}>
-            {typeLabels[appointment.type]}
+          <Badge className={typeColor}>
+            {typeLabel}
           </Badge>
         </div>
         {appointment.notes && (

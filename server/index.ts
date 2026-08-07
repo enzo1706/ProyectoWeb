@@ -8,6 +8,13 @@ import { setupSession, ensureDefaultAdmin } from "./session";
 const app = express();
 const httpServer = createServer(app);
 
+// Replit Autoscale (deploymentTarget en .replit) coloca exactamente un proxy propio
+// delante de la app. "1" confía solo en ese hop para X-Forwarded-For/-Proto — necesario
+// para que express-rate-limit vea la IP real de cada usuario en vez de agrupar a todos
+// bajo la IP del proxy. Si el target de deploy cambia a uno con otra cantidad de hops,
+// este valor hay que revisarlo.
+app.set("trust proxy", 1);
+
 declare module "http" {
   interface IncomingMessage {
     rawBody: unknown;
@@ -23,8 +30,6 @@ app.use(
 );
 
 app.use(express.urlencoded({ extended: false }));
-
-setupSession(app);
 
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {
@@ -64,15 +69,21 @@ app.use((req, res, next) => {
 });
 
 (async () => {
-  await ensureDefaultAdmin();
+  await setupSession(app);
+
+  // El admin de desarrollo (admin/admin123) nunca debe crearse en producción:
+  // es una credencial conocida, no una forma válida de aprovisionar un admin real.
+  if (process.env.NODE_ENV !== "production") {
+    await ensureDefaultAdmin();
+  }
   await registerRoutes(httpServer, app);
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    console.error(err);
     const status = err.status || err.statusCode || 500;
     const message = err.message || "Internal Server Error";
 
     res.status(status).json({ message });
-    throw err;
   });
 
   // importantly only setup vite in development and after

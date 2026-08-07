@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
+import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import type { Product } from "@shared/schema";
 import { discountOptions } from "@shared/schema";
 import { Button } from "@/components/ui/button";
@@ -54,7 +55,7 @@ function CatalogProductCard({ product }: { product: Product }) {
     });
   };
 
-  const discountMutation = useMutation({
+  const discountMutation = useGuardedMutation({
     mutationFn: async (discountPercent: number) => {
       const res = await apiRequest("PATCH", `/api/products/${product.id}/discount`, { discountPercent });
       return res.json() as Promise<Product>;
@@ -312,7 +313,7 @@ export default function Productos() {
     });
   };
 
-  const seedMutation = useMutation({
+  const seedMutation = useGuardedMutation({
     mutationFn: async () => {
       const res = await apiRequest("POST", "/api/products/seed");
       return res.json() as Promise<{ count: number; message: string }>;

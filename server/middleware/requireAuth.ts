@@ -1,7 +1,18 @@
 import type { Request, Response, NextFunction } from "express";
 import { storage } from "../storage";
 
-export async function requireAdmin(req: Request, res: Response, next: NextFunction) {
+declare global {
+  namespace Express {
+    interface Request {
+      /** Rol del usuario autenticado. Solo presente si pasó por requireAuth/requireAdmin. */
+      userRole?: string;
+      /** Tenant del usuario autenticado. `null` para admin (cross-tenant por diseño). */
+      consultantId?: number | null;
+    }
+  }
+}
+
+export async function requireAuth(req: Request, res: Response, next: NextFunction) {
   const userId = req.session.userId;
 
   if (!userId) {
@@ -13,10 +24,6 @@ export async function requireAdmin(req: Request, res: Response, next: NextFuncti
   if (!user || !user.status) {
     req.session.destroy(() => {});
     return res.status(401).json({ error: "Sesión inválida" });
-  }
-
-  if (user.role !== "admin") {
-    return res.status(403).json({ error: "Acceso denegado" });
   }
 
   req.userRole = user.role;

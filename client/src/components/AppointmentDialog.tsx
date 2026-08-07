@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -19,6 +19,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -26,41 +27,70 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { Appointment } from "./AppointmentCard";
+import { appointmentTypes, createAppointmentSchema, type Appointment } from "@shared/schema";
+import { typeLabels } from "./AppointmentCard";
+import { ClientCombobox } from "./ClientCombobox";
+import type { Client } from "./ClientCard";
 
-const appointmentSchema = z.object({
-  clientId: z.string().min(1, "Selecciona una clienta"),
+const appointmentFormSchema = z.object({
   date: z.string().min(1, "La fecha es requerida"),
   time: z.string().min(1, "La hora es requerida"),
-  type: z.enum(["seguimiento", "venta", "demostracion", "entrega"]),
+  type: z.enum(appointmentTypes),
   location: z.string().optional(),
   notes: z.string().optional(),
 });
 
-type AppointmentFormData = z.infer<typeof appointmentSchema>;
+type AppointmentFormData = z.infer<typeof appointmentFormSchema>;
+// Misma forma que createAppointmentSchema (clientId/date/time/type/location/notes) — el padre
+// (Agenda.tsx) decide si esto se manda por POST (crear) o PATCH (editar), este diálogo no lo sabe.
+type AppointmentSavePayload = z.infer<typeof createAppointmentSchema>;
 
 interface AppointmentDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onSave: (appointment: Omit<Appointment, "id">) => void;
+  onSave: (appointment: AppointmentSavePayload) => void;
   defaultDate?: string;
+  isSubmitting?: boolean;
+  /** Si viene seteada, el diálogo entra en modo edición sobre esta cita en vez de crear una nueva. */
+  existingAppointment?: Appointment | null;
 }
 
-// todo: remove mock functionality
-const mockClients = [
-  { id: "c1", name: "María García López" },
-  { id: "c2", name: "Ana Martínez Ruiz" },
-  { id: "c3", name: "Laura Hernández" },
-  { id: "c4", name: "Patricia Ruiz Sánchez" },
-  { id: "c5", name: "Carmen Flores" },
-  { id: "c7", name: "Guadalupe Torres" },
-];
+/**
+ * La cita solo guarda clientId + clientName, no el objeto Client completo. Para poder mostrar
+ * (y dejar cambiar) la clienta en modo edición sin pedirle un endpoint nuevo al backend, se arma
+ * un Client "stub" con los dos datos que ya tenemos — ClientCombobox solo usa name/phone para
+ * mostrar el valor actual, así que alcanza para prefill; si la consultora busca otra clienta, ahí
+ * sí se reemplaza por un Client real.
+ */
+function appointmentClientStub(appointment: Appointment): Client {
+  return {
+    id: appointment.clientId ?? 0,
+    consultantId: appointment.consultantId,
+    name: appointment.clientName,
+    phone: "",
+    email: null,
+    birthday: null,
+    address: null,
+    notes: null,
+    totalPurchases: 0,
+    lastPurchase: null,
+  };
+}
 
-export function AppointmentDialog({ open, onOpenChange, onSave, defaultDate }: AppointmentDialogProps) {
+export function AppointmentDialog({
+  open,
+  onOpenChange,
+  onSave,
+  defaultDate,
+  isSubmitting = false,
+  existingAppointment,
+}: AppointmentDialogProps) {
+  const [selectedClient, setSelectedClient] = useState<Client | null>(null);
+  const isEditMode = !!existingAppointment;
+
   const form = useForm<AppointmentFormData>({
-    resolver: zodResolver(appointmentSchema),
+    resolver: zodResolver(appointmentFormSchema),
     defaultValues: {
-      clientId: "",
       date: defaultDate || "",
       time: "",
       type: "seguimiento",
@@ -70,58 +100,65 @@ export function AppointmentDialog({ open, onOpenChange, onSave, defaultDate }: A
   });
 
   useEffect(() => {
-    if (defaultDate) {
+    if (defaultDate && !existingAppointment) {
       form.setValue("date", defaultDate);
     }
-  }, [defaultDate, form]);
+  }, [defaultDate, existingAppointment, form]);
+
+  useEffect(() => {
+    if (open && existingAppointment) {
+      form.reset({
+        date: existingAppointment.date,
+        time: existingAppointment.time,
+        type: existingAppointment.type as (typeof appointmentTypes)[number],
+        location: existingAppointment.location ?? "",
+        notes: existingAppointment.notes ?? "",
+      });
+      setSelectedClient(appointmentClientStub(existingAppointment));
+    }
+  }, [open, existingAppointment, form]);
+
+  // Resetear solo al cerrar (cancelar o éxito confirmado), nunca al enviar —
+  // si el guardado falla el diálogo queda abierto y los datos cargados se conservan.
+  useEffect(() => {
+    if (!open) {
+      form.reset({
+        date: defaultDate || "",
+        time: "",
+        type: "seguimiento",
+        location: "",
+        notes: "",
+      });
+      setSelectedClient(null);
+    }
+  }, [open, defaultDate, form]);
 
   const onSubmit = (data: AppointmentFormData) => {
-    const client = mockClients.find(c => c.id === data.clientId);
-    if (!client) return;
+    if (!selectedClient) return;
 
     onSave({
-      clientId: data.clientId,
-      clientName: client.name,
+      clientId: selectedClient.id,
       date: data.date,
       time: data.time,
       type: data.type,
       location: data.location,
       notes: data.notes,
     });
-    form.reset();
   };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md" data-testid="dialog-appointment">
         <DialogHeader>
-          <DialogTitle>Nueva Cita</DialogTitle>
+          <DialogTitle>{isEditMode ? "Editar Cita" : "Nueva Cita"}</DialogTitle>
         </DialogHeader>
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="flex flex-1 flex-col min-h-0">
             <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain space-y-4 px-1 -mx-1">
-              <FormField
-                control={form.control}
-                name="clientId"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Clienta</FormLabel>
-                    <Select onValueChange={field.onChange} value={field.value}>
-                      <FormControl>
-                        <SelectTrigger data-testid="select-appointment-client">
-                          <SelectValue placeholder="Seleccionar clienta" />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        {mockClients.map((client) => (
-                          <SelectItem key={client.id} value={client.id}>{client.name}</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+              <div className="space-y-1.5">
+                <Label htmlFor="appointment-client">Clienta</Label>
+                <ClientCombobox id="appointment-client" value={selectedClient} onSelect={setSelectedClient} />
+              </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <FormField
                   control={form.control}
@@ -163,10 +200,9 @@ export function AppointmentDialog({ open, onOpenChange, onSave, defaultDate }: A
                         </SelectTrigger>
                       </FormControl>
                       <SelectContent>
-                        <SelectItem value="seguimiento">Seguimiento</SelectItem>
-                        <SelectItem value="venta">Venta</SelectItem>
-                        <SelectItem value="demostracion">Demostración</SelectItem>
-                        <SelectItem value="entrega">Entrega</SelectItem>
+                        {appointmentTypes.map((type) => (
+                          <SelectItem key={type} value={type}>{typeLabels[type]}</SelectItem>
+                        ))}
                       </SelectContent>
                     </Select>
                     <FormMessage />
@@ -209,8 +245,8 @@ export function AppointmentDialog({ open, onOpenChange, onSave, defaultDate }: A
               <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
                 Cancelar
               </Button>
-              <Button type="submit" data-testid="button-save-appointment">
-                Crear Cita
+              <Button type="submit" disabled={!selectedClient || isSubmitting} data-testid="button-save-appointment">
+                {isSubmitting ? "Guardando..." : isEditMode ? "Guardar Cambios" : "Crear Cita"}
               </Button>
             </div>
           </form>

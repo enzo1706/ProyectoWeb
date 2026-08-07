@@ -1,4 +1,5 @@
 import { Link, useLocation } from "wouter";
+import { useQuery } from "@tanstack/react-query";
 import {
   LayoutDashboard,
   Package,
@@ -7,6 +8,7 @@ import {
   Calendar,
   BarChart3,
   Shield,
+  Settings,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import {
@@ -23,6 +25,7 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { useAuth } from "@/hooks/useAuth";
+import type { Consultant } from "@shared/schema";
 
 interface MenuItem {
   title: string;
@@ -37,6 +40,7 @@ const consultantMenuItems: MenuItem[] = [
   { title: "Ventas", url: "/ventas", icon: ShoppingCart },
   { title: "Agenda", url: "/agenda", icon: Calendar },
   { title: "Reportes", url: "/reportes", icon: BarChart3 },
+  { title: "Configuración", url: "/configuracion", icon: Settings },
 ];
 
 const adminMenuItems: MenuItem[] = [
@@ -58,12 +62,18 @@ export function AppSidebar() {
   const isAdmin = user?.role === "admin";
   const menuItems = isAdmin ? adminMenuItems : consultantMenuItems;
 
+  const { data: businessSettings } = useQuery<Consultant>({
+    queryKey: ["/api/business-settings"],
+    enabled: !isAdmin,
+  });
+  const businessName = businessSettings?.businessName || "Mi Negocio";
+
   const handleNavigate = () => {
     if (isMobile) setOpenMobile(false);
   };
 
   return (
-    <Sidebar>
+    <Sidebar className="print:hidden">
       <SidebarHeader className="p-4">
         <div className="flex items-center gap-2">
           <div className="h-8 w-8 rounded-md bg-primary flex items-center justify-center">
@@ -73,9 +83,9 @@ export function AppSidebar() {
               <span className="text-primary-foreground font-bold text-sm">MK</span>
             )}
           </div>
-          <div>
-            <h1 className="font-semibold text-sm">
-              {isAdmin ? "Administración" : "Mary Kay"}
+          <div className="min-w-0">
+            <h1 className="font-semibold text-sm truncate">
+              {isAdmin ? "Administración" : businessName}
             </h1>
             <p className="text-xs text-muted-foreground">Manager</p>
           </div>
@@ -107,8 +117,8 @@ export function AppSidebar() {
         </SidebarGroup>
       </SidebarContent>
       <SidebarFooter className="p-4">
-        <p className="text-xs text-muted-foreground text-center">
-          Mary Kay Manager v1.0
+        <p className="text-xs text-muted-foreground text-center truncate">
+          {isAdmin ? "Manager v1.0" : `${businessName} · Manager v1.0`}
         </p>
       </SidebarFooter>
     </Sidebar>

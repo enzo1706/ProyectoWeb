@@ -14,6 +14,7 @@ import Clientas from "@/pages/Clientas";
 import Ventas from "@/pages/Ventas";
 import Agenda from "@/pages/Agenda";
 import Reportes from "@/pages/Reportes";
+import Configuracion from "@/pages/Configuracion";
 import AdminRouter from "@/pages/admin/AdminRouter";
 import Login from "@/pages/auth/Login";
 import { Loader2, LogOut } from "lucide-react";
@@ -28,6 +29,7 @@ function ConsultantRouter() {
       <Route path="/ventas" component={Ventas} />
       <Route path="/agenda" component={Agenda} />
       <Route path="/reportes" component={Reportes} />
+      <Route path="/configuracion" component={Configuracion} />
       <Route component={NotFound} />
     </Switch>
   );
@@ -76,10 +78,10 @@ function AppShell() {
 
   return (
     <SidebarProvider style={style as React.CSSProperties}>
-      <div className="flex h-screen w-full bg-background">
+      <div className="flex h-screen w-full bg-background print:h-auto">
         <AppSidebar />
-        <div className="flex flex-col flex-1 overflow-hidden">
-          <header className="flex items-center justify-between gap-2 p-2 pt-[max(0.5rem,env(safe-area-inset-top))] border-b shrink-0 bg-background/80 backdrop-blur-sm">
+        <div className="flex flex-col flex-1 overflow-hidden print:overflow-visible">
+          <header className="flex items-center justify-between gap-2 p-2 pt-[max(0.5rem,env(safe-area-inset-top))] border-b shrink-0 bg-background/80 backdrop-blur-sm print:hidden">
             <div className="flex items-center gap-2">
               <SidebarTrigger data-testid="button-sidebar-toggle" />
               {isAdmin && (
@@ -104,7 +106,7 @@ function AppShell() {
               </Button>
             </div>
           </header>
-          <main className="flex-1 overflow-auto">
+          <main className="flex-1 overflow-auto print:overflow-visible">
             {isAdmin ? <AdminRouter /> : <ConsultantRouter />}
           </main>
         </div>

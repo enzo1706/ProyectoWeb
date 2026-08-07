@@ -2,8 +2,9 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { SaleCard, type Sale } from "@/components/SaleCard";
+import { SaleCard, type Sale, type SaleDetails } from "@/components/SaleCard";
 import { NewSaleDialog } from "@/components/NewSaleDialog";
+import { SaleDetailDialog } from "@/components/SaleDetailDialog";
 import { Plus, Search, Filter } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -23,12 +24,15 @@ const statusFilters = [
   { value: "pendiente", label: "Pendientes" },
   { value: "entregado", label: "Entregados" },
   { value: "pagado", label: "Pagados" },
+  { value: "cancelada", label: "Canceladas" },
 ];
 
 export default function Ventas() {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("todos");
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [selectedSaleId, setSelectedSaleId] = useState<number | null>(null);
+  const [editingSale, setEditingSale] = useState<SaleDetails | null>(null);
 
   const { data: sales = [] } = useQuery<Sale[]>({ queryKey: ["/api/sales"] });
   const { data: products = [] } = useQuery<Product[]>({ queryKey: ["/api/products"] });
@@ -146,7 +150,7 @@ export default function Ventas() {
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {filteredSales.map((sale) => (
-          <SaleCard key={sale.id} sale={sale} />
+          <SaleCard key={sale.id} sale={sale} onClick={(s) => setSelectedSaleId(s.id)} />
         ))}
       </div>
 
@@ -157,9 +161,24 @@ export default function Ventas() {
       )}
 
       <NewSaleDialog
-        open={dialogOpen}
-        onOpenChange={setDialogOpen}
+        open={dialogOpen || editingSale !== null}
+        onOpenChange={(next) => {
+          if (!next) {
+            setDialogOpen(false);
+            setEditingSale(null);
+          }
+        }}
         products={products}
+        existingSale={editingSale}
+      />
+
+      <SaleDetailDialog
+        saleId={selectedSaleId}
+        onOpenChange={(next) => !next && setSelectedSaleId(null)}
+        onEdit={(sale) => {
+          setSelectedSaleId(null);
+          setEditingSale(sale);
+        }}
       />
     </div>
   );

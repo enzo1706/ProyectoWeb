@@ -3,12 +3,14 @@ import { useQuery } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { MetricCard } from "@/components/MetricCard";
-import { AppointmentCard, typeLabels, type Appointment as CardAppointment } from "@/components/AppointmentCard";
+import { AppointmentCard, typeLabels } from "@/components/AppointmentCard";
 import { LowStockDialog } from "@/components/LowStockDialog";
 import { AppointmentDetailDialog } from "@/components/AppointmentDetailDialog";
 import { TopClientsDialog, type TopClient } from "@/components/TopClientsDialog";
 import { CategoryProductsDialog, type TopProductByCategory } from "@/components/CategoryProductsDialog";
 import type { Product, Appointment } from "@shared/schema";
+import { chartTooltipStyle } from "@/lib/chart-theme";
+import { parseLocalDate } from "@/lib/date";
 import {
   DollarSign,
   Package,
@@ -55,11 +57,6 @@ const topProductsData = [
   { name: "Gel Limpiador", ventas: 12 },
 ];
 
-function parseLocalDate(dateStr: string): Date {
-  const [year, month, day] = dateStr.split("-").map(Number);
-  return new Date(year, month - 1, day);
-}
-
 function formatAppointmentShort(appointment: Appointment): string {
   const date = parseLocalDate(appointment.date);
   const dd = String(date.getDate()).padStart(2, "0");
@@ -67,27 +64,10 @@ function formatAppointmentShort(appointment: Appointment): string {
   return `${dd}/${mm} - ${appointment.time}`;
 }
 
-const cardAppointmentTypes = ["seguimiento", "venta", "demostracion", "entrega"] as const;
-
-function toCardAppointment(appointment: Appointment): CardAppointment {
-  return {
-    id: String(appointment.id),
-    clientName: appointment.clientName,
-    clientId: appointment.clientId !== null ? String(appointment.clientId) : "",
-    date: appointment.date,
-    time: appointment.time,
-    type: (cardAppointmentTypes as readonly string[]).includes(appointment.type)
-      ? (appointment.type as CardAppointment["type"])
-      : "seguimiento",
-    notes: appointment.notes ?? undefined,
-    location: appointment.location ?? undefined,
-  };
-}
-
 export default function Dashboard() {
   const [lowStockOpen, setLowStockOpen] = useState(false);
   const [appointmentDetailOpen, setAppointmentDetailOpen] = useState(false);
-  const [selectedAppointment, setSelectedAppointment] = useState<Appointment | null>(null);
+  const [selectedAppointmentId, setSelectedAppointmentId] = useState<number | null>(null);
   const [topClientsOpen, setTopClientsOpen] = useState(false);
   const [categoryDialogOpen, setCategoryDialogOpen] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
@@ -115,8 +95,12 @@ export default function Dashboard() {
 
   const nextAppointment = upcomingAppointments[0];
 
+  // Derivado de la lista en vivo (no un snapshot) — así, si el estado cambia desde el propio
+  // diálogo, el badge se actualiza y la cita desaparece de la lista sin recargar la página.
+  const detailAppointment = upcomingAppointments.find((a) => a.id === selectedAppointmentId) ?? null;
+
   const openAppointmentDetail = (appointment: Appointment) => {
-    setSelectedAppointment(appointment);
+    setSelectedAppointmentId(appointment.id);
     setAppointmentDetailOpen(true);
   };
 
@@ -148,7 +132,7 @@ export default function Dashboard() {
         <MetricCard
           title="Próximas Citas"
           value={nextAppointment ? formatAppointmentShort(nextAppointment) : "No hay próximas citas"}
-          subtitle={nextAppointment ? typeLabels[nextAppointment.type as keyof typeof typeLabels] ?? nextAppointment.type : undefined}
+          subtitle={nextAppointment ? typeLabels[nextAppointment.type] ?? nextAppointment.type : undefined}
           icon={Calendar}
           onClick={nextAppointment ? () => openAppointmentDetail(nextAppointment) : undefined}
         />
@@ -172,11 +156,7 @@ export default function Dashboard() {
                   <XAxis dataKey="month" stroke="hsl(var(--muted-foreground))" fontSize={12} />
                   <YAxis stroke="hsl(var(--muted-foreground))" fontSize={12} tickFormatter={(v) => `$${v}`} />
                   <Tooltip
-                    contentStyle={{
-                      backgroundColor: "hsl(var(--card))",
-                      border: "1px solid hsl(var(--border))",
-                      borderRadius: "6px",
-                    }}
+                    contentStyle={chartTooltipStyle}
                     formatter={(value: number) => [`$${value}`, "Ventas"]}
                   />
                   <Line
@@ -216,11 +196,7 @@ export default function Dashboard() {
                     ))}
                   </Pie>
                   <Tooltip
-                    contentStyle={{
-                      backgroundColor: "hsl(var(--card))",
-                      border: "1px solid hsl(var(--border))",
-                      borderRadius: "6px",
-                    }}
+                    contentStyle={chartTooltipStyle}
                     formatter={(value: number) => [`${value}%`, ""]}
                   />
                 </PieChart>
@@ -263,11 +239,7 @@ export default function Dashboard() {
                     tickFormatter={(value: string) => (value.length > 16 ? `${value.slice(0, 15)}…` : value)}
                   />
                   <Tooltip
-                    contentStyle={{
-                      backgroundColor: "hsl(var(--card))",
-                      border: "1px solid hsl(var(--border))",
-                      borderRadius: "6px",
-                    }}
+                    contentStyle={chartTooltipStyle}
                   />
                   <Bar dataKey="ventas" fill="hsl(var(--primary))" radius={[0, 4, 4, 0]} />
                 </BarChart>
@@ -290,7 +262,7 @@ export default function Dashboard() {
               upcomingAppointments.slice(0, 3).map((apt) => (
                 <AppointmentCard
                   key={apt.id}
-                  appointment={toCardAppointment(apt)}
+                  appointment={apt}
                   onClick={() => openAppointmentDetail(apt)}
                 />
               ))
@@ -302,8 +274,11 @@ export default function Dashboard() {
       <LowStockDialog open={lowStockOpen} onOpenChange={setLowStockOpen} products={lowStockProducts} />
       <AppointmentDetailDialog
         open={appointmentDetailOpen}
-        onOpenChange={setAppointmentDetailOpen}
-        appointment={selectedAppointment}
+        onOpenChange={(next) => {
+          setAppointmentDetailOpen(next);
+          if (!next) setSelectedAppointmentId(null);
+        }}
+        appointment={detailAppointment}
       />
       <TopClientsDialog open={topClientsOpen} onOpenChange={setTopClientsOpen} clients={topClients} />
       <CategoryProductsDialog

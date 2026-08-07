@@ -5,6 +5,7 @@ import type { Client } from "../ClientCard";
 
 const mockClient: Client = {
   id: 1,
+  consultantId: 1,
   name: "María García López",
   phone: "5551234567",
   email: "maria.garcia@email.com",
@@ -26,6 +27,7 @@ export default function ClientDetailSheetExample() {
         onOpenChange={setOpen}
         client={mockClient}
         onEdit={(client) => console.log("Editar clienta:", client.name)}
+        onNewSale={(client) => console.log("Nueva venta para:", client.name)}
       />
     </>
   );

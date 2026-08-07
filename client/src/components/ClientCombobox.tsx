@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
+import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { Button } from "@/components/ui/button";
 import {
   Popover,
@@ -22,9 +23,10 @@ import type { Client } from "./ClientCard";
 interface ClientComboboxProps {
   value: Client | null;
   onSelect: (client: Client) => void;
+  id?: string;
 }
 
-export function ClientCombobox({ value, onSelect }: ClientComboboxProps) {
+export function ClientCombobox({ value, onSelect, id }: ClientComboboxProps) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -46,8 +48,8 @@ export function ClientCombobox({ value, onSelect }: ClientComboboxProps) {
     enabled: open,
   });
 
-  const createMutation = useMutation({
-    mutationFn: async (data: Omit<Client, "id" | "totalPurchases" | "lastPurchase">) => {
+  const createMutation = useGuardedMutation({
+    mutationFn: async (data: Omit<Client, "id" | "totalPurchases" | "lastPurchase" | "consultantId">) => {
       const res = await apiRequest("POST", "/api/clients", data);
       return res.json() as Promise<Client>;
     },
@@ -65,6 +67,7 @@ export function ClientCombobox({ value, onSelect }: ClientComboboxProps) {
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <Button
+            id={id}
             type="button"
             variant="outline"
             role="combobox"

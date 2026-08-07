@@ -1,13 +1,22 @@
 import { useCallback, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
+import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { readSheet } from "read-excel-file/browser";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Label } from "@/components/ui/label";
 import { Upload, FileSpreadsheet, Package, CheckCircle2, AlertTriangle, X } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
-import { bulkProductSchema } from "@shared/schema";
+import { bulkProductSchema, type Consultant } from "@shared/schema";
 import { z } from "zod";
 
 type BulkProductInput = z.infer<typeof bulkProductSchema>[number];
@@ -231,10 +240,15 @@ export default function ProductManagement() {
   const [parseError, setParseError] = useState<string | null>(null);
   const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [uploadComplete, setUploadComplete] = useState(false);
+  const [targetConsultantId, setTargetConsultantId] = useState<string>("");
 
-  const bulkMutation = useMutation({
-    mutationFn: async (products: BulkProductInput[]) => {
-      const res = await apiRequest("POST", "/api/admin/products/bulk", products);
+  const { data: consultants = [] } = useQuery<Consultant[]>({
+    queryKey: ["/api/admin/consultants"],
+  });
+
+  const bulkMutation = useGuardedMutation({
+    mutationFn: async ({ consultantId, products }: { consultantId: number; products: BulkProductInput[] }) => {
+      const res = await apiRequest("POST", "/api/admin/products/bulk", { consultantId, products });
       return res.json();
     },
     onSuccess: (data) => {
@@ -308,7 +322,7 @@ export default function ProductManagement() {
           Carga Masiva de Productos
         </h1>
         <p className="text-muted-foreground mt-1">
-          Sube el catálogo completo de productos Mary Kay para todas las consultoras
+          Sube un catálogo de productos para una consultora específica
         </p>
       </div>
 
@@ -355,10 +369,26 @@ export default function ProductManagement() {
                   </div>
                 )}
 
+                <div className="space-y-2">
+                  <Label htmlFor="target-consultant">Consultora destino</Label>
+                  <Select value={targetConsultantId} onValueChange={setTargetConsultantId}>
+                    <SelectTrigger id="target-consultant" className="max-w-sm" data-testid="select-target-consultant">
+                      <SelectValue placeholder="Elegí a qué consultora pertenece este catálogo" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {consultants.map((c) => (
+                        <SelectItem key={c.id} value={String(c.id)} data-testid={`option-consultant-${c.id}`}>
+                          {c.businessName}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
                 <div className="flex flex-col sm:flex-row gap-2">
                   <Button
-                    onClick={() => bulkMutation.mutate(preview.valid)}
-                    disabled={preview.valid.length === 0 || bulkMutation.isPending}
+                    onClick={() => bulkMutation.mutate({ consultantId: Number(targetConsultantId), products: preview.valid })}
+                    disabled={preview.valid.length === 0 || !targetConsultantId || bulkMutation.isPending}
                     data-testid="button-confirm-upload"
                   >
                     {bulkMutation.isPending ? "Cargando..." : "Confirmar carga"}

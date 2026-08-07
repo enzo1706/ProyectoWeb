@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import {
   Dialog,
   DialogContent,
@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -38,11 +39,16 @@ import { EditSaleItemDialog } from "./EditSaleItemDialog";
 import { ClientCombobox } from "./ClientCombobox";
 import { SaleInstallmentsEditor } from "./SaleInstallmentsEditor";
 import type { Client } from "./ClientCard";
+import type { SaleDetails } from "./SaleCard";
 
 interface NewSaleDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   products: Product[];
+  /** Si viene seteada, el diálogo entra en modo edición sobre esta venta en vez de crear una nueva. */
+  existingSale?: SaleDetails | null;
+  /** Clienta con la que arranca precargado el combobox al abrir una venta nueva (ej. desde su ficha). Sigue siendo editable. */
+  preselectedClient?: Client | null;
 }
 
 const paymentMethodLabels: Record<PaymentMethod, string> = {
@@ -54,6 +60,11 @@ const paymentMethodLabels: Record<PaymentMethod, string> = {
 function toDateInputValue(date: Date): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function parseLocalDate(dateStr: string): Date {
+  const [year, month, day] = dateStr.split("-").map(Number);
+  return new Date(year, month - 1, day);
 }
 
 function OrderAdjustmentField({
@@ -125,8 +136,10 @@ function OrderAdjustmentField({
   );
 }
 
-export function NewSaleDialog({ open, onOpenChange, products }: NewSaleDialogProps) {
+export function NewSaleDialog({ open, onOpenChange, products, existingSale, preselectedClient }: NewSaleDialogProps) {
   const { toast } = useToast();
+  const isEditMode = !!existingSale;
+
   const [lines, setLines] = useState<OrderLine[]>([]);
   const [editingProductId, setEditingProductId] = useState<number | null>(null);
   const [client, setClient] = useState<Client | null>(null);
@@ -139,7 +152,62 @@ export function NewSaleDialog({ open, onOpenChange, products }: NewSaleDialogPro
   const [orderDiscount, setOrderDiscount] = useState<OrderAdjustment | null>(null);
   const [orderSurcharge, setOrderSurcharge] = useState<OrderAdjustment | null>(null);
   const [shippingCost, setShippingCost] = useState<number | null>(null);
+  const [notes, setNotes] = useState("");
   const [adjustProductId, setAdjustProductId] = useState<string>("");
+
+  // En modo edición, el stock real ya tiene descontado lo que esta venta reservó — para poder
+  // elegir las mismas cantidades (o más) hay que sumárselo de vuelta antes de mostrarlo.
+  const effectiveProducts = useMemo(() => {
+    if (!existingSale) return products;
+    const reserved = new Map(
+      existingSale.items.filter((i) => i.productId !== null).map((i) => [i.productId as number, i.quantity]),
+    );
+    if (reserved.size === 0) return products;
+    return products.map((p) => (reserved.has(p.id) ? { ...p, unidades: p.unidades + (reserved.get(p.id) as number) } : p));
+  }, [products, existingSale]);
+
+  useEffect(() => {
+    if (open && existingSale) {
+      setLines(
+        existingSale.items
+          .filter((i) => i.productId !== null)
+          .map((i) => {
+            const product = effectiveProducts.find((p) => p.id === i.productId);
+            const adjusted = i.price !== i.originalPrice;
+            return {
+              productId: i.productId as number,
+              productName: i.productName,
+              category: i.category,
+              imagen: product?.imagen ?? null,
+              originalPrice: i.originalPrice,
+              quantity: i.quantity,
+              maxQuantity: product?.unidades ?? i.quantity,
+              mode: adjusted ? "manualPrice" : "none",
+              adjustmentValue: adjusted ? i.price : null,
+            };
+          }),
+      );
+      setPaymentMethod(existingSale.paymentMethod as PaymentMethod);
+      setInstallmentsCount(existingSale.installments.length);
+      setInstallmentAmounts(existingSale.installments.map((i) => i.amount));
+      setInstallmentFrequency((existingSale.installmentFrequency as InstallmentFrequency | null) ?? null);
+      setOrderDiscount(
+        existingSale.orderDiscountType
+          ? { type: existingSale.orderDiscountType as "percent" | "fixed", value: existingSale.orderDiscountValue ?? 0 }
+          : null,
+      );
+      setOrderSurcharge(
+        existingSale.orderSurchargeType
+          ? { type: existingSale.orderSurchargeType as "percent" | "fixed", value: existingSale.orderSurchargeValue ?? 0 }
+          : null,
+      );
+      setShippingCost(existingSale.shippingCost ?? null);
+      setNotes(existingSale.notes ?? "");
+      setDate(parseLocalDate(existingSale.date));
+    } else if (open && !existingSale && preselectedClient) {
+      setClient(preselectedClient);
+    }
+  }, [open, existingSale, preselectedClient, effectiveProducts]);
 
   const subtotal = computeSubtotal(lines.map((l) => ({ quantity: l.quantity, unitPrice: getLineFinalPrice(l) })));
   const totals = computeSaleTotals({ subtotal, orderDiscount, orderSurcharge, shippingCost });
@@ -210,12 +278,42 @@ export function NewSaleDialog({ open, onOpenChange, products }: NewSaleDialogPro
     setOrderDiscount(null);
     setOrderSurcharge(null);
     setShippingCost(null);
+    setNotes("");
     setAdjustProductId("");
     onOpenChange(false);
   };
 
-  const createSaleMutation = useMutation({
+  const invalidateAfterSave = () => {
+    queryClient.invalidateQueries({ queryKey: ["/api/sales"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/sales/top-products"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/clients/top"] });
+    queryClient.invalidateQueries({
+      predicate: (query) => typeof query.queryKey[0] === "string" && query.queryKey[0].startsWith("/api/reports"),
+    });
+    if (existingSale) {
+      queryClient.invalidateQueries({ queryKey: ["/api/sales", existingSale.id] });
+    }
+  };
+
+  const saveSaleMutation = useGuardedMutation({
     mutationFn: async () => {
+      if (isEditMode && existingSale) {
+        const payload = {
+          items: lines.map((l) => ({ productId: l.productId, quantity: l.quantity, unitPrice: getLineFinalPrice(l) })),
+          orderDiscount,
+          orderSurcharge,
+          shippingCost: shippingCost ?? undefined,
+          paymentMethod,
+          installments: effectiveInstallments.map((amount) => ({ amount })),
+          installmentFrequency: installmentsCount > 1 ? installmentFrequency ?? undefined : undefined,
+          notes: notes.trim() ? notes.trim() : undefined,
+        };
+        const res = await apiRequest("PATCH", `/api/sales/${existingSale.id}`, payload);
+        return res.json();
+      }
+
       const payload = {
         clientId: client!.id,
         date: toDateInputValue(date),
@@ -226,42 +324,44 @@ export function NewSaleDialog({ open, onOpenChange, products }: NewSaleDialogPro
         paymentMethod,
         installments: effectiveInstallments.map((amount) => ({ amount })),
         installmentFrequency: installmentsCount > 1 ? installmentFrequency ?? undefined : undefined,
+        notes: notes.trim() ? notes.trim() : undefined,
         status: "pendiente",
       };
       const res = await apiRequest("POST", "/api/sales", payload);
       return res.json();
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/sales"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/sales/top-products"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
-      toast({ title: "Venta registrada correctamente" });
+      invalidateAfterSave();
+      toast({ title: isEditMode ? "Venta actualizada correctamente" : "Venta registrada correctamente" });
       resetAndClose();
     },
     onError: (err: Error) => {
-      toast({ title: "No se pudo registrar la venta", description: err.message, variant: "destructive" });
+      toast({
+        title: isEditMode ? "No se pudo actualizar la venta" : "No se pudo registrar la venta",
+        description: err.message,
+        variant: "destructive",
+      });
     },
   });
 
   const canSubmit =
     lines.length > 0 &&
-    client !== null &&
+    (isEditMode || client !== null) &&
     installmentsValid &&
     (installmentsCount === 1 || installmentFrequency !== null) &&
-    !createSaleMutation.isPending;
+    !saveSaleMutation.isPending;
 
   return (
     <Dialog open={open} onOpenChange={(next) => (next ? onOpenChange(next) : resetAndClose())}>
       <DialogContent className="max-w-4xl" data-testid="dialog-new-sale">
         <DialogHeader>
-          <DialogTitle>Nueva Venta</DialogTitle>
+          <DialogTitle>{isEditMode ? "Editar Venta" : "Nueva Venta"}</DialogTitle>
         </DialogHeader>
 
         <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain space-y-6 px-1 -mx-1">
           <section className="space-y-2">
             <h3 className="text-sm font-semibold text-muted-foreground">1. Elegí los productos</h3>
-            <SaleProductPicker products={products} orderedQuantities={orderedQuantities} onAdd={addProduct} />
+            <SaleProductPicker products={effectiveProducts} orderedQuantities={orderedQuantities} onAdd={addProduct} />
           </section>
 
           <section className="space-y-2">
@@ -351,32 +451,45 @@ export function NewSaleDialog({ open, onOpenChange, products }: NewSaleDialogPro
 
               <section className="space-y-1.5">
                 <Label>Clienta</Label>
-                <ClientCombobox value={client} onSelect={setClient} />
+                {isEditMode ? (
+                  <p className="text-sm rounded-md border bg-muted px-3 py-2" data-testid="text-edit-client-name">
+                    {existingSale!.clientName} <span className="text-muted-foreground">(no editable)</span>
+                  </p>
+                ) : (
+                  <ClientCombobox value={client} onSelect={setClient} />
+                )}
               </section>
 
               <section className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div className="space-y-1.5">
                   <Label>Fecha</Label>
-                  <Popover open={datePopoverOpen} onOpenChange={setDatePopoverOpen}>
-                    <PopoverTrigger asChild>
-                      <Button type="button" variant="outline" className="w-full justify-start font-normal" data-testid="button-sale-date">
-                        <CalendarIcon className="h-4 w-4 mr-2" />
-                        {date.toLocaleDateString("es-MX", { day: "numeric", month: "long", year: "numeric" })}
-                      </Button>
-                    </PopoverTrigger>
-                    <PopoverContent className="w-auto p-0">
-                      <Calendar
-                        mode="single"
-                        selected={date}
-                        onSelect={(d) => {
-                          if (d) {
-                            setDate(d);
-                            setDatePopoverOpen(false);
-                          }
-                        }}
-                      />
-                    </PopoverContent>
-                  </Popover>
+                  {isEditMode ? (
+                    <p className="text-sm rounded-md border bg-muted px-3 py-2 flex items-center gap-2" data-testid="text-edit-date">
+                      <CalendarIcon className="h-4 w-4 text-muted-foreground" />
+                      {date.toLocaleDateString("es-MX", { day: "numeric", month: "long", year: "numeric" })}
+                    </p>
+                  ) : (
+                    <Popover open={datePopoverOpen} onOpenChange={setDatePopoverOpen}>
+                      <PopoverTrigger asChild>
+                        <Button type="button" variant="outline" className="w-full justify-start font-normal" data-testid="button-sale-date">
+                          <CalendarIcon className="h-4 w-4 mr-2" />
+                          {date.toLocaleDateString("es-MX", { day: "numeric", month: "long", year: "numeric" })}
+                        </Button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-auto p-0">
+                        <Calendar
+                          mode="single"
+                          selected={date}
+                          onSelect={(d) => {
+                            if (d) {
+                              setDate(d);
+                              setDatePopoverOpen(false);
+                            }
+                          }}
+                        />
+                      </PopoverContent>
+                    </Popover>
+                  )}
                 </div>
                 <div className="space-y-1.5">
                   <Label>Método de pago</Label>
@@ -407,6 +520,18 @@ export function NewSaleDialog({ open, onOpenChange, products }: NewSaleDialogPro
                   onFrequencyChange={setInstallmentFrequency}
                 />
               </section>
+
+              <section className="space-y-1.5">
+                <Label htmlFor="sale-notes">Observaciones</Label>
+                <Textarea
+                  id="sale-notes"
+                  placeholder="Notas internas sobre esta venta (opcional)"
+                  value={notes}
+                  onChange={(e) => setNotes(e.target.value)}
+                  maxLength={1000}
+                  data-testid="input-sale-notes"
+                />
+              </section>
             </>
           )}
         </div>
@@ -417,11 +542,11 @@ export function NewSaleDialog({ open, onOpenChange, products }: NewSaleDialogPro
           </Button>
           <Button
             type="button"
-            onClick={() => createSaleMutation.mutate()}
+            onClick={() => saveSaleMutation.mutate()}
             disabled={!canSubmit}
             data-testid="button-confirm-sale"
           >
-            {createSaleMutation.isPending ? "Guardando..." : "Registrar Venta"}
+            {saveSaleMutation.isPending ? "Guardando..." : isEditMode ? "Guardar Cambios" : "Registrar Venta"}
           </Button>
         </DialogFooter>
 

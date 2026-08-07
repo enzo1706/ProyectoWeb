@@ -1,7 +1,9 @@
-import type { Express, Request, Response } from "express";
+import type { Express, Request, Response, NextFunction } from "express";
 import { type Server } from "http";
 import type { z } from "zod";
-import { storage, SaleValidationError } from "./storage";
+import bcrypt from "bcryptjs";
+import rateLimit from "express-rate-limit";
+import { storage, SaleValidationError, AppointmentValidationError, isBcryptHash } from "./storage";
 import {
   bulkProductSchema,
   createConsultantSchema,
@@ -9,9 +11,37 @@ import {
   applyDiscountSchema,
   insertClientSchema,
   createSaleSchema,
+  updateSaleSchema,
+  updateInstallmentStatusSchema,
+  createAppointmentSchema,
+  updateAppointmentSchema,
+  updateAppointmentStatusSchema,
+  updateBusinessSettingsSchema,
+  adminBulkImportSchema,
   type InsertProduct,
 } from "@shared/schema";
 import { requireAdmin } from "./middleware/requireAdmin";
+import { requireAuth } from "./middleware/requireAuth";
+
+const loginRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiados intentos de inicio de sesión. Probá de nuevo en unos minutos." },
+});
+
+/**
+ * Corre después de requireAuth en las rutas de negocio: un admin está autenticado pero
+ * no pertenece a ninguna consultora (consultantId null por diseño), así que nunca debe
+ * poder tocar datos scopeados por tenant a través de estos endpoints.
+ */
+function requireConsultant(req: Request, res: Response, next: NextFunction) {
+  if (req.consultantId === null || req.consultantId === undefined) {
+    return res.status(403).json({ error: "Esta acción es exclusiva de cuentas consultora" });
+  }
+  next();
+}
 
 const COMBINING_MARKS_START = 0x0300;
 const COMBINING_MARKS_END = 0x036f;
@@ -115,9 +145,15 @@ function omitPassword<T extends { password?: string }>(user: T) {
   return safe;
 }
 
+function parseDateRange(req: Request): { start?: string; end?: string } {
+  const start = typeof req.query.start === "string" && req.query.start ? req.query.start : undefined;
+  const end = typeof req.query.end === "string" && req.query.end ? req.query.end : undefined;
+  return { start, end };
+}
+
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
 
-  app.post("/api/auth/login", async (req: Request, res: Response) => {
+  app.post("/api/auth/login", loginRateLimiter, async (req: Request, res: Response) => {
     try {
       const parsed = loginSchema.safeParse(req.body);
       if (!parsed.success) {
@@ -125,7 +161,24 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
 
       const user = await storage.getUserByUsername(parsed.data.username);
-      if (!user || user.password !== parsed.data.password) {
+      if (!user) {
+        return res.status(401).json({ error: "Credenciales inválidas" });
+      }
+
+      let passwordMatches: boolean;
+      if (isBcryptHash(user.password)) {
+        passwordMatches = await bcrypt.compare(parsed.data.password, user.password);
+      } else {
+        // Compatibilidad con cuentas creadas antes de esta etapa (password en texto plano).
+        // Si coincide, se migra a hash de forma transparente en este mismo login.
+        passwordMatches = user.password === parsed.data.password;
+        if (passwordMatches) {
+          const newHash = await bcrypt.hash(parsed.data.password, 10);
+          await storage.updateUserPassword(user.id, newHash);
+        }
+      }
+
+      if (!passwordMatches) {
         return res.status(401).json({ error: "Credenciales inválidas" });
       }
 
@@ -173,9 +226,57 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.use("/api/admin", requireAdmin);
 
-  app.get("/api/products", async (_req: Request, res: Response) => {
+  // Mismo patrón que /api/admin: cualquier sesión válida (admin o consultant) puede
+  // acceder a los datos de negocio. Sin esto, estas rutas quedan abiertas sin login.
+  // requireConsultant además exige que la sesión pertenezca a una consultora (admin
+  // nunca debe poder tocar datos de negocio scopeados por tenant a través de estas rutas).
+  app.use("/api/products", requireAuth, requireConsultant);
+  app.use("/api/clients", requireAuth, requireConsultant);
+  app.use("/api/sales", requireAuth, requireConsultant);
+  app.use("/api/appointments", requireAuth, requireConsultant);
+  app.use("/api/reports", requireAuth, requireConsultant);
+  app.use("/api/dashboard", requireAuth, requireConsultant);
+
+  // Sin requireConsultant: admin recibe 404 explícito ("no aplica"), no el 403 genérico.
+  app.get("/api/business-settings", requireAuth, async (req: Request, res: Response) => {
     try {
-      const list = await storage.getAllProducts();
+      if (req.consultantId === null || req.consultantId === undefined) {
+        return res.status(404).json({ error: "La configuración de negocio no aplica para administradores" });
+      }
+      const settings = await storage.getBusinessSettings(req.consultantId);
+      if (!settings) {
+        return res.status(404).json({ error: "Configuración no encontrada" });
+      }
+      res.json(settings);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener la configuración" });
+    }
+  });
+
+  app.patch("/api/business-settings", requireAuth, async (req: Request, res: Response) => {
+    try {
+      if (req.consultantId === null || req.consultantId === undefined) {
+        return res.status(404).json({ error: "La configuración de negocio no aplica para administradores" });
+      }
+      const parsed = updateBusinessSettingsSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+      const updated = await storage.updateBusinessSettings(req.consultantId, parsed.data);
+      if (!updated) {
+        return res.status(404).json({ error: "Configuración no encontrada" });
+      }
+      res.json(updated);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar la configuración" });
+    }
+  });
+
+  app.get("/api/products", async (req: Request, res: Response) => {
+    try {
+      const list = await storage.getAllProducts(req.consultantId!);
       res.json(list);
     } catch (error) {
       console.error(error);
@@ -183,10 +284,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.post("/api/products/seed", async (_req: Request, res: Response) => {
+  app.post("/api/products/seed", async (req: Request, res: Response) => {
     try {
-      const count = await storage.bulkInsertProducts([...SEED_PRODUCTS]);
-      const list = await storage.getAllProducts();
+      const count = await storage.bulkInsertProducts(req.consultantId!, [...SEED_PRODUCTS]);
+      const list = await storage.getAllProducts(req.consultantId!);
       res.json({ message: "Catálogo de prueba cargado", count, products: list });
     } catch (error) {
       console.error(error);
@@ -194,9 +295,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.get("/api/products/low-stock", async (_req: Request, res: Response) => {
+  app.get("/api/products/low-stock", async (req: Request, res: Response) => {
     try {
-      const list = await storage.getLowStockProducts();
+      const list = await storage.getLowStockProducts(req.consultantId!);
       res.json(list);
     } catch (error) {
       console.error(error);
@@ -204,9 +305,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.get("/api/appointments/upcoming", async (_req: Request, res: Response) => {
+  app.get("/api/appointments/upcoming", async (req: Request, res: Response) => {
     try {
-      const list = await storage.getUpcomingAppointments();
+      const list = await storage.getUpcomingAppointments(req.consultantId!);
       res.json(list);
     } catch (error) {
       console.error(error);
@@ -214,9 +315,112 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.get("/api/clients/top", async (_req: Request, res: Response) => {
+  app.get("/api/appointments", async (req: Request, res: Response) => {
     try {
-      const list = await storage.getTopClients();
+      const start = typeof req.query.start === "string" ? req.query.start : "";
+      const end = typeof req.query.end === "string" ? req.query.end : "";
+      if (!start || !end) {
+        return res.status(400).json({ error: "Los parámetros start y end son requeridos" });
+      }
+      if (end <= start) {
+        return res.status(400).json({ error: "El parámetro end debe ser posterior a start" });
+      }
+      const list = await storage.getAppointmentsInRange(req.consultantId!, start, end);
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener citas" });
+    }
+  });
+
+  app.post("/api/appointments", async (req: Request, res: Response) => {
+    try {
+      const parsed = createAppointmentSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const appointment = await storage.createAppointment(req.consultantId!, parsed.data);
+      if (!appointment) {
+        return res.status(404).json({ error: "Clienta no encontrada" });
+      }
+      res.status(201).json(appointment);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al crear la cita" });
+    }
+  });
+
+  app.patch("/api/appointments/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const parsed = updateAppointmentSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const updated = await storage.updateAppointment(req.consultantId!, id, parsed.data);
+      if (!updated) {
+        return res.status(404).json({ error: "Cita no encontrada" });
+      }
+      res.json(updated);
+    } catch (error) {
+      if (error instanceof AppointmentValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar la cita" });
+    }
+  });
+
+  app.patch("/api/appointments/:id/status", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const parsed = updateAppointmentStatusSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const updated = await storage.updateAppointmentStatus(req.consultantId!, id, parsed.data.status);
+      if (!updated) {
+        return res.status(404).json({ error: "Cita no encontrada" });
+      }
+      res.json(updated);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar el estado de la cita" });
+    }
+  });
+
+  app.delete("/api/appointments/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const deleted = await storage.deleteAppointment(req.consultantId!, id);
+      if (!deleted) {
+        return res.status(404).json({ error: "Cita no encontrada" });
+      }
+      res.status(204).send();
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al eliminar la cita" });
+    }
+  });
+
+  app.get("/api/clients/top", async (req: Request, res: Response) => {
+    try {
+      const list = await storage.getTopClients(req.consultantId!);
       res.json(list);
     } catch (error) {
       console.error(error);
@@ -228,7 +432,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const category = typeof req.query.category === "string" && req.query.category ? req.query.category : undefined;
       const limit = typeof req.query.limit === "string" ? parseInt(req.query.limit, 10) : undefined;
-      const list = await storage.getTopProductsByCategory(category, limit && !isNaN(limit) ? limit : undefined);
+      const list = await storage.getTopProductsByCategory(req.consultantId!, category, limit && !isNaN(limit) ? limit : undefined);
       res.json(list);
     } catch (error) {
       console.error(error);
@@ -240,7 +444,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     try {
       const search = typeof req.query.search === "string" ? req.query.search : "";
       const limit = typeof req.query.limit === "string" ? parseInt(req.query.limit, 10) : undefined;
-      const list = await storage.searchClients(search, limit && !isNaN(limit) ? limit : undefined);
+      const list = await storage.searchClients(req.consultantId!, search, limit && !isNaN(limit) ? limit : undefined);
       res.json(list);
     } catch (error) {
       console.error(error);
@@ -254,7 +458,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (!parsed.success) {
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
-      const client = await storage.createClient(parsed.data);
+
+      const duplicate = await storage.findDuplicateClient(req.consultantId!, parsed.data.phone, parsed.data.email ?? null);
+      if (duplicate) {
+        const field = duplicate.phone === parsed.data.phone ? "teléfono" : "email";
+        return res.status(409).json({ error: `Ya existe una clienta registrada con ese ${field}` });
+      }
+
+      const client = await storage.createClient(req.consultantId!, parsed.data);
       res.status(201).json(client);
     } catch (error) {
       console.error(error);
@@ -274,7 +485,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
 
-      const updated = await storage.updateClient(id, parsed.data);
+      if (parsed.data.phone !== undefined || parsed.data.email !== undefined) {
+        const current = await storage.getClientById(req.consultantId!, id);
+        if (!current) {
+          return res.status(404).json({ error: "Clienta no encontrada" });
+        }
+        const phone = parsed.data.phone ?? current.phone;
+        const email = parsed.data.email !== undefined ? parsed.data.email : current.email;
+        const duplicate = await storage.findDuplicateClient(req.consultantId!, phone, email, id);
+        if (duplicate) {
+          const field = duplicate.phone === phone ? "teléfono" : "email";
+          return res.status(409).json({ error: `Ya existe otra clienta registrada con ese ${field}` });
+        }
+      }
+
+      const updated = await storage.updateClient(req.consultantId!, id, parsed.data);
       if (!updated) {
         return res.status(404).json({ error: "Clienta no encontrada" });
       }
@@ -285,9 +510,60 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.get("/api/sales", async (_req: Request, res: Response) => {
+  app.delete("/api/clients/:id", async (req: Request, res: Response) => {
     try {
-      const list = await storage.getAllSales();
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const result = await storage.deleteClient(req.consultantId!, id);
+      if (result === "not_found") {
+        return res.status(404).json({ error: "Clienta no encontrada" });
+      }
+      if (result === "has_relations") {
+        return res.status(409).json({
+          error: "No se puede eliminar: la clienta tiene ventas o citas asociadas. Esos registros se conservan para historial.",
+        });
+      }
+      res.status(204).send();
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al eliminar clienta" });
+    }
+  });
+
+  app.get("/api/clients/:id/sales", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+      const list = await storage.getSalesByClient(req.consultantId!, id);
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener las ventas de la clienta" });
+    }
+  });
+
+  app.get("/api/clients/:id/appointments", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+      const list = await storage.getAppointmentsByClient(req.consultantId!, id);
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener las citas de la clienta" });
+    }
+  });
+
+  app.get("/api/sales", async (req: Request, res: Response) => {
+    try {
+      const list = await storage.getAllSales(req.consultantId!);
       res.json(list);
     } catch (error) {
       console.error(error);
@@ -302,7 +578,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
 
-      const sale = await storage.createSale(parsed.data);
+      const sale = await storage.createSale(req.consultantId!, parsed.data);
       res.status(201).json(sale);
     } catch (error) {
       if (error instanceof SaleValidationError) {
@@ -313,30 +589,105 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.post("/api/dashboard/seed-demo", async (_req: Request, res: Response) => {
+  app.get("/api/sales/:id", async (req: Request, res: Response) => {
     try {
-      await storage.seedDashboardDemoData();
-      res.json({ message: "Datos de demostración cargados" });
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const sale = await storage.getSaleDetails(req.consultantId!, id);
+      if (!sale) {
+        return res.status(404).json({ error: "Venta no encontrada" });
+      }
+      res.json(sale);
     } catch (error) {
       console.error(error);
-      res.status(500).json({ error: "Error al cargar datos de demostración" });
+      res.status(500).json({ error: "Error al obtener la venta" });
     }
   });
 
-  app.post("/api/products/import", async (req: Request, res: Response) => {
+  app.patch("/api/sales/:id", async (req: Request, res: Response) => {
     try {
-      const parsed = bulkProductSchema.safeParse(req.body);
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const parsed = updateSaleSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
 
-      const items = parsed.data.map(toInsertProduct);
+      const updated = await storage.updateSale(req.consultantId!, id, parsed.data);
+      if (!updated) {
+        return res.status(404).json({ error: "Venta no encontrada" });
+      }
+      res.json(updated);
+    } catch (error) {
+      if (error instanceof SaleValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar la venta" });
+    }
+  });
 
-      const count = await storage.bulkInsertProducts(items);
-      res.json({ message: "Catálogo actualizado", count });
+  app.post("/api/sales/:id/cancel", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const cancelled = await storage.cancelSale(req.consultantId!, id);
+      if (!cancelled) {
+        return res.status(404).json({ error: "Venta no encontrada" });
+      }
+      res.json(cancelled);
+    } catch (error) {
+      if (error instanceof SaleValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error(error);
+      res.status(500).json({ error: "Error al cancelar la venta" });
+    }
+  });
+
+  app.patch("/api/sales/:id/installments/:installmentId", async (req: Request, res: Response) => {
+    try {
+      const saleId = parseInt(req.params.id, 10);
+      const installmentId = parseInt(req.params.installmentId, 10);
+      if (isNaN(saleId) || isNaN(installmentId)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const parsed = updateInstallmentStatusSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const updated = await storage.updateInstallmentStatus(req.consultantId!, saleId, installmentId, parsed.data.status);
+      if (!updated) {
+        return res.status(404).json({ error: "Cuota no encontrada" });
+      }
+      res.json(updated);
+    } catch (error) {
+      if (error instanceof SaleValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar la cuota" });
+    }
+  });
+
+  app.post("/api/dashboard/seed-demo", async (req: Request, res: Response) => {
+    try {
+      await storage.seedDashboardDemoData(req.consultantId!);
+      res.json({ message: "Datos de demostración cargados" });
     } catch (error) {
       console.error(error);
-      res.status(500).json({ error: "Error al importar" });
+      res.status(500).json({ error: "Error al cargar datos de demostración" });
     }
   });
 
@@ -352,7 +703,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
 
-      const updated = await storage.applyProductDiscount(id, parsed.data.discountPercent);
+      const updated = await storage.applyProductDiscount(req.consultantId!, id, parsed.data.discountPercent);
       if (!updated) {
         return res.status(404).json({ error: "Producto no encontrado" });
       }
@@ -434,20 +785,183 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // Para el selector del bulk import: solo admin puede ver la lista de consultoras existentes.
+  app.get("/api/admin/consultants", async (_req: Request, res: Response) => {
+    try {
+      const list = await storage.listConsultantAccounts();
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al listar consultoras" });
+    }
+  });
+
   app.post("/api/admin/products/bulk", async (req: Request, res: Response) => {
     try {
-      const parsed = bulkProductSchema.safeParse(req.body);
+      const parsed = adminBulkImportSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
 
-      const items = parsed.data.map(toInsertProduct);
+      const target = await storage.getBusinessSettings(parsed.data.consultantId);
+      if (!target) {
+        return res.status(404).json({ error: "La consultora indicada no existe" });
+      }
 
-      const count = await storage.bulkInsertProducts(items);
+      const items = parsed.data.products.map(toInsertProduct);
+
+      const count = await storage.bulkInsertProducts(parsed.data.consultantId, items);
       res.json({ message: "Catálogo cargado correctamente", count });
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error en carga masiva" });
+    }
+  });
+
+  app.get("/api/reports/sales-summary", async (req: Request, res: Response) => {
+    try {
+      const { start, end } = parseDateRange(req);
+      if (!start || !end) {
+        return res.status(400).json({ error: "Los parámetros start y end son requeridos" });
+      }
+      const groupByParam = typeof req.query.groupBy === "string" ? req.query.groupBy : "day";
+      if (groupByParam !== "day" && groupByParam !== "week" && groupByParam !== "month") {
+        return res.status(400).json({ error: "groupBy debe ser day, week o month" });
+      }
+      const list = await storage.getSalesSummary(req.consultantId!, start, end, groupByParam);
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener el resumen de ventas" });
+    }
+  });
+
+  app.get("/api/reports/top-products", async (req: Request, res: Response) => {
+    try {
+      const { start, end } = parseDateRange(req);
+      const category = typeof req.query.category === "string" && req.query.category ? req.query.category : undefined;
+      const limit = typeof req.query.limit === "string" ? parseInt(req.query.limit, 10) : undefined;
+      const orderParam = typeof req.query.order === "string" ? req.query.order : "desc";
+      if (orderParam !== "asc" && orderParam !== "desc") {
+        return res.status(400).json({ error: "order debe ser asc o desc" });
+      }
+      const list = await storage.getTopProductsByCategory(
+        req.consultantId!,
+        category,
+        limit && !isNaN(limit) ? limit : undefined,
+        start,
+        end,
+        orderParam,
+      );
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener productos más vendidos" });
+    }
+  });
+
+  app.get("/api/reports/top-categories", async (req: Request, res: Response) => {
+    try {
+      const { start, end } = parseDateRange(req);
+      const list = await storage.getTopCategories(req.consultantId!, start, end);
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener categorías más vendidas" });
+    }
+  });
+
+  app.get("/api/reports/top-clients", async (req: Request, res: Response) => {
+    try {
+      const { start, end } = parseDateRange(req);
+      const limit = typeof req.query.limit === "string" ? parseInt(req.query.limit, 10) : undefined;
+      const list = await storage.getTopClients(req.consultantId!, limit && !isNaN(limit) ? limit : undefined, start, end);
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener mejores clientas" });
+    }
+  });
+
+  app.get("/api/reports/payment-methods", async (req: Request, res: Response) => {
+    try {
+      const { start, end } = parseDateRange(req);
+      const list = await storage.getSalesByPaymentMethod(req.consultantId!, start, end);
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener ventas por método de pago" });
+    }
+  });
+
+  app.get("/api/reports/installments-breakdown", async (req: Request, res: Response) => {
+    try {
+      const { start, end } = parseDateRange(req);
+      const breakdown = await storage.getInstallmentsBreakdown(req.consultantId!, start, end);
+      res.json(breakdown);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener ventas por cuotas" });
+    }
+  });
+
+  app.get("/api/reports/stock-valuation", async (req: Request, res: Response) => {
+    try {
+      const result = await storage.getStockValuation(req.consultantId!);
+      res.json(result);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener el stock valorizado" });
+    }
+  });
+
+  app.get("/api/reports/inactive-clients", async (req: Request, res: Response) => {
+    try {
+      const daysParam = typeof req.query.days === "string" ? parseInt(req.query.days, 10) : 30;
+      const days = !isNaN(daysParam) && daysParam > 0 ? daysParam : 30;
+      const list = await storage.getInactiveClients(req.consultantId!, days);
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener clientas inactivas" });
+    }
+  });
+
+  app.get("/api/reports/upcoming-birthdays", async (req: Request, res: Response) => {
+    try {
+      const daysParam = typeof req.query.days === "string" ? parseInt(req.query.days, 10) : 30;
+      const days = !isNaN(daysParam) && daysParam > 0 ? daysParam : 30;
+      const list = await storage.getUpcomingBirthdays(req.consultantId!, days);
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener próximos cumpleaños" });
+    }
+  });
+
+  app.get("/api/reports/appointments-summary", async (req: Request, res: Response) => {
+    try {
+      const { start, end } = parseDateRange(req);
+      if (!start || !end) {
+        return res.status(400).json({ error: "Los parámetros start y end son requeridos" });
+      }
+      const summary = await storage.getAppointmentsSummary(req.consultantId!, start, end);
+      res.json(summary);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener el resumen de citas" });
+    }
+  });
+
+  app.get("/api/reports/pending-installments", async (req: Request, res: Response) => {
+    try {
+      const limitParam = typeof req.query.limit === "string" ? parseInt(req.query.limit, 10) : undefined;
+      const limit = limitParam !== undefined && !isNaN(limitParam) ? limitParam : undefined;
+      const list = await storage.getPendingInstallments(req.consultantId!, limit);
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener cuotas pendientes" });
     }
   });
 

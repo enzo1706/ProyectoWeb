@@ -179,6 +179,24 @@
   }
 }
 
+/* Reportes: fuerza un tema claro al imprimir, sin importar el tema activo en pantalla. */
+@media print {
+  :root,
+  .dark {
+    --background: 0 0% 100%;
+    --foreground: 0 0% 9%;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 9%;
+    --border: 0 0% 85%;
+    --muted: 0 0% 95%;
+    --muted-foreground: 0 0% 35%;
+  }
+
+  body {
+    background: white !important;
+  }
+}
+
 /**
  * Using the elevate system.
  * Automatic contrast adjustment.

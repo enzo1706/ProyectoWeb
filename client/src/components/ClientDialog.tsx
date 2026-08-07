@@ -37,10 +37,14 @@ interface ClientDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   client: Client | null;
-  onSave: (client: Omit<Client, "id" | "totalPurchases" | "lastPurchase">) => void;
+  // consultantId nunca se manda desde el cliente — el backend lo deriva de la sesión.
+  onSave: (client: Omit<Client, "id" | "totalPurchases" | "lastPurchase" | "consultantId">) => void;
+  /** Clientas ya cargadas en la lista actual — se usa para un chequeo rápido de duplicados
+   * en el cliente. El backend sigue siendo la fuente de verdad (valida contra toda la base). */
+  existingClients?: Client[];
 }
 
-export function ClientDialog({ open, onOpenChange, client, onSave }: ClientDialogProps) {
+export function ClientDialog({ open, onOpenChange, client, onSave, existingClients = [] }: ClientDialogProps) {
   const form = useForm<ClientFormData>({
     resolver: zodResolver(clientSchema),
     defaultValues: {
@@ -76,10 +80,26 @@ export function ClientDialog({ open, onOpenChange, client, onSave }: ClientDialo
   }, [client, form]);
 
   const onSubmit = (data: ClientFormData) => {
+    const email = data.email?.trim() || null;
+    const duplicate = existingClients.find((c) => {
+      if (client && c.id === client.id) return false;
+      if (c.phone === data.phone) return true;
+      if (email && c.email && c.email.toLowerCase() === email.toLowerCase()) return true;
+      return false;
+    });
+    if (duplicate) {
+      if (duplicate.phone === data.phone) {
+        form.setError("phone", { message: "Ya existe una clienta con ese teléfono" });
+      } else {
+        form.setError("email", { message: "Ya existe una clienta con ese email" });
+      }
+      return;
+    }
+
     onSave({
       name: data.name || null,
       phone: data.phone,
-      email: data.email || null,
+      email,
       birthday: data.birthday || null,
       address: data.address || null,
       notes: data.notes || null,

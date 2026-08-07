@@ -16,7 +16,7 @@ const isLocalHost =
   databaseUrl.hostname === "127.0.0.1" ||
   databaseUrl.hostname === "::1";
 
-const pool = new pg.Pool({
+export const pool = new pg.Pool({
   connectionString: databaseUrl.toString(),
   ssl: isLocalHost ? false : { rejectUnauthorized: false },
 });

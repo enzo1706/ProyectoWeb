@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
+import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import {
   Table,
   TableBody,
@@ -41,7 +42,7 @@ export default function UserManagement() {
     queryKey: ["/api/admin/users"],
   });
 
-  const toggleMutation = useMutation({
+  const toggleMutation = useGuardedMutation({
     mutationFn: async (id: number) => {
       const res = await apiRequest("PATCH", `/api/admin/users/${id}/toggle-status`);
       return res.json();
@@ -55,7 +56,7 @@ export default function UserManagement() {
     },
   });
 
-  const createMutation = useMutation({
+  const createMutation = useGuardedMutation({
     mutationFn: async (data: { username: string; password: string }) => {
       const res = await apiRequest("POST", "/api/admin/users", data);
       return res.json();
