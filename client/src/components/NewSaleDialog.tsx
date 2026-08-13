@@ -49,6 +49,8 @@ interface NewSaleDialogProps {
   existingSale?: SaleDetails | null;
   /** Clienta con la que arranca precargado el combobox al abrir una venta nueva (ej. desde su ficha). Sigue siendo editable. */
   preselectedClient?: Client | null;
+  /** Líneas con las que arranca precargado el pedido (ej. viene del carrito armado en Productos). Solo aplica en modo creación. */
+  initialLines?: OrderLine[];
 }
 
 const paymentMethodLabels: Record<PaymentMethod, string> = {
@@ -136,7 +138,7 @@ function OrderAdjustmentField({
   );
 }
 
-export function NewSaleDialog({ open, onOpenChange, products, existingSale, preselectedClient }: NewSaleDialogProps) {
+export function NewSaleDialog({ open, onOpenChange, products, existingSale, preselectedClient, initialLines }: NewSaleDialogProps) {
   const { toast } = useToast();
   const isEditMode = !!existingSale;
 
@@ -204,10 +206,15 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
       setShippingCost(existingSale.shippingCost ?? null);
       setNotes(existingSale.notes ?? "");
       setDate(parseLocalDate(existingSale.date));
-    } else if (open && !existingSale && preselectedClient) {
-      setClient(preselectedClient);
+    } else if (open && !existingSale) {
+      if (initialLines && initialLines.length > 0) {
+        setLines(initialLines);
+      }
+      if (preselectedClient) {
+        setClient(preselectedClient);
+      }
     }
-  }, [open, existingSale, preselectedClient, effectiveProducts]);
+  }, [open, existingSale, preselectedClient, initialLines, effectiveProducts]);
 
   const subtotal = computeSubtotal(lines.map((l) => ({ quantity: l.quantity, unitPrice: getLineFinalPrice(l) })));
   const totals = computeSaleTotals({ subtotal, orderDiscount, orderSurcharge, shippingCost });

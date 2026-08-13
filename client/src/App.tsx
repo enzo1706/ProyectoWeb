@@ -7,6 +7,7 @@ import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/AppSidebar";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { AuthProvider, useAuth } from "@/hooks/useAuth";
+import { SaleCartProvider } from "@/hooks/use-sale-cart";
 import NotFound from "@/pages/not-found";
 import Dashboard from "@/pages/Dashboard";
 import Productos from "@/pages/Productos";
@@ -120,8 +121,10 @@ function App() {
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
         <TooltipProvider>
-          <AppShell />
-          <Toaster />
+          <SaleCartProvider>
+            <AppShell />
+            <Toaster />
+          </SaleCartProvider>
         </TooltipProvider>
       </AuthProvider>
     </QueryClientProvider>

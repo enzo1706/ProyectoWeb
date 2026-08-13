@@ -1,6 +1,7 @@
 import {
   users,
   products,
+  productStock,
   clients,
   appointments,
   sales,
@@ -12,11 +13,13 @@ import {
   createAppointmentSchema,
   updateAppointmentSchema,
   updateBusinessSettingsSchema,
+  createProductSchema,
   appointmentStatuses,
   type User,
   type InsertUser,
   type Product,
   type InsertProduct,
+  type ProductStock,
   type Client,
   type InsertClient,
   type Appointment,
@@ -33,9 +36,10 @@ import {
   computeInstallmentDueDate,
 } from "@shared/saleCalculations";
 import type { z } from "zod";
-import { eq, ne, count, sql, and, gte, lt, asc, desc, isNotNull, inArray, ilike, or } from "drizzle-orm";
+import { eq, ne, count, sql, and, gte, lt, asc, desc, isNotNull, isNull, inArray, ilike, or } from "drizzle-orm";
 import type { db as database } from "./db";
 import { resolveStorageMode } from "./storage-mode";
+import { slugify } from "@shared/slug";
 import bcrypt from "bcryptjs";
 
 export class SaleValidationError extends Error {}
@@ -59,6 +63,23 @@ export type UpdateSaleInput = z.infer<typeof updateSaleSchema>;
 export type CreateAppointmentInput = z.infer<typeof createAppointmentSchema>;
 export type UpdateAppointmentInput = z.infer<typeof updateAppointmentSchema>;
 export type UpdateBusinessSettingsInput = z.infer<typeof updateBusinessSettingsSchema>;
+export type CreateProductInput = z.infer<typeof createProductSchema>;
+
+type ProductRow = typeof products.$inferSelect;
+type StockFields = Pick<ProductStock, "unidades" | "stockMinimo" | "costPrice" | "selectedDiscount" | "discontinued">;
+
+/** Combina un producto de catálogo con la fila de stock de la consultora que lo está mirando
+ * (o los defaults, si todavía no tiene una) — la forma `Product` que consume el resto de la app. */
+function withStockDefaults(product: ProductRow, stock?: StockFields | null): Product {
+  return {
+    ...product,
+    unidades: stock?.unidades ?? 0,
+    stockMinimo: stock?.stockMinimo ?? 5,
+    costPrice: stock?.costPrice ?? null,
+    selectedDiscount: stock?.selectedDiscount ?? null,
+    discontinued: stock?.discontinued ?? false,
+  };
+}
 
 export interface TopClient {
   clientId: number;
@@ -208,16 +229,31 @@ export interface IStorage {
   updateUserPassword(id: number, newHash: string): Promise<void>;
   getConsultants(): Promise<User[]>;
   toggleUserStatus(id: number): Promise<User | undefined>;
+  /** Para el bootstrap del primer admin: si ya existe alguno, el script no debe crear otro. */
+  hasAdminAccount(): Promise<boolean>;
   getProductCount(): Promise<number>;
-  /** Admin-only: lista de consultoras existentes (para el selector del bulk import). */
+  /** Admin-only: lista de consultoras existentes. */
   listConsultantAccounts(): Promise<Consultant[]>;
   getBusinessSettings(consultantId: number): Promise<Consultant | undefined>;
   updateBusinessSettings(consultantId: number, input: UpdateBusinessSettingsInput): Promise<Consultant | undefined>;
   getAllProducts(consultantId: number): Promise<Product[]>;
   getProductsByIds(consultantId: number, ids: number[]): Promise<Product[]>;
-  bulkInsertProducts(consultantId: number, items: InsertProduct[]): Promise<number>;
+  /** Admin-only: carga/actualiza el catálogo GLOBAL (consultantId null) — no toca stock de nadie. */
+  bulkInsertProducts(items: InsertProduct[]): Promise<number>;
+  /** Catálogo de prueba de una consultora (ej. botón "Cargar catálogo de prueba"): productos
+   * privados de ella, no globales — igual que bulkInsertProducts pero scopeado, con stock propio. */
+  seedOwnProducts(consultantId: number, items: CreateProductInput[]): Promise<number>;
   getLowStockProducts(consultantId: number): Promise<Product[]>;
   applyProductDiscount(consultantId: number, productId: number, discountPercent: number): Promise<Product | undefined>;
+  createProduct(consultantId: number, input: CreateProductInput): Promise<Product>;
+  setProductDiscontinued(consultantId: number, productId: number, discontinued: boolean): Promise<Product | undefined>;
+  /** La consultora fija su propio stock sobre un producto (global o manual propio). */
+  setProductStock(consultantId: number, productId: number, unidades: number): Promise<Product | undefined>;
+  /** Admin-only: catálogo global completo (sin stock, eso es por consultora) para la pantalla de imágenes. */
+  listGlobalProducts(): Promise<ProductRow[]>;
+  /** Admin-only: solo aplica a productos globales — las imágenes de productos manuales las
+   * gestiona cada consultora dueña, no el admin. */
+  setProductImage(productId: number, imagen: string | null): Promise<ProductRow | undefined>;
   getUpcomingAppointments(consultantId: number, limit?: number): Promise<Appointment[]>;
   getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<Appointment[]>;
   createAppointment(consultantId: number, input: CreateAppointmentInput): Promise<Appointment | undefined>;
@@ -328,6 +364,12 @@ export class DatabaseStorage implements IStorage {
     return updated;
   }
 
+  async hasAdminAccount(): Promise<boolean> {
+    const db = await this.getDb();
+    const [result] = await db.select({ value: count() }).from(users).where(eq(users.role, "admin"));
+    return (result?.value ?? 0) > 0;
+  }
+
   async getProductCount(): Promise<number> {
     const db = await this.getDb();
     const [result] = await db.select({ value: count() }).from(products);
@@ -355,63 +397,253 @@ export class DatabaseStorage implements IStorage {
     return updated;
   }
 
+  /** Catálogo visible para la consultora: lo global (consultantId null) + lo manual propio,
+   * con su stock resuelto (o defaults si todavía no cargó stock para ese producto). */
   async getAllProducts(consultantId: number): Promise<Product[]> {
     const db = await this.getDb();
-    return db
-      .select()
+    const rows = await db
+      .select({ product: products, stock: productStock })
       .from(products)
-      .where(eq(products.consultantId, consultantId))
+      .leftJoin(productStock, and(eq(productStock.productId, products.id), eq(productStock.consultantId, consultantId)))
+      .where(or(isNull(products.consultantId), eq(products.consultantId, consultantId)))
       .orderBy(products.seccion, products.linea, products.producto);
+    return rows.map((r) => withStockDefaults(r.product, r.stock));
   }
 
   async getProductsByIds(consultantId: number, ids: number[]): Promise<Product[]> {
     if (ids.length === 0) return [];
     const db = await this.getDb();
-    return db.select().from(products).where(and(inArray(products.id, ids), eq(products.consultantId, consultantId)));
+    const rows = await db
+      .select({ product: products, stock: productStock })
+      .from(products)
+      .leftJoin(productStock, and(eq(productStock.productId, products.id), eq(productStock.consultantId, consultantId)))
+      .where(and(inArray(products.id, ids), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
+    return rows.map((r) => withStockDefaults(r.product, r.stock));
   }
 
-  async bulkInsertProducts(consultantId: number, items: InsertProduct[]): Promise<number> {
+  /** Admin-only: carga/actualiza el catálogo GLOBAL. `unique(consultantId, codigo)` no alcanza
+   * para deduplicar filas globales (dos NULL nunca son "iguales" en SQL), así que en vez de un
+   * ON CONFLICT con índice parcial (no verificable contra Postgres real en este entorno) se hace
+   * un select-then-upsert explícito por código — mismo resultado, portable a MemoryStorage. */
+  async bulkInsertProducts(items: InsertProduct[]): Promise<number> {
     if (items.length === 0) return 0;
 
     const db = await this.getDb();
-    const inserted = await db
-      .insert(products)
-      .values(items.map((item) => ({ ...item, consultantId })))
-      .onConflictDoUpdate({
-        target: [products.consultantId, products.codigo],
-        set: {
-          seccion: sql`EXCLUDED.seccion`,
-          linea: sql`EXCLUDED.linea`,
-          producto: sql`EXCLUDED.producto`,
-          precio: sql`EXCLUDED.precio`,
-          unidades: sql`EXCLUDED.unidades`,
-          imagen: sql`EXCLUDED.imagen`,
-          stockMinimo: sql`EXCLUDED.stock_minimo`,
-        },
-      })
-      .returning();
+    let changed = 0;
+    await db.transaction(async (tx) => {
+      for (const item of items) {
+        const [existing] = await tx
+          .select({ id: products.id })
+          .from(products)
+          .where(and(isNull(products.consultantId), eq(products.codigo, item.codigo)));
 
-    return inserted.length;
+        if (existing) {
+          await tx
+            .update(products)
+            .set({
+              seccion: item.seccion,
+              linea: item.linea ?? null,
+              producto: item.producto,
+              variante: item.variante ?? "Estándar",
+              puntos: item.puntos ?? 0,
+              precio: item.precio,
+              imagen: item.imagen ?? null,
+            })
+            .where(eq(products.id, existing.id));
+        } else {
+          await tx.insert(products).values({ ...item, consultantId: null, source: "import" });
+        }
+        changed++;
+      }
+    });
+
+    return changed;
   }
 
+  /** Mismo patrón select-then-upsert que bulkInsertProducts, pero scopeado a UNA consultora
+   * (productos privados, no globales) y sembrando también su propio stock en la misma pasada —
+   * usado por el botón "Cargar catálogo de prueba". Idempotente: reintentar no duplica. */
+  async seedOwnProducts(consultantId: number, items: CreateProductInput[]): Promise<number> {
+    if (items.length === 0) return 0;
+
+    const db = await this.getDb();
+    let changed = 0;
+    await db.transaction(async (tx) => {
+      for (const item of items) {
+        const variante = item.variante ?? "Estándar";
+        const codigo = item.codigo ?? slugify(`${item.seccion}-${item.linea ?? ""}-${item.producto}-${variante}-${Date.now()}`);
+
+        const [existing] = await tx
+          .select({ id: products.id })
+          .from(products)
+          .where(and(eq(products.consultantId, consultantId), eq(products.codigo, codigo)));
+
+        let productId: number;
+        if (existing) {
+          await tx
+            .update(products)
+            .set({
+              seccion: item.seccion,
+              linea: item.linea ?? null,
+              producto: item.producto,
+              variante,
+              puntos: item.puntos,
+              precio: item.precio,
+              imagen: item.imagen ?? null,
+            })
+            .where(eq(products.id, existing.id));
+          productId = existing.id;
+        } else {
+          const [created] = await tx
+            .insert(products)
+            .values({
+              consultantId,
+              seccion: item.seccion,
+              linea: item.linea ?? null,
+              producto: item.producto,
+              variante,
+              codigo,
+              puntos: item.puntos,
+              precio: item.precio,
+              imagen: item.imagen ?? null,
+              source: "manual",
+            })
+            .returning();
+          productId = created.id;
+        }
+
+        await tx
+          .insert(productStock)
+          .values({ consultantId, productId, unidades: item.unidades, stockMinimo: item.stockMinimo ?? 5 })
+          .onConflictDoUpdate({
+            target: [productStock.consultantId, productStock.productId],
+            set: { unidades: item.unidades },
+          });
+        changed++;
+      }
+    });
+
+    return changed;
+  }
+
+  /** Solo productos que la consultora ya tiene cargados en su stock — no tiene sentido avisar
+   * "stock bajo" de todo el catálogo global que todavía no tocó. */
   async getLowStockProducts(consultantId: number): Promise<Product[]> {
     const db = await this.getDb();
-    return db
+    const rows = await db
+      .select({ product: products, stock: productStock })
+      .from(productStock)
+      .innerJoin(products, eq(products.id, productStock.productId))
+      .where(and(eq(productStock.consultantId, consultantId), sql`${productStock.unidades} <= ${productStock.stockMinimo}`))
+      .orderBy(asc(productStock.unidades));
+    return rows.map((r) => withStockDefaults(r.product, r.stock));
+  }
+
+  private async findVisibleProduct(db: Database, consultantId: number, productId: number): Promise<ProductRow | undefined> {
+    const [product] = await db
       .select()
       .from(products)
-      .where(and(eq(products.consultantId, consultantId), sql`${products.unidades} <= ${products.stockMinimo}`))
-      .orderBy(asc(products.unidades));
+      .where(and(eq(products.id, productId), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
+    return product;
   }
 
   async applyProductDiscount(consultantId: number, productId: number, discountPercent: number): Promise<Product | undefined> {
     const db = await this.getDb();
+    const product = await this.findVisibleProduct(db, consultantId, productId);
+    if (!product) return undefined;
+
+    const costPrice = Math.round(product.precio * (1 - discountPercent / 100));
+    const [stock] = await db
+      .insert(productStock)
+      .values({ consultantId, productId, selectedDiscount: discountPercent, costPrice })
+      .onConflictDoUpdate({
+        target: [productStock.consultantId, productStock.productId],
+        set: { selectedDiscount: discountPercent, costPrice },
+      })
+      .returning();
+    return withStockDefaults(product, stock);
+  }
+
+  async createProduct(consultantId: number, input: CreateProductInput): Promise<Product> {
+    const db = await this.getDb();
+    const variante = input.variante ?? "Estándar";
+    const codigo = input.codigo ?? slugify(`${input.seccion}-${input.linea ?? ""}-${input.producto}-${variante}-${Date.now()}`);
+    return db.transaction(async (tx) => {
+      const [created] = await tx
+        .insert(products)
+        .values({
+          consultantId,
+          seccion: input.seccion,
+          linea: input.linea ?? null,
+          producto: input.producto,
+          variante,
+          codigo,
+          puntos: input.puntos,
+          precio: input.precio,
+          imagen: input.imagen ?? null,
+          source: "manual",
+        })
+        .returning();
+      const [stock] = await tx
+        .insert(productStock)
+        .values({
+          consultantId,
+          productId: created.id,
+          unidades: input.unidades,
+          stockMinimo: input.stockMinimo ?? 5,
+        })
+        .returning();
+      return withStockDefaults(created, stock);
+    });
+  }
+
+  async setProductDiscontinued(consultantId: number, productId: number, discontinued: boolean): Promise<Product | undefined> {
+    const db = await this.getDb();
+    const product = await this.findVisibleProduct(db, consultantId, productId);
+    if (!product) return undefined;
+
+    const [stock] = await db
+      .insert(productStock)
+      .values({ consultantId, productId, discontinued })
+      .onConflictDoUpdate({
+        target: [productStock.consultantId, productStock.productId],
+        set: { discontinued },
+      })
+      .returning();
+    return withStockDefaults(product, stock);
+  }
+
+  async setProductStock(consultantId: number, productId: number, unidades: number): Promise<Product | undefined> {
+    const db = await this.getDb();
+    const product = await this.findVisibleProduct(db, consultantId, productId);
+    if (!product) return undefined;
+
+    const [stock] = await db
+      .insert(productStock)
+      .values({ consultantId, productId, unidades })
+      .onConflictDoUpdate({
+        target: [productStock.consultantId, productStock.productId],
+        set: { unidades },
+      })
+      .returning();
+    return withStockDefaults(product, stock);
+  }
+
+  async listGlobalProducts(): Promise<ProductRow[]> {
+    const db = await this.getDb();
+    return db
+      .select()
+      .from(products)
+      .where(isNull(products.consultantId))
+      .orderBy(products.seccion, products.linea, products.producto);
+  }
+
+  async setProductImage(productId: number, imagen: string | null): Promise<ProductRow | undefined> {
+    const db = await this.getDb();
     const [updated] = await db
       .update(products)
-      .set({
-        selectedDiscount: discountPercent,
-        costPrice: sql`ROUND(${products.precio} * (1 - ${discountPercent} / 100.0))`,
-      })
-      .where(and(eq(products.id, productId), eq(products.consultantId, consultantId)))
+      .set({ imagen })
+      .where(and(eq(products.id, productId), isNull(products.consultantId)))
       .returning();
     return updated;
   }
@@ -894,13 +1126,14 @@ export class DatabaseStorage implements IStorage {
     const db = await this.getDb();
     const [row] = await db
       .select({
-        valueAtCost: sql<number>`coalesce(sum(${products.unidades} * coalesce(${products.costPrice}, ${products.precio})), 0)`,
-        valueAtPrice: sql<number>`coalesce(sum(${products.unidades} * ${products.precio}), 0)`,
+        valueAtCost: sql<number>`coalesce(sum(${productStock.unidades} * coalesce(${productStock.costPrice}, ${products.precio})), 0)`,
+        valueAtPrice: sql<number>`coalesce(sum(${productStock.unidades} * ${products.precio}), 0)`,
         productCount: count(products.id),
-        unitCount: sql<number>`coalesce(sum(${products.unidades}), 0)`,
+        unitCount: sql<number>`coalesce(sum(${productStock.unidades}), 0)`,
       })
-      .from(products)
-      .where(eq(products.consultantId, consultantId));
+      .from(productStock)
+      .innerJoin(products, eq(products.id, productStock.productId))
+      .where(eq(productStock.consultantId, consultantId));
 
     const valueAtCost = Number(row?.valueAtCost ?? 0);
     const valueAtPrice = Number(row?.valueAtPrice ?? 0);
@@ -1036,10 +1269,9 @@ export class DatabaseStorage implements IStorage {
     const db = await this.getDb();
 
     const productIds = input.items.map((i) => i.productId);
-    const foundProducts = await db
-      .select()
-      .from(products)
-      .where(and(inArray(products.id, productIds), eq(products.consultantId, consultantId)));
+    // Reutiliza el mismo join catálogo+stock que getProductsByIds — costo y stock siempre
+    // resueltos contra el stock propio de esta consultora, sea el producto global o manual.
+    const foundProducts = await this.getProductsByIds(consultantId, productIds);
     const productById = new Map(foundProducts.map((p) => [p.id, p]));
 
     const lines = input.items.map((item) => {
@@ -1124,9 +1356,9 @@ export class DatabaseStorage implements IStorage {
 
       for (const line of lines) {
         await tx
-          .update(products)
+          .update(productStock)
           .set({ unidades: line.product.unidades - line.quantity })
-          .where(eq(products.id, line.product.id));
+          .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, line.product.id)));
       }
 
       return sale;
@@ -1157,10 +1389,12 @@ export class DatabaseStorage implements IStorage {
           ...input.items.map((i) => i.productId),
         ]),
       );
-      const involvedProducts = await tx
-        .select()
+      const involvedRows = await tx
+        .select({ product: products, stock: productStock })
         .from(products)
-        .where(and(inArray(products.id, involvedIds), eq(products.consultantId, consultantId)));
+        .leftJoin(productStock, and(eq(productStock.productId, products.id), eq(productStock.consultantId, consultantId)))
+        .where(and(inArray(products.id, involvedIds), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
+      const involvedProducts = involvedRows.map((r) => withStockDefaults(r.product, r.stock));
       const productById = new Map(involvedProducts.map((p) => [p.id, p]));
       const stockById = new Map(involvedProducts.map((p) => [p.id, p.unidades]));
 
@@ -1203,7 +1437,10 @@ export class DatabaseStorage implements IStorage {
 
       // A partir de acá ya está todo validado: recién ahora se escribe.
       for (const productId of involvedIds) {
-        await tx.update(products).set({ unidades: stockById.get(productId)! }).where(eq(products.id, productId));
+        await tx
+          .update(productStock)
+          .set({ unidades: stockById.get(productId)! })
+          .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, productId)));
       }
 
       await tx.delete(saleItems).where(eq(saleItems.saleId, id));
@@ -1268,15 +1505,21 @@ export class DatabaseStorage implements IStorage {
       const items = await tx.select().from(saleItems).where(eq(saleItems.saleId, id));
       const productIds = items.map((i) => i.productId).filter((pid): pid is number => pid !== null);
       if (productIds.length > 0) {
-        const involvedProducts = await tx.select().from(products).where(inArray(products.id, productIds));
-        const stockById = new Map(involvedProducts.map((p) => [p.id, p.unidades]));
+        const stockRows = await tx
+          .select()
+          .from(productStock)
+          .where(and(eq(productStock.consultantId, consultantId), inArray(productStock.productId, productIds)));
+        const stockById = new Map(stockRows.map((s) => [s.productId, s.unidades]));
         for (const item of items) {
           if (item.productId !== null) {
             stockById.set(item.productId, (stockById.get(item.productId) ?? 0) + item.quantity);
           }
         }
         for (const productId of productIds) {
-          await tx.update(products).set({ unidades: stockById.get(productId)! }).where(eq(products.id, productId));
+          await tx
+            .update(productStock)
+            .set({ unidades: stockById.get(productId)! })
+            .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, productId)));
         }
       }
 
@@ -1427,7 +1670,8 @@ export class DatabaseStorage implements IStorage {
 export class MemoryStorage implements IStorage {
   private users: User[] = [];
   private consultants: Consultant[] = [];
-  private products: Product[] = [];
+  private products: ProductRow[] = [];
+  private productStock: ProductStock[] = [];
   private clients: Client[] = [];
   private appointments: Appointment[] = [];
   private sales: Sale[] = [];
@@ -1436,11 +1680,36 @@ export class MemoryStorage implements IStorage {
   private nextUserId = 1;
   private nextConsultantId = 1;
   private nextProductId = 1;
+  private nextProductStockId = 1;
   private nextClientId = 1;
   private nextAppointmentId = 1;
   private nextSaleId = 1;
   private nextSaleItemId = 1;
   private nextSaleInstallmentId = 1;
+
+  /** Fila de stock de la consultora sobre un producto, creándola con defaults si no existe. */
+  private getOrCreateStock(consultantId: number, productId: number): ProductStock {
+    let stock = this.productStock.find((s) => s.consultantId === consultantId && s.productId === productId);
+    if (!stock) {
+      stock = {
+        id: this.nextProductStockId++,
+        consultantId,
+        productId,
+        unidades: 0,
+        stockMinimo: 5,
+        costPrice: null,
+        selectedDiscount: null,
+        discontinued: false,
+      };
+      this.productStock.push(stock);
+    }
+    return stock;
+  }
+
+  /** Producto visible para la consultora (global o manual propio) o undefined si no aplica. */
+  private findVisibleProduct(consultantId: number, productId: number): ProductRow | undefined {
+    return this.products.find((p) => p.id === productId && (p.consultantId === null || p.consultantId === consultantId));
+  }
 
   async getUser(id: number): Promise<User | undefined> {
     return this.users.find((user) => user.id === id);
@@ -1495,6 +1764,10 @@ export class MemoryStorage implements IStorage {
     return user;
   }
 
+  async hasAdminAccount(): Promise<boolean> {
+    return this.users.some((u) => u.role === "admin");
+  }
+
   async getProductCount(): Promise<number> {
     return this.products.length;
   }
@@ -1518,51 +1791,51 @@ export class MemoryStorage implements IStorage {
 
   async getAllProducts(consultantId: number): Promise<Product[]> {
     return this.products
-      .filter((p) => p.consultantId === consultantId)
+      .filter((p) => p.consultantId === null || p.consultantId === consultantId)
       .sort((a, b) =>
-        [a.seccion, a.linea, a.producto].join(" ").localeCompare(
-          [b.seccion, b.linea, b.producto].join(" "),
+        [a.seccion, a.linea ?? "", a.producto].join(" ").localeCompare(
+          [b.seccion, b.linea ?? "", b.producto].join(" "),
         ),
-      );
+      )
+      .map((p) => withStockDefaults(p, this.productStock.find((s) => s.consultantId === consultantId && s.productId === p.id)));
   }
 
   async getProductsByIds(consultantId: number, ids: number[]): Promise<Product[]> {
-    return this.products.filter((p) => ids.includes(p.id) && p.consultantId === consultantId);
+    return this.products
+      .filter((p) => ids.includes(p.id) && (p.consultantId === null || p.consultantId === consultantId))
+      .map((p) => withStockDefaults(p, this.productStock.find((s) => s.consultantId === consultantId && s.productId === p.id)));
   }
 
-  async bulkInsertProducts(consultantId: number, items: InsertProduct[]): Promise<number> {
+  /** Admin-only: catálogo GLOBAL — dedupe por código entre los productos globales (consultantId
+   * null), nunca toca el stock de ninguna consultora. */
+  async bulkInsertProducts(items: InsertProduct[]): Promise<number> {
     let changed = 0;
 
     for (const item of items) {
-      const existing = this.products.find((product) => product.codigo === item.codigo && product.consultantId === consultantId);
+      const existing = this.products.find((product) => product.codigo === item.codigo && product.consultantId === null);
       if (existing) {
         Object.assign(existing, {
           seccion: item.seccion,
-          linea: item.linea,
+          linea: item.linea ?? null,
           producto: item.producto,
           variante: item.variante ?? "Estándar",
           puntos: item.puntos ?? 0,
           precio: item.precio,
-          unidades: item.unidades ?? 0,
           imagen: item.imagen ?? null,
-          stockMinimo: item.stockMinimo ?? 5,
         });
       } else {
         this.products.push({
           id: this.nextProductId++,
-          consultantId,
+          consultantId: null,
           seccion: item.seccion,
-          linea: item.linea,
+          linea: item.linea ?? null,
           producto: item.producto,
           variante: item.variante ?? "Estándar",
           codigo: item.codigo ?? `producto-${this.nextProductId}`,
           puntos: item.puntos ?? 0,
           precio: item.precio,
-          unidades: item.unidades ?? 0,
           imagen: item.imagen ?? null,
-          stockMinimo: item.stockMinimo ?? 5,
-          costPrice: null,
-          selectedDiscount: null,
+          source: "import",
         });
       }
       changed++;
@@ -1571,17 +1844,123 @@ export class MemoryStorage implements IStorage {
     return changed;
   }
 
+  /** Catálogo de prueba de UNA consultora — productos privados (no globales), con su propio
+   * stock sembrado en la misma pasada. Idempotente, igual que bulkInsertProducts. */
+  async seedOwnProducts(consultantId: number, items: CreateProductInput[]): Promise<number> {
+    let changed = 0;
+
+    for (const item of items) {
+      const variante = item.variante ?? "Estándar";
+      const codigo = item.codigo ?? slugify(`${item.seccion}-${item.linea ?? ""}-${item.producto}-${variante}-${Date.now()}`);
+      let product = this.products.find((p) => p.codigo === codigo && p.consultantId === consultantId);
+
+      if (product) {
+        Object.assign(product, {
+          seccion: item.seccion,
+          linea: item.linea ?? null,
+          producto: item.producto,
+          variante,
+          puntos: item.puntos,
+          precio: item.precio,
+          imagen: item.imagen ?? null,
+        });
+      } else {
+        product = {
+          id: this.nextProductId++,
+          consultantId,
+          seccion: item.seccion,
+          linea: item.linea ?? null,
+          producto: item.producto,
+          variante,
+          codigo,
+          puntos: item.puntos,
+          precio: item.precio,
+          imagen: item.imagen ?? null,
+          source: "manual",
+        };
+        this.products.push(product);
+      }
+
+      const stock = this.getOrCreateStock(consultantId, product.id);
+      stock.unidades = item.unidades;
+      changed++;
+    }
+
+    return changed;
+  }
+
   async getLowStockProducts(consultantId: number): Promise<Product[]> {
-    return this.products
-      .filter((p) => p.consultantId === consultantId && p.unidades <= p.stockMinimo)
-      .sort((a, b) => a.unidades - b.unidades);
+    return this.productStock
+      .filter((s) => s.consultantId === consultantId && s.unidades <= s.stockMinimo)
+      .sort((a, b) => a.unidades - b.unidades)
+      .map((s) => {
+        const product = this.products.find((p) => p.id === s.productId)!;
+        return withStockDefaults(product, s);
+      });
   }
 
   async applyProductDiscount(consultantId: number, productId: number, discountPercent: number): Promise<Product | undefined> {
-    const product = this.products.find((p) => p.id === productId && p.consultantId === consultantId);
+    const product = this.findVisibleProduct(consultantId, productId);
     if (!product) return undefined;
-    product.selectedDiscount = discountPercent;
-    product.costPrice = Math.round(product.precio * (1 - discountPercent / 100));
+    const stock = this.getOrCreateStock(consultantId, productId);
+    stock.selectedDiscount = discountPercent;
+    stock.costPrice = Math.round(product.precio * (1 - discountPercent / 100));
+    return withStockDefaults(product, stock);
+  }
+
+  async createProduct(consultantId: number, input: CreateProductInput): Promise<Product> {
+    const variante = input.variante ?? "Estándar";
+    const codigo = input.codigo ?? slugify(`${input.seccion}-${input.linea ?? ""}-${input.producto}-${variante}-${Date.now()}`);
+    const product: ProductRow = {
+      id: this.nextProductId++,
+      consultantId,
+      seccion: input.seccion,
+      linea: input.linea ?? null,
+      producto: input.producto,
+      variante,
+      codigo,
+      puntos: input.puntos,
+      precio: input.precio,
+      imagen: input.imagen ?? null,
+      source: "manual",
+    };
+    this.products.push(product);
+    const stock = this.getOrCreateStock(consultantId, product.id);
+    stock.unidades = input.unidades;
+    stock.stockMinimo = input.stockMinimo ?? 5;
+    return withStockDefaults(product, stock);
+  }
+
+  async setProductDiscontinued(consultantId: number, productId: number, discontinued: boolean): Promise<Product | undefined> {
+    const product = this.findVisibleProduct(consultantId, productId);
+    if (!product) return undefined;
+    const stock = this.getOrCreateStock(consultantId, productId);
+    stock.discontinued = discontinued;
+    return withStockDefaults(product, stock);
+  }
+
+  async setProductStock(consultantId: number, productId: number, unidades: number): Promise<Product | undefined> {
+    const product = this.findVisibleProduct(consultantId, productId);
+    if (!product) return undefined;
+    const stock = this.getOrCreateStock(consultantId, productId);
+    stock.unidades = unidades;
+    return withStockDefaults(product, stock);
+  }
+
+  async listGlobalProducts(): Promise<ProductRow[]> {
+    return this.products
+      .filter((p) => p.consultantId === null)
+      .sort((a, b) =>
+        [a.seccion, a.linea ?? "", a.producto].join(" ").localeCompare(
+          [b.seccion, b.linea ?? "", b.producto].join(" "),
+        ),
+      );
+  }
+
+  async setProductImage(productId: number, imagen: string | null): Promise<ProductRow | undefined> {
+    const product = this.products.find((p) => p.id === productId && p.consultantId === null);
+    if (!product) return undefined;
+    product.imagen = imagen;
     return product;
   }
 
@@ -1946,12 +2325,14 @@ export class MemoryStorage implements IStorage {
     let valueAtPrice = 0;
     let unitCount = 0;
     let productCount = 0;
-    for (const p of this.products) {
-      if (p.consultantId !== consultantId) continue;
-      const cost = p.costPrice ?? p.precio;
-      valueAtCost += p.unidades * cost;
-      valueAtPrice += p.unidades * p.precio;
-      unitCount += p.unidades;
+    for (const stock of this.productStock) {
+      if (stock.consultantId !== consultantId) continue;
+      const product = this.products.find((p) => p.id === stock.productId);
+      if (!product) continue;
+      const cost = stock.costPrice ?? product.precio;
+      valueAtCost += stock.unidades * cost;
+      valueAtPrice += stock.unidades * product.precio;
+      unitCount += stock.unidades;
       productCount++;
     }
     return {
@@ -2063,9 +2444,8 @@ export class MemoryStorage implements IStorage {
   }
 
   async createSale(consultantId: number, input: CreateSaleInput): Promise<Sale> {
-    const productById = new Map(
-      this.products.filter((p) => p.consultantId === consultantId).map((p) => [p.id, p]),
-    );
+    const productIds = input.items.map((i) => i.productId);
+    const productById = new Map((await this.getProductsByIds(consultantId, productIds)).map((p) => [p.id, p]));
 
     const lines = input.items.map((item) => {
       const product = productById.get(item.productId);
@@ -2131,7 +2511,8 @@ export class MemoryStorage implements IStorage {
         originalPrice: line.product.precio,
         price: line.unitPrice,
       });
-      line.product.unidades -= line.quantity;
+      const stock = this.getOrCreateStock(consultantId, line.product.id);
+      stock.unidades -= line.quantity;
     }
 
     installmentAmounts.forEach((amount, index) => {
@@ -2157,10 +2538,15 @@ export class MemoryStorage implements IStorage {
 
     const existingItems = this.saleItems.filter((i) => i.saleId === id);
 
+    const involvedIds = Array.from(
+      new Set([
+        ...existingItems.map((i) => i.productId).filter((pid): pid is number => pid !== null),
+        ...input.items.map((i) => i.productId),
+      ]),
+    );
+    const productById = new Map((await this.getProductsByIds(consultantId, involvedIds)).map((p) => [p.id, p]));
     const stockById = new Map<number, number>();
-    for (const p of this.products) {
-      if (p.consultantId === consultantId) stockById.set(p.id, p.unidades);
-    }
+    productById.forEach((p) => stockById.set(p.id, p.unidades));
 
     // 1) Restaurar el stock que esta venta tenía reservado (como si se hubiera eliminado).
     for (const item of existingItems) {
@@ -2170,9 +2556,6 @@ export class MemoryStorage implements IStorage {
     }
 
     // 2) Validar y reservar stock para la nueva composición, sobre el stock ya restaurado.
-    const productById = new Map(
-      this.products.filter((p) => p.consultantId === consultantId).map((p) => [p.id, p]),
-    );
     const lines = input.items.map((item) => {
       const product = productById.get(item.productId);
       if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
@@ -2204,8 +2587,8 @@ export class MemoryStorage implements IStorage {
 
     // A partir de acá ya está todo validado: recién ahora se muta estado.
     stockById.forEach((newStock, productId) => {
-      const product = productById.get(productId);
-      if (product) product.unidades = newStock;
+      const stock = this.getOrCreateStock(consultantId, productId);
+      stock.unidades = newStock;
     });
 
     this.saleItems = this.saleItems.filter((i) => i.saleId !== id);
@@ -2261,8 +2644,8 @@ export class MemoryStorage implements IStorage {
     const items = this.saleItems.filter((i) => i.saleId === id);
     for (const item of items) {
       if (item.productId !== null) {
-        const product = this.products.find((p) => p.id === item.productId);
-        if (product) product.unidades += item.quantity;
+        const stock = this.getOrCreateStock(consultantId, item.productId);
+        stock.unidades += item.quantity;
       }
     }
 
@@ -2285,7 +2668,9 @@ export class MemoryStorage implements IStorage {
   }
 
   async seedDashboardDemoData(consultantId: number): Promise<void> {
-    const ownProducts = this.products.filter((p) => p.consultantId === consultantId);
+    // Catálogo visible completo (global + manual propio) — la mayoría de sus productos van a
+    // ser globales ahora, filtrar solo por consultantId nunca encontraría nada.
+    const ownProducts = await this.getAllProducts(consultantId);
     if (ownProducts.length === 0) return;
 
     const c1: Client = {

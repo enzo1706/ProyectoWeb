@@ -47,6 +47,12 @@ export function computeSaleTotals(input: SaleTotalsInput): SaleTotals {
   return { subtotal: input.subtotal, discountAmount, surchargeAmount, shippingCost, total };
 }
 
+/** Lo que le cuesta el producto a la consultora según su descuento de compra — misma fórmula
+ * que usa el backend en `applyProductDiscount` (storage.ts) al persistir `costPrice`. */
+export function computeDiscountedCost(precio: number, discountPercent: number): number {
+  return Math.round(precio * (1 - discountPercent / 100));
+}
+
 /** Precio final de una línea según el modo de ajuste elegido en EditSaleItemDialog. */
 export function computeItemFinalPrice(originalPrice: number, mode: ItemAdjustmentMode, value: number | null): number {
   switch (mode) {

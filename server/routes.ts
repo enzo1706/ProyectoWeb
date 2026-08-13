@@ -3,7 +3,9 @@ import { type Server } from "http";
 import type { z } from "zod";
 import bcrypt from "bcryptjs";
 import rateLimit from "express-rate-limit";
+import multer from "multer";
 import { storage, SaleValidationError, AppointmentValidationError, isBcryptHash } from "./storage";
+import { uploadProductImage, deleteProductImage } from "./image-storage";
 import {
   bulkProductSchema,
   createConsultantSchema,
@@ -18,10 +20,14 @@ import {
   updateAppointmentStatusSchema,
   updateBusinessSettingsSchema,
   adminBulkImportSchema,
+  createProductSchema,
+  toggleProductDiscontinuedSchema,
+  setProductStockSchema,
   type InsertProduct,
 } from "@shared/schema";
 import { requireAdmin } from "./middleware/requireAdmin";
 import { requireAuth } from "./middleware/requireAuth";
+import { slugify } from "@shared/slug";
 
 const loginRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -29,6 +35,25 @@ const loginRateLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Demasiados intentos de inicio de sesión. Probá de nuevo en unos minutos." },
+});
+
+const ALLOWED_IMAGE_TYPES: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+};
+
+// Memoria, nunca disco: el buffer va directo a Supabase Storage — el server no debe depender
+// de un disco persistente (Replit Autoscale no lo garantiza entre reinicios/instancias).
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (!ALLOWED_IMAGE_TYPES[file.mimetype]) {
+      return cb(new Error("Formato no permitido. Usá JPG, PNG o WebP."));
+    }
+    cb(null, true);
+  },
 });
 
 /**
@@ -43,37 +68,17 @@ function requireConsultant(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
-const COMBINING_MARKS_START = 0x0300;
-const COMBINING_MARKS_END = 0x036f;
-
-function stripDiacritics(value: string): string {
-  return Array.from(value.normalize("NFD"))
-    .filter((ch) => {
-      const code = ch.codePointAt(0) ?? 0;
-      return code < COMBINING_MARKS_START || code > COMBINING_MARKS_END;
-    })
-    .join("");
-}
-
-function slugify(value: string): string {
-  return stripDiacritics(value)
-    .replace(/\s+/g, "-")
-    .toLowerCase();
-}
-
 function toInsertProduct(item: z.infer<typeof bulkProductSchema>[number]): InsertProduct {
   const variante = item.variante ?? "Estándar";
   return {
     seccion: item.seccion,
-    linea: item.linea,
+    linea: item.linea ?? null,
     producto: item.producto,
     precio: item.precio,
-    unidades: item.unidades ?? 0,
-    codigo: item.codigo ?? slugify(`${item.seccion}-${item.linea}-${item.producto}-${variante}`),
+    codigo: item.codigo ?? slugify(`${item.seccion}-${item.linea ?? ""}-${item.producto}-${variante}`),
     variante,
     puntos: item.puntos ?? 0,
     imagen: item.imagen ?? null,
-    stockMinimo: item.stockMinimo ?? 5,
   };
 }
 
@@ -286,12 +291,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.post("/api/products/seed", async (req: Request, res: Response) => {
     try {
-      const count = await storage.bulkInsertProducts(req.consultantId!, [...SEED_PRODUCTS]);
+      // Privado de esta consultora (no global) — es un catálogo de prueba para ella sola.
+      const count = await storage.seedOwnProducts(req.consultantId!, [...SEED_PRODUCTS]);
       const list = await storage.getAllProducts(req.consultantId!);
       res.json({ message: "Catálogo de prueba cargado", count, products: list });
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al cargar productos de prueba" });
+    }
+  });
+
+  app.post("/api/products", async (req: Request, res: Response) => {
+    try {
+      const parsed = createProductSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+      const created = await storage.createProduct(req.consultantId!, parsed.data);
+      res.status(201).json(created);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al crear el producto" });
     }
   });
 
@@ -715,6 +735,54 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  app.patch("/api/products/:id/discontinued", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const parsed = toggleProductDiscontinuedSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const updated = await storage.setProductDiscontinued(req.consultantId!, id, parsed.data.discontinued);
+      if (!updated) {
+        return res.status(404).json({ error: "Producto no encontrado" });
+      }
+
+      res.json(updated);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar el producto" });
+    }
+  });
+
+  app.patch("/api/products/:id/stock", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const parsed = setProductStockSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const updated = await storage.setProductStock(req.consultantId!, id, parsed.data.unidades);
+      if (!updated) {
+        return res.status(404).json({ error: "Producto no encontrado" });
+      }
+
+      res.json(updated);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar el stock" });
+    }
+  });
+
   app.get("/api/admin/stats", async (_req: Request, res: Response) => {
     try {
       const consultants = await storage.getConsultants();
@@ -796,6 +864,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // Carga masiva del catálogo GLOBAL: queda visible para todas las consultoras de una,
+  // ninguna se elige como destino — el stock de cada una se configura aparte.
   app.post("/api/admin/products/bulk", async (req: Request, res: Response) => {
     try {
       const parsed = adminBulkImportSchema.safeParse(req.body);
@@ -803,18 +873,95 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
 
-      const target = await storage.getBusinessSettings(parsed.data.consultantId);
-      if (!target) {
-        return res.status(404).json({ error: "La consultora indicada no existe" });
-      }
-
       const items = parsed.data.products.map(toInsertProduct);
-
-      const count = await storage.bulkInsertProducts(parsed.data.consultantId, items);
+      const count = await storage.bulkInsertProducts(items);
       res.json({ message: "Catálogo cargado correctamente", count });
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error en carga masiva" });
+    }
+  });
+
+  app.get("/api/admin/products", async (_req: Request, res: Response) => {
+    try {
+      const list = await storage.listGlobalProducts();
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener el catálogo global" });
+    }
+  });
+
+  function handleImageUpload(req: Request, res: Response, next: NextFunction) {
+    imageUpload.single("image")(req, res, (err: unknown) => {
+      if (!err) return next();
+      const message =
+        err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE"
+          ? "La imagen no puede superar los 5MB."
+          : err instanceof Error
+            ? err.message
+            : "No se pudo procesar el archivo.";
+      res.status(400).json({ error: message });
+    });
+  }
+
+  app.post("/api/admin/products/:id/image", handleImageUpload, async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+      if (!req.file) {
+        return res.status(400).json({ error: "Falta el archivo de imagen" });
+      }
+
+      const catalog = await storage.listGlobalProducts();
+      const existing = catalog.find((p) => p.id === id);
+      if (!existing) {
+        return res.status(404).json({ error: "Producto global no encontrado" });
+      }
+
+      const extension = ALLOWED_IMAGE_TYPES[req.file.mimetype];
+      const url = await uploadProductImage(id, req.file.buffer, req.file.mimetype, extension);
+
+      const updated = await storage.setProductImage(id, url);
+      if (!updated) {
+        return res.status(404).json({ error: "Producto global no encontrado" });
+      }
+
+      if (existing.imagen) {
+        await deleteProductImage(existing.imagen);
+      }
+
+      res.json(updated);
+    } catch (error) {
+      console.error(error);
+      const message = error instanceof Error ? error.message : "Error al subir la imagen";
+      res.status(500).json({ error: message });
+    }
+  });
+
+  app.delete("/api/admin/products/:id/image", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const catalog = await storage.listGlobalProducts();
+      const product = catalog.find((p) => p.id === id);
+      if (!product) {
+        return res.status(404).json({ error: "Producto global no encontrado" });
+      }
+
+      if (product.imagen) {
+        await deleteProductImage(product.imagen);
+      }
+      const updated = await storage.setProductImage(id, null);
+      res.json(updated);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al quitar la imagen" });
     }
   });
 

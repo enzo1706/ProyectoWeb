@@ -1,0 +1,1 @@
+ALTER TABLE "products" ALTER COLUMN "linea" DROP NOT NULL;

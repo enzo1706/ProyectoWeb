@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useSaleCart } from "@/hooks/use-sale-cart";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SaleCard, type Sale, type SaleDetails } from "@/components/SaleCard";
@@ -28,11 +29,21 @@ const statusFilters = [
 ];
 
 export default function Ventas() {
+  const cart = useSaleCart();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("todos");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [selectedSaleId, setSelectedSaleId] = useState<number | null>(null);
   const [editingSale, setEditingSale] = useState<SaleDetails | null>(null);
+
+  // Si venimos de "Ir a Ventas" desde Productos con un carrito ya armado, abrir el diálogo
+  // de venta nueva automáticamente en vez de dejar el carrito perdido en un botón sin apretar.
+  useEffect(() => {
+    if (cart.lines.length > 0 && !dialogOpen && editingSale === null) {
+      setDialogOpen(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const { data: sales = [] } = useQuery<Sale[]>({ queryKey: ["/api/sales"] });
   const { data: products = [] } = useQuery<Product[]>({ queryKey: ["/api/products"] });
@@ -164,12 +175,18 @@ export default function Ventas() {
         open={dialogOpen || editingSale !== null}
         onOpenChange={(next) => {
           if (!next) {
+            const wasEditing = editingSale !== null;
             setDialogOpen(false);
             setEditingSale(null);
+            // Solo se limpia el carrito compartido si esta sesión de venta arrancó (o pudo
+            // arrancar) desde el carrito de Productos — nunca al cerrar la edición de una
+            // venta ya existente, que no tiene relación con el carrito.
+            if (!wasEditing) cart.clear();
           }
         }}
         products={products}
         existingSale={editingSale}
+        initialLines={cart.lines}
       />
 
       <SaleDetailDialog

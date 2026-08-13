@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Package, Plus } from "lucide-react";
 import { formatPrice } from "@/lib/currency";
 import { cn } from "@/lib/utils";
+import { getProductCategories } from "@/lib/productCategories";
 import type { Product } from "@shared/schema";
 
 interface SaleProductPickerProps {
@@ -15,10 +16,7 @@ interface SaleProductPickerProps {
 export function SaleProductPicker({ products, orderedQuantities, onAdd }: SaleProductPickerProps) {
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
 
-  const categories = useMemo(
-    () => Array.from(new Set(products.map((p) => p.seccion))).sort(),
-    [products],
-  );
+  const categories = useMemo(() => getProductCategories(products), [products]);
 
   useEffect(() => {
     if (!selectedCategory && categories.length > 0) {

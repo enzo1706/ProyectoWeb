@@ -25,28 +25,52 @@ export const users = pgTable("users", {
   consultantId: integer("consultant_id").references(() => consultants.id),
 });
 
+/**
+ * Catálogo puro — nombre, precio público, código, etc. `consultantId`:
+ * `NULL` = producto GLOBAL (cargado por el admin, visible para todas las consultoras);
+ * con valor = producto MANUAL, privado de esa única consultora (como antes).
+ * El stock/costo/descuento de cada consultora sobre un producto vive aparte, en `productStock`
+ * — nunca se copia ni se mezcla entre consultoras (ver `productStock` más abajo).
+ */
 export const products = pgTable("products", {
   id: serial("id").primaryKey(),
-  // Nullable durante esta etapa (ver estrategia de migración en dos pasos, sin backfill
-  // agresivo) — toda fila NUEVA siempre lo trae seteado desde la app.
   consultantId: integer("consultant_id").references(() => consultants.id),
   seccion: text("seccion").notNull(),
-  linea: text("linea").notNull(),
+  // Nullable: varios catálogos reales (ej. Mary Kay) no tienen un segundo nivel de
+  // categorización — no se inventa un valor cuando el archivo de origen no lo trae.
+  linea: text("linea"),
   producto: text("producto").notNull(),
   variante: text("variante").notNull().default("Estándar"),
   codigo: text("codigo").notNull(),
   puntos: integer("puntos").notNull().default(0),
   precio: integer("precio").notNull(),
-  unidades: integer("unidades").notNull().default(0),
   imagen: text("imagen"),
+  // "import": catálogo global cargado por el admin (consultantId siempre null acá).
+  // "manual": la consultora lo cargó ella misma (consultantId siempre el suyo).
+  source: text("source").notNull().default("import"),
+}, (table) => ({
+  // Sigue sirviendo para deduplicar productos MANUALES entre sí (por consultora). Los
+  // globales (consultantId null) se dedupean aparte en el import — ver bulkInsertProducts.
+  consultantCodigoUnique: unique("products_consultant_codigo_unique").on(table.consultantId, table.codigo),
+  consultantIdx: index("products_consultant_id_idx").on(table.consultantId),
+}));
+
+/** El inventario de UNA consultora sobre UN producto (global o manual propio): cuántas
+ * unidades tiene, a qué costo lo compró, si sigue vendiéndolo. Separado de `products` para
+ * que el catálogo sea compartido y el stock nunca se copie ni se mezcle entre consultoras. */
+export const productStock = pgTable("product_stock", {
+  id: serial("id").primaryKey(),
+  consultantId: integer("consultant_id").notNull().references(() => consultants.id),
+  productId: integer("product_id").notNull().references(() => products.id),
+  unidades: integer("unidades").notNull().default(0),
   stockMinimo: integer("stock_minimo").notNull().default(5),
   costPrice: integer("cost_price"),
   selectedDiscount: integer("selected_discount"),
+  discontinued: boolean("discontinued").notNull().default(false),
 }, (table) => ({
-  // Reemplaza el unique global por consultora — dos consultoras distintas pueden tener
-  // el mismo código de catálogo (ej. cargan el mismo demo) sin chocar entre sí.
-  consultantCodigoUnique: unique("products_consultant_codigo_unique").on(table.consultantId, table.codigo),
-  consultantIdx: index("products_consultant_id_idx").on(table.consultantId),
+  consultantProductUnique: unique("product_stock_consultant_product_unique").on(table.consultantId, table.productId),
+  consultantIdx: index("product_stock_consultant_id_idx").on(table.consultantId),
+  productIdx: index("product_stock_product_id_idx").on(table.productId),
 }));
 
 export const PHONE_REGEX = /^\d{10}$/;
@@ -153,7 +177,14 @@ export type Consultant = typeof consultants.$inferSelect;
 export type InsertConsultant = typeof consultants.$inferInsert;
 export type User = typeof users.$inferSelect;
 export type InsertUser = typeof users.$inferInsert;
-export type Product = typeof products.$inferSelect;
+export type ProductStock = typeof productStock.$inferSelect;
+export type InsertProductStock = typeof productStock.$inferInsert;
+/** Forma "hidratada" que consume el resto de la app (frontend, ventas, etc.): catálogo +
+ * la fila de stock ya resuelta de la consultora que está mirando, con defaults si todavía
+ * no cargó stock para ese producto. Misma forma que el `Product` de antes de esta etapa —
+ * no cambia ningún import en el frontend. */
+export type Product = typeof products.$inferSelect &
+  Pick<ProductStock, "unidades" | "stockMinimo" | "costPrice" | "selectedDiscount" | "discontinued">;
 export type InsertProduct = typeof products.$inferInsert;
 export type Client = typeof clients.$inferSelect;
 export type InsertClient = typeof clients.$inferInsert;
@@ -201,27 +232,50 @@ export const insertSaleSchema = createInsertSchema(sales).omit({ id: true });
 export const insertSaleItemSchema = createInsertSchema(saleItems).omit({ id: true });
 export const insertSaleInstallmentSchema = createInsertSchema(saleInstallments).omit({ id: true });
 
+// Carga masiva de admin = catálogo GLOBAL puro, sin stock (el stock es de cada consultora,
+// se carga aparte — ver setProductStockSchema). Por eso no lleva unidades/stockMinimo.
 export const bulkProductSchema = z.array(
   z.object({
     seccion: z.string().min(1),
-    linea: z.string().min(1),
+    linea: z.string().optional(),
     producto: z.string().min(1),
     precio: z.number().int().nonnegative(),
-    unidades: z.number().int().nonnegative().default(0),
     codigo: z.string().optional(),
     variante: z.string().optional(),
     puntos: z.number().int().nonnegative().optional(),
     imagen: z.string().optional(),
-    stockMinimo: z.number().int().nonnegative().optional(),
   }),
 );
 
-export const discountOptions = [20, 25, 30, 35, 40, 45, 50] as const;
+export const discountOptions = [35, 40, 45] as const;
 
 export const applyDiscountSchema = z.object({
   discountPercent: z.number().int().refine((v) => (discountOptions as readonly number[]).includes(v), {
     message: "El descuento debe ser uno de los valores permitidos",
   }),
+});
+
+// Alta manual de un producto suelto desde Productos (fuera de la carga masiva por Excel/CSV).
+// consultantId, source y discontinued los pone el servidor, nunca el cliente.
+export const createProductSchema = z.object({
+  seccion: z.string().trim().min(1, "La categoría es obligatoria"),
+  linea: z.string().trim().optional(),
+  producto: z.string().trim().min(1, "El nombre del producto es obligatorio"),
+  variante: z.string().trim().min(1).optional(),
+  precio: z.number().int().nonnegative(),
+  unidades: z.number().int().nonnegative().default(0),
+  puntos: z.number().int().nonnegative().default(0),
+  codigo: z.string().trim().min(1).optional(),
+  imagen: z.string().trim().min(1).optional(),
+  stockMinimo: z.number().int().nonnegative().optional(),
+});
+
+export const toggleProductDiscontinuedSchema = z.object({
+  discontinued: z.boolean(),
+});
+
+export const setProductStockSchema = z.object({
+  unidades: z.number().int().nonnegative(),
 });
 
 const orderAdjustmentSchema = z
@@ -280,10 +334,9 @@ export const updateBusinessSettingsSchema = z.object({
   monthlyGoal: z.number().int().nonnegative().nullable().optional(),
 });
 
-// Solo para el endpoint administrativo de carga masiva de catálogo: el admin elige
-// explícitamente a qué consultora pertenece el catálogo. Nunca lo manda una consultora.
+// Carga masiva de catálogo global — admin-only. No lleva consultantId: el producto queda
+// visible para todas las consultoras de una, no se le asigna a ninguna en particular.
 export const adminBulkImportSchema = z.object({
-  consultantId: z.number().int().positive(),
   products: bulkProductSchema,
 });
 

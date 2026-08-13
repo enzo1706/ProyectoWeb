@@ -1,8 +1,13 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useLocation } from "wouter";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
+import { useSaleCart } from "@/hooks/use-sale-cart";
 import type { Product } from "@shared/schema";
-import { discountOptions } from "@shared/schema";
+import { discountOptions, createProductSchema } from "@shared/schema";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -20,73 +25,93 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
 import { Skeleton } from "@/components/ui/skeleton";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 import { formatPrice } from "@/lib/currency";
+import { computeDiscountedCost } from "@shared/saleCalculations";
+import { getProductCategories } from "@/lib/productCategories";
+import { ProductSelectionModal } from "@/components/ProductSelectionModal";
+import type { OrderLine } from "@/components/SaleOrderTable";
 import {
   Package,
   PackageOpen,
-  Minus,
-  Plus,
   ShoppingBag,
+  ShoppingCart,
   Sparkles,
   Loader2,
   Search,
   SearchX,
+  Plus,
+  ArchiveRestore,
+  Archive,
+  Pencil,
+  Check,
+  X,
 } from "lucide-react";
 
-function CatalogProductCard({ product }: { product: Product }) {
-  const { toast } = useToast();
-  const [quantity, setQuantity] = useState(1);
-  const [discount, setDiscount] = useState<string>(
-    product.selectedDiscount ? String(product.selectedDiscount) : "",
-  );
-  const maxQty = Math.max(product.unidades, 0);
-  const outOfStock = maxQty === 0;
+const STOCK_FILTER = "__stock";
+const DISCONTINUED_FILTER = "__discontinued";
+const MANUAL_FILTER = "__manual";
+const ALL_FILTER = "__all";
 
-  const adjust = (delta: number) => {
-    setQuantity((q) => {
-      const next = q + delta;
-      if (next < 1) return 1;
-      if (maxQty > 0 && next > maxQty) return maxQty;
-      return next;
-    });
+function CatalogProductCard({
+  product,
+  globalDiscount,
+  onOpen,
+  onToggleDiscontinued,
+  isTogglingDiscontinued,
+  onSetStock,
+  isSettingStock,
+}: {
+  product: Product;
+  globalDiscount: number | null;
+  onOpen: () => void;
+  onToggleDiscontinued: () => void;
+  isTogglingDiscontinued: boolean;
+  onSetStock: (unidades: number) => void;
+  isSettingStock: boolean;
+}) {
+  const outOfStock = product.unidades <= 0;
+  const discountedCost = globalDiscount !== null ? computeDiscountedCost(product.precio, globalDiscount) : null;
+  const [editingStock, setEditingStock] = useState(false);
+  const [stockInput, setStockInput] = useState("");
+
+  const startEditingStock = () => {
+    setStockInput(String(product.unidades));
+    setEditingStock(true);
   };
 
-  const discountMutation = useGuardedMutation({
-    mutationFn: async (discountPercent: number) => {
-      const res = await apiRequest("PATCH", `/api/products/${product.id}/discount`, { discountPercent });
-      return res.json() as Promise<Product>;
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
-      toast({ title: "Producto seleccionado correctamente" });
-    },
-    onError: (err: Error) => {
-      toast({
-        title: "No se pudo guardar la selección",
-        description: err.message,
-        variant: "destructive",
-      });
-    },
-  });
-
-  const selectedDiscount = discount ? Number(discount) : null;
-  const cost =
-    selectedDiscount !== null
-      ? product.selectedDiscount === selectedDiscount && product.costPrice !== null
-        ? product.costPrice
-        : Math.round(product.precio * (1 - selectedDiscount / 100))
-      : null;
+  const confirmStock = () => {
+    const parsed = Number(stockInput);
+    if (!Number.isInteger(parsed) || parsed < 0) return;
+    onSetStock(parsed);
+    setEditingStock(false);
+  };
 
   return (
     <Card
       className={cn(
-        "flex flex-col overflow-hidden shadow-sm transition-shadow hover:shadow-md",
-        outOfStock && "opacity-75",
+        "flex flex-col overflow-hidden shadow-sm transition-shadow hover:shadow-md cursor-pointer",
+        (outOfStock || product.discontinued) && "opacity-75",
       )}
+      onClick={onOpen}
       data-testid={`card-product-${product.id}`}
     >
       {product.imagen ? (
@@ -102,105 +127,121 @@ function CatalogProductCard({ product }: { product: Product }) {
         </div>
       )}
       <CardHeader className="pb-2">
-        <p className="text-xs uppercase tracking-wide text-muted-foreground truncate">
-          {product.seccion} · {product.linea}
-        </p>
+        <div className="flex items-start justify-between gap-2">
+          <p className="text-xs uppercase tracking-wide text-muted-foreground truncate">
+            {product.linea ? `${product.seccion} · ${product.linea}` : product.seccion}
+          </p>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7 shrink-0 -mt-1 -mr-1"
+            title={product.discontinued ? "Reactivar producto" : "Marcar como discontinuado"}
+            disabled={isTogglingDiscontinued}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleDiscontinued();
+            }}
+            data-testid={`button-toggle-discontinued-${product.id}`}
+          >
+            {product.discontinued ? <ArchiveRestore className="h-4 w-4" /> : <Archive className="h-4 w-4" />}
+          </Button>
+        </div>
         <CardTitle className="text-lg font-semibold text-foreground leading-snug line-clamp-2">
           {product.producto}
         </CardTitle>
         <p className="text-xs text-muted-foreground font-mono">{product.codigo}</p>
-        {product.variante !== "Estándar" && (
-          <p className="text-xs text-muted-foreground">{product.variante}</p>
+        {product.discontinued && (
+          <Badge variant="destructive" className="w-fit text-xs">Discontinuado</Badge>
         )}
       </CardHeader>
-      <CardContent className="flex-1 space-y-3">
+      <CardContent className="flex-1 space-y-2">
         <div className="flex items-baseline justify-between gap-2">
-          <span className="text-2xl font-bold text-primary">
-            {formatPrice(product.precio)}
+          <span className="text-2xl font-bold text-primary" data-testid={`text-cost-${product.id}`}>
+            {formatPrice(discountedCost ?? product.precio)}
           </span>
           {product.puntos > 0 && (
-            <Badge
-              variant="secondary"
-              className="bg-primary/10 text-primary border-0 text-xs"
-            >
+            <Badge variant="secondary" className="bg-primary/10 text-primary border-0 text-xs">
               {product.puntos} pts
             </Badge>
           )}
         </div>
-        <div className="flex items-center gap-2 text-sm">
-          <Package className="h-4 w-4 text-muted-foreground shrink-0" />
-          <span
-            className={cn(
-              outOfStock ? "text-destructive font-medium" : "text-muted-foreground",
-            )}
-          >
-            {outOfStock
-              ? "Sin stock"
-              : `${product.unidades} unidad${product.unidades !== 1 ? "es" : ""} disponible${product.unidades !== 1 ? "s" : ""}`}
-          </span>
-        </div>
-
-        <div className="space-y-1.5">
-          <Select value={discount} onValueChange={setDiscount}>
-            <SelectTrigger data-testid={`select-discount-${product.id}`}>
-              <SelectValue placeholder="Elegir descuento" />
-            </SelectTrigger>
-            <SelectContent>
-              {discountOptions.map((pct) => (
-                <SelectItem key={pct} value={String(pct)}>
-                  {pct}%
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          {cost !== null && (
-            <p className="text-sm text-muted-foreground" data-testid={`text-cost-${product.id}`}>
-              Costo: <span className="font-semibold text-foreground">{formatPrice(cost)}</span>
-            </p>
-          )}
-        </div>
+        {discountedCost !== null && (
+          <p className="text-xs text-muted-foreground">
+            PVP: <span className="line-through">{formatPrice(product.precio)}</span>
+          </p>
+        )}
+        {editingStock ? (
+          <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+            <Input
+              type="number"
+              min={0}
+              step="1"
+              value={stockInput}
+              onChange={(e) => setStockInput(e.target.value)}
+              className="h-8 w-20"
+              autoFocus
+              data-testid={`input-stock-${product.id}`}
+            />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 shrink-0"
+              disabled={isSettingStock}
+              onClick={confirmStock}
+              data-testid={`button-confirm-stock-${product.id}`}
+            >
+              <Check className="h-4 w-4" />
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 shrink-0"
+              onClick={() => setEditingStock(false)}
+              data-testid={`button-cancel-stock-${product.id}`}
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 text-sm">
+            <Package className="h-4 w-4 text-muted-foreground shrink-0" />
+            <span className={cn(outOfStock ? "text-destructive font-medium" : "text-muted-foreground")}>
+              {outOfStock
+                ? "Sin stock"
+                : `${product.unidades} unidad${product.unidades !== 1 ? "es" : ""} disponible${product.unidades !== 1 ? "s" : ""}`}
+            </span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6 shrink-0"
+              title="Editar mi stock"
+              onClick={(e) => {
+                e.stopPropagation();
+                startEditingStock();
+              }}
+              data-testid={`button-edit-stock-${product.id}`}
+            >
+              <Pencil className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        )}
       </CardContent>
-      <CardFooter className="flex flex-col gap-3 pt-0">
-        <div className="flex w-full items-center justify-between rounded-lg border bg-muted p-1">
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="shrink-0"
-            onClick={() => adjust(-1)}
-            disabled={quantity <= 1 || outOfStock}
-            aria-label="Disminuir cantidad"
-            data-testid={`button-qty-minus-${product.id}`}
-          >
-            <Minus className="h-4 w-4" />
-          </Button>
-          <span
-            className="min-w-[2rem] text-center font-semibold tabular-nums"
-            data-testid={`text-qty-${product.id}`}
-          >
-            {quantity}
-          </span>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="shrink-0"
-            onClick={() => adjust(1)}
-            disabled={outOfStock || (maxQty > 0 && quantity >= maxQty)}
-            aria-label="Aumentar cantidad"
-            data-testid={`button-qty-plus-${product.id}`}
-          >
-            <Plus className="h-4 w-4" />
-          </Button>
-        </div>
+      <CardFooter className="pt-0">
         <Button
           className="w-full bg-primary hover:bg-primary/90"
-          disabled={outOfStock || selectedDiscount === null || discountMutation.isPending}
-          onClick={() => selectedDiscount !== null && discountMutation.mutate(selectedDiscount)}
+          disabled={outOfStock}
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpen();
+          }}
           data-testid={`button-select-${product.id}`}
         >
           <ShoppingBag className="h-4 w-4 mr-2" />
-          {discountMutation.isPending ? "Guardando..." : "Seleccionar"}
+          {outOfStock ? "Sin stock" : "Agregar"}
         </Button>
       </CardFooter>
     </Card>
@@ -277,19 +318,200 @@ function NoMatches() {
   );
 }
 
+const manualProductFormSchema = createProductSchema.extend({
+  precio: z.string().min(1, "El precio es obligatorio"),
+  unidades: z.string().optional(),
+  puntos: z.string().optional(),
+  // Campos opcionales del schema base (min(1) del lado del servidor) — en el form se aceptan
+  // vacíos y se convierten a `undefined` recién al armar el payload, así el vacío no bloquea el submit.
+  variante: z.string().optional(),
+  codigo: z.string().optional(),
+});
+type ManualProductFormData = z.infer<typeof manualProductFormSchema>;
+
+function AddProductDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
+  const { toast } = useToast();
+  const form = useForm<ManualProductFormData>({
+    resolver: zodResolver(manualProductFormSchema),
+    defaultValues: { seccion: "", linea: "", producto: "", variante: "", precio: "", unidades: "0", puntos: "0", codigo: "" },
+  });
+
+  const createMutation = useGuardedMutation({
+    mutationFn: async (data: ManualProductFormData) => {
+      const res = await apiRequest("POST", "/api/products", {
+        seccion: data.seccion,
+        linea: data.linea || undefined,
+        producto: data.producto,
+        variante: data.variante || undefined,
+        precio: Math.round(Number(data.precio) * 100),
+        unidades: data.unidades ? Number(data.unidades) : 0,
+        puntos: data.puntos ? Number(data.puntos) : 0,
+        codigo: data.codigo || undefined,
+      });
+      return res.json() as Promise<Product>;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      toast({ title: "Producto agregado al catálogo" });
+      form.reset();
+      onOpenChange(false);
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo agregar el producto", description: err.message, variant: "destructive" });
+    },
+  });
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-md" data-testid="dialog-add-product">
+        <DialogHeader>
+          <DialogTitle>Agregar producto manualmente</DialogTitle>
+        </DialogHeader>
+        <Form {...form}>
+          <form
+            onSubmit={form.handleSubmit((data) => createMutation.mutate(data))}
+            className="space-y-4 flex-1 min-h-0 overflow-y-auto overscroll-contain px-1 -mx-1"
+          >
+            <FormField
+              control={form.control}
+              name="seccion"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Categoría</FormLabel>
+                  <FormControl>
+                    <Input {...field} data-testid="input-manual-seccion" />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="linea"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Línea (opcional)</FormLabel>
+                  <FormControl>
+                    <Input {...field} data-testid="input-manual-linea" />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="producto"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Nombre del producto</FormLabel>
+                  <FormControl>
+                    <Input {...field} data-testid="input-manual-producto" />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="variante"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Tono / variante (opcional)</FormLabel>
+                  <FormControl>
+                    <Input {...field} data-testid="input-manual-variante" />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <div className="grid grid-cols-2 gap-4">
+              <FormField
+                control={form.control}
+                name="precio"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Precio público</FormLabel>
+                    <FormControl>
+                      <Input {...field} type="number" min={0} step="0.01" data-testid="input-manual-precio" />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="unidades"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Stock inicial</FormLabel>
+                    <FormControl>
+                      <Input {...field} type="number" min={0} step="1" data-testid="input-manual-unidades" />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <FormField
+                control={form.control}
+                name="puntos"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Puntos (opcional)</FormLabel>
+                    <FormControl>
+                      <Input {...field} type="number" min={0} step="1" data-testid="input-manual-puntos" />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="codigo"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Código (opcional)</FormLabel>
+                    <FormControl>
+                      <Input {...field} data-testid="input-manual-codigo" />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+
+            <DialogFooter className="border-t pt-4">
+              <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+                Cancelar
+              </Button>
+              <Button type="submit" disabled={createMutation.isPending} data-testid="button-save-manual-product">
+                {createMutation.isPending ? "Guardando..." : "Agregar"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </Form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export default function Productos() {
   const { toast } = useToast();
+  const [, setLocation] = useLocation();
+  const cart = useSaleCart();
   const [search, setSearch] = useState("");
-  const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set());
+  const [categoryFilter, setCategoryFilter] = useState<string>(ALL_FILTER);
+  const [globalDiscount, setGlobalDiscount] = useState<string>("");
+  const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
+  const [addProductOpen, setAddProductOpen] = useState(false);
 
   const { data: products = [], isLoading, isError, error } = useQuery<Product[]>({
     queryKey: ["/api/products"],
   });
 
-  const categories = useMemo(
-    () => Array.from(new Set(products.map((p) => p.seccion))).sort(),
-    [products],
-  );
+  const categories = useMemo(() => getProductCategories(products), [products]);
+  const discountValue = globalDiscount ? Number(globalDiscount) : null;
 
   const filteredProducts = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -299,19 +521,16 @@ export default function Productos() {
         p.producto.toLowerCase().includes(term) ||
         p.codigo.toLowerCase().includes(term) ||
         p.seccion.toLowerCase().includes(term);
-      const matchesCategory = selectedCategories.size === 0 || selectedCategories.has(p.seccion);
+
+      let matchesCategory = true;
+      if (categoryFilter === STOCK_FILTER) matchesCategory = p.unidades > 0;
+      else if (categoryFilter === DISCONTINUED_FILTER) matchesCategory = p.discontinued;
+      else if (categoryFilter === MANUAL_FILTER) matchesCategory = p.source === "manual";
+      else if (categoryFilter !== ALL_FILTER) matchesCategory = p.seccion === categoryFilter;
+
       return matchesSearch && matchesCategory;
     });
-  }, [products, search, selectedCategories]);
-
-  const toggleCategory = (category: string) => {
-    setSelectedCategories((prev) => {
-      const next = new Set(prev);
-      if (next.has(category)) next.delete(category);
-      else next.add(category);
-      return next;
-    });
-  };
+  }, [products, search, categoryFilter]);
 
   const seedMutation = useGuardedMutation({
     mutationFn: async () => {
@@ -335,24 +554,68 @@ export default function Productos() {
     },
   });
 
+  const [togglingId, setTogglingId] = useState<number | null>(null);
+  const toggleDiscontinuedMutation = useGuardedMutation({
+    mutationFn: async ({ id, discontinued }: { id: number; discontinued: boolean }) => {
+      setTogglingId(id);
+      const res = await apiRequest("PATCH", `/api/products/${id}/discontinued`, { discontinued });
+      return res.json() as Promise<Product>;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo actualizar el producto", description: err.message, variant: "destructive" });
+    },
+    onSettled: () => setTogglingId(null),
+  });
+
+  const [settingStockId, setSettingStockId] = useState<number | null>(null);
+  const setStockMutation = useGuardedMutation({
+    mutationFn: async ({ id, unidades }: { id: number; unidades: number }) => {
+      setSettingStockId(id);
+      const res = await apiRequest("PATCH", `/api/products/${id}/stock`, { unidades });
+      return res.json() as Promise<Product>;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      toast({ title: "Stock actualizado" });
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo actualizar el stock", description: err.message, variant: "destructive" });
+    },
+    onSettled: () => setSettingStockId(null),
+  });
+
+  const cartSubtotal = cart.lines.reduce((sum, l) => {
+    const price = l.mode === "manualPrice" && l.adjustmentValue !== null ? l.adjustmentValue : l.originalPrice;
+    return sum + price * l.quantity;
+  }, 0);
+
   return (
     <div
-      className="min-h-full bg-background p-6 space-y-6"
+      className="min-h-full bg-background p-6 space-y-6 pb-24"
       data-testid="page-productos"
     >
       <header className="space-y-1">
-        <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10">
-            <Package className="h-5 w-5 text-primary" />
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10">
+              <Package className="h-5 w-5 text-primary" />
+            </div>
+            <div>
+              <h1 className="text-3xl font-bold text-foreground">
+                Catálogo de Productos
+              </h1>
+              <p className="text-muted-foreground text-sm">
+                Elegí el descuento de compra, filtrá por categoría y armá tu pedido
+              </p>
+            </div>
           </div>
-          <div>
-            <h1 className="text-3xl font-bold text-foreground">
-              Catálogo de Productos
-            </h1>
-            <p className="text-muted-foreground text-sm">
-              Explora el inventario disponible y selecciona productos para tu pedido
-            </p>
-          </div>
+          <Button variant="outline" onClick={() => setAddProductOpen(true)} data-testid="button-open-add-product">
+            <Plus className="h-4 w-4 mr-2" />
+            Agregar producto
+          </Button>
         </div>
         {!isLoading && products.length > 0 && (
           <p className="text-sm text-muted-foreground pl-[3.25rem]">
@@ -363,39 +626,45 @@ export default function Productos() {
 
       {!isLoading && !isError && products.length > 0 && (
         <div className="space-y-3">
-          <div className="relative max-w-md">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-            <Input
-              placeholder="Buscar por nombre, código o categoría..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="pl-9"
-              data-testid="input-search-products"
-            />
-          </div>
-          {categories.length > 1 && (
-            <div className="flex flex-wrap gap-2.5">
-              {categories.map((category) => {
-                const active = selectedCategories.has(category);
-                return (
-                  <Badge
-                    key={category}
-                    role="button"
-                    tabIndex={0}
-                    variant={active ? "default" : "outline"}
-                    onClick={() => toggleCategory(category)}
-                    className={cn(
-                      "cursor-pointer select-none px-3.5 py-2 active-elevate-2",
-                      active ? "bg-primary text-primary-foreground" : "text-muted-foreground bg-card",
-                    )}
-                    data-testid={`filter-category-${category}`}
-                  >
-                    {category}
-                  </Badge>
-                );
-              })}
+          <div className="flex flex-col sm:flex-row gap-3">
+            <div className="relative flex-1">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+              <Input
+                placeholder="Buscar por nombre, código o categoría..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="pl-9"
+                data-testid="input-search-products"
+              />
             </div>
-          )}
+            <Select value={globalDiscount || "none"} onValueChange={(v) => setGlobalDiscount(v === "none" ? "" : v)}>
+              <SelectTrigger className="w-full sm:w-[200px]" data-testid="select-global-discount">
+                <SelectValue placeholder="Descuento de compra" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">Sin descuento</SelectItem>
+                {discountOptions.map((pct) => (
+                  <SelectItem key={pct} value={String(pct)}>
+                    Descuento de compra: {pct}%
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={categoryFilter} onValueChange={setCategoryFilter}>
+              <SelectTrigger className="w-full sm:w-[220px]" data-testid="select-category-filter">
+                <SelectValue placeholder="Categoría" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL_FILTER}>Todas las categorías</SelectItem>
+                {categories.map((category) => (
+                  <SelectItem key={category} value={category}>{category}</SelectItem>
+                ))}
+                <SelectItem value={STOCK_FILTER}>Productos en Stock</SelectItem>
+                <SelectItem value={DISCONTINUED_FILTER}>Discontinuos</SelectItem>
+                <SelectItem value={MANUAL_FILTER}>Agregados manualmente</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
         </div>
       )}
 
@@ -422,8 +691,46 @@ export default function Productos() {
           data-testid="catalog-grid"
         >
           {filteredProducts.map((product) => (
-            <CatalogProductCard key={product.id} product={product} />
+            <CatalogProductCard
+              key={product.id}
+              product={product}
+              globalDiscount={discountValue}
+              onOpen={() => setSelectedProduct(product)}
+              onToggleDiscontinued={() =>
+                toggleDiscontinuedMutation.mutate({ id: product.id, discontinued: !product.discontinued })
+              }
+              isTogglingDiscontinued={togglingId === product.id}
+              onSetStock={(unidades) => setStockMutation.mutate({ id: product.id, unidades })}
+              isSettingStock={settingStockId === product.id}
+            />
           ))}
+        </div>
+      )}
+
+      <ProductSelectionModal
+        open={selectedProduct !== null}
+        onOpenChange={(open) => !open && setSelectedProduct(null)}
+        product={selectedProduct}
+        allProducts={products}
+        globalDiscount={discountValue}
+        onAdd={(line: OrderLine) => cart.addLine(line)}
+      />
+
+      <AddProductDialog open={addProductOpen} onOpenChange={setAddProductOpen} />
+
+      {cart.lines.length > 0 && (
+        <div className="fixed bottom-0 left-0 right-0 border-t bg-background/95 backdrop-blur-sm p-4 shadow-lg z-40">
+          <div className="mx-auto flex max-w-4xl items-center justify-between gap-4">
+            <div className="flex items-center gap-2 text-sm">
+              <ShoppingCart className="h-5 w-5 text-primary" />
+              <span data-testid="text-cart-summary">
+                {cart.lines.length} producto{cart.lines.length !== 1 ? "s" : ""} · {formatPrice(cartSubtotal)}
+              </span>
+            </div>
+            <Button onClick={() => setLocation("/ventas")} data-testid="button-go-to-sale">
+              Ir a Ventas
+            </Button>
+          </div>
         </div>
       )}
     </div>

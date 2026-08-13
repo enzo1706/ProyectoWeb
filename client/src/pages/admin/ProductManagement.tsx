@@ -11,13 +11,34 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
-import { Upload, FileSpreadsheet, Package, CheckCircle2, AlertTriangle, X } from "lucide-react";
+import { Input } from "@/components/ui/input";
+import { Upload, FileSpreadsheet, Package, CheckCircle2, AlertTriangle, X, ImagePlus } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
-import { bulkProductSchema, type Consultant } from "@shared/schema";
+import { bulkProductSchema } from "@shared/schema";
+import { slugify } from "@shared/slug";
 import { z } from "zod";
+
+interface GlobalProduct {
+  id: number;
+  seccion: string;
+  linea: string | null;
+  producto: string;
+  variante: string;
+  codigo: string;
+  puntos: number;
+  precio: number;
+  imagen: string | null;
+}
 
 type BulkProductInput = z.infer<typeof bulkProductSchema>[number];
 
@@ -46,49 +67,42 @@ function stripDiacritics(value: string): string {
     .join("");
 }
 
-function slugify(value: string): string {
-  return stripDiacritics(value).replace(/\s+/g, "-").toLowerCase();
-}
-
 function normalizeHeader(raw: string): string {
   return stripDiacritics(raw).toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+// Solo trim/colapso de espacios — NO recapitalizar. Las categorías reales de un catálogo
+// (ej. "TimeWise") pueden tener mayúsculas internas intencionales que hay que conservar tal cual.
 function normalizeCategoryLabel(raw: string): string {
-  const trimmed = raw.trim().replace(/\s+/g, " ");
-  return trimmed
-    .toLowerCase()
-    .split(" ")
-    .map((word) => (word.length > 0 ? word[0].toUpperCase() + word.slice(1) : word))
-    .join(" ");
+  return raw.trim().replace(/\s+/g, " ");
 }
 
+// Solo catálogo — sin stock: el admin carga el catálogo GLOBAL (mismo para todas las
+// consultoras), el stock lo configura después cada una por separado.
 const FIELD_ALIASES: Record<string, string[]> = {
-  seccion: ["seccion", "categoria"],
+  seccion: ["seccion", "categoria", "categorias"],
   linea: ["linea", "coleccion"],
-  producto: ["producto", "nombre", "nombreproducto"],
-  variante: ["variante", "color", "tono"],
+  producto: ["producto", "productos", "nombre", "nombreproducto"],
+  variante: ["variante", "color", "tono", "tonos"],
   codigo: ["codigo", "sku"],
   puntos: ["puntos", "pts"],
-  precio: ["precio", "preciopublico", "precioventa", "precioventapublico"],
-  unidades: ["unidades", "stock", "cantidad", "unidadesdisponibles"],
-  imagen: ["imagen", "imagenurl", "foto", "urlimagen"],
-  stockMinimo: ["stockminimo", "stockmin", "minimo"],
+  precio: ["precio", "preciopublico", "precioventa", "precioventapublico", "precioventaalpublico"],
+  imagen: ["imagen", "imagenurl", "foto", "urlimagen", "fotodelproducto"],
 };
 
-const REQUIRED_FIELDS = ["seccion", "linea", "producto", "precio"] as const;
+// "linea" quedó afuera: el schema ya la acepta vacía — varios catálogos reales no tienen
+// un segundo nivel de categoría, y no vamos a bloquear la carga por eso.
+const REQUIRED_FIELDS = ["seccion", "producto", "precio"] as const;
 
 const FIELD_LABELS: Record<string, string> = {
   seccion: "Categoría/Sección",
   linea: "Línea",
   producto: "Producto",
   precio: "Precio",
-  unidades: "Unidades",
   codigo: "Código",
   variante: "Variante",
   puntos: "Puntos",
   imagen: "Imagen",
-  stockMinimo: "Stock Mínimo",
 };
 
 function resolveColumnMap(headerRow: unknown[]): Record<string, number> {
@@ -119,15 +133,14 @@ function parseRow(row: unknown[], columnMap: Record<string, number>, rowNumber: 
 
   const seccion = seccionRaw ? normalizeCategoryLabel(seccionRaw) : "";
 
+  // `linea` es opcional — no bloquea la generación de código (varios catálogos reales no la traen).
   let autoCodigo = false;
-  if (!codigo && seccion && linea && producto) {
+  if (!codigo && seccion && producto) {
     codigo = slugify(`${seccion}-${linea}-${producto}-${variante ?? "Estandar"}`);
     autoCodigo = true;
   }
 
-  const unidadesRaw = get("unidades");
   const puntosRaw = get("puntos");
-  const stockMinimoRaw = get("stockMinimo");
   const imagen = get("imagen") || undefined;
 
   if (!precioRaw) {
@@ -136,15 +149,15 @@ function parseRow(row: unknown[], columnMap: Record<string, number>, rowNumber: 
 
   const candidate = {
     seccion,
-    linea,
+    linea: linea || undefined,
     producto,
-    precio: Number(precioRaw),
-    unidades: unidadesRaw ? Number(unidadesRaw) : 0,
+    // El archivo trae el precio en pesos enteros; toda la app guarda montos en centavos
+    // (mismo criterio que el resto de los inputs de dinero, ej. Configuración/costo de envío).
+    precio: Math.round(Number(precioRaw) * 100),
     codigo,
     variante,
     puntos: puntosRaw ? Number(puntosRaw) : undefined,
     imagen,
-    stockMinimo: stockMinimoRaw ? Number(stockMinimoRaw) : undefined,
   };
 
   const result = bulkProductSchema.element.safeParse(candidate);
@@ -158,17 +171,24 @@ function parseRow(row: unknown[], columnMap: Record<string, number>, rowNumber: 
   return { rowNumber, autoCodigo, data: result.data };
 }
 
-function buildPreview(rows: unknown[][]): { preview?: PreviewResult; error?: string } {
+interface BuildPreviewResult {
+  preview?: PreviewResult;
+  error?: string;
+  /** Se devuelve cuando falta mapear manualmente alguna columna obligatoria. */
+  headerRow?: unknown[];
+  missingFields?: string[];
+}
+
+function buildPreview(rows: unknown[][], manualColumnMap: Record<string, number> = {}): BuildPreviewResult {
   const [headerRow, ...dataRows] = rows;
   if (!headerRow) {
     return { error: "El archivo está vacío." };
   }
 
-  const columnMap = resolveColumnMap(headerRow);
+  const columnMap = { ...resolveColumnMap(headerRow), ...manualColumnMap };
   const missing = REQUIRED_FIELDS.filter((field) => !(field in columnMap));
   if (missing.length > 0) {
-    const labels = missing.map((f) => FIELD_LABELS[f]).join(", ");
-    return { error: `No se encontraron las columnas: ${labels}. Revisá los encabezados del archivo.` };
+    return { headerRow, missingFields: missing };
   }
 
   const nonEmptyRows = dataRows.filter((row) => row.some((cell) => String(cell ?? "").trim() !== ""));
@@ -191,7 +211,16 @@ function buildPreview(rows: unknown[][]): { preview?: PreviewResult; error?: str
   return { preview: { valid, invalid, autoCodigoCount } };
 }
 
-function parseCsv(text: string): string[][] {
+/** Excel en configuración regional Español suele exportar CSV con `;` (usa `,` como separador
+ * decimal). Se cuenta cuál aparece más veces en la primera línea para no asumir siempre coma. */
+function detectDelimiter(text: string): "," | ";" {
+  const firstLine = text.split(/\r?\n/, 1)[0] ?? "";
+  const commaCount = (firstLine.match(/,/g) ?? []).length;
+  const semicolonCount = (firstLine.match(/;/g) ?? []).length;
+  return semicolonCount > commaCount ? ";" : ",";
+}
+
+function parseCsv(text: string, delimiter: "," | ";" = ","): string[][] {
   const rows: string[][] = [];
   let row: string[] = [];
   let field = "";
@@ -212,7 +241,7 @@ function parseCsv(text: string): string[][] {
       }
     } else if (char === '"') {
       inQuotes = true;
-    } else if (char === ",") {
+    } else if (char === delimiter) {
       row.push(field);
       field = "";
     } else if (char === "\n" || char === "\r") {
@@ -232,6 +261,199 @@ function parseCsv(text: string): string[][] {
   return rows.filter((r) => r.some((c) => c.trim() !== ""));
 }
 
+function ProductImageDialog({
+  product,
+  open,
+  onOpenChange,
+}: {
+  product: GlobalProduct | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const { toast } = useToast();
+  const [file, setFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+
+  const handleClose = () => {
+    setFile(null);
+    setPreviewUrl(null);
+    onOpenChange(false);
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = e.target.files?.[0] ?? null;
+    setFile(selected);
+    setPreviewUrl(selected ? URL.createObjectURL(selected) : null);
+  };
+
+  const uploadMutation = useGuardedMutation({
+    mutationFn: async () => {
+      if (!product || !file) throw new Error("Elegí un archivo primero");
+      const formData = new FormData();
+      formData.append("image", file);
+      const res = await fetch(`/api/admin/products/${product.id}/image`, {
+        method: "POST",
+        body: formData,
+        credentials: "include",
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "No se pudo subir la imagen");
+      }
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/admin/products"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      toast({ title: "Imagen actualizada" });
+      handleClose();
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo subir la imagen", description: err.message, variant: "destructive" });
+    },
+  });
+
+  const removeMutation = useGuardedMutation({
+    mutationFn: async () => {
+      if (!product) return;
+      const res = await apiRequest("DELETE", `/api/admin/products/${product.id}/image`);
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/admin/products"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      toast({ title: "Imagen quitada" });
+      handleClose();
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo quitar la imagen", description: err.message, variant: "destructive" });
+    },
+  });
+
+  if (!product) return null;
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => !next && handleClose()}>
+      <DialogContent className="max-w-md" data-testid="dialog-product-image">
+        <DialogHeader>
+          <DialogTitle>{product.producto}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="flex h-40 w-full items-center justify-center overflow-hidden rounded-lg border bg-muted">
+            {previewUrl || product.imagen ? (
+              <img
+                src={previewUrl ?? product.imagen ?? undefined}
+                alt={product.producto}
+                className="h-full w-full object-cover"
+              />
+            ) : (
+              <Package className="h-10 w-10 text-muted-foreground" />
+            )}
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="product-image-file">Imagen (JPG, PNG o WebP, hasta 5MB)</Label>
+            <Input
+              id="product-image-file"
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              onChange={handleFileChange}
+              data-testid="input-product-image"
+            />
+          </div>
+        </div>
+        <DialogFooter className="flex-wrap gap-2 border-t pt-4">
+          {product.imagen && (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => removeMutation.mutate()}
+              disabled={removeMutation.isPending}
+              data-testid="button-remove-image"
+            >
+              Quitar imagen
+            </Button>
+          )}
+          <Button type="button" variant="ghost" onClick={handleClose}>
+            Cancelar
+          </Button>
+          <Button
+            type="button"
+            onClick={() => uploadMutation.mutate()}
+            disabled={!file || uploadMutation.isPending}
+            data-testid="button-upload-image"
+          >
+            {uploadMutation.isPending ? "Subiendo..." : "Subir imagen"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function GlobalCatalogList() {
+  const { data: products = [], isLoading } = useQuery<GlobalProduct[]>({
+    queryKey: ["/api/admin/products"],
+  });
+  const [selected, setSelected] = useState<GlobalProduct | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
+
+  return (
+    <Card className="shadow-sm" data-testid="card-global-catalog">
+      <CardHeader>
+        <CardTitle className="text-lg text-foreground">Catálogo global</CardTitle>
+        <p className="text-sm text-muted-foreground">
+          Productos ya cargados — agregá o cambiá la imagen de cada uno.
+        </p>
+      </CardHeader>
+      <CardContent>
+        {isLoading ? (
+          <p className="text-sm text-muted-foreground">Cargando...</p>
+        ) : products.length === 0 ? (
+          <p className="text-sm text-muted-foreground" data-testid="empty-global-catalog">
+            Todavía no hay productos globales cargados.
+          </p>
+        ) : (
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {products.map((p) => (
+              <div
+                key={p.id}
+                className="flex items-center gap-3 rounded-lg border p-2"
+                data-testid={`row-global-product-${p.id}`}
+              >
+                <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-md bg-muted">
+                  {p.imagen ? (
+                    <img src={p.imagen} alt={p.producto} className="h-full w-full object-cover" />
+                  ) : (
+                    <Package className="h-5 w-5 text-muted-foreground" />
+                  )}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium">{p.producto}</p>
+                  <p className="truncate font-mono text-xs text-muted-foreground">{p.codigo}</p>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setSelected(p);
+                    setDialogOpen(true);
+                  }}
+                  data-testid={`button-manage-image-${p.id}`}
+                >
+                  <ImagePlus className="h-4 w-4 mr-1" />
+                  {p.imagen ? "Cambiar" : "Agregar"}
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
+      <ProductImageDialog product={selected} open={dialogOpen} onOpenChange={setDialogOpen} />
+    </Card>
+  );
+}
+
 export default function ProductManagement() {
   const { toast } = useToast();
   const [isDragging, setIsDragging] = useState(false);
@@ -240,20 +462,19 @@ export default function ProductManagement() {
   const [parseError, setParseError] = useState<string | null>(null);
   const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [uploadComplete, setUploadComplete] = useState(false);
-  const [targetConsultantId, setTargetConsultantId] = useState<string>("");
-
-  const { data: consultants = [] } = useQuery<Consultant[]>({
-    queryKey: ["/api/admin/consultants"],
-  });
+  const [rawRows, setRawRows] = useState<unknown[][] | null>(null);
+  const [mappingInfo, setMappingInfo] = useState<{ headerRow: unknown[]; missingFields: string[] } | null>(null);
+  const [manualColumnMap, setManualColumnMap] = useState<Record<string, number>>({});
 
   const bulkMutation = useGuardedMutation({
-    mutationFn: async ({ consultantId, products }: { consultantId: number; products: BulkProductInput[] }) => {
-      const res = await apiRequest("POST", "/api/admin/products/bulk", { consultantId, products });
+    mutationFn: async ({ products }: { products: BulkProductInput[] }) => {
+      const res = await apiRequest("POST", "/api/admin/products/bulk", { products });
       return res.json();
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["/api/admin/stats"] });
       queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/admin/products"] });
       setUploadComplete(true);
       setSelectedFile(null);
       setPreview(null);
@@ -267,29 +488,51 @@ export default function ProductManagement() {
     },
   });
 
-  const processFile = useCallback(async (file: File) => {
-    setSelectedFile(file);
-    setUploadComplete(false);
-    setParseError(null);
-    setPreview(null);
-    setIsParsing(true);
-
-    try {
-      const isCsv = file.name.toLowerCase().endsWith(".csv");
-      const rows = isCsv ? parseCsv(await file.text()) : await readSheet(file);
-
-      const { preview: result, error } = buildPreview(rows);
-      if (error) {
-        setParseError(error);
-      } else if (result) {
-        setPreview(result);
-      }
-    } catch (err) {
-      setParseError(err instanceof Error ? `No se pudo leer el archivo: ${err.message}` : "No se pudo leer el archivo.");
-    } finally {
-      setIsParsing(false);
+  const applyPreview = useCallback((rows: unknown[][], manualMap: Record<string, number>) => {
+    const result = buildPreview(rows, manualMap);
+    if (result.error) {
+      setParseError(result.error);
+      setMappingInfo(null);
+    } else if (result.missingFields && result.missingFields.length > 0) {
+      setMappingInfo({ headerRow: result.headerRow!, missingFields: result.missingFields });
+      setPreview(null);
+    } else if (result.preview) {
+      setPreview(result.preview);
+      setMappingInfo(null);
     }
   }, []);
+
+  const processFile = useCallback(
+    async (file: File) => {
+      setSelectedFile(file);
+      setUploadComplete(false);
+      setParseError(null);
+      setPreview(null);
+      setMappingInfo(null);
+      setManualColumnMap({});
+      setRawRows(null);
+      setIsParsing(true);
+
+      try {
+        const isCsv = file.name.toLowerCase().endsWith(".csv");
+        let rows: unknown[][];
+        if (isCsv) {
+          const rawText = await file.text();
+          const text = rawText.charCodeAt(0) === 0xfeff ? rawText.slice(1) : rawText;
+          rows = parseCsv(text, detectDelimiter(text));
+        } else {
+          rows = await readSheet(file);
+        }
+        setRawRows(rows);
+        applyPreview(rows, {});
+      } catch (err) {
+        setParseError(err instanceof Error ? `No se pudo leer el archivo: ${err.message}` : "No se pudo leer el archivo.");
+      } finally {
+        setIsParsing(false);
+      }
+    },
+    [applyPreview],
+  );
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
@@ -312,6 +555,9 @@ export default function ProductManagement() {
     setParseError(null);
     setPreview(null);
     setUploadComplete(false);
+    setMappingInfo(null);
+    setManualColumnMap({});
+    setRawRows(null);
   };
 
   return (
@@ -322,7 +568,7 @@ export default function ProductManagement() {
           Carga Masiva de Productos
         </h1>
         <p className="text-muted-foreground mt-1">
-          Sube un catálogo de productos para una consultora específica
+          Sube el catálogo global de productos — queda visible para todas las consultoras
         </p>
       </div>
 
@@ -334,7 +580,55 @@ export default function ProductManagement() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {preview && !uploadComplete ? (
+            {mappingInfo ? (
+              <div className="space-y-4" data-testid="mapping-panel">
+                <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
+                  <p className="flex items-center gap-2 text-sm font-medium text-foreground mb-1">
+                    <AlertTriangle className="h-4 w-4 text-amber-600" />
+                    No reconocimos automáticamente algunas columnas obligatorias
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Elegí manualmente qué columna del archivo corresponde a cada campo.
+                  </p>
+                </div>
+
+                <div className="space-y-3">
+                  {mappingInfo.missingFields.map((field) => (
+                    <div key={field} className="space-y-1.5">
+                      <Label>{FIELD_LABELS[field]}</Label>
+                      <Select
+                        value={manualColumnMap[field] !== undefined ? String(manualColumnMap[field]) : ""}
+                        onValueChange={(v) => setManualColumnMap((prev) => ({ ...prev, [field]: Number(v) }))}
+                      >
+                        <SelectTrigger data-testid={`select-map-${field}`}>
+                          <SelectValue placeholder="Elegí la columna del archivo" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {mappingInfo.headerRow.map((h, i) => (
+                            <SelectItem key={i} value={String(i)}>
+                              {String(h ?? `Columna ${i + 1}`) || `Columna ${i + 1}`}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <Button
+                    onClick={() => rawRows && applyPreview(rawRows, manualColumnMap)}
+                    disabled={mappingInfo.missingFields.some((f) => manualColumnMap[f] === undefined)}
+                    data-testid="button-confirm-mapping"
+                  >
+                    Confirmar mapeo
+                  </Button>
+                  <Button variant="outline" onClick={reset} data-testid="button-cancel-mapping">
+                    Elegir otro archivo
+                  </Button>
+                </div>
+              </div>
+            ) : preview && !uploadComplete ? (
               <div className="space-y-4" data-testid="preview-panel">
                 <div className="flex items-center gap-3 rounded-lg border bg-muted p-4">
                   <CheckCircle2 className="h-8 w-8 text-primary shrink-0" />
@@ -369,26 +663,10 @@ export default function ProductManagement() {
                   </div>
                 )}
 
-                <div className="space-y-2">
-                  <Label htmlFor="target-consultant">Consultora destino</Label>
-                  <Select value={targetConsultantId} onValueChange={setTargetConsultantId}>
-                    <SelectTrigger id="target-consultant" className="max-w-sm" data-testid="select-target-consultant">
-                      <SelectValue placeholder="Elegí a qué consultora pertenece este catálogo" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {consultants.map((c) => (
-                        <SelectItem key={c.id} value={String(c.id)} data-testid={`option-consultant-${c.id}`}>
-                          {c.businessName}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-
                 <div className="flex flex-col sm:flex-row gap-2">
                   <Button
-                    onClick={() => bulkMutation.mutate({ consultantId: Number(targetConsultantId), products: preview.valid })}
-                    disabled={preview.valid.length === 0 || !targetConsultantId || bulkMutation.isPending}
+                    onClick={() => bulkMutation.mutate({ products: preview.valid })}
+                    disabled={preview.valid.length === 0 || bulkMutation.isPending}
                     data-testid="button-confirm-upload"
                   >
                     {bulkMutation.isPending ? "Cargando..." : "Confirmar carga"}
@@ -493,7 +771,7 @@ export default function ProductManagement() {
               Columnas obligatorias:
             </p>
             <ul className="space-y-2">
-              {["Sección (o Categoría)", "Línea", "Producto", "Precio"].map((col) => (
+              {["Sección (o Categoría)", "Producto", "Precio"].map((col) => (
                 <li
                   key={col}
                   className="flex items-center gap-2 text-foreground"
@@ -507,7 +785,7 @@ export default function ProductManagement() {
               Columnas opcionales:
             </p>
             <ul className="space-y-2">
-              {["Código", "Variante", "Puntos", "Unidades (stock)", "Imagen (URL)", "Stock Mínimo"].map((col) => (
+              {["Línea", "Código", "Variante", "Puntos", "Imagen (URL)"].map((col) => (
                 <li
                   key={col}
                   className="flex items-center gap-2 text-muted-foreground"
@@ -518,11 +796,13 @@ export default function ProductManagement() {
               ))}
             </ul>
             <div className="rounded-md bg-muted p-3 text-xs text-muted-foreground border">
-              Los encabezados admiten variantes razonables (con o sin tilde, "Categoría" en lugar de "Sección", etc.). Si un producto no trae código, se genera uno automáticamente. Vas a poder revisar una vista previa antes de confirmar la carga.
+              Los encabezados admiten variantes razonables (con o sin tilde, "Categoría" en lugar de "Sección", etc.). Si un producto no trae código, se genera uno automáticamente. Vas a poder revisar una vista previa antes de confirmar la carga. El catálogo queda visible para todas las consultoras — cada una carga su propio stock después, desde Productos.
             </div>
           </CardContent>
         </Card>
       </div>
+
+      <GlobalCatalogList />
     </div>
   );
 }
