@@ -1,4 +1,5 @@
 import { useCallback, useState } from "react";
+import { Link } from "wouter";
 import { useQuery } from "@tanstack/react-query";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { readSheet } from "read-excel-file/browser";
@@ -399,11 +400,19 @@ function GlobalCatalogList() {
 
   return (
     <Card className="shadow-sm" data-testid="card-global-catalog">
-      <CardHeader>
-        <CardTitle className="text-lg text-foreground">Catálogo global</CardTitle>
-        <p className="text-sm text-muted-foreground">
-          Productos ya cargados — agregá o cambiá la imagen de cada uno.
-        </p>
+      <CardHeader className="flex flex-row items-start justify-between gap-4">
+        <div>
+          <CardTitle className="text-lg text-foreground">Catálogo global</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Productos ya cargados — agregá o cambiá la imagen de cada uno.
+          </p>
+        </div>
+        <Link href="/admin/productos/imagenes">
+          <Button variant="outline" size="sm" data-testid="button-bulk-image-upload">
+            <ImagePlus className="h-4 w-4 mr-1" />
+            Carga masiva de imágenes
+          </Button>
+        </Link>
       </CardHeader>
       <CardContent>
         {isLoading ? (
