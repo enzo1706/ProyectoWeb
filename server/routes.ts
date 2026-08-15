@@ -5,13 +5,13 @@ import bcrypt from "bcryptjs";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
 import { storage, SaleValidationError, AppointmentValidationError, isBcryptHash } from "./storage";
-import { uploadProductImage, deleteProductImage } from "./image-storage";
+import { uploadProductImage, deleteProductImage, isValidImageBuffer } from "./image-storage";
 import {
   bulkProductSchema,
   createConsultantSchema,
   loginSchema,
   applyDiscountSchema,
-  insertClientSchema,
+  clientWriteSchema,
   createSaleSchema,
   updateSaleSchema,
   updateInstallmentStatusSchema,
@@ -44,7 +44,8 @@ const ALLOWED_IMAGE_TYPES: Record<string, string> = {
 };
 
 // Memoria, nunca disco: el buffer va directo a Supabase Storage — el server no debe depender
-// de un disco persistente (Replit Autoscale no lo garantiza entre reinicios/instancias).
+// de un disco persistente (los contenedores de hosting como Railway no lo garantizan entre
+// reinicios/redeploys).
 const imageUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
@@ -474,7 +475,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.post("/api/clients", async (req: Request, res: Response) => {
     try {
-      const parsed = insertClientSchema.safeParse(req.body);
+      const parsed = clientWriteSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
@@ -500,7 +501,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "ID inválido" });
       }
 
-      const parsed = insertClientSchema.partial().safeParse(req.body);
+      const parsed = clientWriteSchema.partial().safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
@@ -915,29 +916,41 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "Falta el archivo de imagen" });
       }
 
-      const catalog = await storage.listGlobalProducts();
-      const existing = catalog.find((p) => p.id === id);
-      if (!existing) {
-        return res.status(404).json({ error: "Producto global no encontrado" });
+      // El mimetype de multer viene del Content-Type que declaró el cliente — falsificable.
+      // Esto confirma que el contenido real del archivo es la imagen que dice ser.
+      if (!isValidImageBuffer(req.file.buffer, req.file.mimetype)) {
+        return res.status(400).json({ error: "El archivo no es una imagen válida" });
       }
 
       const extension = ALLOWED_IMAGE_TYPES[req.file.mimetype];
       const url = await uploadProductImage(id, req.file.buffer, req.file.mimetype, extension);
 
-      const updated = await storage.setProductImage(id, url);
-      if (!updated) {
+      let result;
+      try {
+        result = await storage.setProductImage(id, url);
+      } catch (dbError) {
+        // La imagen nueva ya se subió a Storage pero Postgres falló después — la borramos
+        // para no dejarla huérfana (nadie la referencia todavía) y devolvemos el error.
+        console.error("Fallo al guardar la imagen en la base, revirtiendo la subida:", dbError);
+        await deleteProductImage(url);
+        throw dbError;
+      }
+
+      if (!result.product) {
+        // El producto no existe (o no es global) — la imagen recién subida queda huérfana
+        // si no la borramos, porque nunca se llegó a referenciar desde ningún lado.
+        await deleteProductImage(url);
         return res.status(404).json({ error: "Producto global no encontrado" });
       }
 
-      if (existing.imagen) {
-        await deleteProductImage(existing.imagen);
+      if (result.previousImage) {
+        await deleteProductImage(result.previousImage);
       }
 
-      res.json(updated);
+      res.json(result.product);
     } catch (error) {
       console.error(error);
-      const message = error instanceof Error ? error.message : "Error al subir la imagen";
-      res.status(500).json({ error: message });
+      res.status(500).json({ error: "Error al subir la imagen" });
     }
   });
 
@@ -948,17 +961,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "ID inválido" });
       }
 
-      const catalog = await storage.listGlobalProducts();
-      const product = catalog.find((p) => p.id === id);
-      if (!product) {
+      const result = await storage.setProductImage(id, null);
+      if (!result.product) {
         return res.status(404).json({ error: "Producto global no encontrado" });
       }
-
-      if (product.imagen) {
-        await deleteProductImage(product.imagen);
+      if (result.previousImage) {
+        await deleteProductImage(result.previousImage);
       }
-      const updated = await storage.setProductImage(id, null);
-      res.json(updated);
+      res.json(result.product);
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al quitar la imagen" });

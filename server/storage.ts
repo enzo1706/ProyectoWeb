@@ -68,6 +68,15 @@ export type CreateProductInput = z.infer<typeof createProductSchema>;
 type ProductRow = typeof products.$inferSelect;
 type StockFields = Pick<ProductStock, "unidades" | "stockMinimo" | "costPrice" | "selectedDiscount" | "discontinued">;
 
+/** `previousImage` es el valor que tenía la fila justo antes de este cambio, leído bajo lock
+ * — nunca una foto vieja tomada antes de subir el archivo nuevo. Así, si dos reemplazos del
+ * mismo producto se pisan, cada uno borra exactamente el archivo que dejó de estar referenciado
+ * (nunca el que "ganó"), sin importar el orden en que terminen. */
+export interface SetProductImageResult {
+  product: ProductRow | undefined;
+  previousImage: string | null;
+}
+
 /** Combina un producto de catálogo con la fila de stock de la consultora que lo está mirando
  * (o los defaults, si todavía no tiene una) — la forma `Product` que consume el resto de la app. */
 function withStockDefaults(product: ProductRow, stock?: StockFields | null): Product {
@@ -253,7 +262,7 @@ export interface IStorage {
   listGlobalProducts(): Promise<ProductRow[]>;
   /** Admin-only: solo aplica a productos globales — las imágenes de productos manuales las
    * gestiona cada consultora dueña, no el admin. */
-  setProductImage(productId: number, imagen: string | null): Promise<ProductRow | undefined>;
+  setProductImage(productId: number, imagen: string | null): Promise<SetProductImageResult>;
   getUpcomingAppointments(consultantId: number, limit?: number): Promise<Appointment[]>;
   getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<Appointment[]>;
   createAppointment(consultantId: number, input: CreateAppointmentInput): Promise<Appointment | undefined>;
@@ -638,14 +647,26 @@ export class DatabaseStorage implements IStorage {
       .orderBy(products.seccion, products.linea, products.producto);
   }
 
-  async setProductImage(productId: number, imagen: string | null): Promise<ProductRow | undefined> {
+  async setProductImage(productId: number, imagen: string | null): Promise<SetProductImageResult> {
     const db = await this.getDb();
-    const [updated] = await db
-      .update(products)
-      .set({ imagen })
-      .where(and(eq(products.id, productId), isNull(products.consultantId)))
-      .returning();
-    return updated;
+    return db.transaction(async (tx) => {
+      // FOR UPDATE: si dos requests tocan la imagen del mismo producto a la vez (dos filas
+      // de una carga masiva apuntando al mismo id, o un reemplazo superpuesto con un borrado),
+      // el segundo espera acá y lee el valor que dejó el primero — nunca una foto stale.
+      const [current] = await tx
+        .select({ imagen: products.imagen })
+        .from(products)
+        .where(and(eq(products.id, productId), isNull(products.consultantId)))
+        .for("update");
+      if (!current) return { product: undefined, previousImage: null };
+
+      const [updated] = await tx
+        .update(products)
+        .set({ imagen })
+        .where(and(eq(products.id, productId), isNull(products.consultantId)))
+        .returning();
+      return { product: updated, previousImage: current.imagen };
+    });
   }
 
   async getUpcomingAppointments(consultantId: number, limit = 10): Promise<Appointment[]> {
@@ -1268,33 +1289,15 @@ export class DatabaseStorage implements IStorage {
   async createSale(consultantId: number, input: CreateSaleInput): Promise<Sale> {
     const db = await this.getDb();
 
-    const productIds = input.items.map((i) => i.productId);
-    // Reutiliza el mismo join catálogo+stock que getProductsByIds — costo y stock siempre
-    // resueltos contra el stock propio de esta consultora, sea el producto global o manual.
-    const foundProducts = await this.getProductsByIds(consultantId, productIds);
-    const productById = new Map(foundProducts.map((p) => [p.id, p]));
+    const productIds = Array.from(new Set(input.items.map((i) => i.productId)));
 
-    const lines = input.items.map((item) => {
-      const product = productById.get(item.productId);
-      if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
-      if (product.unidades < item.quantity) {
-        throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${product.unidades})`);
-      }
-      return { product, quantity: item.quantity, unitPrice: item.unitPrice ?? product.precio };
-    });
-
-    const subtotal = computeSubtotal(lines.map((l) => ({ quantity: l.quantity, unitPrice: l.unitPrice })));
-    const totals = computeSaleTotals({
-      subtotal,
-      orderDiscount: input.orderDiscount ?? null,
-      orderSurcharge: input.orderSurcharge ?? null,
-      shippingCost: input.shippingCost ?? null,
-    });
-
-    const installmentAmounts = input.installments.map((i) => i.amount);
-    if (!installmentsSumMatches(installmentAmounts, totals.total)) {
-      throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
-    }
+    // Catálogo (nombre/precio/sección): no lo toca ninguna venta concurrente, se puede leer
+    // sin lock. El stock sí — se relee y se bloquea recién dentro de la transacción, más abajo.
+    const catalogRows = await db
+      .select()
+      .from(products)
+      .where(and(inArray(products.id, productIds), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
+    const catalogById = new Map(catalogRows.map((p) => [p.id, p]));
 
     const [client] = await db
       .select()
@@ -1303,12 +1306,55 @@ export class DatabaseStorage implements IStorage {
     if (!client) throw new SaleValidationError("Clienta no encontrada");
     const clientName = client.name ?? client.phone;
 
-    const profit = lines.reduce((sum, l) => {
-      const cost = l.product.costPrice ?? l.product.precio;
-      return sum + (l.unitPrice - cost) * l.quantity;
-    }, 0);
-
     return db.transaction(async (tx) => {
+      // SELECT ... FOR UPDATE: bloquea las filas de stock involucradas hasta el commit. Si
+      // dos ventas del mismo producto llegan a la vez, la segunda queda esperando acá y
+      // recién lee (y valida) el stock ya descontado por la primera — nunca las dos ven el
+      // mismo número y "pisan" la escritura de la otra (lost update).
+      const stockRows = productIds.length
+        ? await tx
+            .select()
+            .from(productStock)
+            .where(and(eq(productStock.consultantId, consultantId), inArray(productStock.productId, productIds)))
+            .for("update")
+        : [];
+      const stockByProductId = new Map(stockRows.map((s) => [s.productId, s]));
+
+      const lines = input.items.map((item) => {
+        const product = catalogById.get(item.productId);
+        if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
+        const stock = stockByProductId.get(item.productId);
+        const available = stock?.unidades ?? 0;
+        if (available < item.quantity) {
+          throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);
+        }
+        return {
+          product,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice ?? product.precio,
+          costPrice: stock?.costPrice ?? null,
+          remainingAfterSale: available - item.quantity,
+        };
+      });
+
+      const subtotal = computeSubtotal(lines.map((l) => ({ quantity: l.quantity, unitPrice: l.unitPrice })));
+      const totals = computeSaleTotals({
+        subtotal,
+        orderDiscount: input.orderDiscount ?? null,
+        orderSurcharge: input.orderSurcharge ?? null,
+        shippingCost: input.shippingCost ?? null,
+      });
+
+      const installmentAmounts = input.installments.map((i) => i.amount);
+      if (!installmentsSumMatches(installmentAmounts, totals.total)) {
+        throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
+      }
+
+      const profit = lines.reduce((sum, l) => {
+        const cost = l.costPrice ?? l.product.precio;
+        return sum + (l.unitPrice - cost) * l.quantity;
+      }, 0);
+
       const [sale] = await tx
         .insert(sales)
         .values({
@@ -1357,7 +1403,7 @@ export class DatabaseStorage implements IStorage {
       for (const line of lines) {
         await tx
           .update(productStock)
-          .set({ unidades: line.product.unidades - line.quantity })
+          .set({ unidades: line.remainingAfterSale })
           .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, line.product.id)));
       }
 
@@ -1389,14 +1435,27 @@ export class DatabaseStorage implements IStorage {
           ...input.items.map((i) => i.productId),
         ]),
       );
-      const involvedRows = await tx
-        .select({ product: products, stock: productStock })
-        .from(products)
-        .leftJoin(productStock, and(eq(productStock.productId, products.id), eq(productStock.consultantId, consultantId)))
-        .where(and(inArray(products.id, involvedIds), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
-      const involvedProducts = involvedRows.map((r) => withStockDefaults(r.product, r.stock));
-      const productById = new Map(involvedProducts.map((p) => [p.id, p]));
-      const stockById = new Map(involvedProducts.map((p) => [p.id, p.unidades]));
+
+      // Catálogo: sin lock, no compite por concurrencia.
+      const productRows = involvedIds.length
+        ? await tx
+            .select()
+            .from(products)
+            .where(and(inArray(products.id, involvedIds), or(isNull(products.consultantId), eq(products.consultantId, consultantId))))
+        : [];
+      const productById = new Map(productRows.map((p) => [p.id, p]));
+
+      // Stock: FOR UPDATE — bloquea estas filas hasta el commit, igual que en createSale,
+      // para que dos ediciones/ventas concurrentes sobre el mismo producto no se pisen.
+      const stockRows = involvedIds.length
+        ? await tx
+            .select()
+            .from(productStock)
+            .where(and(eq(productStock.consultantId, consultantId), inArray(productStock.productId, involvedIds)))
+            .for("update")
+        : [];
+      const stockRowById = new Map(stockRows.map((s) => [s.productId, s]));
+      const stockById = new Map(involvedIds.map((pid) => [pid, stockRowById.get(pid)?.unidades ?? 0]));
 
       // 1) Restaurar el stock que esta venta tenía reservado (como si se hubiera eliminado).
       for (const item of existingItems) {
@@ -1414,7 +1473,8 @@ export class DatabaseStorage implements IStorage {
           throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);
         }
         stockById.set(item.productId, available - item.quantity);
-        return { product, quantity: item.quantity, unitPrice: item.unitPrice ?? product.precio };
+        const costPrice = stockRowById.get(item.productId)?.costPrice ?? null;
+        return { product, quantity: item.quantity, unitPrice: item.unitPrice ?? product.precio, costPrice };
       });
 
       const subtotal = computeSubtotal(lines.map((l) => ({ quantity: l.quantity, unitPrice: l.unitPrice })));
@@ -1431,7 +1491,7 @@ export class DatabaseStorage implements IStorage {
       }
 
       const profit = lines.reduce((sum, l) => {
-        const cost = l.product.costPrice ?? l.product.precio;
+        const cost = l.costPrice ?? l.product.precio;
         return sum + (l.unitPrice - cost) * l.quantity;
       }, 0);
 
@@ -1508,7 +1568,8 @@ export class DatabaseStorage implements IStorage {
         const stockRows = await tx
           .select()
           .from(productStock)
-          .where(and(eq(productStock.consultantId, consultantId), inArray(productStock.productId, productIds)));
+          .where(and(eq(productStock.consultantId, consultantId), inArray(productStock.productId, productIds)))
+          .for("update");
         const stockById = new Map(stockRows.map((s) => [s.productId, s.unidades]));
         for (const item of items) {
           if (item.productId !== null) {
@@ -1957,11 +2018,12 @@ export class MemoryStorage implements IStorage {
       );
   }
 
-  async setProductImage(productId: number, imagen: string | null): Promise<ProductRow | undefined> {
+  async setProductImage(productId: number, imagen: string | null): Promise<SetProductImageResult> {
     const product = this.products.find((p) => p.id === productId && p.consultantId === null);
-    if (!product) return undefined;
+    if (!product) return { product: undefined, previousImage: null };
+    const previousImage = product.imagen;
     product.imagen = imagen;
-    return product;
+    return { product, previousImage };
   }
 
   async getUpcomingAppointments(consultantId: number, limit = 10): Promise<Appointment[]> {

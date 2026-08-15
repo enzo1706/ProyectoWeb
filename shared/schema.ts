@@ -203,6 +203,10 @@ export const selectProductSchema = createSelectSchema(products);
 export const insertClientSchema = createInsertSchema(clients).omit({ id: true }).extend({
   phone: z.string().regex(PHONE_REGEX, PHONE_ERROR_MESSAGE),
 });
+/** El `consultantId` de una clienta lo decide siempre el backend a partir de la sesión
+ * (nunca el body) — este schema es el que de verdad se usa para crear/editar, así que ni
+ * siquiera parsea si alguien manda `consultantId`, sea o no el propio. */
+export const clientWriteSchema = insertClientSchema.omit({ consultantId: true });
 export const insertAppointmentSchema = createInsertSchema(appointments).omit({ id: true });
 
 export const createAppointmentSchema = z.object({

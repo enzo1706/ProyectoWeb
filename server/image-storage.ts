@@ -2,6 +2,24 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 const BUCKET = "product-images";
 
+/** Firma binaria real de cada formato — el `mimetype` que manda multer viene del header
+ * `Content-Type` de la parte multipart, que el cliente arma libremente (falsificable con
+ * curl/Postman). Esto lee los primeros bytes del archivo de verdad, sin agregar ninguna
+ * dependencia nueva: las tres firmas son cortas y estables. */
+const MAGIC_BYTE_CHECKS: Record<string, (buf: Buffer) => boolean> = {
+  "image/jpeg": (buf) => buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff,
+  "image/png": (buf) =>
+    buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+  "image/webp": (buf) =>
+    buf.length >= 12 && buf.subarray(0, 4).toString("ascii") === "RIFF" && buf.subarray(8, 12).toString("ascii") === "WEBP",
+};
+
+/** true solo si el contenido real del archivo coincide con el `mimetype` declarado. */
+export function isValidImageBuffer(buffer: Buffer, declaredMimeType: string): boolean {
+  const check = MAGIC_BYTE_CHECKS[declaredMimeType];
+  return check ? check(buffer) : false;
+}
+
 let client: SupabaseClient | null = null;
 let bucketReady = false;
 
