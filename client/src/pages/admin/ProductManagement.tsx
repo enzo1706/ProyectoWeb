@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { readSheet } from "read-excel-file/browser";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import {
   Select,
   SelectContent,
@@ -19,10 +19,20 @@ import {
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogFooter,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogAction,
+  AlertDialogCancel,
+} from "@/components/ui/alert-dialog";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Upload, FileSpreadsheet, Package, CheckCircle2, AlertTriangle, X, ImagePlus } from "lucide-react";
-import { apiRequest, queryClient } from "@/lib/queryClient";
+import { apiRequest, extractFriendlyErrorMessage, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 import { bulkProductSchema } from "@shared/schema";
@@ -274,6 +284,7 @@ function ProductImageDialog({
   const { toast } = useToast();
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [removeConfirmOpen, setRemoveConfirmOpen] = useState(false);
 
   const handleClose = () => {
     setFile(null);
@@ -298,8 +309,8 @@ function ProductImageDialog({
         credentials: "include",
       });
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || "No se pudo subir la imagen");
+        const rawText = await res.text().catch(() => "");
+        throw new Error(extractFriendlyErrorMessage(res.status, rawText));
       }
       return res.json();
     },
@@ -367,7 +378,7 @@ function ProductImageDialog({
             <Button
               type="button"
               variant="outline"
-              onClick={() => removeMutation.mutate()}
+              onClick={() => setRemoveConfirmOpen(true)}
               disabled={removeMutation.isPending}
               data-testid="button-remove-image"
             >
@@ -387,6 +398,32 @@ function ProductImageDialog({
           </Button>
         </DialogFooter>
       </DialogContent>
+
+      <AlertDialog open={removeConfirmOpen} onOpenChange={setRemoveConfirmOpen}>
+        <AlertDialogContent data-testid="dialog-confirm-remove-image">
+          <AlertDialogHeader>
+            <AlertDialogTitle>¿Querés quitar la imagen de este producto?</AlertDialogTitle>
+            <AlertDialogDescription>
+              La imagen se eliminará del catálogo, pero el producto no se eliminará.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel data-testid="button-cancel-remove-image">Cancelar</AlertDialogCancel>
+            <AlertDialogAction
+              className={buttonVariants({ variant: "destructive" })}
+              onClick={(e) => {
+                e.preventDefault();
+                removeMutation.mutate();
+                setRemoveConfirmOpen(false);
+              }}
+              disabled={removeMutation.isPending}
+              data-testid="button-confirm-remove-image"
+            >
+              {removeMutation.isPending ? "Quitando..." : "Quitar imagen"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Dialog>
   );
 }

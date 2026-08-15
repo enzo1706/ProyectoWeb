@@ -94,6 +94,8 @@ export function SaleOrderTable({ lines, onEdit, onRemove }: SaleOrderTableProps)
                         variant="ghost"
                         size="icon"
                         onClick={() => onEdit(line.productId)}
+                        title={`Editar ${line.productName}`}
+                        aria-label={`Editar ${line.productName}`}
                         data-testid={`button-edit-order-item-${line.productId}`}
                       >
                         <Pencil className="h-4 w-4" />
@@ -103,6 +105,8 @@ export function SaleOrderTable({ lines, onEdit, onRemove }: SaleOrderTableProps)
                         variant="ghost"
                         size="icon"
                         onClick={() => onRemove(line.productId)}
+                        title={`Quitar ${line.productName}`}
+                        aria-label={`Quitar ${line.productName}`}
                         data-testid={`button-remove-order-item-${line.productId}`}
                       >
                         <X className="h-4 w-4 text-destructive" />
@@ -157,6 +161,8 @@ export function SaleOrderTable({ lines, onEdit, onRemove }: SaleOrderTableProps)
                   variant="ghost"
                   size="icon"
                   onClick={() => onEdit(line.productId)}
+                  title={`Editar ${line.productName}`}
+                  aria-label={`Editar ${line.productName}`}
                   data-testid={`button-edit-order-item-mobile-${line.productId}`}
                 >
                   <Pencil className="h-4 w-4" />
@@ -166,6 +172,8 @@ export function SaleOrderTable({ lines, onEdit, onRemove }: SaleOrderTableProps)
                   variant="ghost"
                   size="icon"
                   onClick={() => onRemove(line.productId)}
+                  title={`Quitar ${line.productName}`}
+                  aria-label={`Quitar ${line.productName}`}
                   data-testid={`button-remove-order-item-mobile-${line.productId}`}
                 >
                   <X className="h-4 w-4 text-destructive" />

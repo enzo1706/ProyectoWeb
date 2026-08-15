@@ -129,7 +129,15 @@ function OrderAdjustmentField({
           data-testid={`input-${testIdPrefix}-value`}
         />
         {adjustment && (
-          <Button type="button" variant="ghost" size="icon" onClick={handleClear} data-testid={`button-clear-${testIdPrefix}`}>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            onClick={handleClear}
+            title={`Quitar ${label.toLowerCase()}`}
+            aria-label={`Quitar ${label.toLowerCase()}`}
+            data-testid={`button-clear-${testIdPrefix}`}
+          >
             <X className="h-4 w-4" />
           </Button>
         )}
@@ -293,6 +301,7 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
   const invalidateAfterSave = () => {
     queryClient.invalidateQueries({ queryKey: ["/api/sales"] });
     queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
     queryClient.invalidateQueries({ queryKey: ["/api/sales/top-products"] });
     queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
     queryClient.invalidateQueries({ queryKey: ["/api/clients/top"] });
@@ -418,7 +427,15 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
                         data-testid="input-shipping-cost"
                       />
                       {shippingCost !== null && (
-                        <Button type="button" variant="ghost" size="icon" onClick={() => setShippingCost(null)} data-testid="button-remove-shipping">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => setShippingCost(null)}
+                          title="Quitar costo de envío"
+                          aria-label="Quitar costo de envío"
+                          data-testid="button-remove-shipping"
+                        >
                           <X className="h-4 w-4" />
                         </Button>
                       )}

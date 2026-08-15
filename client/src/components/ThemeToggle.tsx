@@ -25,6 +25,8 @@ export function ThemeToggle() {
       size="icon"
       variant="ghost"
       onClick={toggleTheme}
+      title={theme === "light" ? "Cambiar a modo oscuro" : "Cambiar a modo claro"}
+      aria-label={theme === "light" ? "Cambiar a modo oscuro" : "Cambiar a modo claro"}
       data-testid="button-theme-toggle"
     >
       {theme === "light" ? (

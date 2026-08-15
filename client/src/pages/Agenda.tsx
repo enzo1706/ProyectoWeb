@@ -166,10 +166,24 @@ export default function Agenda() {
               {months[month]} {year}
             </CardTitle>
             <div className="flex gap-1">
-              <Button variant="ghost" size="icon" onClick={prevMonth} data-testid="button-prev-month">
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={prevMonth}
+                title="Mes anterior"
+                aria-label="Mes anterior"
+                data-testid="button-prev-month"
+              >
                 <ChevronLeft className="h-4 w-4" />
               </Button>
-              <Button variant="ghost" size="icon" onClick={nextMonth} data-testid="button-next-month">
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={nextMonth}
+                title="Mes siguiente"
+                aria-label="Mes siguiente"
+                data-testid="button-next-month"
+              >
                 <ChevronRight className="h-4 w-4" />
               </Button>
             </div>

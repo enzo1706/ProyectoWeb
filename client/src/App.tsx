@@ -1,4 +1,5 @@
 import { Switch, Route, Redirect, useLocation } from "wouter";
+import { Suspense, lazy } from "react";
 import { queryClient } from "./lib/queryClient";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
@@ -10,29 +11,44 @@ import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import { SaleCartProvider } from "@/hooks/use-sale-cart";
 import NotFound from "@/pages/not-found";
 import Dashboard from "@/pages/Dashboard";
-import Productos from "@/pages/Productos";
-import Clientas from "@/pages/Clientas";
-import Ventas from "@/pages/Ventas";
-import Agenda from "@/pages/Agenda";
-import Reportes from "@/pages/Reportes";
-import Configuracion from "@/pages/Configuracion";
-import AdminRouter from "@/pages/admin/AdminRouter";
 import Login from "@/pages/auth/Login";
 import { Loader2, LogOut } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
+// Dashboard queda de carga inmediata (es la pantalla con la que arranca toda consultora).
+// El resto son rutas "secundarias" — code splitting por ruta para que nadie descargue
+// Reportes (recharts) o el panel de Admin completo (read-excel-file, carga masiva de
+// imágenes) si nunca entra ahí.
+const Productos = lazy(() => import("@/pages/Productos"));
+const Clientas = lazy(() => import("@/pages/Clientas"));
+const Ventas = lazy(() => import("@/pages/Ventas"));
+const Agenda = lazy(() => import("@/pages/Agenda"));
+const Reportes = lazy(() => import("@/pages/Reportes"));
+const Configuracion = lazy(() => import("@/pages/Configuracion"));
+const AdminRouter = lazy(() => import("@/pages/admin/AdminRouter"));
+
+function PageLoader() {
+  return (
+    <div className="flex h-full min-h-[50vh] items-center justify-center">
+      <Loader2 className="h-8 w-8 animate-spin text-primary" />
+    </div>
+  );
+}
+
 function ConsultantRouter() {
   return (
-    <Switch>
-      <Route path="/" component={Dashboard} />
-      <Route path="/productos" component={Productos} />
-      <Route path="/clientas" component={Clientas} />
-      <Route path="/ventas" component={Ventas} />
-      <Route path="/agenda" component={Agenda} />
-      <Route path="/reportes" component={Reportes} />
-      <Route path="/configuracion" component={Configuracion} />
-      <Route component={NotFound} />
-    </Switch>
+    <Suspense fallback={<PageLoader />}>
+      <Switch>
+        <Route path="/" component={Dashboard} />
+        <Route path="/productos" component={Productos} />
+        <Route path="/clientas" component={Clientas} />
+        <Route path="/ventas" component={Ventas} />
+        <Route path="/agenda" component={Agenda} />
+        <Route path="/reportes" component={Reportes} />
+        <Route path="/configuracion" component={Configuracion} />
+        <Route component={NotFound} />
+      </Switch>
+    </Suspense>
   );
 }
 
@@ -101,6 +117,7 @@ function AppShell() {
                 size="icon"
                 onClick={() => logout().then(() => window.location.assign("/login"))}
                 title="Cerrar sesión"
+                aria-label="Cerrar sesión"
                 data-testid="button-logout"
               >
                 <LogOut className="h-4 w-4" />
@@ -108,7 +125,13 @@ function AppShell() {
             </div>
           </header>
           <main className="flex-1 overflow-auto print:overflow-visible">
-            {isAdmin ? <AdminRouter /> : <ConsultantRouter />}
+            {isAdmin ? (
+              <Suspense fallback={<PageLoader />}>
+                <AdminRouter />
+              </Suspense>
+            ) : (
+              <ConsultantRouter />
+            )}
           </main>
         </div>
       </div>

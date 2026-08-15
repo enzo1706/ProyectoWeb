@@ -135,8 +135,9 @@ function CatalogProductCard({
             type="button"
             variant="ghost"
             size="icon"
-            className="h-7 w-7 shrink-0 -mt-1 -mr-1"
+            className="shrink-0 -mt-2 -mr-2"
             title={product.discontinued ? "Reactivar producto" : "Marcar como discontinuado"}
+            aria-label={product.discontinued ? "Reactivar producto" : "Marcar como discontinuado"}
             disabled={isTogglingDiscontinued}
             onClick={(e) => {
               e.stopPropagation();
@@ -187,7 +188,9 @@ function CatalogProductCard({
               type="button"
               variant="ghost"
               size="icon"
-              className="h-8 w-8 shrink-0"
+              className="shrink-0"
+              title="Guardar stock"
+              aria-label="Guardar stock"
               disabled={isSettingStock}
               onClick={confirmStock}
               data-testid={`button-confirm-stock-${product.id}`}
@@ -198,7 +201,9 @@ function CatalogProductCard({
               type="button"
               variant="ghost"
               size="icon"
-              className="h-8 w-8 shrink-0"
+              className="shrink-0"
+              title="Cancelar edición de stock"
+              aria-label="Cancelar edición de stock"
               onClick={() => setEditingStock(false)}
               data-testid={`button-cancel-stock-${product.id}`}
             >
@@ -217,8 +222,9 @@ function CatalogProductCard({
               type="button"
               variant="ghost"
               size="icon"
-              className="h-6 w-6 shrink-0"
+              className="shrink-0"
               title="Editar mi stock"
+              aria-label="Editar mi stock"
               onClick={(e) => {
                 e.stopPropagation();
                 startEditingStock();
@@ -539,6 +545,7 @@ export default function Productos() {
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
       queryClient.invalidateQueries({ queryKey: ["/api/admin/stats"] });
       toast({
         title: "Catálogo listo",
@@ -579,6 +586,7 @@ export default function Productos() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
       toast({ title: "Stock actualizado" });
     },
     onError: (err: Error) => {

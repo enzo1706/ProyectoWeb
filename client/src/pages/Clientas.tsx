@@ -157,6 +157,7 @@ export default function Clientas() {
         client={editingClient}
         onSave={handleSave}
         existingClients={clients}
+        isSaving={createMutation.isPending || updateMutation.isPending}
       />
 
       <ClientDetailSheet

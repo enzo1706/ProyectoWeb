@@ -42,9 +42,19 @@ interface ClientDialogProps {
   /** Clientas ya cargadas en la lista actual — se usa para un chequeo rápido de duplicados
    * en el cliente. El backend sigue siendo la fuente de verdad (valida contra toda la base). */
   existingClients?: Client[];
+  /** La mutation de guardado vive en el padre (Clientas.tsx) — este flag es lo único que
+   * el diálogo necesita para mostrar el estado de "guardando". */
+  isSaving?: boolean;
 }
 
-export function ClientDialog({ open, onOpenChange, client, onSave, existingClients = [] }: ClientDialogProps) {
+export function ClientDialog({
+  open,
+  onOpenChange,
+  client,
+  onSave,
+  existingClients = [],
+  isSaving = false,
+}: ClientDialogProps) {
   const form = useForm<ClientFormData>({
     resolver: zodResolver(clientSchema),
     defaultValues: {
@@ -211,11 +221,11 @@ export function ClientDialog({ open, onOpenChange, client, onSave, existingClien
               />
             </div>
             <div className="flex justify-end gap-2 pt-4 shrink-0 border-t">
-              <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+              <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={isSaving}>
                 Cancelar
               </Button>
-              <Button type="submit" data-testid="button-save-client">
-                {client ? "Guardar Cambios" : "Crear Clienta"}
+              <Button type="submit" disabled={isSaving} data-testid="button-save-client">
+                {isSaving ? "Guardando..." : client ? "Guardar Cambios" : "Crear Clienta"}
               </Button>
             </div>
           </form>

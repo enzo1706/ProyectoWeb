@@ -28,7 +28,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { cn } from "@/lib/utils";
-import { queryClient } from "@/lib/queryClient";
+import { extractFriendlyErrorMessage, queryClient } from "@/lib/queryClient";
 import { runWithConcurrency } from "@/lib/concurrency";
 import {
   formatProductLabel,
@@ -194,8 +194,8 @@ export default function BulkImageUpload() {
         credentials: "include",
       });
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || `Error ${res.status} al subir la imagen`);
+        const rawText = await res.text().catch(() => "");
+        throw new Error(extractFriendlyErrorMessage(res.status, rawText));
       }
       const updated = await res.json();
       productsById.set(updated.id, updated);
@@ -234,7 +234,7 @@ export default function BulkImageUpload() {
     <div className="p-4 md:p-6 space-y-6 max-w-6xl mx-auto" data-testid="page-bulk-image-upload">
       <div className="flex items-center gap-3">
         <Link href="/admin/productos">
-          <Button variant="ghost" size="icon" data-testid="button-back-to-catalog">
+          <Button variant="ghost" size="icon" title="Volver al catálogo" aria-label="Volver al catálogo" data-testid="button-back-to-catalog">
             <ArrowLeft className="h-4 w-4" />
           </Button>
         </Link>
@@ -325,7 +325,7 @@ export default function BulkImageUpload() {
               <CardTitle className="text-lg">Previsualización</CardTitle>
             </CardHeader>
             <CardContent className="space-y-1">
-              <div className="overflow-x-auto">
+              <div className="hidden sm:block overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b text-left text-muted-foreground">
@@ -352,6 +352,20 @@ export default function BulkImageUpload() {
                     ))}
                   </tbody>
                 </table>
+              </div>
+
+              <div className="sm:hidden space-y-3">
+                {rows.map((row) => (
+                  <RowCard
+                    key={row.key}
+                    row={row}
+                    products={products}
+                    productsById={productsById}
+                    onAssign={assignProduct}
+                    onRemove={removeRow}
+                    disabled={isUploading}
+                  />
+                ))}
               </div>
             </CardContent>
           </Card>
@@ -483,11 +497,90 @@ function RowView({
         <StatusBadge row={row} alreadyHasImage={alreadyHasImage} />
       </td>
       <td className="p-2">
-        <Button variant="ghost" size="icon" onClick={() => onRemove(row.key)} disabled={disabled} data-testid={`button-remove-row-${row.key}`}>
+        <Button
+          variant="ghost"
+          size="icon"
+          title="Quitar este archivo de la lista"
+          aria-label="Quitar este archivo de la lista"
+          onClick={() => onRemove(row.key)}
+          disabled={disabled}
+          data-testid={`button-remove-row-${row.key}`}
+        >
           <X className="h-4 w-4" />
         </Button>
       </td>
     </tr>
+  );
+}
+
+/** Misma información que `RowView` (la fila de la tabla desktop), reordenada como tarjeta
+ * vertical para no forzar scroll horizontal en celulares. El selector de producto es el
+ * mismo `ProductPicker` — ninguna funcionalidad cambia entre una versión y la otra. */
+function RowCard({
+  row,
+  products,
+  productsById,
+  onAssign,
+  onRemove,
+  disabled,
+}: {
+  row: Row;
+  products: GlobalProduct[];
+  productsById: Map<number, GlobalProduct>;
+  onAssign: (key: string, productId: number) => void;
+  onRemove: (key: string) => void;
+  disabled: boolean;
+}) {
+  const assignedProduct = row.productId !== null ? productsById.get(row.productId) ?? null : null;
+  const alreadyHasImage = !!assignedProduct?.imagen;
+
+  return (
+    <div className="rounded-lg border p-3 space-y-3" data-testid={`card-bulk-image-${row.key}`}>
+      <div className="flex items-start gap-3">
+        <div className="h-14 w-14 overflow-hidden rounded-md border bg-muted flex items-center justify-center shrink-0">
+          {row.invalidReason ? (
+            <ImageOff className="h-5 w-5 text-destructive" />
+          ) : (
+            <img src={row.previewUrl} alt={row.file.name} className="h-full w-full object-cover" />
+          )}
+        </div>
+        <div className="min-w-0 flex-1 space-y-0.5">
+          <p className="truncate font-mono text-xs text-muted-foreground" title={row.file.name}>
+            {row.file.name}
+          </p>
+          {row.invalidReason ? (
+            <p className="text-xs text-destructive">{row.invalidReason}</p>
+          ) : (
+            assignedProduct && <p className="text-xs text-muted-foreground">{assignedProduct.seccion}</p>
+          )}
+        </div>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="shrink-0"
+          onClick={() => onRemove(row.key)}
+          disabled={disabled}
+          aria-label="Quitar este archivo de la lista"
+          data-testid={`button-remove-row-mobile-${row.key}`}
+        >
+          <X className="h-4 w-4" />
+        </Button>
+      </div>
+
+      {!row.invalidReason && (
+        <ProductPicker
+          products={products}
+          value={row.productId}
+          onSelect={(id) => onAssign(row.key, id)}
+          disabled={disabled}
+        />
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        {row.method && <MethodBadge method={row.method} />}
+        <StatusBadge row={row} alreadyHasImage={alreadyHasImage} />
+      </div>
+    </div>
   );
 }
 

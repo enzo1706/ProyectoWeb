@@ -292,7 +292,7 @@ function ExportButton({ onClick, testId }: { onClick: () => void; testId: string
     <Button
       variant="ghost"
       size="icon"
-      className="h-7 w-7 shrink-0 print:hidden"
+      className="shrink-0 print:hidden"
       onClick={onClick}
       data-testid={testId}
       title="Exportar CSV"

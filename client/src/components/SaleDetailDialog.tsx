@@ -68,6 +68,7 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
     queryClient.invalidateQueries({ queryKey: ["/api/sales"] });
     queryClient.invalidateQueries({ queryKey: ["/api/sales", saleId] });
     queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
     queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
     queryClient.invalidateQueries({ queryKey: ["/api/clients/top"] });
     queryClient.invalidateQueries({
