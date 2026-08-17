@@ -1,102 +1,179 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useLocation } from "wouter";
 import { apiRequest } from "@/lib/queryClient";
+import { useAuth } from "@/hooks/useAuth";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { MetricCard } from "@/components/MetricCard";
-import { AppointmentCard, typeLabels } from "@/components/AppointmentCard";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import { LowStockDialog } from "@/components/LowStockDialog";
 import { AppointmentDetailDialog } from "@/components/AppointmentDetailDialog";
-import { TopClientsDialog, type TopClient } from "@/components/TopClientsDialog";
-import { CategoryProductsDialog, type TopProductByCategory } from "@/components/CategoryProductsDialog";
+import { SaleDetailDialog } from "@/components/SaleDetailDialog";
+import { NewSaleDialog } from "@/components/NewSaleDialog";
+import { formatPrice } from "@/lib/currency";
+import { toDateStr } from "@/lib/date";
 import type { Product, Appointment } from "@shared/schema";
-import { chartTooltipStyle } from "@/lib/chart-theme";
-import { parseLocalDate } from "@/lib/date";
 import {
-  DollarSign,
-  Package,
-  Users,
+  Plus,
+  Clock,
   Calendar,
+  Package,
+  Gift,
+  MessageCircleHeart,
+  PartyPopper,
+  type LucideIcon,
 } from "lucide-react";
-import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  LineChart,
-  Line,
-  PieChart,
-  Pie,
-  Cell,
-} from "recharts";
 
-// todo: remove mock functionality
-const monthlySalesData = [
-  { month: "Jun", ventas: 2400 },
-  { month: "Jul", ventas: 3200 },
-  { month: "Ago", ventas: 2800 },
-  { month: "Sep", ventas: 3600 },
-  { month: "Oct", ventas: 4100 },
-  { month: "Nov", ventas: 4250 },
-];
+// Formas de respuesta de /api/reports/* — server-only, se replican acá como contrato de
+// API (mismo criterio que ya usa Reportes.tsx para estos mismos endpoints).
+interface PendingInstallmentRow {
+  saleId: number;
+  clientName: string;
+  installmentNumber: number;
+  amount: number;
+  dueDate: string;
+  isOverdue: boolean;
+}
+interface UpcomingBirthdayRow {
+  clientId: number;
+  name: string | null;
+  phone: string;
+  birthday: string;
+  daysUntil: number;
+}
+interface InactiveClientRow {
+  clientId: number;
+  name: string | null;
+  phone: string;
+  lastPurchase: string | null;
+  daysSinceLastPurchase: number | null;
+  totalPurchased: number;
+}
+interface SalesSummaryPoint {
+  period: string;
+  totalSales: number;
+  totalProfit: number;
+  salesCount: number;
+  avgTicket: number;
+}
 
-// todo: remove mock functionality
-const categoryData = [
-  { name: "Cuidado Piel", value: 45, color: "hsl(330, 81%, 45%)" },
-  { name: "Maquillaje", value: 35, color: "hsl(280, 65%, 40%)" },
-  { name: "Fragancias", value: 12, color: "hsl(200, 70%, 35%)" },
-  { name: "Accesorios", value: 8, color: "hsl(25, 75%, 40%)" },
-];
+interface TaskItem {
+  key: string;
+  icon: LucideIcon;
+  colorClass: string;
+  title: string;
+  subtitle: string;
+  actionLabel: string;
+  onAction: () => void;
+}
 
-// todo: remove mock functionality
-const topProductsData = [
-  { name: "TimeWise Serum", ventas: 24 },
-  { name: "Base CC Cream", ventas: 18 },
-  { name: "Labial Ultimate", ventas: 15 },
-  { name: "Gel Limpiador", ventas: 12 },
-];
+const MAX_TASKS = 4;
 
-function formatAppointmentShort(appointment: Appointment): string {
-  const date = parseLocalDate(appointment.date);
-  const dd = String(date.getDate()).padStart(2, "0");
-  const mm = String(date.getMonth() + 1).padStart(2, "0");
-  return `${dd}/${mm} - ${appointment.time}`;
+function currentMonthRange(): { start: string; end: string } {
+  const now = new Date();
+  return {
+    start: toDateStr(new Date(now.getFullYear(), now.getMonth(), 1)),
+    end: toDateStr(new Date(now.getFullYear(), now.getMonth() + 1, 1)),
+  };
+}
+
+function previousMonthRange(): { start: string; end: string } {
+  const now = new Date();
+  return {
+    start: toDateStr(new Date(now.getFullYear(), now.getMonth() - 1, 1)),
+    end: toDateStr(new Date(now.getFullYear(), now.getMonth(), 1)),
+  };
+}
+
+function sumSales(points: SalesSummaryPoint[]): number {
+  return points.reduce((sum, p) => sum + p.totalSales, 0);
+}
+
+function TaskRow({ task }: { task: TaskItem }) {
+  const Icon = task.icon;
+  return (
+    <div className="flex items-center gap-3 py-2.5" data-testid={`task-row-${task.key}`}>
+      <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${task.colorClass}`}>
+        <Icon className="h-4 w-4" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-semibold text-foreground">{task.title}</p>
+        <p className="truncate text-sm text-muted-foreground">{task.subtitle}</p>
+      </div>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="shrink-0"
+        onClick={task.onAction}
+        data-testid={`button-task-action-${task.key}`}
+      >
+        {task.actionLabel}
+      </Button>
+    </div>
+  );
 }
 
 export default function Dashboard() {
+  const { user } = useAuth();
+  const [, setLocation] = useLocation();
+
   const [lowStockOpen, setLowStockOpen] = useState(false);
   const [appointmentDetailOpen, setAppointmentDetailOpen] = useState(false);
   const [selectedAppointmentId, setSelectedAppointmentId] = useState<number | null>(null);
-  const [topClientsOpen, setTopClientsOpen] = useState(false);
-  const [categoryDialogOpen, setCategoryDialogOpen] = useState(false);
-  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [selectedSaleId, setSelectedSaleId] = useState<number | null>(null);
+  const [newSaleOpen, setNewSaleOpen] = useState(false);
 
-  const { data: lowStockProducts = [] } = useQuery<Product[]>({
+  const today = toDateStr(new Date());
+  const { start: monthStart, end: monthEnd } = currentMonthRange();
+  const { start: prevMonthStart, end: prevMonthEnd } = previousMonthRange();
+
+  const { data: lowStockProducts = [], isLoading: loadingLowStock } = useQuery<Product[]>({
     queryKey: ["/api/products/low-stock"],
   });
 
-  const { data: upcomingAppointments = [] } = useQuery<Appointment[]>({
+  const { data: upcomingAppointments = [], isLoading: loadingAppointments } = useQuery<Appointment[]>({
     queryKey: ["/api/appointments/upcoming"],
   });
 
-  const { data: topClients = [] } = useQuery<TopClient[]>({
-    queryKey: ["/api/clients/top"],
+  const { data: pendingInstallments = [], isLoading: loadingInstallments } = useQuery<PendingInstallmentRow[]>({
+    queryKey: ["/api/reports/pending-installments"],
   });
 
-  const { data: categoryProducts = [] } = useQuery<TopProductByCategory[]>({
-    queryKey: ["/api/sales/top-products", selectedCategory],
+  const { data: upcomingBirthdays = [], isLoading: loadingBirthdays } = useQuery<UpcomingBirthdayRow[]>({
+    queryKey: ["/api/reports/upcoming-birthdays", 30],
     queryFn: async () => {
-      const res = await apiRequest("GET", `/api/sales/top-products?category=${encodeURIComponent(selectedCategory ?? "")}`);
+      const res = await apiRequest("GET", "/api/reports/upcoming-birthdays?days=30");
       return res.json();
     },
-    enabled: categoryDialogOpen && !!selectedCategory,
   });
 
-  const nextAppointment = upcomingAppointments[0];
+  const { data: inactiveClients = [], isLoading: loadingInactive } = useQuery<InactiveClientRow[]>({
+    queryKey: ["/api/reports/inactive-clients", 30],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/reports/inactive-clients?days=30");
+      return res.json();
+    },
+  });
 
-  // Derivado de la lista en vivo (no un snapshot) — así, si el estado cambia desde el propio
-  // diálogo, el badge se actualiza y la cita desaparece de la lista sin recargar la página.
+  const { data: currentMonthPoints = [], isLoading: loadingCurrentMonth } = useQuery<SalesSummaryPoint[]>({
+    queryKey: ["/api/reports/sales-summary", monthStart, monthEnd],
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/reports/sales-summary?start=${monthStart}&end=${monthEnd}&groupBy=month`);
+      return res.json();
+    },
+  });
+
+  const { data: previousMonthPoints = [] } = useQuery<SalesSummaryPoint[]>({
+    queryKey: ["/api/reports/sales-summary", prevMonthStart, prevMonthEnd],
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/reports/sales-summary?start=${prevMonthStart}&end=${prevMonthEnd}&groupBy=month`);
+      return res.json();
+    },
+  });
+
+  const { data: products = [] } = useQuery<Product[]>({ queryKey: ["/api/products"] });
+
   const detailAppointment = upcomingAppointments.find((a) => a.id === selectedAppointmentId) ?? null;
 
   const openAppointmentDetail = (appointment: Appointment) => {
@@ -104,172 +181,195 @@ export default function Dashboard() {
     setAppointmentDetailOpen(true);
   };
 
-  const handleCategoryClick = (categoryName: string) => {
-    setSelectedCategory(categoryName);
-    setCategoryDialogOpen(true);
-  };
+  const tasks = useMemo<TaskItem[]>(() => {
+    const items: TaskItem[] = [];
+
+    // 1) Cuotas vencidas o que vencen hoy — lo más urgente.
+    for (const inst of pendingInstallments) {
+      if (items.length >= MAX_TASKS) break;
+      if (inst.isOverdue || inst.dueDate === today) {
+        items.push({
+          key: `installment-${inst.saleId}-${inst.installmentNumber}`,
+          icon: Clock,
+          colorClass: "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+          title: inst.isOverdue ? `Cuota de ${inst.clientName} está vencida` : `Cuota de ${inst.clientName} vence hoy`,
+          subtitle: formatPrice(inst.amount),
+          actionLabel: "Cobrada",
+          onAction: () => setSelectedSaleId(inst.saleId),
+        });
+      }
+    }
+
+    // 2) Citas de hoy.
+    for (const apt of upcomingAppointments) {
+      if (items.length >= MAX_TASKS) break;
+      if (apt.date === today) {
+        items.push({
+          key: `appointment-${apt.id}`,
+          icon: Calendar,
+          colorClass: "bg-blue-500/10 text-blue-600 dark:text-blue-400",
+          title: `Cita con ${apt.clientName}, ${apt.time} hs`,
+          subtitle: apt.location || "Sin lugar especificado",
+          actionLabel: "Ver",
+          onAction: () => openAppointmentDetail(apt),
+        });
+      }
+    }
+
+    // 3) Stock crítico (el que menos unidades tiene).
+    if (items.length < MAX_TASKS && lowStockProducts.length > 0) {
+      const worst = [...lowStockProducts].sort((a, b) => a.unidades - b.unidades)[0];
+      items.push({
+        key: `low-stock-${worst.id}`,
+        icon: Package,
+        colorClass: "bg-destructive/10 text-destructive",
+        title: "Se está por acabar",
+        subtitle: `${worst.producto}, quedan ${worst.unidades}`,
+        actionLabel: "Reponer",
+        onAction: () => setLowStockOpen(true),
+      });
+    }
+
+    // 4) Cumpleaños en los próximos 7 días.
+    for (const b of upcomingBirthdays) {
+      if (items.length >= MAX_TASKS) break;
+      if (b.daysUntil <= 7) {
+        items.push({
+          key: `birthday-${b.clientId}`,
+          icon: Gift,
+          colorClass: "bg-purple-500/10 text-purple-600 dark:text-purple-400",
+          title: `Cumpleaños de ${b.name ?? b.phone}`,
+          subtitle: b.daysUntil === 0 ? "Hoy" : b.daysUntil === 1 ? "Mañana" : `En ${b.daysUntil} días`,
+          actionLabel: "Saludar",
+          onAction: () => setLocation("/clientas"),
+        });
+      }
+    }
+
+    // 5) Si no hay nada urgente todavía, completar con sugerencias suaves: cumpleaños más
+    // lejanos y clientas inactivas — igual que el "no hay nada urgente" del mockup.
+    if (items.length === 0) {
+      for (const b of upcomingBirthdays) {
+        if (items.length >= MAX_TASKS) break;
+        if (b.daysUntil > 7) {
+          items.push({
+            key: `birthday-soon-${b.clientId}`,
+            icon: PartyPopper,
+            colorClass: "bg-purple-500/10 text-purple-600 dark:text-purple-400",
+            title: `Cumpleaños de ${b.name ?? b.phone} esta semana`,
+            subtitle: "Ofrecele algo especial",
+            actionLabel: "Saludar",
+            onAction: () => setLocation("/clientas"),
+          });
+        }
+      }
+      for (const c of inactiveClients) {
+        if (items.length >= MAX_TASKS) break;
+        items.push({
+          key: `inactive-${c.clientId}`,
+          icon: MessageCircleHeart,
+          colorClass: "bg-purple-500/10 text-purple-600 dark:text-purple-400",
+          title: `Hace ${c.daysSinceLastPurchase ?? "muchos"} días no le vendés a ${c.name ?? c.phone}`,
+          subtitle: "Podría ser un buen día para escribirle",
+          actionLabel: "Contactar",
+          onAction: () => setLocation("/clientas"),
+        });
+      }
+    }
+
+    return items;
+  }, [pendingInstallments, upcomingAppointments, lowStockProducts, upcomingBirthdays, inactiveClients, today]);
+
+  const isLoadingTasks =
+    loadingInstallments || loadingAppointments || loadingLowStock || loadingBirthdays || loadingInactive;
+
+  // Mientras carga, un título neutro — "Tenés el día libre" antes de tener los datos
+  // reales sería afirmar algo que todavía no se sabe.
+  const tasksTitle = isLoadingTasks ? "Para hoy" : tasks.length === 0 ? "Tenés el día libre de pendientes" : "Para hoy";
+
+  const monthTotal = sumSales(currentMonthPoints);
+  const prevMonthTotal = sumSales(previousMonthPoints);
+  const trendText =
+    prevMonthTotal > 0
+      ? monthTotal > prevMonthTotal
+        ? "Vas mejor que el mes pasado"
+        : monthTotal < prevMonthTotal
+          ? "Vendiste menos que el mes pasado"
+          : "Igual que el mes pasado"
+      : null;
 
   return (
-    <div className="p-6 space-y-6" data-testid="page-dashboard">
+    <div className="p-4 sm:p-6 space-y-5 max-w-2xl mx-auto" data-testid="page-dashboard">
       <div>
-        <h1 className="text-3xl font-bold">Inicio</h1>
-        <p className="text-muted-foreground">Resumen de tu negocio Mary Kay</p>
+        <p className="text-sm text-muted-foreground" data-testid="text-greeting-sub">
+          Hola, {user?.username}
+        </p>
+        <h1 className="text-xl sm:text-2xl font-bold text-foreground" data-testid="text-greeting-main">
+          Así está tu negocio hoy
+        </h1>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <MetricCard
-          title="Ventas del Mes"
-          value="$4,250.00"
-          icon={DollarSign}
-          trend={{ value: 12.5, isPositive: true }}
-        />
-        <MetricCard
-          title="Productos con bajo Stock"
-          value={lowStockProducts.length}
-          icon={Package}
-          onClick={() => setLowStockOpen(true)}
-        />
-        <MetricCard
-          title="Próximas Citas"
-          value={nextAppointment ? formatAppointmentShort(nextAppointment) : "No hay próximas citas"}
-          subtitle={nextAppointment ? typeLabels[nextAppointment.type] ?? nextAppointment.type : undefined}
-          icon={Calendar}
-          onClick={nextAppointment ? () => openAppointmentDetail(nextAppointment) : undefined}
-        />
-        <MetricCard
-          title="Mejores Clientes"
-          value={topClients.length}
-          icon={Users}
-          onClick={() => setTopClientsOpen(true)}
-        />
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <Card className="lg:col-span-2" data-testid="card-sales-chart">
-          <CardHeader>
-            <CardTitle className="text-lg">Ventas Mensuales</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="h-[250px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={monthlySalesData}>
-                  <XAxis dataKey="month" stroke="hsl(var(--muted-foreground))" fontSize={12} />
-                  <YAxis stroke="hsl(var(--muted-foreground))" fontSize={12} tickFormatter={(v) => `$${v}`} />
-                  <Tooltip
-                    contentStyle={chartTooltipStyle}
-                    formatter={(value: number) => [`$${value}`, "Ventas"]}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="ventas"
-                    stroke="hsl(var(--primary))"
-                    strokeWidth={2}
-                    dot={{ fill: "hsl(var(--primary))" }}
-                  />
-                </LineChart>
-              </ResponsiveContainer>
+      <Card data-testid="card-today-tasks">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base" data-testid="text-tasks-title">
+            {tasksTitle}
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="divide-y">
+          {isLoadingTasks ? (
+            <div className="space-y-3 py-1">
+              <Skeleton className="h-12 w-full" />
+              <Skeleton className="h-12 w-full" />
             </div>
-          </CardContent>
-        </Card>
+          ) : tasks.length === 0 ? (
+            <p className="py-6 text-center text-sm text-muted-foreground" data-testid="text-tasks-empty">
+              No hay nada pendiente por ahora. ¡Buen momento para planear tu próxima venta!
+            </p>
+          ) : (
+            tasks.map((task) => <TaskRow key={task.key} task={task} />)
+          )}
+        </CardContent>
+      </Card>
 
-        <Card data-testid="card-category-chart">
-          <CardHeader>
-            <CardTitle className="text-lg">Ventas por Categoría</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="h-[200px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie
-                    data={categoryData}
-                    cx="50%"
-                    cy="50%"
-                    innerRadius={40}
-                    outerRadius={70}
-                    paddingAngle={4}
-                    dataKey="value"
-                    cursor="pointer"
-                    onClick={(entry) => handleCategoryClick(entry.name)}
-                  >
-                    {categoryData.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={entry.color} />
-                    ))}
-                  </Pie>
-                  <Tooltip
-                    contentStyle={chartTooltipStyle}
-                    formatter={(value: number) => [`${value}%`, ""]}
-                  />
-                </PieChart>
-              </ResponsiveContainer>
-            </div>
-            <div className="flex flex-wrap justify-center gap-2.5 mt-2">
-              {categoryData.map((cat) => (
-                <button
-                  key={cat.name}
-                  type="button"
-                  onClick={() => handleCategoryClick(cat.name)}
-                  className="flex items-center gap-1.5 text-xs hover-elevate active-elevate-2 rounded-md px-2.5 py-2"
-                >
-                  <div className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: cat.color }} />
-                  <span className="text-muted-foreground">{cat.name}</span>
-                </button>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+      <Button
+        type="button"
+        size="lg"
+        className="h-14 w-full text-base font-semibold"
+        onClick={() => setNewSaleOpen(true)}
+        data-testid="button-register-sale"
+      >
+        <Plus className="mr-2 h-5 w-5" />
+        Registrar venta
+      </Button>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <Card data-testid="card-top-products">
-          <CardHeader>
-            <CardTitle className="text-lg">Productos Más Vendidos</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="h-[200px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={topProductsData} layout="vertical">
-                  <XAxis type="number" stroke="hsl(var(--muted-foreground))" fontSize={12} />
-                  <YAxis
-                    dataKey="name"
-                    type="category"
-                    stroke="hsl(var(--muted-foreground))"
-                    fontSize={11}
-                    width={100}
-                    tickLine={false}
-                    tickFormatter={(value: string) => (value.length > 16 ? `${value.slice(0, 15)}…` : value)}
-                  />
-                  <Tooltip
-                    contentStyle={chartTooltipStyle}
-                  />
-                  <Bar dataKey="ventas" fill="hsl(var(--primary))" radius={[0, 4, 4, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card data-testid="card-upcoming-appointments">
-          <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0">
-            <CardTitle className="text-lg flex items-center gap-2">
-              <Calendar className="h-4 w-4" />
-              Próximas Citas
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            {upcomingAppointments.length === 0 ? (
-              <p className="text-center text-muted-foreground py-8">No hay próximas citas</p>
+      <Card data-testid="card-month-summary">
+        <CardContent className="flex items-center justify-between gap-3 py-5">
+          <div>
+            <p className="text-sm text-muted-foreground">Este mes vendiste</p>
+            {loadingCurrentMonth ? (
+              <Skeleton className="mt-1 h-8 w-28" />
             ) : (
-              upcomingAppointments.slice(0, 3).map((apt) => (
-                <AppointmentCard
-                  key={apt.id}
-                  appointment={apt}
-                  onClick={() => openAppointmentDetail(apt)}
-                />
-              ))
+              <p className="text-2xl font-bold text-foreground sm:text-3xl" data-testid="text-month-total">
+                {formatPrice(monthTotal)}
+              </p>
             )}
-          </CardContent>
-        </Card>
-      </div>
+          </div>
+          {trendText && (
+            <p className="text-right text-sm font-semibold text-emerald-600 dark:text-emerald-400" data-testid="text-month-trend">
+              {trendText}
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
+      <button
+        type="button"
+        onClick={() => setLocation("/reportes")}
+        className="block w-full text-center text-sm text-muted-foreground hover-elevate active-elevate-2 rounded-md py-2"
+        data-testid="link-view-reports"
+      >
+        Ver todos los reportes
+      </button>
 
       <LowStockDialog open={lowStockOpen} onOpenChange={setLowStockOpen} products={lowStockProducts} />
       <AppointmentDetailDialog
@@ -280,13 +380,17 @@ export default function Dashboard() {
         }}
         appointment={detailAppointment}
       />
-      <TopClientsDialog open={topClientsOpen} onOpenChange={setTopClientsOpen} clients={topClients} />
-      <CategoryProductsDialog
-        open={categoryDialogOpen}
-        onOpenChange={setCategoryDialogOpen}
-        category={selectedCategory}
-        products={categoryProducts}
+      <SaleDetailDialog
+        saleId={selectedSaleId}
+        onOpenChange={(next) => {
+          if (!next) setSelectedSaleId(null);
+        }}
+        onEdit={() => {
+          setSelectedSaleId(null);
+          setLocation("/ventas");
+        }}
       />
+      <NewSaleDialog open={newSaleOpen} onOpenChange={setNewSaleOpen} products={products} />
     </div>
   );
 }
