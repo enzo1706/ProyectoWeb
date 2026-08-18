@@ -48,6 +48,7 @@ import { formatPrice } from "@/lib/currency";
 import { computeDiscountedCost } from "@shared/saleCalculations";
 import { getProductCategories } from "@/lib/productCategories";
 import { ProductSelectionModal } from "@/components/ProductSelectionModal";
+import { LoadOrderDialog } from "@/components/LoadOrderDialog";
 import type { OrderLine } from "@/components/SaleOrderTable";
 import {
   Package,
@@ -59,11 +60,13 @@ import {
   Search,
   SearchX,
   Plus,
+  PackagePlus,
   ArchiveRestore,
   Archive,
   Pencil,
   Check,
   X,
+  AlertTriangle,
 } from "lucide-react";
 
 const STOCK_FILTER = "__stock";
@@ -337,6 +340,11 @@ type ManualProductFormData = z.infer<typeof manualProductFormSchema>;
 
 function AddProductDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const { toast } = useToast();
+  // El costo de un producto en esta app siempre se calcula a partir de un descuento de
+  // compra sobre el precio de lista (mismo modelo que ya usa el resto de Productos) — no
+  // existe un campo de "precio de costo" suelto en el backend, así que la alerta de "sin
+  // costo" se dispara cuando no se elige ninguno de los descuentos habituales.
+  const [purchaseDiscount, setPurchaseDiscount] = useState<string>("");
   const form = useForm<ManualProductFormData>({
     resolver: zodResolver(manualProductFormSchema),
     defaultValues: { seccion: "", linea: "", producto: "", variante: "", precio: "", unidades: "0", puntos: "0", codigo: "" },
@@ -354,12 +362,17 @@ function AddProductDialog({ open, onOpenChange }: { open: boolean; onOpenChange:
         puntos: data.puntos ? Number(data.puntos) : 0,
         codigo: data.codigo || undefined,
       });
-      return res.json() as Promise<Product>;
+      const created = (await res.json()) as Product;
+      if (purchaseDiscount) {
+        await apiRequest("PATCH", `/api/products/${created.id}/discount`, { discountPercent: Number(purchaseDiscount) });
+      }
+      return created;
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/products"] });
       toast({ title: "Producto agregado al catálogo" });
       form.reset();
+      setPurchaseDiscount("");
       onOpenChange(false);
     },
     onError: (err: Error) => {
@@ -487,6 +500,27 @@ function AddProductDialog({ open, onOpenChange }: { open: boolean; onOpenChange:
               />
             </div>
 
+            <div>
+              <FormLabel className="text-sm font-medium">Descuento de compra (opcional)</FormLabel>
+              <Select value={purchaseDiscount || "none"} onValueChange={(v) => setPurchaseDiscount(v === "none" ? "" : v)}>
+                <SelectTrigger className="mt-1.5" data-testid="select-manual-purchase-discount">
+                  <SelectValue placeholder="Sin descuento" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none" data-testid="option-manual-purchase-discount-none">Sin descuento</SelectItem>
+                  {discountOptions.map((pct) => (
+                    <SelectItem key={pct} value={String(pct)} data-testid={`option-manual-purchase-discount-${pct}`}>{pct}%</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {!purchaseDiscount && (
+                <div className="mt-2 flex items-start gap-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                  <span>Sin descuento de compra: no vas a poder ver el costo real de este producto hasta que lo completes.</span>
+                </div>
+              )}
+            </div>
+
             <DialogFooter className="border-t pt-4">
               <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
                 Cancelar
@@ -511,6 +545,7 @@ export default function Productos() {
   const [globalDiscount, setGlobalDiscount] = useState<string>("");
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
   const [addProductOpen, setAddProductOpen] = useState(false);
+  const [loadOrderOpen, setLoadOrderOpen] = useState(false);
 
   const { data: products = [], isLoading, isError, error } = useQuery<Product[]>({
     queryKey: ["/api/products"],
@@ -620,10 +655,16 @@ export default function Productos() {
               </p>
             </div>
           </div>
-          <Button variant="outline" onClick={() => setAddProductOpen(true)} data-testid="button-open-add-product">
-            <Plus className="h-4 w-4 mr-2" />
-            Agregar producto
-          </Button>
+          <div className="flex flex-wrap justify-end gap-2">
+            <Button variant="outline" onClick={() => setAddProductOpen(true)} data-testid="button-open-add-product">
+              <Plus className="h-4 w-4 mr-2" />
+              Agregar producto
+            </Button>
+            <Button onClick={() => setLoadOrderOpen(true)} data-testid="button-open-load-order">
+              <PackagePlus className="h-4 w-4 mr-2" />
+              Cargar pedido
+            </Button>
+          </div>
         </div>
         {!isLoading && products.length > 0 && (
           <p className="text-sm text-muted-foreground pl-[3.25rem]">
@@ -658,20 +699,28 @@ export default function Productos() {
                 ))}
               </SelectContent>
             </Select>
-            <Select value={categoryFilter} onValueChange={setCategoryFilter}>
-              <SelectTrigger className="w-full sm:w-[220px]" data-testid="select-category-filter">
-                <SelectValue placeholder="Categoría" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL_FILTER}>Todas las categorías</SelectItem>
-                {categories.map((category) => (
-                  <SelectItem key={category} value={category}>{category}</SelectItem>
-                ))}
-                <SelectItem value={STOCK_FILTER}>Productos en Stock</SelectItem>
-                <SelectItem value={DISCONTINUED_FILTER}>Discontinuos</SelectItem>
-                <SelectItem value={MANUAL_FILTER}>Agregados manualmente</SelectItem>
-              </SelectContent>
-            </Select>
+          </div>
+          <div className="flex gap-2 overflow-x-auto pb-1" data-testid="category-chip-row">
+            {[
+              { value: ALL_FILTER, label: "Todas" },
+              ...categories.map((c) => ({ value: c, label: c })),
+              { value: STOCK_FILTER, label: "En stock" },
+              { value: DISCONTINUED_FILTER, label: "Discontinuos" },
+              { value: MANUAL_FILTER, label: "Agregados manualmente" },
+            ].map((chip) => (
+              <button
+                key={chip.value}
+                type="button"
+                onClick={() => setCategoryFilter(chip.value)}
+                className={cn(
+                  "shrink-0 whitespace-nowrap rounded-full border px-3.5 py-1.5 text-sm font-medium",
+                  categoryFilter === chip.value ? "border-primary bg-primary text-primary-foreground" : "bg-muted/50",
+                )}
+                data-testid={`chip-category-${chip.value}`}
+              >
+                {chip.label}
+              </button>
+            ))}
           </div>
         </div>
       )}
@@ -725,6 +774,8 @@ export default function Productos() {
       />
 
       <AddProductDialog open={addProductOpen} onOpenChange={setAddProductOpen} />
+
+      <LoadOrderDialog open={loadOrderOpen} onOpenChange={setLoadOrderOpen} products={products} />
 
       {cart.lines.length > 0 && (
         <div className="fixed bottom-0 left-0 right-0 border-t bg-background/95 backdrop-blur-sm p-4 shadow-lg z-40">

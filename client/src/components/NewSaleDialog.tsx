@@ -32,6 +32,7 @@ import { SaleProductStep, type ProductSubView, type SaleProductStepHandle } from
 import { EditSaleItemDialog } from "./EditSaleItemDialog";
 import { ClientDialog } from "./ClientDialog";
 import { SaleInstallmentsEditor } from "./SaleInstallmentsEditor";
+import { WizardDots } from "./WizardDots";
 import type { Client } from "./ClientCard";
 import type { SaleDetails } from "./SaleCard";
 
@@ -73,17 +74,6 @@ function toDateInputValue(date: Date): string {
 function parseLocalDate(dateStr: string): Date {
   const [year, month, day] = dateStr.split("-").map(Number);
   return new Date(year, month - 1, day);
-}
-
-/** 5 puntos de progreso — el paso actual y los ya completados quedan resaltados. */
-function WizardDots({ total, current }: { total: number; current: number }) {
-  return (
-    <div className="flex gap-1.5 px-1" data-testid="wizard-progress">
-      {Array.from({ length: total }, (_, i) => (
-        <div key={i} className={cn("h-1 flex-1 rounded-full", i <= current ? "bg-primary" : "bg-muted")} />
-      ))}
-    </div>
-  );
 }
 
 export function NewSaleDialog({ open, onOpenChange, products, existingSale, preselectedClient, initialLines }: NewSaleDialogProps) {
