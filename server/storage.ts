@@ -35,6 +35,7 @@ import {
   installmentsSumMatches,
   computeInstallmentDueDate,
 } from "@shared/saleCalculations";
+import { resolveLowStockThreshold, DEFAULT_LOW_STOCK_THRESHOLD } from "@shared/stockAlerts";
 import type { z } from "zod";
 import { eq, ne, count, sql, and, gte, lt, asc, desc, isNotNull, isNull, inArray, ilike, or } from "drizzle-orm";
 import type { db as database } from "./db";
@@ -66,7 +67,10 @@ export type UpdateBusinessSettingsInput = z.infer<typeof updateBusinessSettingsS
 export type CreateProductInput = z.infer<typeof createProductSchema>;
 
 type ProductRow = typeof products.$inferSelect;
-type StockFields = Pick<ProductStock, "unidades" | "stockMinimo" | "costPrice" | "selectedDiscount" | "discontinued">;
+type StockFields = Pick<
+  ProductStock,
+  "unidades" | "stockMinimo" | "costPrice" | "selectedDiscount" | "discontinued" | "remindStockAt"
+>;
 
 /** `previousImage` es el valor que tenía la fila justo antes de este cambio, leído bajo lock
  * — nunca una foto vieja tomada antes de subir el archivo nuevo. Así, si dos reemplazos del
@@ -78,15 +82,23 @@ export interface SetProductImageResult {
 }
 
 /** Combina un producto de catálogo con la fila de stock de la consultora que lo está mirando
- * (o los defaults, si todavía no tiene una) — la forma `Product` que consume el resto de la app. */
-function withStockDefaults(product: ProductRow, stock?: StockFields | null): Product {
+ * (o los defaults, si todavía no tiene una) — la forma `Product` que consume el resto de la app.
+ * `consultantDefaultThreshold` es el umbral de perfil (Configuración) — ver resolveLowStockThreshold. */
+function withStockDefaults(
+  product: ProductRow,
+  stock?: StockFields | null,
+  consultantDefaultThreshold?: number | null,
+): Product {
+  const stockMinimo = stock?.stockMinimo ?? null;
   return {
     ...product,
     unidades: stock?.unidades ?? 0,
-    stockMinimo: stock?.stockMinimo ?? 5,
+    stockMinimo,
     costPrice: stock?.costPrice ?? null,
     selectedDiscount: stock?.selectedDiscount ?? null,
     discontinued: stock?.discontinued ?? false,
+    remindStockAt: stock?.remindStockAt ?? null,
+    effectiveStockMinimo: resolveLowStockThreshold(stockMinimo, consultantDefaultThreshold),
   };
 }
 
@@ -256,8 +268,17 @@ export interface IStorage {
   applyProductDiscount(consultantId: number, productId: number, discountPercent: number): Promise<Product | undefined>;
   createProduct(consultantId: number, input: CreateProductInput): Promise<Product>;
   setProductDiscontinued(consultantId: number, productId: number, discontinued: boolean): Promise<Product | undefined>;
-  /** La consultora fija su propio stock sobre un producto (global o manual propio). */
-  setProductStock(consultantId: number, productId: number, unidades: number): Promise<Product | undefined>;
+  /** La consultora fija su propio stock sobre un producto (global o manual propio). `stockMinimo`
+   * es opcional: si viene, actualiza también el umbral propio del producto (null lo borra). */
+  setProductStock(
+    consultantId: number,
+    productId: number,
+    unidades: number,
+    stockMinimo?: number | null,
+  ): Promise<Product | undefined>;
+  /** Pospone la alerta de stock bajo de este producto hasta `remindAt` (YYYY-MM-DD), o la
+   * cancela si `remindAt` es null. */
+  setProductStockReminder(consultantId: number, productId: number, remindAt: string | null): Promise<Product | undefined>;
   /** Admin-only: catálogo global completo (sin stock, eso es por consultora) para la pantalla de imágenes. */
   listGlobalProducts(): Promise<ProductRow[]>;
   /** Admin-only: solo aplica a productos globales — las imágenes de productos manuales las
@@ -396,11 +417,26 @@ export class DatabaseStorage implements IStorage {
     return row;
   }
 
+  /** Umbral de stock bajo predeterminado del perfil de la consultora — usado por
+   * withStockDefaults para resolver el umbral efectivo de cada producto. */
+  private async getDefaultThreshold(db: Database, consultantId: number): Promise<number | null> {
+    const [row] = await db
+      .select({ defaultLowStockThreshold: consultants.defaultLowStockThreshold })
+      .from(consultants)
+      .where(eq(consultants.id, consultantId));
+    return row?.defaultLowStockThreshold ?? null;
+  }
+
   async updateBusinessSettings(consultantId: number, input: UpdateBusinessSettingsInput): Promise<Consultant | undefined> {
     const db = await this.getDb();
     const [updated] = await db
       .update(consultants)
-      .set({ businessName: input.businessName, currency: input.currency, monthlyGoal: input.monthlyGoal ?? null })
+      .set({
+        businessName: input.businessName,
+        currency: input.currency,
+        monthlyGoal: input.monthlyGoal ?? null,
+        defaultLowStockThreshold: input.defaultLowStockThreshold ?? null,
+      })
       .where(eq(consultants.id, consultantId))
       .returning();
     return updated;
@@ -410,13 +446,16 @@ export class DatabaseStorage implements IStorage {
    * con su stock resuelto (o defaults si todavía no cargó stock para ese producto). */
   async getAllProducts(consultantId: number): Promise<Product[]> {
     const db = await this.getDb();
-    const rows = await db
-      .select({ product: products, stock: productStock })
-      .from(products)
-      .leftJoin(productStock, and(eq(productStock.productId, products.id), eq(productStock.consultantId, consultantId)))
-      .where(or(isNull(products.consultantId), eq(products.consultantId, consultantId)))
-      .orderBy(products.seccion, products.linea, products.producto);
-    return rows.map((r) => withStockDefaults(r.product, r.stock));
+    const [rows, defaultThreshold] = await Promise.all([
+      db
+        .select({ product: products, stock: productStock })
+        .from(products)
+        .leftJoin(productStock, and(eq(productStock.productId, products.id), eq(productStock.consultantId, consultantId)))
+        .where(or(isNull(products.consultantId), eq(products.consultantId, consultantId)))
+        .orderBy(products.seccion, products.linea, products.producto),
+      this.getDefaultThreshold(db, consultantId),
+    ]);
+    return rows.map((r) => withStockDefaults(r.product, r.stock, defaultThreshold));
   }
 
   async getProductsByIds(consultantId: number, ids: number[]): Promise<Product[]> {
@@ -427,6 +466,8 @@ export class DatabaseStorage implements IStorage {
       .from(products)
       .leftJoin(productStock, and(eq(productStock.productId, products.id), eq(productStock.consultantId, consultantId)))
       .where(and(inArray(products.id, ids), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
+    // effectiveStockMinimo no es relevante para los consumidores actuales de este método
+    // (precios/cálculo de venta) — se omite la consulta extra al perfil de la consultora.
     return rows.map((r) => withStockDefaults(r.product, r.stock));
   }
 
@@ -536,16 +577,20 @@ export class DatabaseStorage implements IStorage {
   }
 
   /** Solo productos que la consultora ya tiene cargados en su stock — no tiene sentido avisar
-   * "stock bajo" de todo el catálogo global que todavía no tocó. */
+   * "stock bajo" de todo el catálogo global que todavía no tocó. Alerta cuando unidades es
+   * MENOR al umbral efectivo (propio del producto, si no el del perfil, si no 2 — ver
+   * resolveLowStockThreshold), nunca cuando es igual. */
   async getLowStockProducts(consultantId: number): Promise<Product[]> {
     const db = await this.getDb();
+    const defaultThreshold = await this.getDefaultThreshold(db, consultantId);
+    const effectiveThresholdSql = sql`coalesce(${productStock.stockMinimo}, ${defaultThreshold}, ${DEFAULT_LOW_STOCK_THRESHOLD})`;
     const rows = await db
       .select({ product: products, stock: productStock })
       .from(productStock)
       .innerJoin(products, eq(products.id, productStock.productId))
-      .where(and(eq(productStock.consultantId, consultantId), sql`${productStock.unidades} <= ${productStock.stockMinimo}`))
+      .where(and(eq(productStock.consultantId, consultantId), sql`${productStock.unidades} < ${effectiveThresholdSql}`))
       .orderBy(asc(productStock.unidades));
-    return rows.map((r) => withStockDefaults(r.product, r.stock));
+    return rows.map((r) => withStockDefaults(r.product, r.stock, defaultThreshold));
   }
 
   private async findVisibleProduct(db: Database, consultantId: number, productId: number): Promise<ProductRow | undefined> {
@@ -570,14 +615,14 @@ export class DatabaseStorage implements IStorage {
         set: { selectedDiscount: discountPercent, costPrice },
       })
       .returning();
-    return withStockDefaults(product, stock);
+    return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
   }
 
   async createProduct(consultantId: number, input: CreateProductInput): Promise<Product> {
     const db = await this.getDb();
     const variante = input.variante ?? "Estándar";
     const codigo = input.codigo ?? slugify(`${input.seccion}-${input.linea ?? ""}-${input.producto}-${variante}-${Date.now()}`);
-    return db.transaction(async (tx) => {
+    const [created, stock] = await db.transaction(async (tx) => {
       const [created] = await tx
         .insert(products)
         .values({
@@ -599,11 +644,12 @@ export class DatabaseStorage implements IStorage {
           consultantId,
           productId: created.id,
           unidades: input.unidades,
-          stockMinimo: input.stockMinimo ?? 5,
+          stockMinimo: input.stockMinimo ?? null,
         })
         .returning();
-      return withStockDefaults(created, stock);
+      return [created, stock];
     });
+    return withStockDefaults(created, stock, await this.getDefaultThreshold(db, consultantId));
   }
 
   async setProductDiscontinued(consultantId: number, productId: number, discontinued: boolean): Promise<Product | undefined> {
@@ -619,23 +665,47 @@ export class DatabaseStorage implements IStorage {
         set: { discontinued },
       })
       .returning();
-    return withStockDefaults(product, stock);
+    return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
   }
 
-  async setProductStock(consultantId: number, productId: number, unidades: number): Promise<Product | undefined> {
+  async setProductStock(
+    consultantId: number,
+    productId: number,
+    unidades: number,
+    stockMinimo?: number | null,
+  ): Promise<Product | undefined> {
+    const db = await this.getDb();
+    const product = await this.findVisibleProduct(db, consultantId, productId);
+    if (!product) return undefined;
+
+    const setFields: Partial<typeof productStock.$inferInsert> = { unidades };
+    if (stockMinimo !== undefined) setFields.stockMinimo = stockMinimo;
+
+    const [stock] = await db
+      .insert(productStock)
+      .values({ consultantId, productId, ...setFields })
+      .onConflictDoUpdate({
+        target: [productStock.consultantId, productStock.productId],
+        set: setFields,
+      })
+      .returning();
+    return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
+  }
+
+  async setProductStockReminder(consultantId: number, productId: number, remindAt: string | null): Promise<Product | undefined> {
     const db = await this.getDb();
     const product = await this.findVisibleProduct(db, consultantId, productId);
     if (!product) return undefined;
 
     const [stock] = await db
       .insert(productStock)
-      .values({ consultantId, productId, unidades })
+      .values({ consultantId, productId, remindStockAt: remindAt })
       .onConflictDoUpdate({
         target: [productStock.consultantId, productStock.productId],
-        set: { unidades },
+        set: { remindStockAt: remindAt },
       })
       .returning();
-    return withStockDefaults(product, stock);
+    return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
   }
 
   async listGlobalProducts(): Promise<ProductRow[]> {
@@ -1757,10 +1827,11 @@ export class MemoryStorage implements IStorage {
         consultantId,
         productId,
         unidades: 0,
-        stockMinimo: 5,
+        stockMinimo: null,
         costPrice: null,
         selectedDiscount: null,
         discontinued: false,
+        remindStockAt: null,
       };
       this.productStock.push(stock);
     }
@@ -1791,6 +1862,7 @@ export class MemoryStorage implements IStorage {
         businessName: insertUser.username,
         currency: "ARS",
         monthlyGoal: null,
+        defaultLowStockThreshold: null,
       };
       this.consultants.push(consultant);
       consultantId = consultant.id;
@@ -1847,10 +1919,16 @@ export class MemoryStorage implements IStorage {
     consultant.businessName = input.businessName;
     consultant.currency = input.currency;
     consultant.monthlyGoal = input.monthlyGoal ?? null;
+    consultant.defaultLowStockThreshold = input.defaultLowStockThreshold ?? null;
     return consultant;
   }
 
+  private getDefaultThresholdMem(consultantId: number): number | null {
+    return this.consultants.find((c) => c.id === consultantId)?.defaultLowStockThreshold ?? null;
+  }
+
   async getAllProducts(consultantId: number): Promise<Product[]> {
+    const defaultThreshold = this.getDefaultThresholdMem(consultantId);
     return this.products
       .filter((p) => p.consultantId === null || p.consultantId === consultantId)
       .sort((a, b) =>
@@ -1858,7 +1936,9 @@ export class MemoryStorage implements IStorage {
           [b.seccion, b.linea ?? "", b.producto].join(" "),
         ),
       )
-      .map((p) => withStockDefaults(p, this.productStock.find((s) => s.consultantId === consultantId && s.productId === p.id)));
+      .map((p) =>
+        withStockDefaults(p, this.productStock.find((s) => s.consultantId === consultantId && s.productId === p.id), defaultThreshold),
+      );
   }
 
   async getProductsByIds(consultantId: number, ids: number[]): Promise<Product[]> {
@@ -1951,12 +2031,15 @@ export class MemoryStorage implements IStorage {
   }
 
   async getLowStockProducts(consultantId: number): Promise<Product[]> {
+    const defaultThreshold = this.getDefaultThresholdMem(consultantId);
     return this.productStock
-      .filter((s) => s.consultantId === consultantId && s.unidades <= s.stockMinimo)
+      .filter(
+        (s) => s.consultantId === consultantId && s.unidades < resolveLowStockThreshold(s.stockMinimo, defaultThreshold),
+      )
       .sort((a, b) => a.unidades - b.unidades)
       .map((s) => {
         const product = this.products.find((p) => p.id === s.productId)!;
-        return withStockDefaults(product, s);
+        return withStockDefaults(product, s, defaultThreshold);
       });
   }
 
@@ -1966,7 +2049,7 @@ export class MemoryStorage implements IStorage {
     const stock = this.getOrCreateStock(consultantId, productId);
     stock.selectedDiscount = discountPercent;
     stock.costPrice = Math.round(product.precio * (1 - discountPercent / 100));
-    return withStockDefaults(product, stock);
+    return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
   async createProduct(consultantId: number, input: CreateProductInput): Promise<Product> {
@@ -1988,8 +2071,8 @@ export class MemoryStorage implements IStorage {
     this.products.push(product);
     const stock = this.getOrCreateStock(consultantId, product.id);
     stock.unidades = input.unidades;
-    stock.stockMinimo = input.stockMinimo ?? 5;
-    return withStockDefaults(product, stock);
+    stock.stockMinimo = input.stockMinimo ?? null;
+    return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
   async setProductDiscontinued(consultantId: number, productId: number, discontinued: boolean): Promise<Product | undefined> {
@@ -1997,15 +2080,29 @@ export class MemoryStorage implements IStorage {
     if (!product) return undefined;
     const stock = this.getOrCreateStock(consultantId, productId);
     stock.discontinued = discontinued;
-    return withStockDefaults(product, stock);
+    return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
-  async setProductStock(consultantId: number, productId: number, unidades: number): Promise<Product | undefined> {
+  async setProductStock(
+    consultantId: number,
+    productId: number,
+    unidades: number,
+    stockMinimo?: number | null,
+  ): Promise<Product | undefined> {
     const product = this.findVisibleProduct(consultantId, productId);
     if (!product) return undefined;
     const stock = this.getOrCreateStock(consultantId, productId);
     stock.unidades = unidades;
-    return withStockDefaults(product, stock);
+    if (stockMinimo !== undefined) stock.stockMinimo = stockMinimo;
+    return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
+  }
+
+  async setProductStockReminder(consultantId: number, productId: number, remindAt: string | null): Promise<Product | undefined> {
+    const product = this.findVisibleProduct(consultantId, productId);
+    if (!product) return undefined;
+    const stock = this.getOrCreateStock(consultantId, productId);
+    stock.remindStockAt = remindAt;
+    return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
   async listGlobalProducts(): Promise<ProductRow[]> {

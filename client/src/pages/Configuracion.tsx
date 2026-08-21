@@ -29,9 +29,11 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Settings } from "lucide-react";
 
 // El form trabaja el objetivo mensual en pesos (como el resto de los inputs de dinero de
-// la app); se convierte a centavos recién al mandarlo al backend.
+// la app); se convierte a centavos recién al mandarlo al backend. Mismo criterio para el
+// umbral de stock bajo: string en el form, número (o null) recién al enviarlo.
 const formSchema = updateBusinessSettingsSchema.extend({
   monthlyGoal: z.string().optional(),
+  defaultLowStockThreshold: z.string().optional(),
 });
 type FormData = z.infer<typeof formSchema>;
 
@@ -44,7 +46,7 @@ export default function Configuracion() {
 
   const form = useForm<FormData>({
     resolver: zodResolver(formSchema),
-    defaultValues: { businessName: "", currency: "ARS", monthlyGoal: "" },
+    defaultValues: { businessName: "", currency: "ARS", monthlyGoal: "", defaultLowStockThreshold: "" },
   });
 
   useEffect(() => {
@@ -53,6 +55,8 @@ export default function Configuracion() {
         businessName: settings.businessName,
         currency: settings.currency,
         monthlyGoal: settings.monthlyGoal !== null ? String(settings.monthlyGoal / 100) : "",
+        defaultLowStockThreshold:
+          settings.defaultLowStockThreshold !== null ? String(settings.defaultLowStockThreshold) : "",
       });
     }
   }, [settings, form]);
@@ -63,6 +67,7 @@ export default function Configuracion() {
         businessName: data.businessName,
         currency: data.currency,
         monthlyGoal: data.monthlyGoal ? Math.round(Number(data.monthlyGoal) * 100) : null,
+        defaultLowStockThreshold: data.defaultLowStockThreshold ? Math.round(Number(data.defaultLowStockThreshold)) : null,
       });
       return res.json() as Promise<Consultant>;
     },
@@ -156,6 +161,32 @@ export default function Configuracion() {
                         />
                       </FormControl>
                       <FormDescription>Opcional — queda guardado como parte de la configuración del negocio.</FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={form.control}
+                  name="defaultLowStockThreshold"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Umbral de stock bajo predeterminado</FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          type="number"
+                          min={1}
+                          step="1"
+                          placeholder="2"
+                          data-testid="input-default-low-stock-threshold"
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        Se te va a avisar cuando un producto tenga menos unidades que esto. Aplica a todo tu
+                        catálogo, salvo que le hayas puesto un umbral propio a algún producto en particular.
+                        Si lo dejás vacío, se usa 2.
+                      </FormDescription>
                       <FormMessage />
                     </FormItem>
                   )}

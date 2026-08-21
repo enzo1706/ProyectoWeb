@@ -13,6 +13,9 @@ export const consultants = pgTable("consultants", {
   businessName: text("business_name").notNull().default(""),
   currency: text("currency").notNull().default("ARS"),
   monthlyGoal: integer("monthly_goal"),
+  // Umbral de stock bajo predeterminado para toda la consultora (Configuración). Nullable:
+  // sin configurar, se usa el default global de la app (ver DEFAULT_LOW_STOCK_THRESHOLD).
+  defaultLowStockThreshold: integer("default_low_stock_threshold"),
 });
 
 export const users = pgTable("users", {
@@ -63,10 +66,15 @@ export const productStock = pgTable("product_stock", {
   consultantId: integer("consultant_id").notNull().references(() => consultants.id),
   productId: integer("product_id").notNull().references(() => products.id),
   unidades: integer("unidades").notNull().default(0),
-  stockMinimo: integer("stock_minimo").notNull().default(5),
+  // Nullable: NULL = sin umbral propio, usa la cascada (ver resolveLowStockThreshold en
+  // shared/stockAlerts.ts) — perfil de la consultora, y si tampoco existe, el default de la app.
+  stockMinimo: integer("stock_minimo"),
   costPrice: integer("cost_price"),
   selectedDiscount: integer("selected_discount"),
   discontinued: boolean("discontinued").notNull().default(false),
+  // Fecha (YYYY-MM-DD) hasta la que se pospone la alerta de stock bajo de este producto —
+  // "Recordarme comprar" en Inicio/Productos. NULL = sin recordatorio activo.
+  remindStockAt: text("remind_stock_at"),
 }, (table) => ({
   consultantProductUnique: unique("product_stock_consultant_product_unique").on(table.consultantId, table.productId),
   consultantIdx: index("product_stock_consultant_id_idx").on(table.consultantId),
@@ -184,7 +192,11 @@ export type InsertProductStock = typeof productStock.$inferInsert;
  * no cargó stock para ese producto. Misma forma que el `Product` de antes de esta etapa —
  * no cambia ningún import en el frontend. */
 export type Product = typeof products.$inferSelect &
-  Pick<ProductStock, "unidades" | "stockMinimo" | "costPrice" | "selectedDiscount" | "discontinued">;
+  Pick<ProductStock, "unidades" | "stockMinimo" | "costPrice" | "selectedDiscount" | "discontinued" | "remindStockAt"> & {
+    /** Umbral de stock bajo ya resuelto (propio del producto, si no el de la consultora, si no
+     * el default de la app) — ver `resolveLowStockThreshold` en `shared/stockAlerts.ts`. */
+    effectiveStockMinimo: number;
+  };
 export type InsertProduct = typeof products.$inferInsert;
 export type Client = typeof clients.$inferSelect;
 export type InsertClient = typeof clients.$inferInsert;
@@ -271,7 +283,7 @@ export const createProductSchema = z.object({
   puntos: z.number().int().nonnegative().default(0),
   codigo: z.string().trim().min(1).optional(),
   imagen: z.string().trim().min(1).optional(),
-  stockMinimo: z.number().int().nonnegative().optional(),
+  stockMinimo: z.number().int().positive().optional(),
 });
 
 export const toggleProductDiscontinuedSchema = z.object({
@@ -280,6 +292,14 @@ export const toggleProductDiscontinuedSchema = z.object({
 
 export const setProductStockSchema = z.object({
   unidades: z.number().int().nonnegative(),
+  // Opcional: si viene, actualiza también el umbral propio del producto. `null` explícito lo
+  // borra (vuelve a usar la cascada: perfil de la consultora, si no el default de la app).
+  stockMinimo: z.number().int().positive().nullable().optional(),
+});
+
+export const setProductStockReminderSchema = z.object({
+  // Fecha YYYY-MM-DD hasta la que posponer la alerta de este producto, o null para cancelarla.
+  remindAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Fecha inválida").nullable(),
 });
 
 const orderAdjustmentSchema = z
@@ -336,6 +356,7 @@ export const updateBusinessSettingsSchema = z.object({
   businessName: z.string().trim().min(1, "El nombre del negocio no puede estar vacío").max(120),
   currency: z.string().trim().length(3, "Usá un código de moneda ISO de 3 letras (ej. ARS, USD)").toUpperCase(),
   monthlyGoal: z.number().int().nonnegative().nullable().optional(),
+  defaultLowStockThreshold: z.number().int().positive().nullable().optional(),
 });
 
 // Carga masiva de catálogo global — admin-only. No lleva consultantId: el producto queda

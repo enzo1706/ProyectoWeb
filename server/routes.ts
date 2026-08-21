@@ -23,6 +23,7 @@ import {
   createProductSchema,
   toggleProductDiscontinuedSchema,
   setProductStockSchema,
+  setProductStockReminderSchema,
   type InsertProduct,
 } from "@shared/schema";
 import { requireAdmin } from "./middleware/requireAdmin";
@@ -772,7 +773,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
 
-      const updated = await storage.setProductStock(req.consultantId!, id, parsed.data.unidades);
+      const updated = await storage.setProductStock(req.consultantId!, id, parsed.data.unidades, parsed.data.stockMinimo);
       if (!updated) {
         return res.status(404).json({ error: "Producto no encontrado" });
       }
@@ -781,6 +782,30 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al actualizar el stock" });
+    }
+  });
+
+  app.patch("/api/products/:id/stock-reminder", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const parsed = setProductStockReminderSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const updated = await storage.setProductStockReminder(req.consultantId!, id, parsed.data.remindAt);
+      if (!updated) {
+        return res.status(404).json({ error: "Producto no encontrado" });
+      }
+
+      res.json(updated);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al guardar el recordatorio" });
     }
   });
 

@@ -44,8 +44,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import { computeDiscountedCost } from "@shared/saleCalculations";
+import { isLowStock, isReminderActive } from "@shared/stockAlerts";
+import { toDateStr } from "@/lib/date";
 import { getProductCategories } from "@/lib/productCategories";
 import { ProductSelectionModal } from "@/components/ProductSelectionModal";
 import { LoadOrderDialog } from "@/components/LoadOrderDialog";
@@ -67,6 +69,7 @@ import {
   Check,
   X,
   AlertTriangle,
+  Clock,
 } from "lucide-react";
 
 const STOCK_FILTER = "__stock";
@@ -82,30 +85,55 @@ function CatalogProductCard({
   isTogglingDiscontinued,
   onSetStock,
   isSettingStock,
+  onSetReminder,
+  isSettingReminder,
 }: {
   product: Product;
   globalDiscount: number | null;
   onOpen: () => void;
   onToggleDiscontinued: () => void;
   isTogglingDiscontinued: boolean;
-  onSetStock: (unidades: number) => void;
+  onSetStock: (unidades: number, stockMinimo?: number | null) => void;
   isSettingStock: boolean;
+  onSetReminder: (remindAt: string | null) => void;
+  isSettingReminder: boolean;
 }) {
+  const { format } = useHideMoney();
   const outOfStock = product.unidades <= 0;
   const discountedCost = globalDiscount !== null ? computeDiscountedCost(product.precio, globalDiscount) : null;
   const [editingStock, setEditingStock] = useState(false);
   const [stockInput, setStockInput] = useState("");
+  const [thresholdInput, setThresholdInput] = useState("");
+  const [remindInput, setRemindInput] = useState("");
+
+  const today = toDateStr(new Date());
+  const lowStock = isLowStock(product.unidades, product.effectiveStockMinimo);
+  const reminderActive = isReminderActive(product.remindStockAt, today);
+  const showAlert = lowStock && !reminderActive;
 
   const startEditingStock = () => {
     setStockInput(String(product.unidades));
+    setThresholdInput(product.stockMinimo !== null ? String(product.stockMinimo) : "");
     setEditingStock(true);
   };
 
   const confirmStock = () => {
     const parsed = Number(stockInput);
     if (!Number.isInteger(parsed) || parsed < 0) return;
-    onSetStock(parsed);
+    if (thresholdInput.trim() === "") {
+      onSetStock(parsed, null);
+    } else {
+      const parsedThreshold = Number(thresholdInput);
+      if (!Number.isInteger(parsedThreshold) || parsedThreshold < 1) return;
+      onSetStock(parsed, parsedThreshold);
+    }
     setEditingStock(false);
+  };
+
+  const confirmReminder = () => {
+    if (!remindInput) return;
+    onSetReminder(remindInput);
+    setRemindInput("");
   };
 
   return (
@@ -162,7 +190,7 @@ function CatalogProductCard({
       <CardContent className="flex-1 space-y-2">
         <div className="flex items-baseline justify-between gap-2">
           <span className="text-2xl font-bold text-primary" data-testid={`text-cost-${product.id}`}>
-            {formatPrice(discountedCost ?? product.precio)}
+            {format(discountedCost ?? product.precio)}
           </span>
           {product.puntos > 0 && (
             <Badge variant="secondary" className="bg-primary/10 text-primary border-0 text-xs">
@@ -172,46 +200,69 @@ function CatalogProductCard({
         </div>
         {discountedCost !== null && (
           <p className="text-xs text-muted-foreground">
-            PVP: <span className="line-through">{formatPrice(product.precio)}</span>
+            PVP: <span className="line-through">{format(product.precio)}</span>
           </p>
         )}
         {editingStock ? (
-          <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
-            <Input
-              type="number"
-              min={0}
-              step="1"
-              value={stockInput}
-              onChange={(e) => setStockInput(e.target.value)}
-              className="h-8 w-20"
-              autoFocus
-              data-testid={`input-stock-${product.id}`}
-            />
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="shrink-0"
-              title="Guardar stock"
-              aria-label="Guardar stock"
-              disabled={isSettingStock}
-              onClick={confirmStock}
-              data-testid={`button-confirm-stock-${product.id}`}
-            >
-              <Check className="h-4 w-4" />
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="shrink-0"
-              title="Cancelar edición de stock"
-              aria-label="Cancelar edición de stock"
-              onClick={() => setEditingStock(false)}
-              data-testid={`button-cancel-stock-${product.id}`}
-            >
-              <X className="h-4 w-4" />
-            </Button>
+          <div className="space-y-1.5" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-1.5">
+              <div className="space-y-0.5">
+                <label className="text-[10px] text-muted-foreground" htmlFor={`input-stock-${product.id}`}>Stock</label>
+                <Input
+                  id={`input-stock-${product.id}`}
+                  type="number"
+                  min={0}
+                  step="1"
+                  value={stockInput}
+                  onChange={(e) => setStockInput(e.target.value)}
+                  className="h-8 w-16"
+                  autoFocus
+                  data-testid={`input-stock-${product.id}`}
+                />
+              </div>
+              <div className="space-y-0.5">
+                <label className="text-[10px] text-muted-foreground" htmlFor={`input-threshold-${product.id}`}>Umbral</label>
+                <Input
+                  id={`input-threshold-${product.id}`}
+                  type="number"
+                  min={1}
+                  step="1"
+                  value={thresholdInput}
+                  onChange={(e) => setThresholdInput(e.target.value)}
+                  placeholder={String(product.effectiveStockMinimo)}
+                  className="h-8 w-16"
+                  data-testid={`input-threshold-${product.id}`}
+                />
+              </div>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="shrink-0 self-end"
+                title="Guardar stock"
+                aria-label="Guardar stock"
+                disabled={isSettingStock}
+                onClick={confirmStock}
+                data-testid={`button-confirm-stock-${product.id}`}
+              >
+                <Check className="h-4 w-4" />
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="shrink-0 self-end"
+                title="Cancelar edición de stock"
+                aria-label="Cancelar edición de stock"
+                onClick={() => setEditingStock(false)}
+                data-testid={`button-cancel-stock-${product.id}`}
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Umbral vacío = usa el predeterminado ({product.effectiveStockMinimo}).
+            </p>
           </div>
         ) : (
           <div className="flex items-center gap-2 text-sm">
@@ -235,6 +286,57 @@ function CatalogProductCard({
               data-testid={`button-edit-stock-${product.id}`}
             >
               <Pencil className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        )}
+
+        {showAlert && (
+          <div
+            className="flex flex-wrap items-center gap-1.5 rounded-md bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-400"
+            onClick={(e) => e.stopPropagation()}
+            data-testid={`alert-low-stock-${product.id}`}
+          >
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            <span className="mr-auto">Poco stock</span>
+            <Input
+              type="date"
+              min={today}
+              value={remindInput}
+              onChange={(e) => setRemindInput(e.target.value)}
+              className="h-7 w-[9.5rem] bg-background text-xs"
+              data-testid={`input-remind-date-${product.id}`}
+            />
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs"
+              disabled={!remindInput || isSettingReminder}
+              onClick={confirmReminder}
+              data-testid={`button-set-reminder-${product.id}`}
+            >
+              Recordarme comprar
+            </Button>
+          </div>
+        )}
+        {reminderActive && (
+          <div
+            className="flex items-center gap-1.5 rounded-md bg-muted/60 px-2 py-1.5 text-xs text-muted-foreground"
+            onClick={(e) => e.stopPropagation()}
+            data-testid={`reminder-active-${product.id}`}
+          >
+            <Clock className="h-3.5 w-3.5 shrink-0" />
+            <span className="mr-auto">Te recordamos el {product.remindStockAt}</span>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              className="h-7 text-xs"
+              disabled={isSettingReminder}
+              onClick={() => onSetReminder(null)}
+              data-testid={`button-cancel-reminder-${product.id}`}
+            >
+              Cancelar
             </Button>
           </div>
         )}
@@ -538,6 +640,7 @@ function AddProductDialog({ open, onOpenChange }: { open: boolean; onOpenChange:
 
 export default function Productos() {
   const { toast } = useToast();
+  const { format } = useHideMoney();
   const [, setLocation] = useLocation();
   const cart = useSaleCart();
   const [search, setSearch] = useState("");
@@ -614,9 +717,11 @@ export default function Productos() {
 
   const [settingStockId, setSettingStockId] = useState<number | null>(null);
   const setStockMutation = useGuardedMutation({
-    mutationFn: async ({ id, unidades }: { id: number; unidades: number }) => {
+    mutationFn: async ({ id, unidades, stockMinimo }: { id: number; unidades: number; stockMinimo?: number | null }) => {
       setSettingStockId(id);
-      const res = await apiRequest("PATCH", `/api/products/${id}/stock`, { unidades });
+      const body: { unidades: number; stockMinimo?: number | null } = { unidades };
+      if (stockMinimo !== undefined) body.stockMinimo = stockMinimo;
+      const res = await apiRequest("PATCH", `/api/products/${id}/stock`, body);
       return res.json() as Promise<Product>;
     },
     onSuccess: () => {
@@ -628,6 +733,24 @@ export default function Productos() {
       toast({ title: "No se pudo actualizar el stock", description: err.message, variant: "destructive" });
     },
     onSettled: () => setSettingStockId(null),
+  });
+
+  const [settingReminderId, setSettingReminderId] = useState<number | null>(null);
+  const setReminderMutation = useGuardedMutation({
+    mutationFn: async ({ id, remindAt }: { id: number; remindAt: string | null }) => {
+      setSettingReminderId(id);
+      const res = await apiRequest("PATCH", `/api/products/${id}/stock-reminder`, { remindAt });
+      return res.json() as Promise<Product>;
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
+      toast({ title: variables.remindAt ? "Te vamos a recordar comprarlo" : "Recordatorio cancelado" });
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo guardar el recordatorio", description: err.message, variant: "destructive" });
+    },
+    onSettled: () => setSettingReminderId(null),
   });
 
   const cartSubtotal = cart.lines.reduce((sum, l) => {
@@ -757,8 +880,10 @@ export default function Productos() {
                 toggleDiscontinuedMutation.mutate({ id: product.id, discontinued: !product.discontinued })
               }
               isTogglingDiscontinued={togglingId === product.id}
-              onSetStock={(unidades) => setStockMutation.mutate({ id: product.id, unidades })}
+              onSetStock={(unidades, stockMinimo) => setStockMutation.mutate({ id: product.id, unidades, stockMinimo })}
               isSettingStock={settingStockId === product.id}
+              onSetReminder={(remindAt) => setReminderMutation.mutate({ id: product.id, remindAt })}
+              isSettingReminder={settingReminderId === product.id}
             />
           ))}
         </div>
@@ -783,7 +908,7 @@ export default function Productos() {
             <div className="flex items-center gap-2 text-sm">
               <ShoppingCart className="h-5 w-5 text-primary" />
               <span data-testid="text-cart-summary">
-                {cart.lines.length} producto{cart.lines.length !== 1 ? "s" : ""} · {formatPrice(cartSubtotal)}
+                {cart.lines.length} producto{cart.lines.length !== 1 ? "s" : ""} · {format(cartSubtotal)}
               </span>
             </div>
             <Button onClick={() => setLocation("/ventas")} data-testid="button-go-to-sale">

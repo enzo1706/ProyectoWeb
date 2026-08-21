@@ -55,7 +55,7 @@ export function LowStockDialog({ open, onOpenChange, products }: LowStockDialogP
                   <Badge variant={product.unidades <= 0 ? "destructive" : "secondary"}>
                     {product.unidades} uds
                   </Badge>
-                  <p className="text-xs text-muted-foreground mt-1">mín. {product.stockMinimo}</p>
+                  <p className="text-xs text-muted-foreground mt-1">mín. {product.effectiveStockMinimo}</p>
                 </div>
               </div>
             ))}
