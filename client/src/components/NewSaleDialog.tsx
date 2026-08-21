@@ -16,7 +16,7 @@ import { Calendar } from "@/components/ui/calendar";
 import { CalendarIcon, ChevronLeft, Plus, Search, User } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import { cn } from "@/lib/utils";
 import {
   computeSubtotal,
@@ -78,6 +78,7 @@ function parseLocalDate(dateStr: string): Date {
 
 export function NewSaleDialog({ open, onOpenChange, products, existingSale, preselectedClient, initialLines }: NewSaleDialogProps) {
   const { toast } = useToast();
+  const { format } = useHideMoney();
   const isEditMode = !!existingSale;
   const steps = isEditMode ? EDIT_STEPS : CREATE_STEPS;
 
@@ -511,29 +512,29 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
               <div className="space-y-1.5 rounded-xl bg-muted/60 p-4">
                 <div className="flex justify-between text-sm text-muted-foreground">
                   <span>Precio original</span>
-                  <span>{formatPrice(subtotal)}</span>
+                  <span>{format(subtotal)}</span>
                 </div>
                 {totals.discountAmount > 0 && (
                   <div className="flex justify-between text-sm text-destructive">
                     <span>Descuento ({orderDiscountPct}%)</span>
-                    <span>− {formatPrice(totals.discountAmount)}</span>
+                    <span>− {format(totals.discountAmount)}</span>
                   </div>
                 )}
                 {totals.surchargeAmount > 0 && (
                   <div className="flex justify-between text-sm text-emerald-600 dark:text-emerald-400">
                     <span>Recargo ({orderSurchargePct}%)</span>
-                    <span>+ {formatPrice(totals.surchargeAmount)}</span>
+                    <span>+ {format(totals.surchargeAmount)}</span>
                   </div>
                 )}
                 {totals.shippingCost > 0 && (
                   <div className="flex justify-between text-sm text-emerald-600 dark:text-emerald-400">
                     <span>Envío</span>
-                    <span>+ {formatPrice(totals.shippingCost)}</span>
+                    <span>+ {format(totals.shippingCost)}</span>
                   </div>
                 )}
                 <div className="flex justify-between border-t pt-2 text-base font-bold">
                   <span>Total a cobrar</span>
-                  <span data-testid="text-sale-total">{formatPrice(totals.total)}</span>
+                  <span data-testid="text-sale-total">{format(totals.total)}</span>
                 </div>
               </div>
             </div>
@@ -618,24 +619,24 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
               </div>
               <div className="flex justify-between text-sm">
                 <span className="text-muted-foreground">Precio original</span>
-                <span className="font-medium">{formatPrice(subtotal)}</span>
+                <span className="font-medium">{format(subtotal)}</span>
               </div>
               {totals.discountAmount > 0 && (
                 <div className="flex justify-between text-sm">
                   <span className="text-muted-foreground">Descuento</span>
-                  <span className="font-medium">-{orderDiscountPct}% ({formatPrice(totals.discountAmount)})</span>
+                  <span className="font-medium">-{orderDiscountPct}% ({format(totals.discountAmount)})</span>
                 </div>
               )}
               {totals.surchargeAmount > 0 && (
                 <div className="flex justify-between text-sm">
                   <span className="text-muted-foreground">Recargo</span>
-                  <span className="font-medium">+{orderSurchargePct}% ({formatPrice(totals.surchargeAmount)})</span>
+                  <span className="font-medium">+{orderSurchargePct}% ({format(totals.surchargeAmount)})</span>
                 </div>
               )}
               {totals.shippingCost > 0 && (
                 <div className="flex justify-between text-sm">
                   <span className="text-muted-foreground">Envío</span>
-                  <span className="font-medium">{formatPrice(totals.shippingCost)}</span>
+                  <span className="font-medium">{format(totals.shippingCost)}</span>
                 </div>
               )}
               <div className="flex justify-between text-sm">
@@ -657,7 +658,7 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
               </div>
               <div className="flex justify-between border-t pt-3 text-base font-bold">
                 <span>Total</span>
-                <span data-testid="text-confirm-total">{formatPrice(totals.total)}</span>
+                <span data-testid="text-confirm-total">{format(totals.total)}</span>
               </div>
             </div>
           )}

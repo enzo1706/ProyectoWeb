@@ -8,7 +8,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Package, Pencil, X } from "lucide-react";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import { computeItemFinalPrice, type ItemAdjustmentMode } from "@shared/saleCalculations";
 
 export interface OrderLine {
@@ -34,6 +34,7 @@ interface SaleOrderTableProps {
 }
 
 export function SaleOrderTable({ lines, onEdit, onRemove }: SaleOrderTableProps) {
+  const { format } = useHideMoney();
   if (lines.length === 0) {
     return (
       <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground" data-testid="empty-order">
@@ -77,15 +78,15 @@ export function SaleOrderTable({ lines, onEdit, onRemove }: SaleOrderTableProps)
                   <TableCell className="text-right tabular-nums">
                     {adjusted ? (
                       <div>
-                        <span className="line-through text-muted-foreground text-xs mr-1">{formatPrice(line.originalPrice)}</span>
-                        <span>{formatPrice(finalPrice)}</span>
+                        <span className="line-through text-muted-foreground text-xs mr-1">{format(line.originalPrice)}</span>
+                        <span>{format(finalPrice)}</span>
                       </div>
                     ) : (
-                      formatPrice(finalPrice)
+                      format(finalPrice)
                     )}
                   </TableCell>
                   <TableCell className="text-right font-semibold tabular-nums" data-testid={`text-order-subtotal-${line.productId}`}>
-                    {formatPrice(finalPrice * line.quantity)}
+                    {format(finalPrice * line.quantity)}
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1 justify-end">
@@ -144,15 +145,15 @@ export function SaleOrderTable({ lines, onEdit, onRemove }: SaleOrderTableProps)
                   <span>Cant. {line.quantity}</span>
                   {adjusted ? (
                     <span>
-                      <span className="line-through text-xs mr-1">{formatPrice(line.originalPrice)}</span>
-                      {formatPrice(finalPrice)}
+                      <span className="line-through text-xs mr-1">{format(line.originalPrice)}</span>
+                      {format(finalPrice)}
                     </span>
                   ) : (
-                    <span>{formatPrice(finalPrice)}</span>
+                    <span>{format(finalPrice)}</span>
                   )}
                 </div>
                 <p className="font-semibold tabular-nums" data-testid={`text-order-subtotal-mobile-${line.productId}`}>
-                  {formatPrice(finalPrice * line.quantity)}
+                  {format(finalPrice * line.quantity)}
                 </p>
               </div>
               <div className="flex flex-col items-center justify-center gap-1 shrink-0">

@@ -16,7 +16,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { apiRequest } from "@/lib/queryClient";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import type { Product } from "@shared/schema";
 import type { TopProductByCategory } from "@/components/CategoryProductsDialog";
 
@@ -29,6 +29,7 @@ const statusFilters = [
 ];
 
 export default function Ventas() {
+  const { format } = useHideMoney();
   const cart = useSaleCart();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("todos");
@@ -88,7 +89,7 @@ export default function Ventas() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold tabular-nums">{formatPrice(totalSales)}</p>
+            <p className="text-2xl font-bold tabular-nums">{format(totalSales)}</p>
           </CardContent>
         </Card>
         <Card>
@@ -99,7 +100,7 @@ export default function Ventas() {
           </CardHeader>
           <CardContent>
             <p className="text-2xl font-bold text-green-600 dark:text-green-400 tabular-nums">
-              {formatPrice(totalProfit)}
+              {format(totalProfit)}
             </p>
           </CardContent>
         </Card>
@@ -125,7 +126,7 @@ export default function Ventas() {
                       <span className="truncate">{p.productName}</span>
                     </span>
                     <span className="text-right shrink-0 tabular-nums text-xs text-muted-foreground">
-                      {p.quantitySold}u · {formatPrice(p.totalSales)}
+                      {p.quantitySold}u · {format(p.totalSales)}
                     </span>
                   </li>
                 ))}

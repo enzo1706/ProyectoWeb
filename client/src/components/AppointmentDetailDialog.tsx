@@ -29,6 +29,7 @@ import { User, Clock, MapPin, FileText, Pencil, Trash2 } from "lucide-react";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
+import { ToastAction } from "@/components/ui/toast";
 import { appointmentStatuses, type Appointment, type AppointmentStatus } from "@shared/schema";
 import { typeColors, typeLabels } from "./AppointmentCard";
 import { parseLocalDate } from "@/lib/date";
@@ -85,13 +86,48 @@ export function AppointmentDetailDialog({ open, onOpenChange, appointment, onEdi
     },
   });
 
+  // Restaura una cita eliminada recreándola (el endpoint de alta no acepta "status" — nace
+  // "pendiente" — así que si el estado original era otro, se reaplica con una segunda
+  // llamada al mismo endpoint que ya usa el selector de estado de este mismo diálogo).
+  const undoDeleteMutation = useGuardedMutation({
+    mutationFn: async (snapshot: Appointment) => {
+      const res = await apiRequest("POST", "/api/appointments", {
+        clientId: snapshot.clientId,
+        date: snapshot.date,
+        time: snapshot.time,
+        type: snapshot.type,
+        location: snapshot.location ?? undefined,
+        notes: snapshot.notes ?? undefined,
+      });
+      const restored = (await res.json()) as Appointment;
+      if (snapshot.status !== "pendiente") {
+        await apiRequest("PATCH", `/api/appointments/${restored.id}/status`, { status: snapshot.status });
+      }
+    },
+    onSuccess: () => {
+      invalidateAfterChange();
+      toast({ title: "Cita restaurada" });
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo deshacer", description: err.message, variant: "destructive" });
+    },
+  });
+
   const deleteMutation = useGuardedMutation({
     mutationFn: async () => {
       await apiRequest("DELETE", `/api/appointments/${appointment!.id}`);
     },
     onSuccess: () => {
       invalidateAfterChange();
-      toast({ title: "Cita eliminada" });
+      const snapshot = appointment!;
+      toast({
+        title: "Cita eliminada",
+        action: (
+          <ToastAction altText="Deshacer" onClick={() => undoDeleteMutation.mutate(snapshot)}>
+            Deshacer
+          </ToastAction>
+        ),
+      });
       setDeleteConfirmOpen(false);
       onOpenChange(false);
     },
@@ -207,8 +243,8 @@ export function AppointmentDetailDialog({ open, onOpenChange, appointment, onEdi
               <AlertDialogHeader>
                 <AlertDialogTitle>¿Eliminar esta cita?</AlertDialogTitle>
                 <AlertDialogDescription>
-                  Esta acción no se puede deshacer. La cita con {appointment.clientName} del {fullDate} se va a
-                  eliminar por completo.
+                  La cita con {appointment.clientName} del {fullDate} se va a eliminar. Vas a poder deshacerlo
+                  justo después, desde el mensaje de confirmación.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>

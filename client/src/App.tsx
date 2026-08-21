@@ -7,8 +7,10 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/AppSidebar";
 import { ThemeToggle } from "@/components/ThemeToggle";
+import { HideMoneyToggle } from "@/components/HideMoneyToggle";
 import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import { SaleCartProvider } from "@/hooks/use-sale-cart";
+import { HideMoneyProvider } from "@/hooks/use-hide-money";
 import NotFound from "@/pages/not-found";
 import Dashboard from "@/pages/Dashboard";
 import Login from "@/pages/auth/Login";
@@ -111,6 +113,7 @@ function AppShell() {
               <span className="text-xs text-muted-foreground hidden md:inline">
                 {user.username}
               </span>
+              <HideMoneyToggle />
               <ThemeToggle />
               <Button
                 variant="ghost"
@@ -144,10 +147,12 @@ function App() {
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
         <TooltipProvider>
-          <SaleCartProvider>
-            <AppShell />
-            <Toaster />
-          </SaleCartProvider>
+          <HideMoneyProvider>
+            <SaleCartProvider>
+              <AppShell />
+              <Toaster />
+            </SaleCartProvider>
+          </HideMoneyProvider>
         </TooltipProvider>
       </AuthProvider>
     </QueryClientProvider>

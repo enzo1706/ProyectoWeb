@@ -18,7 +18,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { User, Calendar, FileText, AlertTriangle, Pencil, Ban } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import type { SaleDetails } from "./SaleCard";
 
 interface SaleDetailDialogProps {
@@ -53,6 +53,7 @@ function parseLocalDate(dateStr: string): Date {
 
 export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDialogProps) {
   const { toast } = useToast();
+  const { format } = useHideMoney();
   const [cancelConfirmOpen, setCancelConfirmOpen] = useState(false);
 
   const saleQuery = useQuery<SaleDetails>({
@@ -171,10 +172,10 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                       <div className="min-w-0">
                         <p className="font-medium truncate">{item.productName}</p>
                         <p className="text-xs text-muted-foreground">
-                          {item.quantity} x {formatPrice(item.price)}
+                          {item.quantity} x {format(item.price)}
                         </p>
                       </div>
-                      <p className="font-medium tabular-nums shrink-0">{formatPrice(item.quantity * item.price)}</p>
+                      <p className="font-medium tabular-nums shrink-0">{format(item.quantity * item.price)}</p>
                     </div>
                   ))}
                 </div>
@@ -182,15 +183,15 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                 <div className="rounded-lg border p-3 space-y-1 text-sm">
                   <div className="flex justify-between text-muted-foreground">
                     <span>Subtotal</span>
-                    <span>{formatPrice(sale.subtotal)}</span>
+                    <span>{format(sale.subtotal)}</span>
                   </div>
                   <div className="flex justify-between font-bold pt-1 border-t">
                     <span>Total</span>
-                    <span data-testid="text-detail-total">{formatPrice(sale.total)}</span>
+                    <span data-testid="text-detail-total">{format(sale.total)}</span>
                   </div>
                   <div className="flex justify-between text-green-600 dark:text-green-400">
                     <span>Ganancia</span>
-                    <span>{formatPrice(sale.profit)}</span>
+                    <span>{format(sale.profit)}</span>
                   </div>
                   <div className="flex justify-between text-muted-foreground">
                     <span>Método de pago</span>
@@ -208,7 +209,7 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                     >
                       <div>
                         <p className="font-medium">
-                          Cuota {inst.installmentNumber} · {formatPrice(inst.amount)}
+                          Cuota {inst.installmentNumber} · {format(inst.amount)}
                         </p>
                         <p className="text-xs text-muted-foreground">
                           Vence {parseLocalDate(inst.dueDate).toLocaleDateString("es-MX", { day: "numeric", month: "short" })}

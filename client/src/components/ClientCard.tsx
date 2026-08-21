@@ -1,7 +1,7 @@
 import { Card, CardContent } from "@/components/ui/card";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Phone, Mail, Calendar, ShoppingBag } from "lucide-react";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import type { Client as BaseClient } from "@shared/schema";
 
 export interface Client extends BaseClient {
@@ -15,6 +15,7 @@ interface ClientCardProps {
 }
 
 export function ClientCard({ client, onClick }: ClientCardProps) {
+  const { format } = useHideMoney();
   const displayName = client.name?.trim() || client.phone;
   const initials = displayName
     .split(" ")
@@ -59,7 +60,7 @@ export function ClientCard({ client, onClick }: ClientCardProps) {
         <div className="mt-4 pt-3 border-t flex items-center justify-between text-sm">
           <div className="flex items-center gap-1 text-muted-foreground">
             <ShoppingBag className="h-3 w-3" />
-            <span>{formatPrice(client.totalPurchases)}</span>
+            <span>{format(client.totalPurchases)}</span>
           </div>
           {client.lastPurchase && (
             <div className="flex items-center gap-1 text-muted-foreground">

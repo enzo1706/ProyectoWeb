@@ -1,7 +1,7 @@
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { User, Calendar, Package } from "lucide-react";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import type { Sale as BaseSale, SaleItem, SaleInstallment } from "@shared/schema";
 
 export type { SaleItem, SaleInstallment };
@@ -41,6 +41,7 @@ function formatSaleDate(date: string): string {
 }
 
 export function SaleCard({ sale, onClick }: SaleCardProps) {
+  const { format } = useHideMoney();
   const isCancelled = sale.status === "cancelada";
   return (
     <Card
@@ -72,11 +73,11 @@ export function SaleCard({ sale, onClick }: SaleCardProps) {
         </div>
         <div className="mt-3 pt-3 border-t flex items-center justify-between">
           <div>
-            <p className="text-lg font-bold tabular-nums">{formatPrice(sale.total)}</p>
+            <p className="text-lg font-bold tabular-nums">{format(sale.total)}</p>
           </div>
           <div className="text-right">
             <p className="text-sm font-medium text-green-600 dark:text-green-400">
-              +{formatPrice(sale.profit)}
+              +{format(sale.profit)}
             </p>
             <p className="text-xs text-muted-foreground">ganancia</p>
           </div>

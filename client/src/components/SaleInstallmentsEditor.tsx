@@ -7,7 +7,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import { cn } from "@/lib/utils";
 import { installmentsSumMatches } from "@shared/saleCalculations";
 import { installmentOptions, installmentFrequencies, type InstallmentFrequency } from "@shared/schema";
@@ -36,6 +36,7 @@ export function SaleInstallmentsEditor({
   frequency,
   onFrequencyChange,
 }: SaleInstallmentsEditorProps) {
+  const { format } = useHideMoney();
   const sum = amounts.reduce((s, a) => s + a, 0);
   const matches = installmentsSumMatches(amounts, total);
 
@@ -93,7 +94,7 @@ export function SaleInstallmentsEditor({
           <div className={cn("flex justify-between text-sm pt-1", matches ? "text-muted-foreground" : "text-destructive font-medium")}>
             <span>Suma de cuotas</span>
             <span>
-              {formatPrice(sum)} / {formatPrice(total)}
+              {format(sum)} / {format(total)}
             </span>
           </div>
           {!matches && (

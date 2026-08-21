@@ -21,7 +21,7 @@ import { Minus, Plus, Package } from "lucide-react";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import { computeDiscountedCost } from "@shared/saleCalculations";
 import { getToneSiblings } from "@/lib/productCategories";
 import type { Product } from "@shared/schema";
@@ -45,6 +45,7 @@ export function ProductSelectionModal({
   onAdd,
 }: ProductSelectionModalProps) {
   const { toast } = useToast();
+  const { format } = useHideMoney();
   const [activeProductId, setActiveProductId] = useState<number | null>(null);
   const [quantity, setQuantity] = useState(1);
   const [priceInput, setPriceInput] = useState("");
@@ -227,7 +228,7 @@ export function ProductSelectionModal({
           <div className="rounded-lg border bg-muted p-3 space-y-1 text-sm">
             <div className="flex justify-between text-muted-foreground">
               <span>Precio público</span>
-              <span data-testid="text-modal-pvp">{formatPrice(activeProduct.precio)}</span>
+              <span data-testid="text-modal-pvp">{format(activeProduct.precio)}</span>
             </div>
             {globalDiscount !== null && (
               <div className="flex justify-between text-muted-foreground">
@@ -237,7 +238,7 @@ export function ProductSelectionModal({
             )}
             <div className="flex justify-between font-bold pt-1 border-t">
               <span>Subtotal</span>
-              <span data-testid="text-modal-subtotal">{formatPrice(subtotal)}</span>
+              <span data-testid="text-modal-subtotal">{format(subtotal)}</span>
             </div>
           </div>
         </div>

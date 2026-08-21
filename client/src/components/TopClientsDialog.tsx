@@ -6,7 +6,7 @@ import {
 } from "@/components/ui/dialog";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Users, ShoppingBag, Package } from "lucide-react";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 
 export interface TopClient {
   clientId: number;
@@ -23,6 +23,7 @@ interface TopClientsDialogProps {
 }
 
 export function TopClientsDialog({ open, onOpenChange, clients }: TopClientsDialogProps) {
+  const { format } = useHideMoney();
   const initials = (name: string) =>
     name
       .split(" ")
@@ -69,7 +70,7 @@ export function TopClientsDialog({ open, onOpenChange, clients }: TopClientsDial
                     </span>
                   </div>
                 </div>
-                <p className="text-lg font-bold tabular-nums shrink-0">{formatPrice(client.totalAmount)}</p>
+                <p className="text-lg font-bold tabular-nums shrink-0">{format(client.totalAmount)}</p>
               </div>
             ))}
           </div>

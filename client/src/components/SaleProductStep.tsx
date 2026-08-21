@@ -3,7 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Package, Plus, Minus, ImagePlus } from "lucide-react";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import { cn } from "@/lib/utils";
 import { getProductCategories, getToneSiblings } from "@/lib/productCategories";
 import { SaleOrderTable, type OrderLine } from "./SaleOrderTable";
@@ -33,6 +33,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
   { products, lines, orderedQuantities, onAddLine, onEditLine, onRemoveLine, subView, onSubViewChange },
   ref,
 ) {
+  const { format } = useHideMoney();
   const categories = useMemo(() => getProductCategories(products), [products]);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
@@ -187,7 +188,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-semibold">{product.producto}</p>
                   <p className="text-xs text-muted-foreground">
-                    {formatPrice(product.precio)} · {remaining <= 0 ? "sin stock" : `${remaining} disp.`}
+                    {format(product.precio)} · {remaining <= 0 ? "sin stock" : `${remaining} disp.`}
                   </p>
                 </div>
               </button>

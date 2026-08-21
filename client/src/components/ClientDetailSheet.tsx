@@ -39,7 +39,8 @@ import {
 } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import { formatPrice } from "@/lib/currency";
+import { ToastAction } from "@/components/ui/toast";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import { typeColors, typeLabels } from "./AppointmentCard";
 import type { Appointment } from "@shared/schema";
 import type { Client } from "./ClientCard";
@@ -103,6 +104,7 @@ function ErrorBlock({ message }: { message: string }) {
 
 export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSale }: ClientDetailSheetProps) {
   const { toast } = useToast();
+  const { format } = useHideMoney();
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
 
   const salesQuery = useQuery<SaleDetails[]>({
@@ -123,6 +125,24 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
     enabled: open && !!client,
   });
 
+  // Restaura una clienta eliminada recreándola con los mismos datos vía el endpoint de alta
+  // existente — la clienta solo se puede borrar cuando no tiene ventas ni citas asociadas
+  // (el backend lo bloquea si las tiene), así que no hay nada más que reconstruir acá.
+  const undoDeleteMutation = useGuardedMutation({
+    mutationFn: async (snapshot: Client) => {
+      const { id, consultantId, totalPurchases, lastPurchase, ...data } = snapshot;
+      const res = await apiRequest("POST", "/api/clients", data);
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
+      toast({ title: "Clienta restaurada" });
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo deshacer", description: err.message, variant: "destructive" });
+    },
+  });
+
   const deleteMutation = useGuardedMutation({
     mutationFn: async () => {
       const res = await apiRequest("DELETE", `/api/clients/${client!.id}`);
@@ -130,7 +150,15 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
-      toast({ title: "Clienta eliminada" });
+      const snapshot = client!;
+      toast({
+        title: "Clienta eliminada",
+        action: (
+          <ToastAction altText="Deshacer" onClick={() => undoDeleteMutation.mutate(snapshot)}>
+            Deshacer
+          </ToastAction>
+        ),
+      });
       setDeleteConfirmOpen(false);
       onOpenChange(false);
     },
@@ -239,7 +267,7 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
             <div className="mt-6 grid grid-cols-2 sm:grid-cols-3 gap-3" data-testid="client-summary">
               <Card>
                 <CardContent className="pt-4 pb-3 text-center">
-                  <p className="text-lg font-bold tabular-nums" data-testid="text-summary-total">{formatPrice(summary.totalPurchased)}</p>
+                  <p className="text-lg font-bold tabular-nums" data-testid="text-summary-total">{format(summary.totalPurchased)}</p>
                   <p className="text-xs text-muted-foreground">Total Comprado</p>
                 </CardContent>
               </Card>
@@ -251,7 +279,7 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
               </Card>
               <Card>
                 <CardContent className="pt-4 pb-3 text-center">
-                  <p className="text-lg font-bold tabular-nums">{formatPrice(summary.avgTicket)}</p>
+                  <p className="text-lg font-bold tabular-nums">{format(summary.avgTicket)}</p>
                   <p className="text-xs text-muted-foreground">Ticket Promedio</p>
                 </CardContent>
               </Card>
@@ -331,7 +359,7 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
                               {saleStatusLabels[entry.sale.status] ?? entry.sale.status}
                             </Badge>
                           </div>
-                          <span className="font-medium tabular-nums">{formatPrice(entry.sale.total)}</span>
+                          <span className="font-medium tabular-nums">{format(entry.sale.total)}</span>
                         </div>
                         <p className="text-sm mt-1 text-muted-foreground truncate">
                           {entry.sale.items.map((i) => i.productName).join(", ")}
@@ -388,23 +416,23 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
                         {sale.items.map((item) => (
                           <div key={item.id} className="flex justify-between gap-2">
                             <span className="truncate">{item.quantity} x {item.productName}</span>
-                            <span className="tabular-nums shrink-0">{formatPrice(item.quantity * item.price)}</span>
+                            <span className="tabular-nums shrink-0">{format(item.quantity * item.price)}</span>
                           </div>
                         ))}
                       </div>
 
                       <div className="flex items-center justify-between gap-2 pt-2 border-t text-sm">
                         <span className="text-muted-foreground">
-                          Subtotal <span className="tabular-nums">{formatPrice(sale.subtotal)}</span> · <span className="capitalize">{sale.paymentMethod}</span>
+                          Subtotal <span className="tabular-nums">{format(sale.subtotal)}</span> · <span className="capitalize">{sale.paymentMethod}</span>
                         </span>
                         {sale.status !== "cancelada" && (
-                          <span className="text-green-600 dark:text-green-400 tabular-nums">+{formatPrice(sale.profit)}</span>
+                          <span className="text-green-600 dark:text-green-400 tabular-nums">+{format(sale.profit)}</span>
                         )}
                       </div>
 
                       {sale.installments.length > 1 && (
                         <div className="text-xs text-muted-foreground">
-                          {sale.installments.length} cuotas: {sale.installments.map((i) => `${formatPrice(i.amount)} (${i.status})`).join(", ")}
+                          {sale.installments.length} cuotas: {sale.installments.map((i) => `${format(i.amount)} (${i.status})`).join(", ")}
                         </div>
                       )}
                     </CardContent>
@@ -467,8 +495,8 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
           <AlertDialogHeader>
             <AlertDialogTitle>¿Eliminar a {displayName}?</AlertDialogTitle>
             <AlertDialogDescription>
-              Esta acción no se puede deshacer. Si la clienta tiene ventas o citas registradas, no se va a poder
-              eliminar — esos datos se conservan siempre para no perder historial.
+              Vas a poder deshacerlo justo después, desde el mensaje de confirmación. Si la clienta tiene ventas o
+              citas registradas, no se va a poder eliminar — esos datos se conservan siempre para no perder historial.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

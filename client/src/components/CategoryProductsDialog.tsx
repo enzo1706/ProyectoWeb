@@ -5,7 +5,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Package, PackageOpen } from "lucide-react";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 
 export interface TopProductByCategory {
   productId: number | null;
@@ -24,6 +24,7 @@ interface CategoryProductsDialogProps {
 }
 
 export function CategoryProductsDialog({ open, onOpenChange, category, products }: CategoryProductsDialogProps) {
+  const { format } = useHideMoney();
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-lg" data-testid="dialog-category-products">
@@ -61,7 +62,7 @@ export function CategoryProductsDialog({ open, onOpenChange, category, products 
                     {product.quantitySold} vendido{product.quantitySold !== 1 ? "s" : ""}
                   </p>
                 </div>
-                <p className="text-lg font-bold tabular-nums shrink-0">{formatPrice(product.totalSales)}</p>
+                <p className="text-lg font-bold tabular-nums shrink-0">{format(product.totalSales)}</p>
               </div>
             ))}
           </div>

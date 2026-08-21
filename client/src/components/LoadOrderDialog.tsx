@@ -6,7 +6,7 @@ import { WizardDots } from "./WizardDots";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import { cn } from "@/lib/utils";
 import { getProductCategories } from "@/lib/productCategories";
 import { discountOptions, type Product } from "@shared/schema";
@@ -36,6 +36,7 @@ const stepLabels: Record<PedidoStep, string> = {
 
 export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialogProps) {
   const { toast } = useToast();
+  const { format } = useHideMoney();
   const [stepIndex, setStepIndex] = useState(0);
   const currentStep = STEPS[stepIndex];
 
@@ -262,7 +263,7 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
                       )}
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-sm font-semibold">{product.producto}</p>
-                        <p className="text-xs text-muted-foreground">{formatPrice(product.precio)}</p>
+                        <p className="text-xs text-muted-foreground">{format(product.precio)}</p>
                       </div>
                       <div className="flex shrink-0 items-center gap-1.5">
                         <Button type="button" variant="outline" size="icon" className="h-7 w-7" onClick={() => setQtyByProduct((p) => ({ ...p, [product.id]: Math.max(1, qty - 1) }))} aria-label="Disminuir cantidad" data-testid={`button-order-qty-minus-${product.id}`}>
@@ -292,7 +293,7 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-sm font-semibold">{line.productName}</p>
                         <p className="text-xs text-muted-foreground">
-                          {line.quantity} unidad{line.quantity !== 1 ? "es" : ""} · {formatPrice(line.precio * line.quantity)}
+                          {line.quantity} unidad{line.quantity !== 1 ? "es" : ""} · {format(line.precio * line.quantity)}
                         </p>
                       </div>
                       <Button type="button" variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => removeLine(line.productId)} aria-label={`Quitar ${line.productName} del pedido`} data-testid={`button-order-remove-${line.productId}`}>
@@ -307,7 +308,7 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
                 <span className="text-sm text-muted-foreground" data-testid="text-order-count">
                   {lines.length} producto{lines.length !== 1 ? "s" : ""} agregado{lines.length !== 1 ? "s" : ""}
                 </span>
-                <span className="text-lg font-bold" data-testid="text-order-subtotal">{formatPrice(subtotal)}</span>
+                <span className="text-lg font-bold" data-testid="text-order-subtotal">{format(subtotal)}</span>
               </div>
             </div>
           )}
@@ -338,20 +339,20 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
               {lines.map((line) => (
                 <div key={line.productId} className="flex justify-between gap-3 text-sm">
                   <span className="text-muted-foreground">{line.productName} x{line.quantity}</span>
-                  <span className="font-medium">{formatPrice(line.precio * line.quantity)}</span>
+                  <span className="font-medium">{format(line.precio * line.quantity)}</span>
                 </div>
               ))}
               <div className="flex justify-between border-t pt-2 text-sm">
                 <span className="text-muted-foreground">Subtotal</span>
-                <span className="font-medium">{formatPrice(subtotal)}</span>
+                <span className="font-medium">{format(subtotal)}</span>
               </div>
               <div className="flex justify-between text-sm">
                 <span className="text-muted-foreground">Descuento ({discount}%)</span>
-                <span className="font-medium">− {formatPrice(discountAmount)}</span>
+                <span className="font-medium">− {format(discountAmount)}</span>
               </div>
               <div className="flex justify-between border-t pt-2 text-base font-bold">
                 <span>Total a pagar</span>
-                <span data-testid="text-order-total">{formatPrice(total)}</span>
+                <span data-testid="text-order-total">{format(total)}</span>
               </div>
             </div>
           )}

@@ -10,11 +10,12 @@ import { NewSaleDialog } from "@/components/NewSaleDialog";
 import { Plus, Search } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import type { InsertClient, Product } from "@shared/schema";
 
 export default function Clientas() {
   const { toast } = useToast();
+  const { format } = useHideMoney();
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -111,7 +112,7 @@ export default function Clientas() {
         <div>
           <h1 className="text-3xl font-bold">Clientas</h1>
           <p className="text-muted-foreground">
-            {clients.length} clientas | Total facturado: {formatPrice(totalRevenue)}
+            {clients.length} clientas | Total facturado: {format(totalRevenue)}
           </p>
         </div>
         <Button onClick={handleNewClient} data-testid="button-add-client">

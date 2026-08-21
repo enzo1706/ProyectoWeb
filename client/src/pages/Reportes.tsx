@@ -16,7 +16,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { MetricCard } from "@/components/MetricCard";
 import { apiRequest } from "@/lib/queryClient";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import { toDateStr, parseLocalDate } from "@/lib/date";
 import { chartTooltipStyle, colorForIndex } from "@/lib/chart-theme";
 import { exportToCsv } from "@/lib/csv";
@@ -329,6 +329,7 @@ function TrendDelta({
 }
 
 export default function Reportes() {
+  const { format } = useHideMoney();
   const [preset, setPreset] = useState<PeriodPreset>("month");
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState("");
@@ -503,9 +504,9 @@ export default function Reportes() {
       ["Métrica", "Valor"],
       [
         ["Período", `${periodLabels[preset]} (${periodRangeLabel})`],
-        ["Ventas Totales", formatPrice(kpis.totalSales)],
-        ["Ganancia Total", formatPrice(kpis.totalProfit)],
-        ["Ticket Promedio", formatPrice(kpis.avgTicket)],
+        ["Ventas Totales", format(kpis.totalSales)],
+        ["Ganancia Total", format(kpis.totalProfit)],
+        ["Ticket Promedio", format(kpis.avgTicket)],
         ["Cantidad de Ventas", kpis.salesCount],
       ],
     );
@@ -515,7 +516,7 @@ export default function Reportes() {
     exportToCsv(
       "reportes-ventas.csv",
       ["Período", "Ventas", "Ganancia", "Cantidad de Ventas", "Ticket Promedio"],
-      chartData.map((p) => [p.label, formatPrice(p.totalSales), formatPrice(p.totalProfit), p.salesCount, formatPrice(p.avgTicket)]),
+      chartData.map((p) => [p.label, format(p.totalSales), format(p.totalProfit), p.salesCount, format(p.avgTicket)]),
     );
   };
 
@@ -523,7 +524,7 @@ export default function Reportes() {
     exportToCsv(
       "reportes-productos.csv",
       ["Producto", "Categoría", "Unidades Vendidas", "Ventas"],
-      (topProductsQuery.data ?? []).map((p) => [p.productName, p.category, p.quantitySold, formatPrice(p.totalSales)]),
+      (topProductsQuery.data ?? []).map((p) => [p.productName, p.category, p.quantitySold, format(p.totalSales)]),
     );
   };
 
@@ -531,7 +532,7 @@ export default function Reportes() {
     exportToCsv(
       "reportes-categorias.csv",
       ["Categoría", "Unidades Vendidas", "Ventas"],
-      (topCategoriesQuery.data ?? []).map((c) => [c.category, c.quantitySold, formatPrice(c.totalSales)]),
+      (topCategoriesQuery.data ?? []).map((c) => [c.category, c.quantitySold, format(c.totalSales)]),
     );
   };
 
@@ -539,7 +540,7 @@ export default function Reportes() {
     exportToCsv(
       "reportes-mejores-clientas.csv",
       ["Clienta", "Cantidad de Compras", "Total Comprado"],
-      (topClientsQuery.data ?? []).map((c) => [c.clientName, c.purchaseCount, formatPrice(c.totalAmount)]),
+      (topClientsQuery.data ?? []).map((c) => [c.clientName, c.purchaseCount, format(c.totalAmount)]),
     );
   };
 
@@ -547,7 +548,7 @@ export default function Reportes() {
     exportToCsv(
       "reportes-metodos-pago.csv",
       ["Método de Pago", "Cantidad de Ventas", "Total"],
-      (paymentMethodsQuery.data ?? []).map((m) => [paymentMethodLabels[m.paymentMethod] ?? m.paymentMethod, m.salesCount, formatPrice(m.totalSales)]),
+      (paymentMethodsQuery.data ?? []).map((m) => [paymentMethodLabels[m.paymentMethod] ?? m.paymentMethod, m.salesCount, format(m.totalSales)]),
     );
   };
 
@@ -557,8 +558,8 @@ export default function Reportes() {
       "reportes-ventas-por-cuotas.csv",
       ["Tipo", "Cantidad de Ventas", "Total"],
       [
-        ["Contado", installmentsQuery.data.singlePayment.salesCount, formatPrice(installmentsQuery.data.singlePayment.totalSales)],
-        ["Financiado (2+ cuotas)", installmentsQuery.data.financed.salesCount, formatPrice(installmentsQuery.data.financed.totalSales)],
+        ["Contado", installmentsQuery.data.singlePayment.salesCount, format(installmentsQuery.data.singlePayment.totalSales)],
+        ["Financiado (2+ cuotas)", installmentsQuery.data.financed.salesCount, format(installmentsQuery.data.financed.totalSales)],
       ],
     );
   };
@@ -583,9 +584,9 @@ export default function Reportes() {
       "reportes-stock-valorizado.csv",
       ["Métrica", "Valor"],
       [
-        ["Valor a Costo", formatPrice(stockValuationQuery.data.valueAtCost)],
-        ["Valor a Venta", formatPrice(stockValuationQuery.data.valueAtPrice)],
-        ["Ganancia Potencial", formatPrice(stockValuationQuery.data.potentialProfit)],
+        ["Valor a Costo", format(stockValuationQuery.data.valueAtCost)],
+        ["Valor a Venta", format(stockValuationQuery.data.valueAtPrice)],
+        ["Ganancia Potencial", format(stockValuationQuery.data.potentialProfit)],
         ["Cantidad de Productos", stockValuationQuery.data.productCount],
         ["Cantidad de Unidades", stockValuationQuery.data.unitCount],
       ],
@@ -601,7 +602,7 @@ export default function Reportes() {
         c.phone,
         c.lastPurchase ?? "Nunca compró",
         c.daysSinceLastPurchase ?? "",
-        formatPrice(c.totalPurchased),
+        format(c.totalPurchased),
       ]),
     );
   };
@@ -618,7 +619,7 @@ export default function Reportes() {
     exportToCsv(
       "reportes-cuotas-pendientes.csv",
       ["Clienta", "Cuota", "Vencimiento", "Monto", "Vencida"],
-      (pendingInstallmentsQuery.data ?? []).map((r) => [r.clientName, r.installmentNumber, r.dueDate, formatPrice(r.amount), r.isOverdue ? "Sí" : "No"]),
+      (pendingInstallmentsQuery.data ?? []).map((r) => [r.clientName, r.installmentNumber, r.dueDate, format(r.amount), r.isOverdue ? "Sí" : "No"]),
     );
   };
 
@@ -704,10 +705,10 @@ export default function Reportes() {
           {executiveSummary && (
             <div className="rounded-lg border bg-muted p-4 text-sm leading-relaxed" data-testid="executive-summary">
               <p>
-                En el período seleccionado se registraron <strong className="font-semibold">{kpis.salesCount}</strong> venta{kpis.salesCount !== 1 ? "s" : ""} por un total de <strong className="font-semibold">{formatPrice(kpis.totalSales)}</strong>.
+                En el período seleccionado se registraron <strong className="font-semibold">{kpis.salesCount}</strong> venta{kpis.salesCount !== 1 ? "s" : ""} por un total de <strong className="font-semibold">{format(kpis.totalSales)}</strong>.
                 {executiveSummary.bestCategory && <> La categoría con mejor desempeño fue <strong className="font-semibold">{executiveSummary.bestCategory.category}</strong>.</>}
                 {executiveSummary.bestClient && <> La mejor clienta fue <strong className="font-semibold">{executiveSummary.bestClient.clientName}</strong>.</>}
-                {" "}El ticket promedio fue de <strong className="font-semibold">{formatPrice(kpis.avgTicket)}</strong> y la rentabilidad promedio fue de <strong className="font-semibold">{executiveSummary.profitMargin}%</strong>.
+                {" "}El ticket promedio fue de <strong className="font-semibold">{format(kpis.avgTicket)}</strong> y la rentabilidad promedio fue de <strong className="font-semibold">{executiveSummary.profitMargin}%</strong>.
               </p>
             </div>
           )}
@@ -718,21 +719,21 @@ export default function Reportes() {
             ) : (
               <>
                 <div>
-                  <MetricCard title="Ventas Totales" value={formatPrice(kpis.totalSales)} icon={DollarSign} />
+                  <MetricCard title="Ventas Totales" value={format(kpis.totalSales)} icon={DollarSign} />
                   {comparePeriod && previousKpis && (
-                    <TrendDelta current={kpis.totalSales} previous={previousKpis.totalSales} format={formatPrice} />
+                    <TrendDelta current={kpis.totalSales} previous={previousKpis.totalSales} format={format} />
                   )}
                 </div>
                 <div>
-                  <MetricCard title="Ganancia Total" value={formatPrice(kpis.totalProfit)} icon={TrendingUp} />
+                  <MetricCard title="Ganancia Total" value={format(kpis.totalProfit)} icon={TrendingUp} />
                   {comparePeriod && previousKpis && (
-                    <TrendDelta current={kpis.totalProfit} previous={previousKpis.totalProfit} format={formatPrice} />
+                    <TrendDelta current={kpis.totalProfit} previous={previousKpis.totalProfit} format={format} />
                   )}
                 </div>
                 <div>
-                  <MetricCard title="Ticket Promedio" value={formatPrice(kpis.avgTicket)} icon={Receipt} />
+                  <MetricCard title="Ticket Promedio" value={format(kpis.avgTicket)} icon={Receipt} />
                   {comparePeriod && previousKpis && (
-                    <TrendDelta current={kpis.avgTicket} previous={previousKpis.avgTicket} format={formatPrice} />
+                    <TrendDelta current={kpis.avgTicket} previous={previousKpis.avgTicket} format={format} />
                   )}
                 </div>
                 <div>
@@ -771,10 +772,10 @@ export default function Reportes() {
                           </linearGradient>
                         </defs>
                         <XAxis dataKey="label" stroke="hsl(var(--muted-foreground))" fontSize={12} />
-                        <YAxis stroke="hsl(var(--muted-foreground))" fontSize={12} tickFormatter={(v) => formatPrice(v)} width={80} />
+                        <YAxis stroke="hsl(var(--muted-foreground))" fontSize={12} tickFormatter={(v) => format(v)} width={80} />
                         <Tooltip
                           contentStyle={chartTooltipStyle}
-                          formatter={(value: number, name: string) => [formatPrice(value), name === "totalSales" ? "Ventas" : "Ganancia"]}
+                          formatter={(value: number, name: string) => [format(value), name === "totalSales" ? "Ventas" : "Ganancia"]}
                         />
                         <Area type="monotone" dataKey="totalSales" stroke="hsl(var(--primary))" fill="url(#salesGradient)" strokeWidth={2} />
                         <Area type="monotone" dataKey="totalProfit" stroke="hsl(140, 60%, 40%)" fill="url(#profitGradient)" strokeWidth={2} />
@@ -820,7 +821,7 @@ export default function Reportes() {
                               <Cell key={entry.category} fill={colorForIndex(index)} />
                             ))}
                           </Pie>
-                          <Tooltip contentStyle={chartTooltipStyle} formatter={(value: number) => [formatPrice(value), "Ventas"]} />
+                          <Tooltip contentStyle={chartTooltipStyle} formatter={(value: number) => [format(value), "Ventas"]} />
                         </PieChart>
                       </ResponsiveContainer>
                     </div>
@@ -905,7 +906,7 @@ export default function Reportes() {
                             {client.purchaseCount} compra{client.purchaseCount !== 1 ? "s" : ""}
                           </p>
                         }
-                        right={<p className="font-medium tabular-nums">{formatPrice(client.totalAmount)}</p>}
+                        right={<p className="font-medium tabular-nums">{format(client.totalAmount)}</p>}
                       />
                     ))}
                   </div>
@@ -934,7 +935,7 @@ export default function Reportes() {
                       >
                         <XAxis type="number" stroke="hsl(var(--muted-foreground))" fontSize={12} />
                         <YAxis dataKey="label" type="category" stroke="hsl(var(--muted-foreground))" fontSize={12} width={90} tickLine={false} />
-                        <Tooltip contentStyle={chartTooltipStyle} formatter={(value: number) => [formatPrice(value), "Ventas"]} />
+                        <Tooltip contentStyle={chartTooltipStyle} formatter={(value: number) => [format(value), "Ventas"]} />
                         <Bar dataKey="totalSales" radius={[0, 4, 4, 0]}>
                           {paymentMethodsQuery.data.map((entry, index) => (
                             <Cell key={entry.paymentMethod} fill={colorForIndex(index)} />
@@ -968,14 +969,14 @@ export default function Reportes() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div className="rounded-lg border p-4">
                     <p className="text-sm text-muted-foreground">Contado</p>
-                    <p className="text-2xl font-bold tabular-nums mt-1">{formatPrice(installmentsQuery.data.singlePayment.totalSales)}</p>
+                    <p className="text-2xl font-bold tabular-nums mt-1">{format(installmentsQuery.data.singlePayment.totalSales)}</p>
                     <p className="text-xs text-muted-foreground mt-1">
                       {installmentsQuery.data.singlePayment.salesCount} venta{installmentsQuery.data.singlePayment.salesCount !== 1 ? "s" : ""}
                     </p>
                   </div>
                   <div className="rounded-lg border p-4">
                     <p className="text-sm text-muted-foreground">Financiado (2+ cuotas)</p>
-                    <p className="text-2xl font-bold tabular-nums mt-1">{formatPrice(installmentsQuery.data.financed.totalSales)}</p>
+                    <p className="text-2xl font-bold tabular-nums mt-1">{format(installmentsQuery.data.financed.totalSales)}</p>
                     <p className="text-xs text-muted-foreground mt-1">
                       {installmentsQuery.data.financed.salesCount} venta{installmentsQuery.data.financed.salesCount !== 1 ? "s" : ""}
                     </p>
@@ -1027,9 +1028,9 @@ export default function Reportes() {
                 <EmptyBlock message="No hay productos cargados." />
               ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
-                  <MetricCard title="Valor a Costo" value={formatPrice(stockValuationQuery.data.valueAtCost)} icon={Package} />
-                  <MetricCard title="Valor a Venta" value={formatPrice(stockValuationQuery.data.valueAtPrice)} icon={DollarSign} />
-                  <MetricCard title="Ganancia Potencial" value={formatPrice(stockValuationQuery.data.potentialProfit)} icon={TrendingUp} />
+                  <MetricCard title="Valor a Costo" value={format(stockValuationQuery.data.valueAtCost)} icon={Package} />
+                  <MetricCard title="Valor a Venta" value={format(stockValuationQuery.data.valueAtPrice)} icon={DollarSign} />
+                  <MetricCard title="Ganancia Potencial" value={format(stockValuationQuery.data.potentialProfit)} icon={TrendingUp} />
                   <MetricCard title="Cantidad de Productos" value={stockValuationQuery.data.productCount} icon={ShoppingBag} />
                   <MetricCard title="Cantidad de Unidades" value={stockValuationQuery.data.unitCount} icon={Receipt} />
                 </div>
@@ -1079,7 +1080,7 @@ export default function Reportes() {
                               {client.lastPurchase ? `Hace ${client.daysSinceLastPurchase} días` : "Nunca compró"}
                             </p>
                             <p className="text-xs text-muted-foreground tabular-nums">
-                              Histórico: {formatPrice(client.totalPurchased)}
+                              Histórico: {format(client.totalPurchased)}
                             </p>
                           </>
                         }
@@ -1161,7 +1162,7 @@ export default function Reportes() {
                       }
                       right={
                         <div className="flex flex-col items-end gap-1">
-                          <p className="font-medium tabular-nums">{formatPrice(row.amount)}</p>
+                          <p className="font-medium tabular-nums">{format(row.amount)}</p>
                           {row.isOverdue && <Badge variant="destructive">Vencida</Badge>}
                         </div>
                       }

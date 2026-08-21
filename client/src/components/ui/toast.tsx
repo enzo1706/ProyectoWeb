@@ -27,7 +27,10 @@ const toastVariants = cva(
   {
     variants: {
       variant: {
-        default: "border bg-background text-foreground",
+        // Todo toast sin variante explícita en esta app es una confirmación de éxito
+        // ("Clienta creada", "Configuración guardada", etc.) — rosado claro para
+        // diferenciarlas del resto, reusando el mismo tono de marca (--primary).
+        default: "border-primary/30 bg-primary/10 text-foreground",
         destructive:
           "destructive group border-destructive bg-destructive text-destructive-foreground",
       },

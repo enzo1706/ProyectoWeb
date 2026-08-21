@@ -10,7 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import { formatPrice } from "@/lib/currency";
+import { useHideMoney } from "@/hooks/use-hide-money";
 import { computeItemFinalPrice, type ItemAdjustmentMode } from "@shared/saleCalculations";
 import type { OrderLine } from "./SaleOrderTable";
 
@@ -22,6 +22,7 @@ interface EditSaleItemDialogProps {
 }
 
 export function EditSaleItemDialog({ open, onOpenChange, line, onSave }: EditSaleItemDialogProps) {
+  const { format } = useHideMoney();
   const [quantity, setQuantity] = useState(1);
   const [mode, setMode] = useState<ItemAdjustmentMode>("none");
   const [adjustmentInput, setAdjustmentInput] = useState("");
@@ -106,15 +107,15 @@ export function EditSaleItemDialog({ open, onOpenChange, line, onSave }: EditSal
           <div className="rounded-lg border bg-muted p-3 space-y-1 text-sm">
             <div className="flex justify-between text-muted-foreground">
               <span>Precio original</span>
-              <span>{formatPrice(line.originalPrice)}</span>
+              <span>{format(line.originalPrice)}</span>
             </div>
             <div className="flex justify-between font-medium">
               <span>Precio final</span>
-              <span data-testid="text-edit-item-final-price">{formatPrice(finalPrice)}</span>
+              <span data-testid="text-edit-item-final-price">{format(finalPrice)}</span>
             </div>
             <div className="flex justify-between font-bold pt-1 border-t">
               <span>Subtotal</span>
-              <span data-testid="text-edit-item-subtotal">{formatPrice(subtotal)}</span>
+              <span data-testid="text-edit-item-subtotal">{format(subtotal)}</span>
             </div>
           </div>
         </div>
