@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
+import { useQuery } from "@tanstack/react-query";
 import { z } from "zod";
 import {
   Dialog,
@@ -27,15 +28,22 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { appointmentTypes, createAppointmentSchema, type Appointment } from "@shared/schema";
-import { typeLabels } from "./AppointmentCard";
+import { X } from "lucide-react";
+import { appointmentTypeSchema, createAppointmentSchema, type Appointment } from "@shared/schema";
+import { FIXED_EVENT_TYPES } from "@shared/eventTypes";
+import { getEventTypeLabel } from "./AppointmentCard";
+import { apiRequest } from "@/lib/queryClient";
 import { ClientCombobox } from "./ClientCombobox";
 import type { Client } from "./ClientCard";
+
+/** Sentinel que representa la opción "Crear evento" en el select — nunca se manda al backend,
+ * apenas se elige el diálogo pasa a modo "nombre nuevo" (ver customMode más abajo). */
+const CUSTOM_TYPE_SENTINEL = "__crear_evento__";
 
 const appointmentFormSchema = z.object({
   date: z.string().min(1, "La fecha es requerida"),
   time: z.string().min(1, "La hora es requerida"),
-  type: z.enum(appointmentTypes),
+  type: appointmentTypeSchema,
   location: z.string().optional(),
   notes: z.string().optional(),
 });
@@ -86,18 +94,48 @@ export function AppointmentDialog({
   existingAppointment,
 }: AppointmentDialogProps) {
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
+  const [customMode, setCustomMode] = useState(false);
   const isEditMode = !!existingAppointment;
+  const defaultType = FIXED_EVENT_TYPES[0].value;
 
   const form = useForm<AppointmentFormData>({
     resolver: zodResolver(appointmentFormSchema),
     defaultValues: {
       date: defaultDate || "",
       time: "",
-      type: "seguimiento",
+      type: defaultType,
       location: "",
       notes: "",
     },
   });
+
+  // Tipos personalizados que la consultora ya creó antes, para ofrecerlos de nuevo en vez de
+  // que tenga que reescribir el nombre cada vez (y así el backend los reconoce como el mismo tipo).
+  const { data: customTypes = [] } = useQuery<string[]>({
+    queryKey: ["/api/appointments/custom-types"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/appointments/custom-types");
+      return res.json();
+    },
+    enabled: open,
+  });
+
+  // El tipo actual de la cita (fijo, legacy, o personalizado) siempre tiene que estar en la
+  // lista de opciones del select, aunque no esté entre los fijos ni en customTypes todavía.
+  const typeOptions = useMemo(() => {
+    const options = FIXED_EVENT_TYPES.map((t) => ({ value: t.value, label: t.label }));
+    const known = new Set(options.map((o) => o.value));
+    for (const custom of customTypes) {
+      if (!known.has(custom)) {
+        options.push({ value: custom, label: custom });
+        known.add(custom);
+      }
+    }
+    if (existingAppointment && !known.has(existingAppointment.type)) {
+      options.push({ value: existingAppointment.type, label: getEventTypeLabel(existingAppointment.type) });
+    }
+    return options;
+  }, [customTypes, existingAppointment]);
 
   useEffect(() => {
     if (defaultDate && !existingAppointment) {
@@ -110,11 +148,12 @@ export function AppointmentDialog({
       form.reset({
         date: existingAppointment.date,
         time: existingAppointment.time,
-        type: existingAppointment.type as (typeof appointmentTypes)[number],
+        type: existingAppointment.type,
         location: existingAppointment.location ?? "",
         notes: existingAppointment.notes ?? "",
       });
       setSelectedClient(appointmentClientStub(existingAppointment));
+      setCustomMode(false);
     }
   }, [open, existingAppointment, form]);
 
@@ -125,13 +164,14 @@ export function AppointmentDialog({
       form.reset({
         date: defaultDate || "",
         time: "",
-        type: "seguimiento",
+        type: defaultType,
         location: "",
         notes: "",
       });
       setSelectedClient(null);
+      setCustomMode(false);
     }
-  }, [open, defaultDate, form]);
+  }, [open, defaultDate, defaultType, form]);
 
   const onSubmit = (data: AppointmentFormData) => {
     if (!selectedClient) return;
@@ -193,18 +233,63 @@ export function AppointmentDialog({
                 render={({ field }) => (
                   <FormItem>
                     <FormLabel>Tipo de Cita</FormLabel>
-                    <Select onValueChange={field.onChange} value={field.value}>
-                      <FormControl>
-                        <SelectTrigger data-testid="select-appointment-type">
-                          <SelectValue />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        {appointmentTypes.map((type) => (
-                          <SelectItem key={type} value={type}>{typeLabels[type]}</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                    {customMode ? (
+                      <div className="flex items-center gap-1.5">
+                        <FormControl>
+                          <Input
+                            autoFocus
+                            placeholder="Nombre del evento"
+                            value={field.value}
+                            onChange={field.onChange}
+                            maxLength={40}
+                            data-testid="input-appointment-custom-type"
+                          />
+                        </FormControl>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className="shrink-0"
+                          title="Volver a la lista de tipos"
+                          aria-label="Volver a la lista de tipos"
+                          onClick={() => {
+                            setCustomMode(false);
+                            field.onChange(defaultType);
+                          }}
+                          data-testid="button-cancel-custom-type"
+                        >
+                          <X className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    ) : (
+                      <Select
+                        onValueChange={(value) => {
+                          if (value === CUSTOM_TYPE_SENTINEL) {
+                            setCustomMode(true);
+                            field.onChange("");
+                          } else {
+                            field.onChange(value);
+                          }
+                        }}
+                        value={field.value}
+                      >
+                        <FormControl>
+                          <SelectTrigger data-testid="select-appointment-type">
+                            <SelectValue />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          {typeOptions.map((option) => (
+                            <SelectItem key={option.value} value={option.value} data-testid={`option-type-${option.value}`}>
+                              {option.label}
+                            </SelectItem>
+                          ))}
+                          <SelectItem value={CUSTOM_TYPE_SENTINEL} data-testid="option-type-custom">
+                            Crear evento
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                    )}
                     <FormMessage />
                   </FormItem>
                 )}

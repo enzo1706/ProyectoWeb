@@ -31,7 +31,7 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { ToastAction } from "@/components/ui/toast";
 import { appointmentStatuses, type Appointment, type AppointmentStatus } from "@shared/schema";
-import { typeColors, typeLabels } from "./AppointmentCard";
+import { getEventTypeColorClass, getEventTypeLabel, getEventTypeIcon } from "./AppointmentCard";
 import { parseLocalDate } from "@/lib/date";
 
 interface AppointmentDetailDialogProps {
@@ -57,8 +57,6 @@ const statusColors: Record<AppointmentStatus, string> = {
   cancelada: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200",
 };
 
-const fallbackTypeColor = "bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-200";
-
 export function AppointmentDetailDialog({ open, onOpenChange, appointment, onEdit }: AppointmentDetailDialogProps) {
   const { toast } = useToast();
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -66,6 +64,7 @@ export function AppointmentDetailDialog({ open, onOpenChange, appointment, onEdi
   const invalidateAfterChange = () => {
     queryClient.invalidateQueries({ queryKey: ["/api/appointments"] });
     queryClient.invalidateQueries({ queryKey: ["/api/appointments/upcoming"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/appointments/custom-types"] });
     queryClient.invalidateQueries({ queryKey: ["/api/reports/appointments-summary"] });
     if (appointment?.clientId) {
       queryClient.invalidateQueries({ queryKey: ["/api/clients", appointment.clientId, "appointments"] });
@@ -136,9 +135,9 @@ export function AppointmentDetailDialog({ open, onOpenChange, appointment, onEdi
     },
   });
 
-  const type = appointment?.type as keyof typeof typeLabels | undefined;
-  const typeLabel = type ? typeLabels[type] ?? appointment?.type : "";
-  const typeColor = type ? typeColors[type] ?? fallbackTypeColor : fallbackTypeColor;
+  const typeLabel = appointment ? getEventTypeLabel(appointment.type) : "";
+  const typeColor = appointment ? getEventTypeColorClass(appointment.type) : "";
+  const TypeIcon = appointment ? getEventTypeIcon(appointment.type) : null;
   const currentStatus = (appointment?.status as AppointmentStatus) ?? "pendiente";
 
   const fullDate = appointment
@@ -171,7 +170,10 @@ export function AppointmentDetailDialog({ open, onOpenChange, appointment, onEdi
                 <div className="flex items-center gap-3 text-sm">
                   <Clock className="h-4 w-4 text-muted-foreground shrink-0" />
                   <span>{appointment.time}</span>
-                  <Badge className={typeColor}>{typeLabel}</Badge>
+                  <Badge className={`${typeColor} gap-1`}>
+                    {TypeIcon && <TypeIcon className="h-3 w-3" />}
+                    {typeLabel}
+                  </Badge>
                 </div>
 
                 <div className="flex items-center gap-3 text-sm">

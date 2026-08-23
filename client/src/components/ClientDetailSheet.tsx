@@ -41,7 +41,7 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { ToastAction } from "@/components/ui/toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
-import { typeColors, typeLabels } from "./AppointmentCard";
+import { getEventTypeColorClass, getEventTypeLabel } from "./AppointmentCard";
 import type { Appointment } from "@shared/schema";
 import type { Client } from "./ClientCard";
 import type { SaleDetails } from "./SaleCard";
@@ -374,8 +374,8 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
                             <Calendar className="h-3.5 w-3.5" />
                             <span>{formatShortDate(entry.date)} · {entry.appointment.time}</span>
                           </div>
-                          <Badge className={typeColors[entry.appointment.type] ?? ""}>
-                            {typeLabels[entry.appointment.type] ?? entry.appointment.type}
+                          <Badge className={getEventTypeColorClass(entry.appointment.type)}>
+                            {getEventTypeLabel(entry.appointment.type)}
                           </Badge>
                         </div>
                         {entry.appointment.notes && (
@@ -459,7 +459,7 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
                           <Clock className="h-3.5 w-3.5" />
                           <span>{formatShortDate(apt.date)} · {apt.time}</span>
                         </div>
-                        <Badge className={typeColors[apt.type] ?? ""}>{typeLabels[apt.type] ?? apt.type}</Badge>
+                        <Badge className={getEventTypeColorClass(apt.type)}>{getEventTypeLabel(apt.type)}</Badge>
                       </div>
                       {apt.location && (
                         <div className="flex items-center gap-2 mt-1 text-sm text-muted-foreground">

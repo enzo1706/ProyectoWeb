@@ -14,9 +14,9 @@ import { AppointmentDetailDialog } from "@/components/AppointmentDetailDialog";
 import { SaleDetailDialog } from "@/components/SaleDetailDialog";
 import { NewSaleDialog } from "@/components/NewSaleDialog";
 import { useHideMoney } from "@/hooks/use-hide-money";
-import { toDateStr } from "@/lib/date";
+import { toDateStr, daysBetween } from "@/lib/date";
 import { isReminderActive } from "@shared/stockAlerts";
-import { typeLabels } from "@/components/AppointmentCard";
+import { getEventTypeLabel } from "@/components/AppointmentCard";
 import type { Product, Appointment, Consultant } from "@shared/schema";
 import {
   Plus,
@@ -96,12 +96,6 @@ function previousMonthRange(): { start: string; end: string } {
 
 function sumSales(points: SalesSummaryPoint[]): number {
   return points.reduce((sum, p) => sum + p.totalSales, 0);
-}
-
-function daysBetween(today: string, dateStr: string): number {
-  const a = new Date(today + "T00:00:00");
-  const b = new Date(dateStr + "T00:00:00");
-  return Math.round((b.getTime() - a.getTime()) / 86400000);
 }
 
 function TaskRow({ task }: { task: TaskItem }) {
@@ -412,7 +406,7 @@ export default function Dashboard() {
                 key: `event-${apt.id}`,
                 icon: Calendar,
                 colorClass: "bg-blue-500/10 text-blue-600 dark:text-blue-400",
-                title: `${apt.date === today ? "Hoy" : apt.date} · ${apt.time} hs — ${typeLabels[apt.type] ?? apt.type}`,
+                title: `${apt.date === today ? "Hoy" : apt.date} · ${apt.time} hs — ${getEventTypeLabel(apt.type)}`,
                 subtitle: apt.clientName,
                 actionLabel: "Ver",
                 onAction: () => openAppointmentDetail(apt),

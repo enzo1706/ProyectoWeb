@@ -1,33 +1,51 @@
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Clock, User, MapPin } from "lucide-react";
+import {
+  Clock,
+  User,
+  MapPin,
+  Sparkles,
+  GraduationCap,
+  Package,
+  Footprints,
+  Presentation,
+  PhoneCall,
+  ShoppingBag,
+  Tag,
+  type LucideIcon,
+} from "lucide-react";
 import type { Appointment } from "@shared/schema";
+import { getEventTypeLabel, getEventTypeColorClass } from "@shared/eventTypes";
 
 interface AppointmentCardProps {
   appointment: Appointment;
   onClick?: (appointment: Appointment) => void;
 }
 
-const FALLBACK_TYPE_COLOR = "bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-200";
-const FALLBACK_TYPE_LABEL = "Cita";
+// Reexportadas desde acá por compatibilidad con el resto de la app (Dashboard, diálogos de
+// cita): la fuente de verdad de labels/colores es shared/eventTypes.ts (la comparten frontend
+// y backend); acá solo se agrega el ícono, que es React y no puede vivir en shared/.
+export { getEventTypeLabel, getEventTypeColorClass };
 
-export const typeColors: Record<string, string> = {
-  seguimiento: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200",
-  venta: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200",
-  demostracion: "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200",
-  entrega: "bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200",
+/** Correspondencia fija tipo -> ícono. Los tipos personalizados (no están acá) usan Tag. */
+const TYPE_ICONS: Record<string, LucideIcon> = {
+  sesion_belleza: Sparkles,
+  capacitacion: GraduationCap,
+  entrega: Package,
+  visita: Footprints,
+  demostracion: Presentation,
+  seguimiento: PhoneCall,
+  venta: ShoppingBag,
 };
 
-export const typeLabels: Record<string, string> = {
-  seguimiento: "Seguimiento",
-  venta: "Venta",
-  demostracion: "Demostración",
-  entrega: "Entrega",
-};
+export function getEventTypeIcon(type: string): LucideIcon {
+  return TYPE_ICONS[type] ?? Tag;
+}
 
 export function AppointmentCard({ appointment, onClick }: AppointmentCardProps) {
-  const typeColor = typeColors[appointment.type] ?? FALLBACK_TYPE_COLOR;
-  const typeLabel = typeLabels[appointment.type] ?? FALLBACK_TYPE_LABEL;
+  const typeColor = getEventTypeColorClass(appointment.type);
+  const typeLabel = getEventTypeLabel(appointment.type);
+  const TypeIcon = getEventTypeIcon(appointment.type);
 
   return (
     <Card
@@ -53,7 +71,8 @@ export function AppointmentCard({ appointment, onClick }: AppointmentCardProps) 
               </div>
             )}
           </div>
-          <Badge className={typeColor}>
+          <Badge className={`${typeColor} gap-1`}>
+            <TypeIcon className="h-3 w-3" />
             {typeLabel}
           </Badge>
         </div>

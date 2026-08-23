@@ -8,3 +8,10 @@ export function parseLocalDate(dateStr: string): Date {
   const [year, month, day] = dateStr.split("-").map(Number);
   return new Date(year, month - 1, day);
 }
+
+/** Días entre dos "YYYY-MM-DD" (positivo si dateStr es posterior a today). */
+export function daysBetween(today: string, dateStr: string): number {
+  const a = new Date(today + "T00:00:00");
+  const b = new Date(dateStr + "T00:00:00");
+  return Math.round((b.getTime() - a.getTime()) / 86400000);
+}

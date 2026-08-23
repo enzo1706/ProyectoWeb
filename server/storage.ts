@@ -36,8 +36,9 @@ import {
   computeInstallmentDueDate,
 } from "@shared/saleCalculations";
 import { resolveLowStockThreshold, DEFAULT_LOW_STOCK_THRESHOLD } from "@shared/stockAlerts";
+import { isKnownEventType, normalizeCustomEventTypeName, KNOWN_EVENT_TYPES } from "@shared/eventTypes";
 import type { z } from "zod";
-import { eq, ne, count, sql, and, gte, lt, asc, desc, isNotNull, isNull, inArray, ilike, or } from "drizzle-orm";
+import { eq, ne, count, sql, and, gte, lt, asc, desc, isNotNull, isNull, inArray, notInArray, ilike, or } from "drizzle-orm";
 import type { db as database } from "./db";
 import { resolveStorageMode } from "./storage-mode";
 import { slugify } from "@shared/slug";
@@ -113,6 +114,9 @@ export interface TopClient {
 export interface ClientWithStats extends Client {
   totalPurchases: number;
   lastPurchase: string | null;
+  /** Suma de cuotas con status "pendiente" de ventas no canceladas — misma condición que ya
+   * usa getPendingInstallments, acá agregada por clienta en vez de listada por cuota. */
+  pendingBalance: number;
 }
 
 export interface SaleWithItemCount extends Sale {
@@ -286,6 +290,9 @@ export interface IStorage {
   setProductImage(productId: number, imagen: string | null): Promise<SetProductImageResult>;
   getUpcomingAppointments(consultantId: number, limit?: number): Promise<Appointment[]>;
   getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<Appointment[]>;
+  /** Tipos de evento personalizados (no fijos/legacy) que la consultora ya usó alguna vez, para
+   * ofrecerlos de nuevo al crear una cita y para el filtro "Todos los eventos" de la Agenda. */
+  getAppointmentCustomTypes(consultantId: number): Promise<string[]>;
   createAppointment(consultantId: number, input: CreateAppointmentInput): Promise<Appointment | undefined>;
   updateAppointment(consultantId: number, id: number, input: UpdateAppointmentInput): Promise<Appointment | undefined>;
   updateAppointmentStatus(consultantId: number, id: number, status: AppointmentStatus): Promise<Appointment | undefined>;
@@ -768,6 +775,24 @@ export class DatabaseStorage implements IStorage {
       .orderBy(asc(appointments.date), asc(appointments.time));
   }
 
+  async getAppointmentCustomTypes(consultantId: number): Promise<string[]> {
+    const db = await this.getDb();
+    const knownValues = KNOWN_EVENT_TYPES.map((t) => t.value);
+    const rows = await db
+      .selectDistinct({ type: appointments.type })
+      .from(appointments)
+      .where(and(eq(appointments.consultantId, consultantId), notInArray(appointments.type, knownValues)));
+    return rows.map((r) => r.type).sort((a, b) => a.localeCompare(b));
+  }
+
+  /** Si el tipo mandado ya es uno fijo/legacy, se usa tal cual. Si no, es un tipo personalizado
+   * nuevo o reusado: se resuelve contra los que ya existen para no crear casi-duplicados. */
+  private async resolveEventType(consultantId: number, rawType: string): Promise<string> {
+    if (isKnownEventType(rawType)) return rawType;
+    const existingCustomTypes = await this.getAppointmentCustomTypes(consultantId);
+    return normalizeCustomEventTypeName(rawType, existingCustomTypes);
+  }
+
   async createAppointment(consultantId: number, input: CreateAppointmentInput): Promise<Appointment | undefined> {
     const db = await this.getDb();
     const [client] = await db
@@ -776,6 +801,7 @@ export class DatabaseStorage implements IStorage {
       .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
     if (!client) return undefined;
     const clientName = client.name ?? client.phone;
+    const type = await this.resolveEventType(consultantId, input.type);
 
     const [appointment] = await db
       .insert(appointments)
@@ -785,7 +811,7 @@ export class DatabaseStorage implements IStorage {
         clientName,
         date: input.date,
         time: input.time,
-        type: input.type,
+        type,
         location: input.location ?? null,
         notes: input.notes ?? null,
       })
@@ -807,6 +833,7 @@ export class DatabaseStorage implements IStorage {
       .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
     if (!client) throw new AppointmentValidationError("Clienta no encontrada");
     const clientName = client.name ?? client.phone;
+    const type = input.type === existing.type ? existing.type : await this.resolveEventType(consultantId, input.type);
 
     const [updated] = await db
       .update(appointments)
@@ -815,7 +842,7 @@ export class DatabaseStorage implements IStorage {
         clientName,
         date: input.date,
         time: input.time,
-        type: input.type,
+        type,
         location: input.location ?? null,
         notes: input.notes ?? null,
       })
@@ -944,10 +971,32 @@ export class DatabaseStorage implements IStorage {
 
     const statsByClient = new Map(statsRows.map((s) => [s.clientId, s]));
 
+    // Misma condición que getPendingInstallments (cuota "pendiente" de una venta no cancelada),
+    // acá agregada por clienta en vez de listada por cuota individual.
+    const balanceRows = await db
+      .select({
+        clientId: sales.clientId,
+        pendingBalance: sql<number>`coalesce(sum(${saleInstallments.amount}), 0)`,
+      })
+      .from(saleInstallments)
+      .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
+      .where(
+        and(
+          eq(sales.consultantId, consultantId),
+          inArray(sales.clientId, clientIds),
+          eq(saleInstallments.status, "pendiente"),
+          ne(sales.status, "cancelada"),
+        ),
+      )
+      .groupBy(sales.clientId);
+
+    const balanceByClient = new Map(balanceRows.map((b) => [b.clientId, Number(b.pendingBalance)]));
+
     return rows.map((row) => ({
       ...row,
       totalPurchases: Number(statsByClient.get(row.id)?.totalAmount ?? 0),
       lastPurchase: statsByClient.get(row.id)?.lastDate ?? null,
+      pendingBalance: balanceByClient.get(row.id) ?? 0,
     }));
   }
 
@@ -2145,10 +2194,27 @@ export class MemoryStorage implements IStorage {
       .sort((a, b) => (a.date === b.date ? a.time.localeCompare(b.time) : a.date.localeCompare(b.date)));
   }
 
+  async getAppointmentCustomTypes(consultantId: number): Promise<string[]> {
+    const knownValues = new Set(KNOWN_EVENT_TYPES.map((t) => t.value));
+    const custom = new Set(
+      this.appointments
+        .filter((a) => a.consultantId === consultantId && !knownValues.has(a.type))
+        .map((a) => a.type),
+    );
+    return Array.from(custom).sort((a, b) => a.localeCompare(b));
+  }
+
+  private async resolveEventType(consultantId: number, rawType: string): Promise<string> {
+    if (isKnownEventType(rawType)) return rawType;
+    const existingCustomTypes = await this.getAppointmentCustomTypes(consultantId);
+    return normalizeCustomEventTypeName(rawType, existingCustomTypes);
+  }
+
   async createAppointment(consultantId: number, input: CreateAppointmentInput): Promise<Appointment | undefined> {
     const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
     if (!client) return undefined;
     const clientName = client.name ?? client.phone;
+    const type = await this.resolveEventType(consultantId, input.type);
 
     const appointment: Appointment = {
       id: this.nextAppointmentId++,
@@ -2157,7 +2223,7 @@ export class MemoryStorage implements IStorage {
       clientName,
       date: input.date,
       time: input.time,
-      type: input.type,
+      type,
       location: input.location ?? null,
       notes: input.notes ?? null,
       status: "pendiente",
@@ -2173,12 +2239,13 @@ export class MemoryStorage implements IStorage {
     const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
     if (!client) throw new AppointmentValidationError("Clienta no encontrada");
     const clientName = client.name ?? client.phone;
+    const type = input.type === existing.type ? existing.type : await this.resolveEventType(consultantId, input.type);
 
     existing.clientId = client.id;
     existing.clientName = clientName;
     existing.date = input.date;
     existing.time = input.time;
-    existing.type = input.type;
+    existing.type = type;
     existing.location = input.location ?? null;
     existing.notes = input.notes ?? null;
     return existing;
@@ -2261,7 +2328,12 @@ export class MemoryStorage implements IStorage {
       const lastPurchase = clientSales.length
         ? clientSales.map((s) => s.date).sort().slice(-1)[0]
         : null;
-      return { ...c, totalPurchases, lastPurchase };
+      // Misma condición que getPendingInstallments (cuota "pendiente" de una venta no cancelada).
+      const clientSaleIds = new Set(clientSales.map((s) => s.id));
+      const pendingBalance = this.saleInstallments
+        .filter((i) => i.status === "pendiente" && clientSaleIds.has(i.saleId))
+        .reduce((sum, i) => sum + i.amount, 0);
+      return { ...c, totalPurchases, lastPurchase, pendingBalance };
     });
   }
 

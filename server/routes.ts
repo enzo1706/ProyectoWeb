@@ -337,6 +337,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  app.get("/api/appointments/custom-types", async (req: Request, res: Response) => {
+    try {
+      const types = await storage.getAppointmentCustomTypes(req.consultantId!);
+      res.json(types);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener los tipos de evento personalizados" });
+    }
+  });
+
   app.get("/api/appointments", async (req: Request, res: Response) => {
     try {
       const start = typeof req.query.start === "string" ? req.query.start : "";

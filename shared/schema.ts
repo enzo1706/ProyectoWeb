@@ -1,6 +1,7 @@
 import { pgTable, serial, text, integer, boolean, index, unique } from "drizzle-orm/pg-core";
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod";
+import { CUSTOM_EVENT_TYPE_MAX_LENGTH } from "./eventTypes";
 
 /**
  * La consultora es la entidad de negocio (tenant). Separada de `users` para que la
@@ -97,8 +98,14 @@ export const clients = pgTable("clients", {
   consultantIdx: index("clients_consultant_id_idx").on(table.consultantId),
 }));
 
-export const appointmentTypes = ["seguimiento", "venta", "demostracion", "entrega"] as const;
-export type AppointmentType = (typeof appointmentTypes)[number];
+// El tipo de evento ya no es un enum cerrado: además de los tipos fijos (ver
+// shared/eventTypes.ts), una consultora puede crear tipos personalizados con nombre libre.
+// La columna en la base siempre fue texto libre, así que esto no requiere migración.
+export const appointmentTypeSchema = z
+  .string()
+  .trim()
+  .min(1, "El tipo de evento es obligatorio")
+  .max(CUSTOM_EVENT_TYPE_MAX_LENGTH, `El nombre no puede superar los ${CUSTOM_EVENT_TYPE_MAX_LENGTH} caracteres`);
 
 export const appointmentStatuses = ["pendiente", "confirmada", "completada", "cancelada"] as const;
 export type AppointmentStatus = (typeof appointmentStatuses)[number];
@@ -225,7 +232,7 @@ export const createAppointmentSchema = z.object({
   clientId: z.number().int().positive(),
   date: z.string().min(1),
   time: z.string().min(1),
-  type: z.enum(appointmentTypes),
+  type: appointmentTypeSchema,
   location: z.string().max(500).optional(),
   notes: z.string().max(500).optional(),
 });
@@ -236,7 +243,7 @@ export const updateAppointmentSchema = z.object({
   clientId: z.number().int().positive(),
   date: z.string().min(1),
   time: z.string().min(1),
-  type: z.enum(appointmentTypes),
+  type: appointmentTypeSchema,
   location: z.string().max(500).optional(),
   notes: z.string().max(500).optional(),
 });

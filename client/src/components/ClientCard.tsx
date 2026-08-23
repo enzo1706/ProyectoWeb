@@ -7,6 +7,7 @@ import type { Client as BaseClient } from "@shared/schema";
 export interface Client extends BaseClient {
   totalPurchases: number;
   lastPurchase?: string | null;
+  pendingBalance?: number;
 }
 
 interface ClientCardProps {
@@ -69,6 +70,14 @@ export function ClientCard({ client, onClick }: ClientCardProps) {
             </div>
           )}
         </div>
+        {!!client.pendingBalance && (
+          <div
+            className="mt-2 text-xs font-medium text-amber-700 dark:text-amber-400"
+            data-testid={`text-pending-balance-${client.id}`}
+          >
+            Saldo pendiente: {format(client.pendingBalance)}
+          </div>
+        )}
       </CardContent>
     </Card>
   );
