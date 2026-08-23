@@ -12,12 +12,13 @@ import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
-  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Select,
   SelectContent,
@@ -25,6 +26,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Dialog,
   DialogContent,
@@ -45,10 +52,9 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 import { useHideMoney } from "@/hooks/use-hide-money";
-import { computeDiscountedCost } from "@shared/saleCalculations";
 import { isLowStock, isReminderActive } from "@shared/stockAlerts";
 import { toDateStr } from "@/lib/date";
-import { getProductCategories } from "@/lib/productCategories";
+import { getProductCategories, getToneSiblings, toneFamilyKey } from "@/lib/productCategories";
 import { ProductSelectionModal } from "@/components/ProductSelectionModal";
 import { LoadOrderDialog } from "@/components/LoadOrderDialog";
 import type { OrderLine } from "@/components/SaleOrderTable";
@@ -63,53 +69,33 @@ import {
   SearchX,
   Plus,
   PackagePlus,
-  ArchiveRestore,
-  Archive,
   Pencil,
   Check,
   X,
   AlertTriangle,
   Clock,
+  ChevronDown,
 } from "lucide-react";
 
-const STOCK_FILTER = "__stock";
-const DISCONTINUED_FILTER = "__discontinued";
 const MANUAL_FILTER = "__manual";
 const ALL_FILTER = "__all";
 
-function CatalogProductCard({
+/** Stock + umbral + recordatorio de compra de un producto puntual (una fila = un producto,
+ * o un tono dentro de un producto con variantes). Misma lógica/mutaciones que ya existían,
+ * solo reempaquetada para poder reusarla tanto en filas simples como en cada tono. */
+function ProductStockCell({
   product,
-  globalDiscount,
-  onOpen,
-  onToggleDiscontinued,
-  isTogglingDiscontinued,
   onSetStock,
   isSettingStock,
-  onSetReminder,
-  isSettingReminder,
 }: {
   product: Product;
-  globalDiscount: number | null;
-  onOpen: () => void;
-  onToggleDiscontinued: () => void;
-  isTogglingDiscontinued: boolean;
   onSetStock: (unidades: number, stockMinimo?: number | null) => void;
   isSettingStock: boolean;
-  onSetReminder: (remindAt: string | null) => void;
-  isSettingReminder: boolean;
 }) {
-  const { format } = useHideMoney();
   const outOfStock = product.unidades <= 0;
-  const discountedCost = globalDiscount !== null ? computeDiscountedCost(product.precio, globalDiscount) : null;
   const [editingStock, setEditingStock] = useState(false);
   const [stockInput, setStockInput] = useState("");
   const [thresholdInput, setThresholdInput] = useState("");
-  const [remindInput, setRemindInput] = useState("");
-
-  const today = toDateStr(new Date());
-  const lowStock = isLowStock(product.unidades, product.effectiveStockMinimo);
-  const reminderActive = isReminderActive(product.remindStockAt, today);
-  const showAlert = lowStock && !reminderActive;
 
   const startEditingStock = () => {
     setStockInput(String(product.unidades));
@@ -130,252 +116,332 @@ function CatalogProductCard({
     setEditingStock(false);
   };
 
-  const confirmReminder = () => {
-    if (!remindInput) return;
-    onSetReminder(remindInput);
-    setRemindInput("");
-  };
-
   return (
-    <Card
-      className={cn(
-        "flex flex-col overflow-hidden shadow-sm transition-shadow hover:shadow-md cursor-pointer",
-        (outOfStock || product.discontinued) && "opacity-75",
-      )}
-      onClick={onOpen}
-      data-testid={`card-product-${product.id}`}
-    >
-      {product.imagen ? (
-        <img
-          src={product.imagen}
-          alt={product.producto}
-          className="h-32 w-full object-cover"
-          data-testid={`image-product-${product.id}`}
-        />
-      ) : (
-        <div className="flex h-32 w-full items-center justify-center bg-muted">
-          <Package className="h-10 w-10 text-muted-foreground" />
-        </div>
-      )}
-      <CardHeader className="pb-2">
-        <div className="flex items-start justify-between gap-2">
-          <p className="text-xs uppercase tracking-wide text-muted-foreground truncate">
-            {product.linea ? `${product.seccion} · ${product.linea}` : product.seccion}
-          </p>
+    <div onClick={(e) => e.stopPropagation()}>
+      {editingStock ? (
+        <div className="flex items-center gap-1.5">
+          <Input
+            id={`input-stock-${product.id}`}
+            type="number"
+            min={0}
+            step="1"
+            value={stockInput}
+            onChange={(e) => setStockInput(e.target.value)}
+            className="h-8 w-14"
+            autoFocus
+            aria-label="Stock"
+            data-testid={`input-stock-${product.id}`}
+          />
+          <Input
+            id={`input-threshold-${product.id}`}
+            type="number"
+            min={1}
+            step="1"
+            value={thresholdInput}
+            onChange={(e) => setThresholdInput(e.target.value)}
+            placeholder={String(product.effectiveStockMinimo)}
+            className="h-8 w-14"
+            aria-label="Umbral de stock bajo"
+            title={`Umbral vacío = usa el predeterminado (${product.effectiveStockMinimo})`}
+            data-testid={`input-threshold-${product.id}`}
+          />
           <Button
             type="button"
             variant="ghost"
             size="icon"
-            className="shrink-0 -mt-2 -mr-2"
-            title={product.discontinued ? "Reactivar producto" : "Marcar como discontinuado"}
-            aria-label={product.discontinued ? "Reactivar producto" : "Marcar como discontinuado"}
-            disabled={isTogglingDiscontinued}
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggleDiscontinued();
-            }}
-            data-testid={`button-toggle-discontinued-${product.id}`}
+            className="h-8 w-8 shrink-0"
+            title="Guardar stock"
+            aria-label="Guardar stock"
+            disabled={isSettingStock}
+            onClick={confirmStock}
+            data-testid={`button-confirm-stock-${product.id}`}
           >
-            {product.discontinued ? <ArchiveRestore className="h-4 w-4" /> : <Archive className="h-4 w-4" />}
+            <Check className="h-4 w-4" />
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 shrink-0"
+            title="Cancelar edición de stock"
+            aria-label="Cancelar edición de stock"
+            onClick={() => setEditingStock(false)}
+            data-testid={`button-cancel-stock-${product.id}`}
+          >
+            <X className="h-4 w-4" />
           </Button>
         </div>
-        <CardTitle className="text-lg font-semibold text-foreground leading-snug line-clamp-2">
-          {product.producto}
-        </CardTitle>
-        <p className="text-xs text-muted-foreground font-mono">{product.codigo}</p>
-        {product.discontinued && (
-          <Badge variant="destructive" className="w-fit text-xs">Discontinuado</Badge>
-        )}
-      </CardHeader>
-      <CardContent className="flex-1 space-y-2">
-        <div className="flex items-baseline justify-between gap-2">
-          <span className="text-2xl font-bold text-primary" data-testid={`text-cost-${product.id}`}>
-            {format(discountedCost ?? product.precio)}
+      ) : (
+        <div className="flex items-center gap-1.5 text-sm">
+          <span className={cn("tabular-nums whitespace-nowrap", outOfStock ? "text-destructive font-medium" : "text-muted-foreground")}>
+            {outOfStock ? "Sin stock" : `${product.unidades} uds`}
           </span>
-          {product.puntos > 0 && (
-            <Badge variant="secondary" className="bg-primary/10 text-primary border-0 text-xs">
-              {product.puntos} pts
-            </Badge>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6 shrink-0"
+            title="Editar stock"
+            aria-label="Editar stock"
+            onClick={startEditingStock}
+            data-testid={`button-edit-stock-${product.id}`}
+          >
+            <Pencil className="h-3 w-3" />
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Indicador de poco stock / recordatorio activo — a ancho completo de la fila (no en la
+ * columna angosta de la derecha). El disparador para FIJAR un recordatorio ya no vive acá
+ * (se centralizó en la notificación general "Recordar stock" de más arriba) — esto solo
+ * informa el estado y deja cancelar un recordatorio puntual ya activo. */
+function ProductStockAlerts({
+  product,
+  onSetReminder,
+  isSettingReminder,
+}: {
+  product: Product;
+  onSetReminder: (remindAt: string | null) => void;
+  isSettingReminder: boolean;
+}) {
+  const today = toDateStr(new Date());
+  const lowStock = isLowStock(product.unidades, product.effectiveStockMinimo);
+  const reminderActive = isReminderActive(product.remindStockAt, today);
+  const showAlert = lowStock && !reminderActive;
+
+  if (!showAlert && !reminderActive) return null;
+
+  return (
+    <div className="px-3 pb-2" onClick={(e) => e.stopPropagation()}>
+      {showAlert && (
+        <div
+          className="flex items-center gap-1.5 rounded-md bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-400"
+          data-testid={`alert-low-stock-${product.id}`}
+        >
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span>Poco stock</span>
+        </div>
+      )}
+      {reminderActive && (
+        <div
+          className="flex items-center gap-1.5 rounded-md bg-muted/60 px-2 py-1.5 text-xs text-muted-foreground"
+          data-testid={`reminder-active-${product.id}`}
+        >
+          <Clock className="h-3.5 w-3.5 shrink-0" />
+          <span className="mr-auto">Te recordamos el {product.remindStockAt}</span>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-7 text-xs"
+            disabled={isSettingReminder}
+            onClick={() => onSetReminder(null)}
+            data-testid={`button-cancel-reminder-${product.id}`}
+          >
+            Cancelar
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface StockActions {
+  onSetStock: (id: number, unidades: number, stockMinimo?: number | null) => void;
+  isSettingStock: (id: number) => boolean;
+  onSetReminder: (id: number, remindAt: string | null) => void;
+  isSettingReminder: (id: number) => boolean;
+}
+
+/** Fila compacta de un producto puntual (sin tonos, o un tono dentro de un grupo expandido).
+ * `compact=true` la usan los tonos: sin foto/categoría, solo el nombre del tono + su stock. */
+function ProductRow({
+  product,
+  onOpen,
+  actions,
+  compact = false,
+}: {
+  product: Product;
+  onOpen: () => void;
+  actions: StockActions;
+  compact?: boolean;
+}) {
+  const { format } = useHideMoney();
+  const outOfStock = product.unidades <= 0;
+
+  return (
+    <div data-testid={`row-product-${product.id}`}>
+      <div
+        className={cn(
+          "flex items-center gap-3 px-3 py-2.5 hover-elevate cursor-pointer",
+          outOfStock && "opacity-75",
+          compact && "pl-4",
+        )}
+        onClick={onOpen}
+      >
+        {!compact && (
+          product.imagen ? (
+            <img
+              src={product.imagen}
+              alt={product.producto}
+              className="h-11 w-11 rounded-md object-cover shrink-0"
+              data-testid={`image-product-${product.id}`}
+            />
+          ) : (
+            <div className="flex h-11 w-11 items-center justify-center rounded-md bg-muted shrink-0">
+              <Package className="h-5 w-5 text-muted-foreground" />
+            </div>
+          )
+        )}
+        <div className="min-w-0 flex-1">
+          <p className="font-medium truncate text-sm" data-testid={`text-name-${product.id}`}>
+            {compact ? product.variante : product.producto}
+          </p>
+          {!compact && (
+            <p className="text-xs text-muted-foreground truncate">
+              {product.linea ? `${product.seccion} · ${product.linea}` : product.seccion}
+            </p>
           )}
         </div>
-        {discountedCost !== null && (
-          <p className="text-xs text-muted-foreground">
-            PVP: <span className="line-through">{format(product.precio)}</span>
-          </p>
-        )}
-        {editingStock ? (
-          <div className="space-y-1.5" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center gap-1.5">
-              <div className="space-y-0.5">
-                <label className="text-[10px] text-muted-foreground" htmlFor={`input-stock-${product.id}`}>Stock</label>
-                <Input
-                  id={`input-stock-${product.id}`}
-                  type="number"
-                  min={0}
-                  step="1"
-                  value={stockInput}
-                  onChange={(e) => setStockInput(e.target.value)}
-                  className="h-8 w-16"
-                  autoFocus
-                  data-testid={`input-stock-${product.id}`}
-                />
-              </div>
-              <div className="space-y-0.5">
-                <label className="text-[10px] text-muted-foreground" htmlFor={`input-threshold-${product.id}`}>Umbral</label>
-                <Input
-                  id={`input-threshold-${product.id}`}
-                  type="number"
-                  min={1}
-                  step="1"
-                  value={thresholdInput}
-                  onChange={(e) => setThresholdInput(e.target.value)}
-                  placeholder={String(product.effectiveStockMinimo)}
-                  className="h-8 w-16"
-                  data-testid={`input-threshold-${product.id}`}
-                />
-              </div>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="shrink-0 self-end"
-                title="Guardar stock"
-                aria-label="Guardar stock"
-                disabled={isSettingStock}
-                onClick={confirmStock}
-                data-testid={`button-confirm-stock-${product.id}`}
-              >
-                <Check className="h-4 w-4" />
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="shrink-0 self-end"
-                title="Cancelar edición de stock"
-                aria-label="Cancelar edición de stock"
-                onClick={() => setEditingStock(false)}
-                data-testid={`button-cancel-stock-${product.id}`}
-              >
-                <X className="h-4 w-4" />
-              </Button>
-            </div>
-            <p className="text-[11px] text-muted-foreground">
-              Umbral vacío = usa el predeterminado ({product.effectiveStockMinimo}).
-            </p>
-          </div>
-        ) : (
-          <div className="flex items-center gap-2 text-sm">
-            <Package className="h-4 w-4 text-muted-foreground shrink-0" />
-            <span className={cn(outOfStock ? "text-destructive font-medium" : "text-muted-foreground")}>
-              {outOfStock
-                ? "Sin stock"
-                : `${product.unidades} unidad${product.unidades !== 1 ? "es" : ""} disponible${product.unidades !== 1 ? "s" : ""}`}
+        <div className="flex flex-col items-end gap-0.5 shrink-0">
+          <div className="flex items-baseline gap-1.5">
+            {product.puntos > 0 && (
+              <Badge variant="secondary" className="bg-primary/10 text-primary border-0 text-[10px] px-1.5 py-0">
+                {product.puntos} pts
+              </Badge>
+            )}
+            <span className="text-sm font-semibold" data-testid={`text-cost-${product.id}`}>
+              {format(product.costPrice ?? product.precio)}
             </span>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="shrink-0"
-              title="Editar mi stock"
-              aria-label="Editar mi stock"
-              onClick={(e) => {
-                e.stopPropagation();
-                startEditingStock();
-              }}
-              data-testid={`button-edit-stock-${product.id}`}
-            >
-              <Pencil className="h-3.5 w-3.5" />
-            </Button>
           </div>
-        )}
-
-        {showAlert && (
-          <div
-            className="flex flex-wrap items-center gap-1.5 rounded-md bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-400"
-            onClick={(e) => e.stopPropagation()}
-            data-testid={`alert-low-stock-${product.id}`}
-          >
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            <span className="mr-auto">Poco stock</span>
-            <Input
-              type="date"
-              min={today}
-              value={remindInput}
-              onChange={(e) => setRemindInput(e.target.value)}
-              className="h-7 w-[9.5rem] bg-background text-xs"
-              data-testid={`input-remind-date-${product.id}`}
-            />
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              className="h-7 text-xs"
-              disabled={!remindInput || isSettingReminder}
-              onClick={confirmReminder}
-              data-testid={`button-set-reminder-${product.id}`}
-            >
-              Recordarme comprar
-            </Button>
-          </div>
-        )}
-        {reminderActive && (
-          <div
-            className="flex items-center gap-1.5 rounded-md bg-muted/60 px-2 py-1.5 text-xs text-muted-foreground"
-            onClick={(e) => e.stopPropagation()}
-            data-testid={`reminder-active-${product.id}`}
-          >
-            <Clock className="h-3.5 w-3.5 shrink-0" />
-            <span className="mr-auto">Te recordamos el {product.remindStockAt}</span>
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              className="h-7 text-xs"
-              disabled={isSettingReminder}
-              onClick={() => onSetReminder(null)}
-              data-testid={`button-cancel-reminder-${product.id}`}
-            >
-              Cancelar
-            </Button>
-          </div>
-        )}
-      </CardContent>
-      <CardFooter className="pt-0">
+          <ProductStockCell
+            product={product}
+            onSetStock={(unidades, stockMinimo) => actions.onSetStock(product.id, unidades, stockMinimo)}
+            isSettingStock={actions.isSettingStock(product.id)}
+          />
+        </div>
         <Button
-          className="w-full bg-primary hover:bg-primary/90"
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8 shrink-0"
           disabled={outOfStock}
+          title={outOfStock ? "Sin stock" : "Agregar"}
+          aria-label={outOfStock ? "Sin stock" : "Agregar"}
           onClick={(e) => {
             e.stopPropagation();
             onOpen();
           }}
           data-testid={`button-select-${product.id}`}
         >
-          <ShoppingBag className="h-4 w-4 mr-2" />
-          {outOfStock ? "Sin stock" : "Agregar"}
+          <ShoppingBag className="h-4 w-4" />
         </Button>
-      </CardFooter>
-    </Card>
+      </div>
+      <ProductStockAlerts
+        product={product}
+        onSetReminder={(remindAt) => actions.onSetReminder(product.id, remindAt)}
+        isSettingReminder={actions.isSettingReminder(product.id)}
+      />
+    </div>
+  );
+}
+
+/** Un producto sin tonos se renderiza directo como ProductRow. Un producto con tonos se
+ * agrupa en una sola fila expandible que muestra el stock de cada tono al desplegarse. */
+function ProductGroup({
+  members,
+  onOpen,
+  actions,
+}: {
+  members: Product[];
+  onOpen: (product: Product) => void;
+  actions: StockActions;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  if (members.length === 1) {
+    return (
+      <ProductRow product={members[0]} onOpen={() => onOpen(members[0])} actions={actions} />
+    );
+  }
+
+  const primary = members[0];
+  const totalUnidades = members.reduce((sum, m) => sum + m.unidades, 0);
+  const anyLowStock = members.some((m) => isLowStock(m.unidades, m.effectiveStockMinimo) && !isReminderActive(m.remindStockAt, toDateStr(new Date())));
+
+  return (
+    <div data-testid={`group-product-${primary.id}`}>
+      <div
+        className="flex items-center gap-3 px-3 py-2.5 hover-elevate cursor-pointer"
+        onClick={() => onOpen(primary)}
+        data-testid={`row-group-${primary.id}`}
+      >
+        {primary.imagen ? (
+          <img
+            src={primary.imagen}
+            alt={primary.producto}
+            className="h-11 w-11 rounded-md object-cover shrink-0"
+            data-testid={`image-product-${primary.id}`}
+          />
+        ) : (
+          <div className="flex h-11 w-11 items-center justify-center rounded-md bg-muted shrink-0">
+            <Package className="h-5 w-5 text-muted-foreground" />
+          </div>
+        )}
+        <div className="min-w-0 flex-1">
+          <p className="font-medium truncate text-sm">{primary.producto}</p>
+          <p className="text-xs text-muted-foreground truncate">
+            {primary.linea ? `${primary.seccion} · ${primary.linea}` : primary.seccion}
+            {" · "}
+            {members.length} tonos
+          </p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {anyLowStock && <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />}
+          <span className="text-sm tabular-nums text-muted-foreground whitespace-nowrap">{totalUnidades} uds</span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 shrink-0"
+            title={expanded ? "Ocultar tonos" : "Ver tonos"}
+            aria-label={expanded ? "Ocultar tonos" : "Ver tonos"}
+            onClick={(e) => {
+              e.stopPropagation();
+              setExpanded((v) => !v);
+            }}
+            data-testid={`button-toggle-tones-${primary.id}`}
+          >
+            <ChevronDown className={cn("h-4 w-4 transition-transform", expanded && "rotate-180")} />
+          </Button>
+        </div>
+      </div>
+      {expanded && (
+        <div className="divide-y border-t bg-muted/20" data-testid={`tones-${primary.id}`}>
+          {members.map((m) => (
+            <ProductRow key={m.id} product={m} onOpen={() => onOpen(m)} actions={actions} compact />
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
 function CatalogSkeleton() {
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+    <div className="divide-y rounded-lg border">
       {Array.from({ length: 6 }).map((_, i) => (
-        <Card key={i}>
-          <CardHeader>
-            <Skeleton className="h-3 w-32" />
-            <Skeleton className="h-6 w-full mt-2" />
-          </CardHeader>
-          <CardContent>
-            <Skeleton className="h-8 w-24" />
-            <Skeleton className="h-4 w-40 mt-3" />
-          </CardContent>
-          <CardFooter>
-            <Skeleton className="h-10 w-full" />
-          </CardFooter>
-        </Card>
+        <div key={i} className="flex items-center gap-3 px-3 py-2.5">
+          <Skeleton className="h-11 w-11 rounded-md shrink-0" />
+          <div className="flex-1 space-y-1.5">
+            <Skeleton className="h-4 w-40" />
+            <Skeleton className="h-3 w-24" />
+          </div>
+          <Skeleton className="h-4 w-16" />
+        </div>
       ))}
     </div>
   );
@@ -645,17 +711,25 @@ export default function Productos() {
   const cart = useSaleCart();
   const [search, setSearch] = useState("");
   const [categoryFilter, setCategoryFilter] = useState<string>(ALL_FILTER);
-  const [globalDiscount, setGlobalDiscount] = useState<string>("");
+  // Por defecto solo se ven productos con stock > 0 — el checkbox habilita ver también los de 0.
+  const [showOutOfStock, setShowOutOfStock] = useState(false);
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
   const [addProductOpen, setAddProductOpen] = useState(false);
   const [loadOrderOpen, setLoadOrderOpen] = useState(false);
+  const [bulkReminderDate, setBulkReminderDate] = useState("");
 
   const { data: products = [], isLoading, isError, error } = useQuery<Product[]>({
     queryKey: ["/api/products"],
   });
 
+  // Mismo endpoint que ya usa el Dashboard para esto — filtra server-side por INNER JOIN a
+  // product_stock, así que solo trae productos que la consultora realmente compró alguna vez
+  // (nunca los del catálogo global que todavía tienen 0 unidades por defecto, sin tocar).
+  const { data: lowStockRaw = [] } = useQuery<Product[]>({
+    queryKey: ["/api/products/low-stock"],
+  });
+
   const categories = useMemo(() => getProductCategories(products), [products]);
-  const discountValue = globalDiscount ? Number(globalDiscount) : null;
 
   const filteredProducts = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -667,14 +741,33 @@ export default function Productos() {
         p.seccion.toLowerCase().includes(term);
 
       let matchesCategory = true;
-      if (categoryFilter === STOCK_FILTER) matchesCategory = p.unidades > 0;
-      else if (categoryFilter === DISCONTINUED_FILTER) matchesCategory = p.discontinued;
-      else if (categoryFilter === MANUAL_FILTER) matchesCategory = p.source === "manual";
+      if (categoryFilter === MANUAL_FILTER) matchesCategory = p.source === "manual";
       else if (categoryFilter !== ALL_FILTER) matchesCategory = p.seccion === categoryFilter;
 
-      return matchesSearch && matchesCategory;
+      const matchesStock = showOutOfStock || p.unidades > 0;
+
+      return matchesSearch && matchesCategory && matchesStock;
     });
-  }, [products, search, categoryFilter]);
+  }, [products, search, categoryFilter, showOutOfStock]);
+
+  // Agrupa por familia (sección+línea+nombre) para que los tonos de un mismo producto
+  // aparezcan como una sola fila expandible en vez de una fila por variante — misma
+  // heurística que ya usa ProductSelectionModal (getToneSiblings), acá aplicada de una
+  // sola pasada sobre la lista ya filtrada en vez de un lookup por producto.
+  const groupedProducts = useMemo(() => {
+    const groups = new Map<string, Product[]>();
+    for (const p of filteredProducts) {
+      const key = toneFamilyKey(p);
+      const existing = groups.get(key);
+      if (existing) existing.push(p);
+      else groups.set(key, [p]);
+    }
+    const result = Array.from(groups.values());
+    for (const members of result) {
+      members.sort((a, b) => a.variante.localeCompare(b.variante));
+    }
+    return result;
+  }, [filteredProducts]);
 
   const seedMutation = useGuardedMutation({
     mutationFn: async () => {
@@ -697,22 +790,6 @@ export default function Productos() {
         variant: "destructive",
       });
     },
-  });
-
-  const [togglingId, setTogglingId] = useState<number | null>(null);
-  const toggleDiscontinuedMutation = useGuardedMutation({
-    mutationFn: async ({ id, discontinued }: { id: number; discontinued: boolean }) => {
-      setTogglingId(id);
-      const res = await apiRequest("PATCH", `/api/products/${id}/discontinued`, { discontinued });
-      return res.json() as Promise<Product>;
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
-    },
-    onError: (err: Error) => {
-      toast({ title: "No se pudo actualizar el producto", description: err.message, variant: "destructive" });
-    },
-    onSettled: () => setTogglingId(null),
   });
 
   const [settingStockId, setSettingStockId] = useState<number | null>(null);
@@ -753,6 +830,45 @@ export default function Productos() {
     onSettled: () => setSettingReminderId(null),
   });
 
+  const stockActions: StockActions = {
+    onSetStock: (id, unidades, stockMinimo) => setStockMutation.mutate({ id, unidades, stockMinimo }),
+    isSettingStock: (id) => settingStockId === id,
+    onSetReminder: (id, remindAt) => setReminderMutation.mutate({ id, remindAt }),
+    isSettingReminder: (id) => settingReminderId === id,
+  };
+
+  // lowStockRaw ya viene filtrado server-side a productos realmente comprados alguna vez
+  // (nunca los del catálogo global sin tocar). Acá solo se excluyen, con la misma condición
+  // que ya usa cada fila y el Dashboard, los que ya tienen un recordatorio activo — para
+  // armar la notificación general y la lista de productos a los que aplica "Recordar stock".
+  const lowStockProducts = useMemo(() => {
+    const today = toDateStr(new Date());
+    return lowStockRaw.filter((p) => !isReminderActive(p.remindStockAt, today));
+  }, [lowStockRaw]);
+
+  const bulkReminderMutation = useGuardedMutation({
+    mutationFn: async (remindAt: string) => {
+      const targets = lowStockProducts;
+      const results = await Promise.allSettled(
+        targets.map((p) => apiRequest("PATCH", `/api/products/${p.id}/stock-reminder`, { remindAt })),
+      );
+      const failedCount = results.filter((r) => r.status === "rejected").length;
+      if (failedCount > 0) {
+        throw new Error(`No se pudo aplicar el recordatorio a ${failedCount} de ${targets.length} producto(s)`);
+      }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
+      toast({ title: "Recordatorio aplicado a todos los productos con stock bajo" });
+      setBulkReminderDate("");
+    },
+    onError: (err: Error) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      toast({ title: "No se pudo aplicar el recordatorio", description: err.message, variant: "destructive" });
+    },
+  });
+
   const cartSubtotal = cart.lines.reduce((sum, l) => {
     const price = l.mode === "manualPrice" && l.adjustmentValue !== null ? l.adjustmentValue : l.originalPrice;
     return sum + price * l.quantity;
@@ -765,32 +881,28 @@ export default function Productos() {
     >
       <header className="space-y-1">
         <div className="flex items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10">
-              <Package className="h-5 w-5 text-primary" />
-            </div>
-            <div>
-              <h1 className="text-3xl font-bold text-foreground">
-                Catálogo de Productos
-              </h1>
-              <p className="text-muted-foreground text-sm">
-                Elegí el descuento de compra, filtrá por categoría y armá tu pedido
-              </p>
-            </div>
-          </div>
-          <div className="flex flex-wrap justify-end gap-2">
-            <Button variant="outline" onClick={() => setAddProductOpen(true)} data-testid="button-open-add-product">
-              <Plus className="h-4 w-4 mr-2" />
-              Agregar producto
-            </Button>
-            <Button onClick={() => setLoadOrderOpen(true)} data-testid="button-open-load-order">
-              <PackagePlus className="h-4 w-4 mr-2" />
-              Cargar pedido
-            </Button>
-          </div>
+          <h1 className="text-3xl font-bold text-foreground">Stock</h1>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button data-testid="button-open-cargar">
+                <Plus className="h-4 w-4 mr-2" />
+                Cargar
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onClick={() => setAddProductOpen(true)} data-testid="option-cargar-producto">
+                <Package className="h-4 w-4 mr-2" />
+                Cargar producto
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => setLoadOrderOpen(true)} data-testid="option-cargar-pedido">
+                <PackagePlus className="h-4 w-4 mr-2" />
+                Cargar pedido
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
         {!isLoading && products.length > 0 && (
-          <p className="text-sm text-muted-foreground pl-[3.25rem]">
+          <p className="text-sm text-muted-foreground">
             {products.length} producto{products.length !== 1 ? "s" : ""} en catálogo
           </p>
         )}
@@ -798,52 +910,79 @@ export default function Productos() {
 
       {!isLoading && !isError && products.length > 0 && (
         <div className="space-y-3">
-          <div className="flex flex-col sm:flex-row gap-3">
-            <div className="relative flex-1">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-              <Input
-                placeholder="Buscar por nombre, código o categoría..."
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                className="pl-9"
-                data-testid="input-search-products"
-              />
-            </div>
-            <Select value={globalDiscount || "none"} onValueChange={(v) => setGlobalDiscount(v === "none" ? "" : v)}>
-              <SelectTrigger className="w-full sm:w-[200px]" data-testid="select-global-discount">
-                <SelectValue placeholder="Descuento de compra" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="none">Sin descuento</SelectItem>
-                {discountOptions.map((pct) => (
-                  <SelectItem key={pct} value={String(pct)}>
-                    Descuento de compra: {pct}%
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+            <Input
+              placeholder="Buscar por nombre o categoría..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="pl-9"
+              data-testid="input-search-products"
+            />
           </div>
-          <div className="flex gap-2 overflow-x-auto pb-1" data-testid="category-chip-row">
-            {[
-              { value: ALL_FILTER, label: "Todas" },
-              ...categories.map((c) => ({ value: c, label: c })),
-              { value: STOCK_FILTER, label: "En stock" },
-              { value: DISCONTINUED_FILTER, label: "Discontinuos" },
-              { value: MANUAL_FILTER, label: "Agregados manualmente" },
-            ].map((chip) => (
-              <button
-                key={chip.value}
-                type="button"
-                onClick={() => setCategoryFilter(chip.value)}
-                className={cn(
-                  "shrink-0 whitespace-nowrap rounded-full border px-3.5 py-1.5 text-sm font-medium",
-                  categoryFilter === chip.value ? "border-primary bg-primary text-primary-foreground" : "bg-muted/50",
-                )}
-                data-testid={`chip-category-${chip.value}`}
-              >
-                {chip.label}
-              </button>
-            ))}
+
+          {lowStockProducts.length > 0 && (
+            <div
+              className="flex flex-wrap items-center gap-2 rounded-lg bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400"
+              data-testid="notification-low-stock"
+            >
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              <span className="font-medium">
+                Tenés {lowStockProducts.length} producto{lowStockProducts.length !== 1 ? "s" : ""} con stock bajo
+              </span>
+              <div className="flex items-center gap-1.5 sm:ml-auto">
+                <Input
+                  type="date"
+                  min={toDateStr(new Date())}
+                  value={bulkReminderDate}
+                  onChange={(e) => setBulkReminderDate(e.target.value)}
+                  className="h-8 w-[9.5rem] bg-background text-xs"
+                  data-testid="input-bulk-remind-date"
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-8 text-xs bg-background"
+                  disabled={!bulkReminderDate || bulkReminderMutation.isPending}
+                  onClick={() => bulkReminderMutation.mutate(bulkReminderDate)}
+                  data-testid="button-bulk-remind-stock"
+                >
+                  {bulkReminderMutation.isPending ? "Aplicando..." : "Recordar stock"}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="select-category-filter" className="text-sm text-muted-foreground shrink-0">
+                Categoría
+              </Label>
+              <Select value={categoryFilter} onValueChange={setCategoryFilter}>
+                <SelectTrigger id="select-category-filter" className="w-full sm:w-[200px]" data-testid="select-category-filter">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ALL_FILTER} data-testid="option-category-todas">Todas</SelectItem>
+                  {categories.map((c) => (
+                    <SelectItem key={c} value={c} data-testid={`option-category-${c}`}>{c}</SelectItem>
+                  ))}
+                  <SelectItem value={MANUAL_FILTER} data-testid="option-category-manual">Agregados manualmente</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="check-show-out-of-stock"
+                checked={showOutOfStock}
+                onCheckedChange={(v) => setShowOutOfStock(v === true)}
+                data-testid="checkbox-show-out-of-stock"
+              />
+              <Label htmlFor="check-show-out-of-stock" className="text-sm font-normal cursor-pointer">
+                Ver productos sin stock
+              </Label>
+            </div>
           </div>
         </div>
       )}
@@ -865,28 +1004,19 @@ export default function Productos() {
 
       {!isLoading && !isError && products.length > 0 && filteredProducts.length === 0 && <NoMatches />}
 
-      {!isLoading && !isError && filteredProducts.length > 0 && (
-        <div
-          className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
-          data-testid="catalog-grid"
-        >
-          {filteredProducts.map((product) => (
-            <CatalogProductCard
-              key={product.id}
-              product={product}
-              globalDiscount={discountValue}
-              onOpen={() => setSelectedProduct(product)}
-              onToggleDiscontinued={() =>
-                toggleDiscontinuedMutation.mutate({ id: product.id, discontinued: !product.discontinued })
-              }
-              isTogglingDiscontinued={togglingId === product.id}
-              onSetStock={(unidades, stockMinimo) => setStockMutation.mutate({ id: product.id, unidades, stockMinimo })}
-              isSettingStock={settingStockId === product.id}
-              onSetReminder={(remindAt) => setReminderMutation.mutate({ id: product.id, remindAt })}
-              isSettingReminder={settingReminderId === product.id}
-            />
-          ))}
-        </div>
+      {!isLoading && !isError && groupedProducts.length > 0 && (
+        <Card className="overflow-hidden p-0" data-testid="catalog-list">
+          <div className="divide-y">
+            {groupedProducts.map((members) => (
+              <ProductGroup
+                key={members[0].id}
+                members={members}
+                onOpen={(product) => setSelectedProduct(product)}
+                actions={stockActions}
+              />
+            ))}
+          </div>
+        </Card>
       )}
 
       <ProductSelectionModal
@@ -894,7 +1024,7 @@ export default function Productos() {
         onOpenChange={(open) => !open && setSelectedProduct(null)}
         product={selectedProduct}
         allProducts={products}
-        globalDiscount={discountValue}
+        globalDiscount={null}
         onAdd={(line: OrderLine) => cart.addLine(line)}
       />
 

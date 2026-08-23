@@ -35,7 +35,7 @@ interface MenuItem {
 
 const consultantMenuItems: MenuItem[] = [
   { title: "Inicio", url: "/", icon: LayoutDashboard },
-  { title: "Productos", url: "/productos", icon: Package },
+  { title: "Stock", url: "/productos", icon: Package },
   { title: "Clientes", url: "/clientas", icon: Users },
   { title: "Ventas", url: "/ventas", icon: ShoppingCart },
   { title: "Agenda", url: "/agenda", icon: Calendar },

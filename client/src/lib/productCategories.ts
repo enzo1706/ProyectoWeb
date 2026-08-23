@@ -10,7 +10,7 @@ export function getProductCategories(products: Product[]): string[] {
  * variantes (tonos) entre sí. Es una heurística de texto — no hay relación de schema real
  * entre variantes, ver plan de "Mejora de Productos". `linea` puede faltar (catálogos reales
  * sin segundo nivel de categoría) — se normaliza a "" para no romper el agrupamiento. */
-function toneFamilyKey(product: Product): string {
+export function toneFamilyKey(product: Product): string {
   return `${product.seccion} ${product.linea ?? ""} ${product.producto}`;
 }
 
