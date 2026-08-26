@@ -38,7 +38,7 @@ import {
 import { resolveLowStockThreshold, DEFAULT_LOW_STOCK_THRESHOLD } from "@shared/stockAlerts";
 import { isKnownEventType, normalizeCustomEventTypeName, KNOWN_EVENT_TYPES } from "@shared/eventTypes";
 import type { z } from "zod";
-import { eq, ne, count, sql, and, gte, lt, asc, desc, isNotNull, isNull, inArray, notInArray, ilike, or } from "drizzle-orm";
+import { eq, ne, count, sql, and, gt, gte, lt, asc, desc, isNotNull, isNull, inArray, notInArray, ilike, or } from "drizzle-orm";
 import type { db as database } from "./db";
 import { resolveStorageMode } from "./storage-mode";
 import { slugify } from "@shared/slug";
@@ -758,7 +758,7 @@ export class DatabaseStorage implements IStorage {
       .where(
         and(
           eq(appointments.consultantId, consultantId),
-          sql`(${appointments.date} > ${nowDate}) OR (${appointments.date} = ${nowDate} AND ${appointments.time} >= ${nowTime})`,
+          or(gt(appointments.date, nowDate), and(eq(appointments.date, nowDate), gte(appointments.time, nowTime))),
           inArray(appointments.status, UPCOMING_APPOINTMENT_STATUSES),
         ),
       )
