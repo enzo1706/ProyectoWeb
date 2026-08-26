@@ -161,7 +161,7 @@ function StockAlertRow({
         min={today}
         value={remindInput}
         onChange={(e) => setRemindInput(e.target.value)}
-        className="h-8 w-[9.5rem] shrink-0 text-xs"
+        className="h-8 w-32 shrink-0 px-2 text-xs"
         aria-label={`Fecha para recordarme comprar ${product.producto}`}
         data-testid={`input-remind-date-${product.id}`}
       />
@@ -169,12 +169,12 @@ function StockAlertRow({
         type="button"
         variant="outline"
         size="sm"
-        className="shrink-0"
+        className="h-8 shrink-0 px-3 text-xs"
         disabled={!remindInput || isSettingReminder}
         onClick={() => remindInput && onSetReminder(product.id, remindInput)}
         data-testid={`button-remind-${product.id}`}
       >
-        Recordarme comprar
+        Recordar
       </Button>
     </div>
   );
