@@ -372,6 +372,20 @@ export const adminBulkImportSchema = z.object({
   products: bulkProductSchema,
 });
 
+// Asignación de imágenes ya presentes en Storage a productos sin imagen, a partir de las
+// coincidencias que arma findProductImageMatches (ver shared/imageMatching.ts). El backend
+// vuelve a validar cada par antes de escribir — este schema solo exige la forma del body.
+export const assignProductImageMatchesSchema = z.object({
+  assignments: z
+    .array(
+      z.object({
+        productId: z.number().int().positive(),
+        fileUrl: z.string().trim().min(1),
+      }),
+    )
+    .min(1, "No hay ninguna asignación para aplicar"),
+});
+
 export const loginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),

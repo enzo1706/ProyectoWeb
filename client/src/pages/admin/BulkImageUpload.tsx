@@ -9,6 +9,8 @@ import {
   Loader2,
   Package,
   RotateCcw,
+  Search,
+  Sparkles,
   Trash2,
   Upload,
   X,
@@ -20,6 +22,16 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Progress } from "@/components/ui/progress";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   Command,
   CommandEmpty,
   CommandGroup,
@@ -28,7 +40,9 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { cn } from "@/lib/utils";
-import { extractFriendlyErrorMessage, queryClient } from "@/lib/queryClient";
+import { apiRequest, extractFriendlyErrorMessage, queryClient } from "@/lib/queryClient";
+import { useToast } from "@/hooks/use-toast";
+import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { runWithConcurrency } from "@/lib/concurrency";
 import {
   formatProductLabel,
@@ -38,6 +52,7 @@ import {
   type MatchMethod,
   type MatchStatus,
 } from "@/lib/imageMatching";
+import type { ProductImageMatch, ProductMatchBucket } from "@shared/imageMatching";
 
 interface GlobalProduct {
   id: number;
@@ -49,6 +64,294 @@ interface GlobalProduct {
   puntos: number;
   precio: number;
   imagen: string | null;
+}
+
+interface ImageMatchSummary {
+  totalProducts: number;
+  withImage: number;
+  withoutImage: number;
+  availableFiles: number;
+  seguras: number;
+  revisar: number;
+  sinCoincidencia: number;
+}
+
+interface ImageMatchResponse {
+  summary: ImageMatchSummary;
+  matches: ProductImageMatch[];
+}
+
+interface AssignResult {
+  productId: number;
+  status: "asignada" | "omitida";
+  reason?: string;
+}
+
+const MATCH_REASON_LABEL: Record<string, string> = {
+  varias_candidatas: "Varias coincidencias encontradas — elegí una.",
+  archivo_en_disputa: "Imagen utilizada por otro producto — revisión manual.",
+  confianza_media: "Coincidencia parcial — revisar antes de asignar.",
+};
+
+const CONFIDENCE_LABEL: Record<string, string> = {
+  exacta: "coincidencia exacta",
+  alta: "coincidencia normalizada",
+  media: "coincidencia parcial",
+};
+
+/**
+ * Complementa la carga manual de más abajo (no la reemplaza): busca, entre las imágenes
+ * que ya están en Supabase Storage sin usar, cuáles podrían corresponder por nombre a
+ * productos globales sin imagen. Solo analiza hasta que se confirma una asignación — ver
+ * server/routes.ts (GET/POST /api/admin/products/image-matches) y shared/imageMatching.ts.
+ */
+function ImageMatchFinder() {
+  const { toast } = useToast();
+  const [ignoredIds, setIgnoredIds] = useState<Set<number>>(new Set());
+  const [confirmBulkOpen, setConfirmBulkOpen] = useState(false);
+  const [assigningKey, setAssigningKey] = useState<string | null>(null);
+
+  const { data, isFetching, refetch, error } = useQuery<ImageMatchResponse>({
+    queryKey: ["/api/admin/products/image-matches"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/admin/products/image-matches");
+      return res.json();
+    },
+    enabled: false,
+  });
+
+  const assignMutation = useGuardedMutation({
+    mutationFn: async (assignments: { productId: number; fileUrl: string }[]) => {
+      const res = await apiRequest("POST", "/api/admin/products/image-matches/assign", { assignments });
+      return res.json() as Promise<{ results: AssignResult[] }>;
+    },
+    onSuccess: (result) => {
+      const assignedCount = result.results.filter((r) => r.status === "asignada").length;
+      const skippedCount = result.results.length - assignedCount;
+      queryClient.invalidateQueries({ queryKey: ["/api/admin/products"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      toast({
+        title:
+          assignedCount > 0
+            ? `${assignedCount} imagen${assignedCount !== 1 ? "es" : ""} asignada${assignedCount !== 1 ? "s" : ""}`
+            : "No se asignó ninguna imagen",
+        description: skippedCount > 0 ? `${skippedCount} se omitieron (ya tenían imagen o hubo un conflicto).` : undefined,
+      });
+      refetch();
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo asignar la imagen", description: err.message, variant: "destructive" });
+    },
+    onSettled: () => setAssigningKey(null),
+  });
+
+  const runSearch = () => {
+    setIgnoredIds(new Set());
+    refetch();
+  };
+
+  const assignOne = (productId: number, fileUrl: string) => {
+    setAssigningKey(`${productId}:${fileUrl}`);
+    assignMutation.mutate([{ productId, fileUrl }]);
+  };
+
+  const ignoreOne = (productId: number) => {
+    setIgnoredIds((prev) => new Set(prev).add(productId));
+  };
+
+  const safeMatches = (data?.matches ?? []).filter((m) => m.bucket === "segura" && !ignoredIds.has(m.productId));
+  const reviewMatches = (data?.matches ?? []).filter((m) => m.bucket === "revisar" && !ignoredIds.has(m.productId));
+  const noneCount = data?.summary.sinCoincidencia ?? 0;
+
+  const handleBulkAssign = () => {
+    const assignments = safeMatches.map((m) => ({ productId: m.productId, fileUrl: m.candidates[0].fileUrl }));
+    setAssigningKey("__bulk__");
+    assignMutation.mutate(assignments, { onSuccess: () => setConfirmBulkOpen(false) });
+  };
+
+  return (
+    <Card className="shadow-sm">
+      <CardHeader>
+        <CardTitle className="text-lg flex items-center gap-2">
+          <Sparkles className="h-5 w-5 text-primary" />
+          Buscar coincidencias
+        </CardTitle>
+        <p className="text-sm text-muted-foreground">
+          Busca, entre las imágenes que ya están en Storage sin usar, cuáles corresponden por nombre a
+          productos sin imagen todavía.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <Button onClick={runSearch} disabled={isFetching} data-testid="button-find-matches">
+          {isFetching ? (
+            <>
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              Analizando imágenes...
+            </>
+          ) : (
+            <>
+              <Search className="h-4 w-4 mr-2" />
+              Buscar coincidencias
+            </>
+          )}
+        </Button>
+
+        {error && <p className="text-sm text-destructive">{(error as Error).message}</p>}
+
+        {data && (
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3" data-testid="summary-seguras">
+                <p className="text-2xl font-bold text-emerald-600 dark:text-emerald-400">{data.summary.seguras}</p>
+                <p className="text-xs text-muted-foreground">🟢 Coincidencias seguras</p>
+              </div>
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3" data-testid="summary-revisar">
+                <p className="text-2xl font-bold text-amber-600 dark:text-amber-400">{data.summary.revisar}</p>
+                <p className="text-xs text-muted-foreground">🟡 Para revisar</p>
+              </div>
+              <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3" data-testid="summary-sin-coincidencia">
+                <p className="text-2xl font-bold text-destructive">{noneCount}</p>
+                <p className="text-xs text-muted-foreground">🔴 Sin imagen encontrada</p>
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground" data-testid="text-match-context">
+              {data.summary.totalProducts} productos en catálogo · {data.summary.withImage} ya tienen imagen ·{" "}
+              {data.summary.availableFiles} imágenes en Storage sin asignar
+            </p>
+
+            {safeMatches.length > 0 && (
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold">🟢 Coincidencias seguras ({safeMatches.length})</h3>
+                  <Button
+                    size="sm"
+                    onClick={() => setConfirmBulkOpen(true)}
+                    disabled={assignMutation.isPending}
+                    data-testid="button-assign-safe-matches"
+                  >
+                    Asignar coincidencias seguras
+                  </Button>
+                </div>
+                {safeMatches.map((m) => (
+                  <MatchRow
+                    key={m.productId}
+                    match={m}
+                    onlyTopCandidate
+                    onAssign={assignOne}
+                    onIgnore={ignoreOne}
+                    isAssigning={(key) => assigningKey === key}
+                  />
+                ))}
+              </div>
+            )}
+
+            {reviewMatches.length > 0 && (
+              <div className="space-y-2">
+                <h3 className="text-sm font-semibold">🟡 Para revisar ({reviewMatches.length})</h3>
+                {reviewMatches.map((m) => (
+                  <MatchRow
+                    key={m.productId}
+                    match={m}
+                    onlyTopCandidate={false}
+                    onAssign={assignOne}
+                    onIgnore={ignoreOne}
+                    isAssigning={(key) => assigningKey === key}
+                  />
+                ))}
+              </div>
+            )}
+
+            {safeMatches.length === 0 && reviewMatches.length === 0 && (
+              <p className="text-sm text-muted-foreground">
+                No hay coincidencias pendientes de revisar. {noneCount > 0 ? `${noneCount} productos sin imagen no tienen ningún archivo parecido en Storage.` : ""}
+              </p>
+            )}
+          </div>
+        )}
+      </CardContent>
+
+      <AlertDialog open={confirmBulkOpen} onOpenChange={setConfirmBulkOpen}>
+        <AlertDialogContent data-testid="dialog-confirm-assign-safe">
+          <AlertDialogHeader>
+            <AlertDialogTitle>¿Asignar {safeMatches.length} imágenes?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Se encontraron {safeMatches.length} coincidencias seguras. ¿Querés asignarlas a los productos?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel data-testid="button-cancel-assign-safe">Cancelar</AlertDialogCancel>
+            <AlertDialogAction onClick={handleBulkAssign} data-testid="button-confirm-assign-safe">
+              Asignar {safeMatches.length} imágenes
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </Card>
+  );
+}
+
+function MatchRow({
+  match,
+  onlyTopCandidate,
+  onAssign,
+  onIgnore,
+  isAssigning,
+}: {
+  match: ProductImageMatch;
+  onlyTopCandidate: boolean;
+  onAssign: (productId: number, fileUrl: string) => void;
+  onIgnore: (productId: number) => void;
+  isAssigning: (key: string) => boolean;
+}) {
+  const candidatesToShow = onlyTopCandidate ? match.candidates.slice(0, 1) : match.candidates;
+
+  return (
+    <div className="rounded-lg border p-3 space-y-2" data-testid={`match-row-${match.productId}`}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="font-medium truncate">{match.productLabel}</p>
+          {match.reason && MATCH_REASON_LABEL[match.reason] && (
+            <p className="text-xs text-muted-foreground">{MATCH_REASON_LABEL[match.reason]}</p>
+          )}
+        </div>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => onIgnore(match.productId)}
+          data-testid={`button-ignore-${match.productId}`}
+        >
+          Ignorar
+        </Button>
+      </div>
+      <div className="space-y-1.5">
+        {candidatesToShow.map((c) => {
+          const key = `${match.productId}:${c.fileUrl}`;
+          return (
+            <div key={c.filePath} className="flex items-center gap-2 rounded-md bg-muted/40 p-2">
+              <img src={c.fileUrl} alt={c.fileName} className="h-10 w-10 rounded object-cover shrink-0 border bg-background" />
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-mono truncate" title={c.fileName}>
+                  {c.fileName}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Confianza: {c.score}% ({CONFIDENCE_LABEL[c.confidence]})
+                </p>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={isAssigning(key)}
+                onClick={() => onAssign(match.productId, c.fileUrl)}
+                data-testid={`button-assign-${match.productId}`}
+              >
+                {isAssigning(key) ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Asignar"}
+              </Button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 type UploadState = "idle" | "uploading" | "success" | "error" | "skipped";
@@ -248,6 +551,8 @@ export default function BulkImageUpload() {
           </p>
         </div>
       </div>
+
+      <ImageMatchFinder />
 
       <Card className="shadow-sm">
         <CardContent className="pt-6">

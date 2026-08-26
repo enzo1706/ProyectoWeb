@@ -5,7 +5,8 @@ import bcrypt from "bcryptjs";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
 import { storage, SaleValidationError, AppointmentValidationError, isBcryptHash } from "./storage";
-import { uploadProductImage, deleteProductImage, isValidImageBuffer } from "./image-storage";
+import { uploadProductImage, deleteProductImage, isValidImageBuffer, listProductImageFiles, extractStoragePath } from "./image-storage";
+import { findProductImageMatches } from "@shared/imageMatching";
 import {
   bulkProductSchema,
   createConsultantSchema,
@@ -20,6 +21,7 @@ import {
   updateAppointmentStatusSchema,
   updateBusinessSettingsSchema,
   adminBulkImportSchema,
+  assignProductImageMatchesSchema,
   createProductSchema,
   toggleProductDiscontinuedSchema,
   setProductStockSchema,
@@ -1007,6 +1009,93 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al quitar la imagen" });
+    }
+  });
+
+  // Solo análisis — no escribe nada. Busca, para cada producto global sin imagen, qué
+  // archivos ya presentes en Storage (y todavía no usados por ningún otro producto) podrían
+  // corresponderle, agrupados por nivel de confianza (ver shared/imageMatching.ts).
+  app.get("/api/admin/products/image-matches", async (_req: Request, res: Response) => {
+    try {
+      const [globalProducts, files] = await Promise.all([storage.listGlobalProducts(), listProductImageFiles()]);
+
+      const referencedPaths = new Set(
+        globalProducts
+          .map((p) => (p.imagen ? extractStoragePath(p.imagen) : null))
+          .filter((path): path is string => path !== null),
+      );
+      const availableFiles = files.filter((f) => !referencedPaths.has(f.path));
+
+      const matches = findProductImageMatches(
+        globalProducts.map((p) => ({ id: p.id, producto: p.producto, variante: p.variante, imagen: p.imagen })),
+        availableFiles,
+      );
+
+      const summary = {
+        totalProducts: globalProducts.length,
+        withImage: globalProducts.length - matches.length,
+        withoutImage: matches.length,
+        availableFiles: availableFiles.length,
+        seguras: matches.filter((m) => m.bucket === "segura").length,
+        revisar: matches.filter((m) => m.bucket === "revisar").length,
+        sinCoincidencia: matches.filter((m) => m.bucket === "sin_coincidencia").length,
+      };
+
+      res.json({ summary, matches });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al buscar coincidencias de imágenes" });
+    }
+  });
+
+  // Aplica una o más asignaciones (una sola request, sin importar si vienen del botón
+  // individual o de "Asignar coincidencias seguras"). Vuelve a validar cada par contra el
+  // estado real justo antes de escribir — nunca confía en el preview que mandó el cliente.
+  app.post("/api/admin/products/image-matches/assign", async (req: Request, res: Response) => {
+    try {
+      const parsed = assignProductImageMatchesSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const globalProducts = await storage.listGlobalProducts();
+      const productById = new Map(globalProducts.map((p) => [p.id, p]));
+      const referencedPaths = new Set(
+        globalProducts
+          .map((p) => (p.imagen ? extractStoragePath(p.imagen) : null))
+          .filter((path): path is string => path !== null),
+      );
+      const claimedInThisBatch = new Set<string>();
+
+      const results: { productId: number; status: "asignada" | "omitida"; reason?: string }[] = [];
+
+      for (const { productId, fileUrl } of parsed.data.assignments) {
+        const product = productById.get(productId);
+        const filePath = extractStoragePath(fileUrl);
+
+        if (!product) {
+          results.push({ productId, status: "omitida", reason: "Producto no encontrado" });
+        } else if (product.imagen) {
+          results.push({ productId, status: "omitida", reason: "El producto ya tiene una imagen" });
+        } else if (filePath === null) {
+          results.push({ productId, status: "omitida", reason: "La imagen no pertenece a este bucket" });
+        } else if (referencedPaths.has(filePath) || claimedInThisBatch.has(filePath)) {
+          results.push({ productId, status: "omitida", reason: "Imagen utilizada por otro producto" });
+        } else {
+          const result = await storage.setProductImage(productId, fileUrl);
+          if (!result.product) {
+            results.push({ productId, status: "omitida", reason: "Producto no encontrado" });
+          } else {
+            claimedInThisBatch.add(filePath);
+            results.push({ productId, status: "asignada" });
+          }
+        }
+      }
+
+      res.json({ results });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al asignar las imágenes" });
     }
   });
 

@@ -1,4 +1,9 @@
-import { slugify } from "@shared/slug";
+import {
+  stripImageExtension,
+  normalizeProductName,
+  extractIdFromFilename,
+  formatProductLabel as sharedFormatProductLabel,
+} from "@shared/imageMatching";
 
 /** Debe coincidir exactamente con ALLOWED_IMAGE_TYPES de server/routes.ts. */
 export const ALLOWED_IMAGE_MIME_TYPES: Record<string, string> = {
@@ -33,28 +38,10 @@ export interface MatchResult {
   candidates: CatalogProductRef[];
 }
 
-function stripExtension(filename: string): string {
-  return filename.replace(/\.[^./\\]+$/, "");
-}
-
-/** Normalización más agresiva que slugify(): además saca puntuación/símbolos que slugify
- * no toca (paréntesis, "+", "/", etc.), para poder comparar un nombre de archivo contra
- * un nombre de producto real sin que un signo de más rompa la igualdad. */
-function normalizeForMatch(value: string): string {
-  return slugify(value)
-    .replace(/[^a-z0-9-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
-}
-
-/** Método PRINCIPAL. Exige el formato exacto `<id>.<ext>` — un entero positivo sin ceros
- * a la izquierda y sin ningún otro carácter. "001.jpg", "47-producto.jpg" y "47 (1).jpg"
- * quedan afuera a propósito: preferimos "sin coincidencia" antes que asignar mal. */
-export function extractIdFromFilename(filename: string): number | null {
-  const base = stripExtension(filename);
-  if (!/^[1-9]\d*$/.test(base)) return null;
-  return Number(base);
-}
+// Reexportada tal cual para no romper el import existente en BulkImageUpload.tsx — la
+// implementación real ahora vive en shared/imageMatching.ts (única fuente de verdad,
+// reusada también por el matching de imágenes ya presentes en Storage).
+export { extractIdFromFilename };
 
 /** Respaldo: compara el nombre de archivo (sin extensión, normalizado) contra el nombre
  * normalizado de cada producto. 0 candidatos → sin coincidencia; 1 → asignación automática;
@@ -69,12 +56,12 @@ export function matchFileToProduct(filename: string, products: CatalogProductRef
     }
   }
 
-  const normalized = normalizeForMatch(stripExtension(filename));
+  const normalized = normalizeProductName(stripImageExtension(filename));
   if (normalized.length === 0) {
     return { status: "sin_coincidencia", method: null, productId: null, candidates: [] };
   }
 
-  const candidates = products.filter((p) => normalizeForMatch(p.producto) === normalized);
+  const candidates = products.filter((p) => normalizeProductName(p.producto) === normalized);
   if (candidates.length === 1) {
     return { status: "reconocida", method: "nombre", productId: candidates[0].id, candidates };
   }
@@ -101,5 +88,5 @@ function inferMimeFromExtension(filename: string): string | null {
 }
 
 export function formatProductLabel(p: Pick<CatalogProductRef, "producto" | "variante">): string {
-  return p.variante && p.variante !== "Estándar" ? `${p.producto} — ${p.variante}` : p.producto;
+  return sharedFormatProductLabel(p);
 }

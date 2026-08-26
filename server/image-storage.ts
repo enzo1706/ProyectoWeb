@@ -86,16 +86,45 @@ export async function uploadProductImage(
   return data.publicUrl;
 }
 
+/** Todos los archivos ya presentes en el bucket bajo `products/` (donde vive todo lo que
+ * sube esta app), con su URL pública ya armada — para el matching por nombre contra
+ * productos sin imagen. No sube ni borra nada, solo lista lo que ya existe. */
+export async function listProductImageFiles(): Promise<{ path: string; name: string; url: string }[]> {
+  const supabase = getClient();
+  await ensureBucket(supabase);
+
+  const { data, error } = await supabase.storage.from(BUCKET).list("products", { limit: 1000 });
+  if (error) {
+    throw new Error(`No se pudo listar las imágenes de Supabase Storage: ${error.message}`);
+  }
+
+  // La SDK devuelve tanto archivos como "carpetas" (placeholders) en el mismo listado —
+  // un archivo real siempre trae `id` seteado, una carpeta no.
+  const files = (data ?? []).filter((entry) => entry.id !== null);
+
+  return files.map((entry) => {
+    const path = `products/${entry.name}`;
+    const { data: urlData } = supabase.storage.from(BUCKET).getPublicUrl(path);
+    return { path, name: entry.name, url: urlData.publicUrl };
+  });
+}
+
+/** De una URL pública del bucket, el path relativo que usan `.remove()`/`.list()` (ej.
+ * "products/47-123.jpg"). null si la URL no es de este bucket (otro origen, etc.). */
+export function extractStoragePath(url: string): string | null {
+  const marker = `/object/public/${BUCKET}/`;
+  const idx = url.indexOf(marker);
+  return idx === -1 ? null : url.slice(idx + marker.length);
+}
+
 /** Best-effort: si la URL no es del bucket esperado (ej. viene de otro origen) no hace nada,
  * en vez de fallar — borrar la imagen vieja nunca debe bloquear guardar la nueva referencia. */
 export async function deleteProductImage(url: string): Promise<void> {
-  const marker = `/object/public/${BUCKET}/`;
-  const idx = url.indexOf(marker);
-  if (idx === -1) return;
+  const path = extractStoragePath(url);
+  if (path === null) return;
 
   try {
     const supabase = getClient();
-    const path = url.slice(idx + marker.length);
     await supabase.storage.from(BUCKET).remove([path]);
   } catch {
     // No se pudo borrar la imagen anterior (credenciales faltantes, red, etc.) — no es
