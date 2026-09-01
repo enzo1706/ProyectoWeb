@@ -47,6 +47,11 @@ export async function createSubscriptionPreapproval(input: CreateSubscriptionPre
       auto_recurring: {
         frequency: 1,
         frequency_type: "months",
+        // La API lo acepta sin esto y completa la fecha actual por su cuenta — pero el
+        // checkout web (cow-payment_summary) parece necesitarlo explícito para poder armar
+        // el texto de "subscription-description" y habilitar el botón "Confirmar" (evidencia:
+        // Etapa D, ese span queda vacío y el botón deshabilitado cuando se omite este campo).
+        start_date: new Date().toISOString(),
         transaction_amount: SUBSCRIPTION_PRICE_ARS,
         currency_id: "ARS",
       },
