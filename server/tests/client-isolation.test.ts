@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import type { AddressInfo } from "net";
 import type { Server } from "http";
 import { db, pool } from "../db";
-import { consultants, users, clients } from "@shared/schema";
+import { consultants, users, clients, subscriptions } from "@shared/schema";
 import { DatabaseStorage } from "../storage";
 
 /**
@@ -54,6 +54,8 @@ afterAll(async () => {
   await db.delete(clients).where(eq(clients.id, clientOfAId));
   await db.delete(users).where(eq(users.id, userAId));
   await db.delete(users).where(eq(users.id, userBId));
+  await db.delete(subscriptions).where(eq(subscriptions.consultantId, consultantAId));
+  await db.delete(subscriptions).where(eq(subscriptions.consultantId, consultantBId));
   await db.delete(consultants).where(eq(consultants.id, consultantAId));
   await db.delete(consultants).where(eq(consultants.id, consultantBId));
   await pool.end();

@@ -8,6 +8,8 @@ import {
   saleItems,
   saleInstallments,
   consultants,
+  subscriptions,
+  payments,
   createSaleSchema,
   updateSaleSchema,
   createAppointmentSchema,
@@ -15,6 +17,8 @@ import {
   updateBusinessSettingsSchema,
   createProductSchema,
   appointmentStatuses,
+  subscriptionStatuses,
+  paymentStatuses,
   type User,
   type InsertUser,
   type Product,
@@ -28,6 +32,8 @@ import {
   type SaleItem,
   type SaleInstallment,
   type Consultant,
+  type Subscription,
+  type Payment,
 } from "@shared/schema";
 import {
   computeSubtotal,
@@ -43,6 +49,7 @@ import type { db as database } from "./db";
 import { resolveStorageMode } from "./storage-mode";
 import { slugify } from "@shared/slug";
 import bcrypt from "bcryptjs";
+import { TRIAL_DAYS, PERIOD_DAYS } from "./config/subscription";
 
 export class SaleValidationError extends Error {}
 export class AppointmentValidationError extends Error {}
@@ -66,6 +73,35 @@ export type CreateAppointmentInput = z.infer<typeof createAppointmentSchema>;
 export type UpdateAppointmentInput = z.infer<typeof updateAppointmentSchema>;
 export type UpdateBusinessSettingsInput = z.infer<typeof updateBusinessSettingsSchema>;
 export type CreateProductInput = z.infer<typeof createProductSchema>;
+export type SubscriptionUpdate = Partial<
+  Pick<
+    Subscription,
+    "status" | "currentPeriodStart" | "currentPeriodEnd" | "lastPaymentId" | "mpPreapprovalId" | "mpPreapprovalCreatedAt" | "canceledAt"
+  >
+>;
+/** Todos los campos van explícitos a propósito (nada de defaults acá): el precio/moneda/
+ * duración del período viven únicamente en server/config/subscription.ts — si esta capa
+ * pusiera un fallback propio, sería un segundo lugar con el mismo número. */
+export interface CreatePendingPaymentInput {
+  externalReference: string;
+  mpPreapprovalId?: string | null;
+  amount: number;
+  currency: string;
+  periodDaysGranted: number;
+}
+export type PaymentUpdate = Partial<Pick<Payment, "status" | "mpPaymentId" | "mpStatusDetail" | "rawPayload" | "paidAt">>;
+export interface ApplyApprovedPaymentInput {
+  externalReference: string;
+  mpPreapprovalId: string;
+  mpPaymentId: string;
+  amount: number;
+  statusDetail: string | null;
+  rawPayload: unknown;
+}
+export type ApplyApprovedPaymentResult =
+  | { outcome: "applied"; payment: Payment }
+  | { outcome: "already_processed"; payment: Payment }
+  | { outcome: "preapproval_mismatch" };
 
 type ProductRow = typeof products.$inferSelect;
 type StockFields = Pick<
@@ -261,6 +297,25 @@ export interface IStorage {
   listConsultantAccounts(): Promise<Consultant[]>;
   getBusinessSettings(consultantId: number): Promise<Consultant | undefined>;
   updateBusinessSettings(consultantId: number, input: UpdateBusinessSettingsInput): Promise<Consultant | undefined>;
+  /** Autogestión: la consultora lo carga la primera vez que inicia una suscripción (Mercado
+   * Pago exige payer_email) — no hay alta desde el admin. */
+  setConsultantEmail(consultantId: number, email: string): Promise<Consultant | undefined>;
+  getSubscriptionByConsultantId(consultantId: number): Promise<Subscription | undefined>;
+  /** Crea la fila de trial de una consultora recién nacida. Nunca se llama dos veces para la
+   * misma consultora — protegido por el unique de consultantId en el schema. */
+  createTrialSubscription(consultantId: number, trialStartAt: Date, trialEndAt: Date): Promise<Subscription>;
+  updateSubscription(consultantId: number, patch: SubscriptionUpdate): Promise<Subscription | undefined>;
+  /** Ledger de pagos de Mercado Pago — append-only, nunca se borra ni se reutiliza una fila. */
+  createPendingPayment(consultantId: number, input: CreatePendingPaymentInput): Promise<Payment>;
+  getPaymentByExternalReference(externalReference: string): Promise<Payment | undefined>;
+  getPaymentByMpPaymentId(mpPaymentId: string): Promise<Payment | undefined>;
+  updatePayment(id: number, patch: PaymentUpdate): Promise<Payment | undefined>;
+  getPaymentsByConsultantId(consultantId: number): Promise<Payment[]>;
+  /** Única puerta de entrada para acreditar un pago real y extender el acceso — transaccional
+   * e idempotente por `mpPaymentId` (una notificación de webhook duplicada nunca extiende dos
+   * veces). Nunca se llama con datos del frontend: solo tras reconsultar el pago real contra
+   * la API de Mercado Pago (ver server/mercadopago.ts). */
+  applyApprovedPayment(consultantId: number, input: ApplyApprovedPaymentInput): Promise<ApplyApprovedPaymentResult>;
   getAllProducts(consultantId: number): Promise<Product[]>;
   getProductsByIds(consultantId: number, ids: number[]): Promise<Product[]>;
   /** Admin-only: carga/actualiza el catálogo GLOBAL (consultantId null) — no toca stock de nadie. */
@@ -358,21 +413,31 @@ export class DatabaseStorage implements IStorage {
     const db = await this.getDb();
     const hashedPassword = await bcrypt.hash(insertUser.password, BCRYPT_SALT_ROUNDS);
 
-    // Toda cuenta consultora nace con su propia consultora — nunca comparte tenant con otra.
-    let consultantId = insertUser.consultantId ?? null;
-    if (insertUser.role === "consultant" && consultantId === null) {
-      const [consultant] = await db
-        .insert(consultants)
-        .values({ businessName: insertUser.username, currency: "ARS", monthlyGoal: null })
-        .returning();
-      consultantId = consultant.id;
-    }
+    // Transaccional: consultora + su trial + el usuario nacen juntos o no nace ninguno — nunca
+    // queda una consultora sin subscription (la migración 0007 ya está aplicada, ver Etapa C).
+    return db.transaction(async (tx) => {
+      // Toda cuenta consultora nace con su propia consultora — nunca comparte tenant con otra.
+      let consultantId = insertUser.consultantId ?? null;
+      if (insertUser.role === "consultant" && consultantId === null) {
+        const [consultant] = await tx
+          .insert(consultants)
+          .values({ businessName: insertUser.username, currency: "ARS", monthlyGoal: null })
+          .returning();
+        consultantId = consultant.id;
 
-    const [user] = await db
-      .insert(users)
-      .values({ ...insertUser, password: hashedPassword, consultantId })
-      .returning();
-    return user;
+        const trialStartAt = new Date();
+        const trialEndAt = new Date(trialStartAt.getTime() + TRIAL_DAYS * 24 * 60 * 60 * 1000);
+        await tx
+          .insert(subscriptions)
+          .values({ consultantId, status: subscriptionStatuses[0], trialStartAt, trialEndAt });
+      }
+
+      const [user] = await tx
+        .insert(users)
+        .values({ ...insertUser, password: hashedPassword, consultantId })
+        .returning();
+      return user;
+    });
   }
 
   async updateUserPassword(id: number, newHash: string): Promise<void> {
@@ -447,6 +512,126 @@ export class DatabaseStorage implements IStorage {
       .where(eq(consultants.id, consultantId))
       .returning();
     return updated;
+  }
+
+  async setConsultantEmail(consultantId: number, email: string): Promise<Consultant | undefined> {
+    const db = await this.getDb();
+    const [updated] = await db.update(consultants).set({ email }).where(eq(consultants.id, consultantId)).returning();
+    return updated;
+  }
+
+  async getSubscriptionByConsultantId(consultantId: number): Promise<Subscription | undefined> {
+    const db = await this.getDb();
+    const [sub] = await db.select().from(subscriptions).where(eq(subscriptions.consultantId, consultantId));
+    return sub;
+  }
+
+  async createTrialSubscription(consultantId: number, trialStartAt: Date, trialEndAt: Date): Promise<Subscription> {
+    const db = await this.getDb();
+    const [sub] = await db
+      .insert(subscriptions)
+      .values({ consultantId, status: subscriptionStatuses[0], trialStartAt, trialEndAt })
+      .returning();
+    return sub;
+  }
+
+  async updateSubscription(consultantId: number, patch: SubscriptionUpdate): Promise<Subscription | undefined> {
+    const db = await this.getDb();
+    const [updated] = await db.update(subscriptions).set(patch).where(eq(subscriptions.consultantId, consultantId)).returning();
+    return updated;
+  }
+
+  async createPendingPayment(consultantId: number, input: CreatePendingPaymentInput): Promise<Payment> {
+    const db = await this.getDb();
+    const [payment] = await db
+      .insert(payments)
+      .values({
+        consultantId,
+        externalReference: input.externalReference,
+        mpPreapprovalId: input.mpPreapprovalId ?? null,
+        amount: input.amount,
+        currency: input.currency,
+        periodDaysGranted: input.periodDaysGranted,
+        status: paymentStatuses[0],
+      })
+      .returning();
+    return payment;
+  }
+
+  async getPaymentByExternalReference(externalReference: string): Promise<Payment | undefined> {
+    const db = await this.getDb();
+    const [payment] = await db.select().from(payments).where(eq(payments.externalReference, externalReference));
+    return payment;
+  }
+
+  async getPaymentByMpPaymentId(mpPaymentId: string): Promise<Payment | undefined> {
+    const db = await this.getDb();
+    const [payment] = await db.select().from(payments).where(eq(payments.mpPaymentId, mpPaymentId));
+    return payment;
+  }
+
+  async updatePayment(id: number, patch: PaymentUpdate): Promise<Payment | undefined> {
+    const db = await this.getDb();
+    const [updated] = await db.update(payments).set(patch).where(eq(payments.id, id)).returning();
+    return updated;
+  }
+
+  async getPaymentsByConsultantId(consultantId: number): Promise<Payment[]> {
+    const db = await this.getDb();
+    return db.select().from(payments).where(eq(payments.consultantId, consultantId)).orderBy(desc(payments.createdAt));
+  }
+
+  async applyApprovedPayment(consultantId: number, input: ApplyApprovedPaymentInput): Promise<ApplyApprovedPaymentResult> {
+    const db = await this.getDb();
+    return db.transaction(async (tx) => {
+      // Idempotencia: si esta notificación ya se procesó antes (webhook duplicado), no
+      // extender el período una segunda vez — mpPaymentId es único por diseño.
+      const [existing] = await tx.select().from(payments).where(eq(payments.mpPaymentId, input.mpPaymentId));
+      if (existing) return { outcome: "already_processed", payment: existing };
+
+      // FOR UPDATE: bloquea la fila hasta el commit, igual que createSale con el stock —
+      // dos notificaciones casi simultáneas para la misma consultora no pueden pisarse.
+      const [sub] = await tx.select().from(subscriptions).where(eq(subscriptions.consultantId, consultantId)).for("update");
+      if (!sub || sub.mpPreapprovalId !== input.mpPreapprovalId) {
+        return { outcome: "preapproval_mismatch" };
+      }
+
+      const now = new Date();
+      const [payment] = await tx
+        .insert(payments)
+        .values({
+          consultantId,
+          externalReference: input.externalReference,
+          mpPreapprovalId: input.mpPreapprovalId,
+          mpPaymentId: input.mpPaymentId,
+          status: "approved",
+          amount: input.amount,
+          currency: "ARS",
+          periodDaysGranted: PERIOD_DAYS,
+          mpStatusDetail: input.statusDetail,
+          rawPayload: input.rawPayload as any,
+          paidAt: now,
+        })
+        .returning();
+
+      // Sin lógica de "renovación anticipada": cada pago aprobado otorga PERIOD_DAYS desde
+      // el momento de la confirmación, sin arrastrar días de un período anterior. El cobro
+      // recurrente lo programa Mercado Pago (no nuestro backend), así que la superposición
+      // de períodos no debería darse en la práctica — ver informe de Etapa C, es una regla
+      // de negocio deliberadamente NO decidida más allá de esto (Etapa A ya lo había dejado
+      // como pregunta abierta).
+      await tx
+        .update(subscriptions)
+        .set({
+          status: "active",
+          currentPeriodStart: now,
+          currentPeriodEnd: new Date(now.getTime() + PERIOD_DAYS * 24 * 60 * 60 * 1000),
+          lastPaymentId: payment.id,
+        })
+        .where(eq(subscriptions.consultantId, consultantId));
+
+      return { outcome: "applied", payment };
+    });
   }
 
   /** Catálogo visible para la consultora: lo global (consultantId null) + lo manual propio,
@@ -1857,6 +2042,8 @@ export class MemoryStorage implements IStorage {
   private sales: Sale[] = [];
   private saleItems: SaleItem[] = [];
   private saleInstallments: SaleInstallment[] = [];
+  private subscriptions: Subscription[] = [];
+  private payments: Payment[] = [];
   private nextUserId = 1;
   private nextConsultantId = 1;
   private nextProductId = 1;
@@ -1866,6 +2053,8 @@ export class MemoryStorage implements IStorage {
   private nextSaleId = 1;
   private nextSaleItemId = 1;
   private nextSaleInstallmentId = 1;
+  private nextSubscriptionId = 1;
+  private nextPaymentId = 1;
 
   /** Fila de stock de la consultora sobre un producto, creándola con defaults si no existe. */
   private getOrCreateStock(consultantId: number, productId: number): ProductStock {
@@ -1912,9 +2101,14 @@ export class MemoryStorage implements IStorage {
         currency: "ARS",
         monthlyGoal: null,
         defaultLowStockThreshold: null,
+        email: null,
       };
       this.consultants.push(consultant);
       consultantId = consultant.id;
+
+      const trialStartAt = new Date();
+      const trialEndAt = new Date(trialStartAt.getTime() + TRIAL_DAYS * 24 * 60 * 60 * 1000);
+      await this.createTrialSubscription(consultantId, trialStartAt, trialEndAt);
     }
 
     const user: User = {
@@ -1970,6 +2164,124 @@ export class MemoryStorage implements IStorage {
     consultant.monthlyGoal = input.monthlyGoal ?? null;
     consultant.defaultLowStockThreshold = input.defaultLowStockThreshold ?? null;
     return consultant;
+  }
+
+  async setConsultantEmail(consultantId: number, email: string): Promise<Consultant | undefined> {
+    const consultant = this.consultants.find((c) => c.id === consultantId);
+    if (!consultant) return undefined;
+    consultant.email = email;
+    return consultant;
+  }
+
+  async getSubscriptionByConsultantId(consultantId: number): Promise<Subscription | undefined> {
+    return this.subscriptions.find((s) => s.consultantId === consultantId);
+  }
+
+  async createTrialSubscription(consultantId: number, trialStartAt: Date, trialEndAt: Date): Promise<Subscription> {
+    if (this.subscriptions.some((s) => s.consultantId === consultantId)) {
+      throw new Error(`Ya existe una subscription para la consultora ${consultantId}`);
+    }
+    const sub: Subscription = {
+      id: this.nextSubscriptionId++,
+      consultantId,
+      status: subscriptionStatuses[0],
+      trialStartAt,
+      trialEndAt,
+      currentPeriodStart: null,
+      currentPeriodEnd: null,
+      lastPaymentId: null,
+      mpPreapprovalId: null,
+      mpPreapprovalCreatedAt: null,
+      canceledAt: null,
+    };
+    this.subscriptions.push(sub);
+    return sub;
+  }
+
+  async updateSubscription(consultantId: number, patch: SubscriptionUpdate): Promise<Subscription | undefined> {
+    const sub = this.subscriptions.find((s) => s.consultantId === consultantId);
+    if (!sub) return undefined;
+    Object.assign(sub, patch);
+    return sub;
+  }
+
+  async createPendingPayment(consultantId: number, input: CreatePendingPaymentInput): Promise<Payment> {
+    if (this.payments.some((p) => p.externalReference === input.externalReference)) {
+      throw new Error(`Ya existe un payment con externalReference ${input.externalReference}`);
+    }
+    const payment: Payment = {
+      id: this.nextPaymentId++,
+      consultantId,
+      externalReference: input.externalReference,
+      mpPreapprovalId: input.mpPreapprovalId ?? null,
+      mpPaymentId: null,
+      status: paymentStatuses[0],
+      amount: input.amount,
+      currency: input.currency,
+      periodDaysGranted: input.periodDaysGranted,
+      mpStatusDetail: null,
+      rawPayload: null,
+      createdAt: new Date(),
+      paidAt: null,
+    };
+    this.payments.push(payment);
+    return payment;
+  }
+
+  async getPaymentByExternalReference(externalReference: string): Promise<Payment | undefined> {
+    return this.payments.find((p) => p.externalReference === externalReference);
+  }
+
+  async getPaymentByMpPaymentId(mpPaymentId: string): Promise<Payment | undefined> {
+    return this.payments.find((p) => p.mpPaymentId === mpPaymentId);
+  }
+
+  async updatePayment(id: number, patch: PaymentUpdate): Promise<Payment | undefined> {
+    const payment = this.payments.find((p) => p.id === id);
+    if (!payment) return undefined;
+    Object.assign(payment, patch);
+    return payment;
+  }
+
+  async getPaymentsByConsultantId(consultantId: number): Promise<Payment[]> {
+    return this.payments
+      .filter((p) => p.consultantId === consultantId)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  }
+
+  async applyApprovedPayment(consultantId: number, input: ApplyApprovedPaymentInput): Promise<ApplyApprovedPaymentResult> {
+    const existing = this.payments.find((p) => p.mpPaymentId === input.mpPaymentId);
+    if (existing) return { outcome: "already_processed", payment: existing };
+
+    const sub = this.subscriptions.find((s) => s.consultantId === consultantId);
+    if (!sub || sub.mpPreapprovalId !== input.mpPreapprovalId) {
+      return { outcome: "preapproval_mismatch" };
+    }
+
+    const now = new Date();
+    const payment: Payment = {
+      id: this.nextPaymentId++,
+      consultantId,
+      externalReference: input.externalReference,
+      mpPreapprovalId: input.mpPreapprovalId,
+      mpPaymentId: input.mpPaymentId,
+      status: "approved",
+      amount: input.amount,
+      currency: "ARS",
+      periodDaysGranted: PERIOD_DAYS,
+      mpStatusDetail: input.statusDetail,
+      rawPayload: input.rawPayload as any,
+      createdAt: now,
+      paidAt: now,
+    };
+    this.payments.push(payment);
+
+    sub.status = "active";
+    sub.currentPeriodStart = now;
+    sub.currentPeriodEnd = new Date(now.getTime() + PERIOD_DAYS * 24 * 60 * 60 * 1000);
+    sub.lastPaymentId = payment.id;
+
+    return { outcome: "applied", payment };
   }
 
   private getDefaultThresholdMem(consultantId: number): number | null {

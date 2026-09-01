@@ -26,11 +26,15 @@ import {
   toggleProductDiscontinuedSchema,
   setProductStockSchema,
   setProductStockReminderSchema,
+  startSubscriptionSchema,
   type InsertProduct,
 } from "@shared/schema";
 import { requireAdmin } from "./middleware/requireAdmin";
 import { requireAuth } from "./middleware/requireAuth";
 import { slugify } from "@shared/slug";
+import { SUBSCRIPTION_PRICE_ARS, PLAN_NAME } from "./config/subscription";
+import { getConsultantAccessStatus, generateExternalReference, parseConsultantIdFromExternalReference } from "./subscription";
+import { createSubscriptionPreapproval, getMercadoPagoPayment, verifyWebhookSignature, InvalidWebhookSignatureError } from "./mercadopago";
 
 const loginRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -70,6 +74,46 @@ function requireConsultant(req: Request, res: Response, next: NextFunction) {
     return res.status(403).json({ error: "Esta acción es exclusiva de cuentas consultora" });
   }
   next();
+}
+
+/**
+ * `payment`/`subscription_authorized_payment`: la única rama que puede otorgar acceso.
+ * Siempre reconsulta el pago real contra la API de Mercado Pago — nunca confía en el body
+ * del webhook. `payment.point_of_interaction.transaction_data.subscription_id` es el id del
+ * preapproval al que pertenece este cobro (distinto de `payment.id`, nunca se mezclan).
+ */
+async function handleApprovedPaymentTopic(paymentId: string | undefined): Promise<void> {
+  if (!paymentId) return;
+
+  const payment = await getMercadoPagoPayment(paymentId);
+  if (payment.status !== "approved") {
+    console.log(`Pago de Mercado Pago ${paymentId} con status "${payment.status}" — no otorga acceso`);
+    return;
+  }
+
+  const consultantId = parseConsultantIdFromExternalReference(payment.external_reference);
+  const mpPreapprovalId = payment.point_of_interaction?.transaction_data?.subscription_id;
+  if (!consultantId || !mpPreapprovalId) {
+    console.error(`Pago ${paymentId} aprobado pero sin external_reference/subscription_id reconocibles — ignorado`);
+    return;
+  }
+
+  const result = await storage.applyApprovedPayment(consultantId, {
+    externalReference: payment.external_reference!,
+    mpPreapprovalId,
+    mpPaymentId: String(payment.id),
+    amount: payment.transaction_amount ?? SUBSCRIPTION_PRICE_ARS,
+    statusDetail: payment.status_detail ?? null,
+    rawPayload: payment,
+  });
+
+  if (result.outcome === "preapproval_mismatch") {
+    console.error(`Pago ${paymentId} no coincide con el preapproval registrado para la consultora ${consultantId} — ignorado`);
+  } else if (result.outcome === "already_processed") {
+    console.log(`Pago ${paymentId} ya había sido procesado — notificación duplicada, ignorada`);
+  } else {
+    console.log(`Pago ${paymentId} aprobado — suscripción activada/renovada para la consultora ${consultantId}`);
+  }
 }
 
 function toInsertProduct(item: z.infer<typeof bulkProductSchema>[number]): InsertProduct {
@@ -281,6 +325,123 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       console.error(error);
       res.status(500).json({ error: "Error al actualizar la configuración" });
     }
+  });
+
+  // Nunca requireActiveSubscription: una consultora bloqueada tiene que poder seguir
+  // consultando su propio estado y pagando — eso es justamente lo que la desbloquea.
+  app.get("/api/subscription/status", requireAuth, async (req: Request, res: Response) => {
+    try {
+      if (req.consultantId === null || req.consultantId === undefined) {
+        return res.status(404).json({ error: "El estado de suscripción no aplica para administradores" });
+      }
+      const access = await getConsultantAccessStatus(req.consultantId);
+      res.json({
+        status: access.status,
+        hasAccess: access.hasAccess,
+        trialEndAt: access.trialEndAt,
+        currentPeriodStart: access.currentPeriodStart,
+        currentPeriodEnd: access.currentPeriodEnd,
+        daysRemaining: access.daysRemaining,
+        plan: { name: PLAN_NAME, priceArs: SUBSCRIPTION_PRICE_ARS },
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al consultar el estado de la suscripción" });
+    }
+  });
+
+  app.post("/api/subscription/start", requireAuth, async (req: Request, res: Response) => {
+    try {
+      if (req.consultantId === null || req.consultantId === undefined) {
+        return res.status(404).json({ error: "La suscripción no aplica para administradores" });
+      }
+      const parsed = startSubscriptionSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      // Ni el precio ni el consultantId salen nunca del body: el precio es SUBSCRIPTION_PRICE_ARS
+      // (config backend) y el consultantId sale de la sesión ya autenticada (req.consultantId).
+      const access = await getConsultantAccessStatus(req.consultantId);
+      if (access.status === "active") {
+        return res.status(409).json({ error: "Ya tenés una suscripción activa" });
+      }
+
+      const subscription = await storage.getSubscriptionByConsultantId(req.consultantId);
+      if (!subscription) {
+        return res.status(404).json({ error: "Suscripción no encontrada" });
+      }
+
+      // Doble click / doble submit: si ya se creó un preapproval hace muy poco y todavía no
+      // se resolvió, no crear uno nuevo (complementa a useGuardedMutation del lado del cliente).
+      if (subscription.mpPreapprovalCreatedAt && Date.now() - subscription.mpPreapprovalCreatedAt.getTime() < 15_000) {
+        return res.status(409).json({ error: "Ya se está procesando tu suscripción, esperá unos segundos" });
+      }
+
+      await storage.setConsultantEmail(req.consultantId, parsed.data.email);
+
+      const externalReference = generateExternalReference(req.consultantId);
+      const preapproval = await createSubscriptionPreapproval({
+        externalReference,
+        payerEmail: parsed.data.email,
+        backUrl: `${req.protocol}://${req.get("host")}/subscription/success`,
+      });
+
+      await storage.updateSubscription(req.consultantId, {
+        mpPreapprovalId: preapproval.id,
+        mpPreapprovalCreatedAt: new Date(),
+      });
+
+      // Solo lo necesario para continuar el checkout — nunca el Access Token ni el objeto
+      // completo que devuelve Mercado Pago.
+      res.json({ initPoint: preapproval.initPoint });
+    } catch (error) {
+      console.error("Error al iniciar la suscripción:", error);
+      res.status(500).json({ error: "No se pudo iniciar la suscripción. Intentá nuevamente." });
+    }
+  });
+
+  /**
+   * Server-to-server, sin sesión (Mercado Pago no puede mandar nuestra cookie). La defensa
+   * real es SIEMPRE volver a consultar el recurso contra la API de Mercado Pago con nuestro
+   * Access Token — la firma (`verifyWebhookSignature`) es una capa adicional, no la única.
+   * Responde 200 salvo firma inválida: evitar tormentas de reintento de MP ante errores
+   * propios, ya quedan logueados para revisar a mano.
+   */
+  app.post("/api/subscription/webhook", async (req: Request, res: Response) => {
+    const xRequestId = req.headers["x-request-id"];
+    const dataId = (req.query["data.id"] ?? req.body?.data?.id) as string | string[] | undefined;
+
+    try {
+      verifyWebhookSignature({ xSignature: req.headers["x-signature"], xRequestId, dataId });
+    } catch (error) {
+      if (error instanceof InvalidWebhookSignatureError) {
+        console.error("Webhook de Mercado Pago rechazado por firma inválida:", error.reason, "x-request-id:", xRequestId);
+        return res.status(401).json({ error: "Firma inválida" });
+      }
+      // Típicamente falta MERCADOPAGO_WEBHOOK_SECRET — error nuestro de configuración, no
+      // del remitente: no tiene sentido que Mercado Pago reintente por esto.
+      console.error("Error validando la firma del webhook de Mercado Pago:", error);
+      return res.sendStatus(200);
+    }
+
+    const topic = (req.query.type ?? req.query.topic ?? req.body?.type ?? req.body?.topic) as string | undefined;
+
+    try {
+      if (topic === "payment" || topic === "subscription_authorized_payment") {
+        await handleApprovedPaymentTopic(typeof dataId === "string" ? dataId : undefined);
+      } else if (topic === "subscription_preapproval") {
+        // Informativo únicamente: autorizar el medio de pago no es lo mismo que cobrar. El
+        // acceso se otorga solo cuando llega un pago aprobado real (rama de arriba).
+        console.log(`Webhook de Mercado Pago: preapproval notificado (topic=subscription_preapproval, data.id=${String(dataId)})`);
+      } else {
+        console.log("Webhook de Mercado Pago con topic no manejado:", topic);
+      }
+    } catch (error) {
+      console.error("Error procesando webhook de Mercado Pago:", error);
+    }
+
+    res.sendStatus(200);
   });
 
   app.get("/api/products", async (req: Request, res: Response) => {

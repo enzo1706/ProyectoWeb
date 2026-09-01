@@ -27,6 +27,10 @@ const Ventas = lazy(() => import("@/pages/Ventas"));
 const Agenda = lazy(() => import("@/pages/Agenda"));
 const Reportes = lazy(() => import("@/pages/Reportes"));
 const Configuracion = lazy(() => import("@/pages/Configuracion"));
+const Subscription = lazy(() => import("@/pages/Subscription"));
+const SubscriptionSuccess = lazy(() => import("@/pages/subscription/SubscriptionSuccess"));
+const SubscriptionFailure = lazy(() => import("@/pages/subscription/SubscriptionFailure"));
+const SubscriptionPending = lazy(() => import("@/pages/subscription/SubscriptionPending"));
 const AdminRouter = lazy(() => import("@/pages/admin/AdminRouter"));
 
 function PageLoader() {
@@ -48,6 +52,10 @@ function ConsultantRouter() {
         <Route path="/agenda" component={Agenda} />
         <Route path="/reportes" component={Reportes} />
         <Route path="/configuracion" component={Configuracion} />
+        <Route path="/subscription" component={Subscription} />
+        <Route path="/subscription/success" component={SubscriptionSuccess} />
+        <Route path="/subscription/failure" component={SubscriptionFailure} />
+        <Route path="/subscription/pending" component={SubscriptionPending} />
         <Route component={NotFound} />
       </Switch>
     </Suspense>

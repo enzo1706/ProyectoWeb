@@ -9,6 +9,7 @@ import {
   BarChart3,
   Shield,
   Settings,
+  CreditCard,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import {
@@ -41,6 +42,7 @@ const consultantMenuItems: MenuItem[] = [
   { title: "Agenda", url: "/agenda", icon: Calendar },
   { title: "Reportes", url: "/reportes", icon: BarChart3 },
   { title: "Configuración", url: "/configuracion", icon: Settings },
+  { title: "Suscripción", url: "/subscription", icon: CreditCard },
 ];
 
 const adminMenuItems: MenuItem[] = [

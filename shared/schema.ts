@@ -1,4 +1,4 @@
-import { pgTable, serial, text, integer, boolean, index, unique } from "drizzle-orm/pg-core";
+import { pgTable, serial, text, integer, boolean, timestamp, jsonb, index, unique } from "drizzle-orm/pg-core";
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod";
 import { CUSTOM_EVENT_TYPE_MAX_LENGTH } from "./eventTypes";
@@ -17,6 +17,10 @@ export const consultants = pgTable("consultants", {
   // Umbral de stock bajo predeterminado para toda la consultora (Configuración). Nullable:
   // sin configurar, se usa el default global de la app (ver DEFAULT_LOW_STOCK_THRESHOLD).
   defaultLowStockThreshold: integer("default_low_stock_threshold"),
+  // Nullable: no existe ningún flujo de alta que lo pida hoy. Se completa recién la primera
+  // vez que la consultora inicia una suscripción (Mercado Pago exige payer_email para crear
+  // el preapproval) — autogestión, no carga del admin. Ver POST /api/subscription/start.
+  email: text("email"),
 });
 
 export const users = pgTable("users", {
@@ -187,6 +191,73 @@ export const saleInstallments = pgTable("sale_installments", {
   statusIdx: index("sale_installments_status_idx").on(table.status),
 }));
 
+export const paymentStatuses = ["pending", "approved", "rejected", "cancelled", "in_process"] as const;
+export type PaymentStatus = (typeof paymentStatuses)[number];
+
+/**
+ * Ledger de pagos de Mercado Pago — una fila por cobro individual (nace en "pending" al crear
+ * el intento, se confirma o rechaza cuando llega el webhook). Nunca se pisa: `amount`
+ * guarda el monto REALMENTE cobrado, no una referencia al precio actual — un cambio de precio
+ * futuro no altera pagos viejos. Único punto de idempotencia real: `mpPaymentId` (el id del
+ * recurso `payment` de Mercado Pago, no el del preapproval ni el externalReference) — eso es
+ * lo que impide procesar dos veces la misma notificación de webhook duplicada.
+ *
+ * `mpPreapprovalId` identifica a qué suscripción (preapproval) de Mercado Pago pertenece este
+ * cobro — es una entidad distinta de `mpPaymentId`, nunca se mezclan: un preapproval es la
+ * suscripción recurrente en sí, un payment es cada cobro individual que genera.
+ *
+ * Única excepción a la convención de fechas del resto del schema (texto "YYYY-MM-DD"): acá se
+ * usa `timestamp` real porque el cálculo de vencimiento necesita hora exacta, no solo fecha.
+ */
+export const payments = pgTable("payments", {
+  id: serial("id").primaryKey(),
+  consultantId: integer("consultant_id").notNull().references(() => consultants.id),
+  externalReference: text("external_reference").notNull().unique(),
+  mpPreapprovalId: text("mp_preapproval_id"),
+  mpPaymentId: text("mp_payment_id").unique(),
+  status: text("status").notNull().default(paymentStatuses[0]),
+  amount: integer("amount").notNull(),
+  currency: text("currency").notNull().default("ARS"),
+  periodDaysGranted: integer("period_days_granted").notNull().default(30),
+  mpStatusDetail: text("mp_status_detail"),
+  rawPayload: jsonb("raw_payload"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  paidAt: timestamp("paid_at", { withTimezone: true }),
+}, (table) => ({
+  consultantIdx: index("payments_consultant_id_idx").on(table.consultantId),
+  statusIdx: index("payments_status_idx").on(table.status),
+}));
+
+export const subscriptionStatuses = ["trial", "active", "expired", "canceled"] as const;
+export type SubscriptionStatus = (typeof subscriptionStatuses)[number];
+
+/**
+ * Estado de acceso de UNA consultora — una fila 1:1 que se actualiza in-place (no una fila
+ * por período: el historial completo ya vive en `payments`). `status` es solo caché de
+ * lectura para el admin — la fuente de verdad real del acceso siempre se calcula al vuelo a
+ * partir de las fechas (ver server/subscription.ts), nunca se confía en esta columna sola.
+ */
+export const subscriptions = pgTable("subscriptions", {
+  id: serial("id").primaryKey(),
+  consultantId: integer("consultant_id").notNull().unique().references(() => consultants.id),
+  status: text("status").notNull().default(subscriptionStatuses[0]),
+  trialStartAt: timestamp("trial_start_at", { withTimezone: true }).notNull().defaultNow(),
+  trialEndAt: timestamp("trial_end_at", { withTimezone: true }).notNull(),
+  currentPeriodStart: timestamp("current_period_start", { withTimezone: true }),
+  currentPeriodEnd: timestamp("current_period_end", { withTimezone: true }),
+  lastPaymentId: integer("last_payment_id").references(() => payments.id),
+  // Id del preapproval (suscripción) de Mercado Pago vigente/más reciente de esta consultora —
+  // durable mientras la suscripción exista, no solo mientras está "pendiente" (a diferencia de
+  // una preferencia de Checkout Pro, que es de un solo uso). También sirve para no crear un
+  // segundo preapproval por doble click: si ya hay uno reciente sin resolver, se reutiliza.
+  mpPreapprovalId: text("mp_preapproval_id"),
+  mpPreapprovalCreatedAt: timestamp("mp_preapproval_created_at", { withTimezone: true }),
+  canceledAt: timestamp("canceled_at", { withTimezone: true }),
+}, (table) => ({
+  statusIdx: index("subscriptions_status_idx").on(table.status),
+  currentPeriodEndIdx: index("subscriptions_current_period_end_idx").on(table.currentPeriodEnd),
+}));
+
 // Tipos para TypeScript
 export type Consultant = typeof consultants.$inferSelect;
 export type InsertConsultant = typeof consultants.$inferInsert;
@@ -215,6 +286,10 @@ export type SaleItem = typeof saleItems.$inferSelect;
 export type InsertSaleItem = typeof saleItems.$inferInsert;
 export type SaleInstallment = typeof saleInstallments.$inferSelect;
 export type InsertSaleInstallment = typeof saleInstallments.$inferInsert;
+export type Payment = typeof payments.$inferSelect;
+export type InsertPayment = typeof payments.$inferInsert;
+export type Subscription = typeof subscriptions.$inferSelect;
+export type InsertSubscription = typeof subscriptions.$inferInsert;
 
 export const insertUserSchema = createInsertSchema(users).omit({ id: true });
 export const insertProductSchema = createInsertSchema(products);
@@ -254,6 +329,8 @@ export const updateAppointmentStatusSchema = z.object({
 export const insertSaleSchema = createInsertSchema(sales).omit({ id: true });
 export const insertSaleItemSchema = createInsertSchema(saleItems).omit({ id: true });
 export const insertSaleInstallmentSchema = createInsertSchema(saleInstallments).omit({ id: true });
+export const insertPaymentSchema = createInsertSchema(payments).omit({ id: true });
+export const insertSubscriptionSchema = createInsertSchema(subscriptions).omit({ id: true });
 
 // Carga masiva de admin = catálogo GLOBAL puro, sin stock (el stock es de cada consultora,
 // se carga aparte — ver setProductStockSchema). Por eso no lleva unidades/stockMinimo.
@@ -389,4 +466,10 @@ export const assignProductImageMatchesSchema = z.object({
 export const loginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
+});
+
+/** Autogestión: la consultora lo carga recién al iniciar su primera suscripción — Mercado
+ * Pago exige payer_email para crear el preapproval. Ver POST /api/subscription/start. */
+export const startSubscriptionSchema = z.object({
+  email: z.string().trim().min(1, "El email es obligatorio").email("Ingresá un email válido"),
 });
