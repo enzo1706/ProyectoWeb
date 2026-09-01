@@ -412,6 +412,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     const xRequestId = req.headers["x-request-id"];
     const dataId = (req.query["data.id"] ?? req.body?.data?.id) as string | string[] | undefined;
 
+    // DIAGNÓSTICO TEMPORAL — Etapa D: confirmar empíricamente si Railway altera x-request-id
+    // antes de que llegue a Express. Solo presencia/nombres, NUNCA valores de firma/secreto.
+    // Sacar este bloque en cuanto quede confirmado (ver informe de Etapa D).
+    console.log(
+      "Webhook received",
+      JSON.stringify({
+        requestIdHeaderPresent: xRequestId !== undefined,
+        signatureHeaderPresent: req.headers["x-signature"] !== undefined,
+        railwayRequestIdHeaderPresent: req.headers["x-railway-request-id"] !== undefined,
+        notificationType: req.query.type ?? req.query.topic ?? req.body?.type ?? req.body?.topic ?? null,
+        dataId: dataId ?? null,
+      }),
+    );
+
     try {
       verifyWebhookSignature({ xSignature: req.headers["x-signature"], xRequestId, dataId });
     } catch (error) {
