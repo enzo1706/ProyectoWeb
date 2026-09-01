@@ -51,7 +51,10 @@ export async function createSubscriptionPreapproval(input: CreateSubscriptionPre
         // checkout web (cow-payment_summary) parece necesitarlo explícito para poder armar
         // el texto de "subscription-description" y habilitar el botón "Confirmar" (evidencia:
         // Etapa D, ese span queda vacío y el botón deshabilitado cuando se omite este campo).
-        start_date: new Date().toISOString(),
+        // +60s de margen: Mercado Pago rechaza con 400 ("cannot be a past date") si para
+        // cuando el request llega a sus servidores el instante exacto de `new Date()` ya
+        // quedó en el pasado (confirmado con el error real en Etapa D).
+        start_date: new Date(Date.now() + 60_000).toISOString(),
         transaction_amount: SUBSCRIPTION_PRICE_ARS,
         currency_id: "ARS",
       },
