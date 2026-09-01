@@ -37,6 +37,13 @@ export interface CreatedPreapproval {
  */
 export async function createSubscriptionPreapproval(input: CreateSubscriptionPreapprovalInput): Promise<CreatedPreapproval> {
   const preApproval = new PreApproval(getConfig());
+  // Segundos exactos, sin milisegundos: en Etapa D, `next_payment_date` volvió en la
+  // respuesta de Mercado Pago 60s ANTES que el `start_date` que mandamos — evitar
+  // redondeos raros y dar más margen (10 min) para que next_payment_date >= start_date.
+  const base = new Date();
+  base.setMilliseconds(0);
+  const startDate = new Date(base.getTime() + 10 * 60 * 1000);
+  const endDate = new Date(base.getTime() + 365 * 24 * 60 * 60 * 1000);
   const response = await preApproval.create({
     body: {
       reason: PLAN_NAME,
@@ -51,16 +58,13 @@ export async function createSubscriptionPreapproval(input: CreateSubscriptionPre
         // checkout web (cow-payment_summary) parece necesitarlo explícito para poder armar
         // el texto de "subscription-description" y habilitar el botón "Confirmar" (evidencia:
         // Etapa D, ese span queda vacío y el botón deshabilitado cuando se omite este campo).
-        // +60s de margen: Mercado Pago rechaza con 400 ("cannot be a past date") si para
-        // cuando el request llega a sus servidores el instante exacto de `new Date()` ya
-        // quedó en el pasado (confirmado con el error real en Etapa D).
-        start_date: new Date(Date.now() + 60_000).toISOString(),
+        start_date: startDate.toISOString(),
         // La referencia oficial de creación de preapproval indica que start_date solo se
         // reconoce si además se manda end_date. No reemplaza nuestra lógica de negocio: el
         // acceso real lo seguimos calculando nosotros (storage.applyApprovedPayment, 30 días
         // por pago aprobado) — esto es únicamente el límite que Mercado Pago exige para su
         // propio cobro recurrente automático del lado de ellos.
-        end_date: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
+        end_date: endDate.toISOString(),
         transaction_amount: SUBSCRIPTION_PRICE_ARS,
         currency_id: "ARS",
       },
