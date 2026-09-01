@@ -55,6 +55,12 @@ export async function createSubscriptionPreapproval(input: CreateSubscriptionPre
         // cuando el request llega a sus servidores el instante exacto de `new Date()` ya
         // quedó en el pasado (confirmado con el error real en Etapa D).
         start_date: new Date(Date.now() + 60_000).toISOString(),
+        // La referencia oficial de creación de preapproval indica que start_date solo se
+        // reconoce si además se manda end_date. No reemplaza nuestra lógica de negocio: el
+        // acceso real lo seguimos calculando nosotros (storage.applyApprovedPayment, 30 días
+        // por pago aprobado) — esto es únicamente el límite que Mercado Pago exige para su
+        // propio cobro recurrente automático del lado de ellos.
+        end_date: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
         transaction_amount: SUBSCRIPTION_PRICE_ARS,
         currency_id: "ARS",
       },
