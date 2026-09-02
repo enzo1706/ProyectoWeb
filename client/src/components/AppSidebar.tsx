@@ -49,6 +49,7 @@ const adminMenuItems: MenuItem[] = [
   { title: "Panel", url: "/admin", icon: LayoutDashboard },
   { title: "Consultoras", url: "/admin/usuarios", icon: Users },
   { title: "Catálogo", url: "/admin/productos", icon: Package },
+  { title: "Suscripciones", url: "/admin/suscripciones", icon: CreditCard },
 ];
 
 function isItemActive(location: string, url: string) {

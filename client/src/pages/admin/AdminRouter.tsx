@@ -11,6 +11,7 @@ const AdminDashboard = lazy(() => import("@/pages/admin/AdminDashboard"));
 const UserManagement = lazy(() => import("@/pages/admin/UserManagement"));
 const ProductManagement = lazy(() => import("@/pages/admin/ProductManagement"));
 const BulkImageUpload = lazy(() => import("@/pages/admin/BulkImageUpload"));
+const SubscriptionManagement = lazy(() => import("@/pages/admin/SubscriptionManagement"));
 
 function AdminPageLoader() {
   return (
@@ -29,6 +30,7 @@ export default function AdminRouter() {
           <Route path="/admin/usuarios" component={UserManagement} />
           <Route path="/admin/productos" component={ProductManagement} />
           <Route path="/admin/productos/imagenes" component={BulkImageUpload} />
+          <Route path="/admin/suscripciones" component={SubscriptionManagement} />
           <Route component={NotFound} />
         </Switch>
       </Suspense>

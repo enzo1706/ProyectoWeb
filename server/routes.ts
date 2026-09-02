@@ -27,7 +27,9 @@ import {
   setProductStockSchema,
   setProductStockReminderSchema,
   startSubscriptionSchema,
+  paymentStatuses,
   type InsertProduct,
+  type PaymentStatus,
 } from "@shared/schema";
 import { requireAdmin } from "./middleware/requireAdmin";
 import { requireAuth } from "./middleware/requireAuth";
@@ -1089,6 +1091,117 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al listar consultoras" });
+    }
+  });
+
+  /**
+   * Panel de Suscripciones (Etapa G): una fila por consultora, con el estado de acceso
+   * calculado por la MISMA función central que usa el gate (getConsultantAccessStatus) —
+   * nunca se reimplementa la regla acá. Nunca llama a la API de Mercado Pago: solo lee lo
+   * que ya está guardado (mpPreapprovalId como referencia, no el estado en vivo de MP).
+   */
+  app.get("/api/admin/subscriptions", async (req: Request, res: Response) => {
+    try {
+      const rows = await storage.listAdminSubscriptions();
+      const enriched = await Promise.all(
+        rows.map(async (row) => {
+          const access = await getConsultantAccessStatus(row.consultantId);
+          return {
+            consultantId: row.consultantId,
+            businessName: row.businessName,
+            username: row.username,
+            email: row.email,
+            status: access.status,
+            hasAccess: access.hasAccess,
+            daysRemaining: access.daysRemaining,
+            trialStartAt: row.subscription?.trialStartAt ?? null,
+            trialEndAt: access.trialEndAt,
+            currentPeriodStart: access.currentPeriodStart,
+            currentPeriodEnd: access.currentPeriodEnd,
+            mpPreapprovalId: row.subscription?.mpPreapprovalId ?? null,
+            lastPayment: row.lastPayment
+              ? {
+                  id: row.lastPayment.id,
+                  mpPaymentId: row.lastPayment.mpPaymentId,
+                  amount: row.lastPayment.amount,
+                  currency: row.lastPayment.currency,
+                  status: row.lastPayment.status,
+                  paidAt: row.lastPayment.paidAt,
+                }
+              : null,
+          };
+        }),
+      );
+
+      const summary = {
+        total: enriched.length,
+        trial: enriched.filter((r) => r.status === "trial").length,
+        active: enriched.filter((r) => r.status === "active").length,
+        expired: enriched.filter((r) => r.status === "expired").length,
+        canceled: enriched.filter((r) => r.status === "canceled").length,
+      };
+
+      const filterStatus = typeof req.query.status === "string" ? req.query.status : undefined;
+      const filtered = filterStatus ? enriched.filter((r) => r.status === filterStatus) : enriched;
+
+      res.json({ summary, rows: filtered });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al listar suscripciones" });
+    }
+  });
+
+  // Historial de pagos de UNA consultora puntual, para el detalle del panel de arriba.
+  app.get("/api/admin/subscriptions/:consultantId/payments", async (req: Request, res: Response) => {
+    try {
+      const consultantId = parseInt(req.params.consultantId, 10);
+      if (isNaN(consultantId)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+      const payments = await storage.getPaymentsByConsultantId(consultantId);
+      res.json(payments);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener el historial de pagos" });
+    }
+  });
+
+  /**
+   * Ledger global de payments (todas las consultoras), con filtros — para el historial de
+   * pagos y las métricas de ingresos. Los ingresos SIEMPRE salen de sumar `amount` de
+   * payments con status "approved" — nunca de subscriptions, nunca de pagos rechazados o
+   * en proceso.
+   */
+  app.get("/api/admin/payments", async (req: Request, res: Response) => {
+    try {
+      const filters: { status?: PaymentStatus; consultantId?: number; from?: Date; to?: Date } = {};
+      if (typeof req.query.status === "string" && paymentStatuses.includes(req.query.status as PaymentStatus)) {
+        filters.status = req.query.status as PaymentStatus;
+      }
+      if (typeof req.query.consultantId === "string") {
+        const id = parseInt(req.query.consultantId, 10);
+        if (!isNaN(id)) filters.consultantId = id;
+      }
+      if (typeof req.query.from === "string") {
+        const from = new Date(req.query.from);
+        if (!isNaN(from.getTime())) filters.from = from;
+      }
+      if (typeof req.query.to === "string") {
+        const to = new Date(req.query.to);
+        if (!isNaN(to.getTime())) filters.to = to;
+      }
+
+      const rows = await storage.listAllPayments(filters);
+      const approved = rows.filter((p) => p.status === "approved");
+      const summary = {
+        totalPayments: rows.length,
+        approvedCount: approved.length,
+        approvedRevenue: approved.reduce((sum, p) => sum + p.amount, 0),
+      };
+      res.json({ summary, rows });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al listar pagos" });
     }
   });
 

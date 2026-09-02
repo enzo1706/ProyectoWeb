@@ -34,6 +34,7 @@ import {
   type Consultant,
   type Subscription,
   type Payment,
+  type PaymentStatus,
 } from "@shared/schema";
 import {
   computeSubtotal,
@@ -102,6 +103,27 @@ export type ApplyApprovedPaymentResult =
   | { outcome: "applied"; payment: Payment }
   | { outcome: "already_processed"; payment: Payment }
   | { outcome: "preapproval_mismatch" };
+
+/** Admin-only: una fila por consultora para el panel de Suscripciones. `subscription` es
+ * null solo si la consultora todavía no tiene fila (no debería pasar en uso normal, pero se
+ * contempla — ver Etapa F, hubo consultoras reales así antes del backfill). */
+export interface AdminSubscriptionRow {
+  consultantId: number;
+  businessName: string;
+  username: string;
+  email: string | null;
+  subscription: Subscription | null;
+  lastPayment: Payment | null;
+}
+export interface AdminPaymentRow extends Payment {
+  businessName: string;
+}
+export interface AdminPaymentFilters {
+  status?: PaymentStatus;
+  consultantId?: number;
+  from?: Date;
+  to?: Date;
+}
 
 type ProductRow = typeof products.$inferSelect;
 type StockFields = Pick<
@@ -316,6 +338,12 @@ export interface IStorage {
    * veces). Nunca se llama con datos del frontend: solo tras reconsultar el pago real contra
    * la API de Mercado Pago (ver server/mercadopago.ts). */
   applyApprovedPayment(consultantId: number, input: ApplyApprovedPaymentInput): Promise<ApplyApprovedPaymentResult>;
+  /** Admin-only: una fila por consultora (con su subscription y su último payment, si los
+   * tiene) para el panel de administración de Suscripciones — nunca llama a la API de
+   * Mercado Pago, solo lee lo que ya tenemos guardado. */
+  listAdminSubscriptions(): Promise<AdminSubscriptionRow[]>;
+  /** Admin-only: ledger completo de payments de todas las consultoras, con filtros opcionales. */
+  listAllPayments(filters?: AdminPaymentFilters): Promise<AdminPaymentRow[]>;
   getAllProducts(consultantId: number): Promise<Product[]>;
   getProductsByIds(consultantId: number, ids: number[]): Promise<Product[]>;
   /** Admin-only: carga/actualiza el catálogo GLOBAL (consultantId null) — no toca stock de nadie. */
@@ -632,6 +660,43 @@ export class DatabaseStorage implements IStorage {
 
       return { outcome: "applied", payment };
     });
+  }
+
+  async listAdminSubscriptions(): Promise<AdminSubscriptionRow[]> {
+    const db = await this.getDb();
+    const rows = await db
+      .select({
+        consultantId: consultants.id,
+        businessName: consultants.businessName,
+        email: consultants.email,
+        username: users.username,
+        subscription: subscriptions,
+        lastPayment: payments,
+      })
+      .from(consultants)
+      .innerJoin(users, and(eq(users.consultantId, consultants.id), eq(users.role, "consultant")))
+      .leftJoin(subscriptions, eq(subscriptions.consultantId, consultants.id))
+      .leftJoin(payments, eq(payments.id, subscriptions.lastPaymentId))
+      .orderBy(consultants.businessName);
+    return rows;
+  }
+
+  async listAllPayments(filters?: AdminPaymentFilters): Promise<AdminPaymentRow[]> {
+    const db = await this.getDb();
+    const conditions = [
+      filters?.status ? eq(payments.status, filters.status) : undefined,
+      filters?.consultantId ? eq(payments.consultantId, filters.consultantId) : undefined,
+      filters?.from ? gte(payments.createdAt, filters.from) : undefined,
+      filters?.to ? lt(payments.createdAt, filters.to) : undefined,
+    ].filter((c): c is NonNullable<typeof c> => c !== undefined);
+
+    const rows = await db
+      .select({ payment: payments, businessName: consultants.businessName })
+      .from(payments)
+      .innerJoin(consultants, eq(consultants.id, payments.consultantId))
+      .where(conditions.length ? and(...conditions) : undefined)
+      .orderBy(desc(payments.createdAt));
+    return rows.map((r) => ({ ...r.payment, businessName: r.businessName }));
   }
 
   /** Catálogo visible para la consultora: lo global (consultantId null) + lo manual propio,
@@ -2282,6 +2347,34 @@ export class MemoryStorage implements IStorage {
     sub.lastPaymentId = payment.id;
 
     return { outcome: "applied", payment };
+  }
+
+  async listAdminSubscriptions(): Promise<AdminSubscriptionRow[]> {
+    return this.consultants
+      .map((c): AdminSubscriptionRow | null => {
+        const user = this.users.find((u) => u.consultantId === c.id && u.role === "consultant");
+        if (!user) return null; // consultants sin user real no debería pasar, se ignora
+        const subscription = this.subscriptions.find((s) => s.consultantId === c.id) ?? null;
+        const lastPayment = subscription?.lastPaymentId
+          ? (this.payments.find((p) => p.id === subscription.lastPaymentId) ?? null)
+          : null;
+        return { consultantId: c.id, businessName: c.businessName, username: user.username, email: c.email, subscription, lastPayment };
+      })
+      .filter((row): row is AdminSubscriptionRow => row !== null)
+      .sort((a, b) => a.businessName.localeCompare(b.businessName));
+  }
+
+  async listAllPayments(filters?: AdminPaymentFilters): Promise<AdminPaymentRow[]> {
+    return this.payments
+      .filter((p) => {
+        if (filters?.status && p.status !== filters.status) return false;
+        if (filters?.consultantId && p.consultantId !== filters.consultantId) return false;
+        if (filters?.from && p.createdAt.getTime() < filters.from.getTime()) return false;
+        if (filters?.to && p.createdAt.getTime() >= filters.to.getTime()) return false;
+        return true;
+      })
+      .map((p) => ({ ...p, businessName: this.consultants.find((c) => c.id === p.consultantId)?.businessName ?? "" }))
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
   }
 
   private getDefaultThresholdMem(consultantId: number): number | null {
