@@ -91,6 +91,17 @@ async function handleApprovedPaymentTopic(paymentId: string | undefined): Promis
     return;
   }
 
+  // El payment ya viene de reconsultar la API real de MP (nunca del payload del webhook), pero
+  // igual puede no coincidir con lo que vendemos — un cambio de precio futuro, una moneda
+  // distinta, o un payment ajeno reutilizado con el mismo external_reference. Nunca se acredita
+  // un período completo por un monto/moneda que no sea exactamente el nuestro.
+  if (payment.transaction_amount !== SUBSCRIPTION_PRICE_ARS || payment.currency_id !== "ARS") {
+    console.error(
+      `Pago ${paymentId} aprobado pero con monto/moneda inesperados (${payment.transaction_amount} ${payment.currency_id}, esperado ${SUBSCRIPTION_PRICE_ARS} ARS) — ignorado`,
+    );
+    return;
+  }
+
   const consultantId = parseConsultantIdFromExternalReference(payment.external_reference);
   const mpPreapprovalId = payment.point_of_interaction?.transaction_data?.subscription_id;
   if (!consultantId || !mpPreapprovalId) {
