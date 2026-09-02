@@ -1,7 +1,7 @@
 import { Switch, Route, Redirect, useLocation } from "wouter";
 import { Suspense, lazy } from "react";
 import { queryClient } from "./lib/queryClient";
-import { QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
@@ -70,6 +70,16 @@ function AppShell() {
   const [location] = useLocation();
   const { user, isLoading, logout } = useAuth();
   const isLoginRoute = location === "/login";
+  const isAdminUser = user?.role === "admin";
+
+  // Se pide siempre (nunca condicionado a un early return, para no romper el orden de
+  // hooks) — solo importa una vez que hay sesión de consultora; para admin/sin sesión
+  // queda deshabilitada y no pega al backend.
+  const { data: subscriptionStatus, isLoading: isSubscriptionStatusLoading } = useQuery<{ hasAccess: boolean }>({
+    queryKey: ["/api/subscription/status"],
+    enabled: !!user && !isAdminUser,
+    refetchInterval: 60_000,
+  });
 
   if (isLoading) {
     return (
@@ -88,7 +98,7 @@ function AppShell() {
     return <Redirect to="/login" />;
   }
 
-  const isAdmin = user.role === "admin";
+  const isAdmin = isAdminUser;
 
   if (isAdmin && !location.startsWith("/admin")) {
     return <Redirect to="/admin" />;
@@ -96,6 +106,15 @@ function AppShell() {
 
   if (!isAdmin && location.startsWith("/admin")) {
     return <Redirect to="/" />;
+  }
+
+  // Backend es la única fuente de verdad del acceso — esto es UX (evitar que la consultora
+  // se quede mirando páginas que el backend le va a rechazar igual), no la protección en sí:
+  // cada endpoint de negocio ya devuelve 403 propio vía requireActiveSubscription. Nunca
+  // bloquea /subscription ni sus retornos — es justamente por donde se recupera el acceso.
+  const isSubscriptionRoute = !isAdmin && location.startsWith("/subscription");
+  if (!isAdmin && !isSubscriptionStatusLoading && subscriptionStatus && !subscriptionStatus.hasAccess && !isSubscriptionRoute) {
+    return <Redirect to="/subscription" />;
   }
 
   const style = {

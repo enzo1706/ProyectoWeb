@@ -31,6 +31,7 @@ import {
 } from "@shared/schema";
 import { requireAdmin } from "./middleware/requireAdmin";
 import { requireAuth } from "./middleware/requireAuth";
+import { requireActiveSubscription } from "./middleware/requireActiveSubscription";
 import { slugify } from "@shared/slug";
 import { SUBSCRIPTION_PRICE_ARS, PLAN_NAME } from "./config/subscription";
 import { getConsultantAccessStatus, generateExternalReference, parseConsultantIdFromExternalReference } from "./subscription";
@@ -294,12 +295,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // acceder a los datos de negocio. Sin esto, estas rutas quedan abiertas sin login.
   // requireConsultant además exige que la sesión pertenezca a una consultora (admin
   // nunca debe poder tocar datos de negocio scopeados por tenant a través de estas rutas).
-  app.use("/api/products", requireAuth, requireConsultant);
-  app.use("/api/clients", requireAuth, requireConsultant);
-  app.use("/api/sales", requireAuth, requireConsultant);
-  app.use("/api/appointments", requireAuth, requireConsultant);
-  app.use("/api/reports", requireAuth, requireConsultant);
-  app.use("/api/dashboard", requireAuth, requireConsultant);
+  // requireActiveSubscription es una tercera capa aparte, no un reemplazo de las dos
+  // anteriores: sin trial vigente ni suscripción activa, 403 antes de llegar al handler —
+  // nunca se monta en /api/subscription/*, /api/auth/*, /api/health ni /api/admin/*.
+  app.use("/api/products", requireAuth, requireConsultant, requireActiveSubscription);
+  app.use("/api/clients", requireAuth, requireConsultant, requireActiveSubscription);
+  app.use("/api/sales", requireAuth, requireConsultant, requireActiveSubscription);
+  app.use("/api/appointments", requireAuth, requireConsultant, requireActiveSubscription);
+  app.use("/api/reports", requireAuth, requireConsultant, requireActiveSubscription);
+  app.use("/api/dashboard", requireAuth, requireConsultant, requireActiveSubscription);
 
   // Sin requireConsultant: admin recibe 404 explícito ("no aplica"), no el 403 genérico.
   app.get("/api/business-settings", requireAuth, async (req: Request, res: Response) => {
