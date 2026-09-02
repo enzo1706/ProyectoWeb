@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import type { Appointment } from "@shared/schema";
 import { getEventTypeLabel, getEventTypeColorClass } from "@shared/eventTypes";
+import { onActivationKeyDown } from "@/lib/utils";
 
 interface AppointmentCardProps {
   appointment: Appointment;
@@ -51,6 +52,9 @@ export function AppointmentCard({ appointment, onClick }: AppointmentCardProps) 
     <Card
       className="hover-elevate cursor-pointer"
       onClick={() => onClick?.(appointment)}
+      role="button"
+      tabIndex={0}
+      onKeyDown={onActivationKeyDown(() => onClick?.(appointment))}
       data-testid={`card-appointment-${appointment.id}`}
     >
       <CardContent className="py-3">

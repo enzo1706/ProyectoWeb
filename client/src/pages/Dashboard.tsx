@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { LowStockDialog } from "@/components/LowStockDialog";
+import { ErrorBlock } from "@/components/ErrorBlock";
 import { AppointmentDetailDialog } from "@/components/AppointmentDetailDialog";
 import { SaleDetailDialog } from "@/components/SaleDetailDialog";
 import { NewSaleDialog } from "@/components/NewSaleDialog";
@@ -225,19 +226,19 @@ export default function Dashboard() {
   const { start: monthStart, end: monthEnd } = currentMonthRange();
   const { start: prevMonthStart, end: prevMonthEnd } = previousMonthRange();
 
-  const { data: lowStockProducts = [], isLoading: loadingLowStock } = useQuery<Product[]>({
+  const { data: lowStockProducts = [], isLoading: loadingLowStock, isError: errorLowStock } = useQuery<Product[]>({
     queryKey: ["/api/products/low-stock"],
   });
 
-  const { data: upcomingAppointments = [], isLoading: loadingAppointments } = useQuery<Appointment[]>({
+  const { data: upcomingAppointments = [], isLoading: loadingAppointments, isError: errorAppointments } = useQuery<Appointment[]>({
     queryKey: ["/api/appointments/upcoming"],
   });
 
-  const { data: pendingInstallments = [], isLoading: loadingInstallments } = useQuery<PendingInstallmentRow[]>({
+  const { data: pendingInstallments = [], isLoading: loadingInstallments, isError: errorInstallments } = useQuery<PendingInstallmentRow[]>({
     queryKey: ["/api/reports/pending-installments"],
   });
 
-  const { data: upcomingBirthdays = [], isLoading: loadingBirthdays } = useQuery<UpcomingBirthdayRow[]>({
+  const { data: upcomingBirthdays = [], isLoading: loadingBirthdays, isError: errorBirthdays } = useQuery<UpcomingBirthdayRow[]>({
     queryKey: ["/api/reports/upcoming-birthdays", 30],
     queryFn: async () => {
       const res = await apiRequest("GET", "/api/reports/upcoming-birthdays?days=30");
@@ -245,7 +246,7 @@ export default function Dashboard() {
     },
   });
 
-  const { data: inactiveClients = [], isLoading: loadingInactive } = useQuery<InactiveClientRow[]>({
+  const { data: inactiveClients = [], isLoading: loadingInactive, isError: errorInactive } = useQuery<InactiveClientRow[]>({
     queryKey: ["/api/reports/inactive-clients", INACTIVE_CLIENTS_DAYS],
     queryFn: async () => {
       const res = await apiRequest("GET", `/api/reports/inactive-clients?days=${INACTIVE_CLIENTS_DAYS}`);
@@ -253,7 +254,7 @@ export default function Dashboard() {
     },
   });
 
-  const { data: currentMonthPoints = [], isLoading: loadingCurrentMonth } = useQuery<SalesSummaryPoint[]>({
+  const { data: currentMonthPoints = [], isLoading: loadingCurrentMonth, isError: errorCurrentMonth } = useQuery<SalesSummaryPoint[]>({
     queryKey: ["/api/reports/sales-summary", monthStart, monthEnd],
     queryFn: async () => {
       const res = await apiRequest("GET", `/api/reports/sales-summary?start=${monthStart}&end=${monthEnd}&groupBy=month`);
@@ -341,8 +342,15 @@ export default function Dashboard() {
   const isLoadingAny =
     loadingInstallments || loadingAppointments || loadingLowStock || loadingBirthdays || loadingInactive;
 
+  // Ninguna de estas queries tiene un estado de error visible propio (a diferencia de
+  // Reportes.tsx) — sin este flag, un fetch fallido cae en el default `[]` y termina
+  // mostrando "no hay nada pendiente" / "$0 este mes" como si fuera un dato real.
+  const hasLoadError =
+    errorLowStock || errorAppointments || errorInstallments || errorBirthdays || errorInactive || errorCurrentMonth;
+
   const hasNothing =
     !isLoadingAny &&
+    !hasLoadError &&
     alertTasks.length === 0 &&
     stockAlertProducts.length === 0 &&
     upcomingEvents.length === 0 &&
@@ -370,6 +378,10 @@ export default function Dashboard() {
           Así está tu negocio hoy
         </h1>
       </div>
+
+      {hasLoadError && (
+        <ErrorBlock message="No pudimos cargar parte de tu información. Los datos de esta pantalla pueden estar incompletos — probá recargar la página." />
+      )}
 
       {isLoadingAny && (
         <Card data-testid="card-loading-tasks">
@@ -488,6 +500,10 @@ export default function Dashboard() {
             <p className="text-sm text-muted-foreground">Este mes vendiste</p>
             {loadingCurrentMonth ? (
               <Skeleton className="mt-1 h-8 w-28" />
+            ) : errorCurrentMonth ? (
+              <p className="text-sm text-destructive" data-testid="text-month-total-error">
+                No se pudo calcular
+              </p>
             ) : (
               <p className="text-2xl font-bold text-foreground sm:text-3xl" data-testid="text-month-total">
                 {format(monthTotal)}

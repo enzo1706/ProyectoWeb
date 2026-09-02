@@ -1,6 +1,7 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { TrendingUp, TrendingDown } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { onActivationKeyDown } from "@/lib/utils";
 
 interface MetricCardProps {
   title: string;
@@ -20,6 +21,8 @@ export function MetricCard({ title, value, icon: Icon, trend, subtitle, onClick 
       className={onClick ? "hover-elevate cursor-pointer" : undefined}
       onClick={onClick}
       role={onClick ? "button" : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      onKeyDown={onClick ? onActivationKeyDown(onClick) : undefined}
       data-testid={`card-metric-${title.toLowerCase().replace(/\s+/g, '-')}`}
     >
       <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0 pb-2">

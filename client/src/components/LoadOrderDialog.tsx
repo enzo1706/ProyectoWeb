@@ -266,11 +266,11 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
                         <p className="text-xs text-muted-foreground">{format(product.precio)}</p>
                       </div>
                       <div className="flex shrink-0 items-center gap-1.5">
-                        <Button type="button" variant="outline" size="icon" className="h-7 w-7" onClick={() => setQtyByProduct((p) => ({ ...p, [product.id]: Math.max(1, qty - 1) }))} aria-label="Disminuir cantidad" data-testid={`button-order-qty-minus-${product.id}`}>
+                        <Button type="button" variant="outline" size="icon" className="h-8 w-8" onClick={() => setQtyByProduct((p) => ({ ...p, [product.id]: Math.max(1, qty - 1) }))} aria-label="Disminuir cantidad" data-testid={`button-order-qty-minus-${product.id}`}>
                           <Minus className="h-3.5 w-3.5" />
                         </Button>
                         <span className="w-4 text-center text-sm tabular-nums" data-testid={`text-order-qty-${product.id}`}>{qty}</span>
-                        <Button type="button" variant="outline" size="icon" className="h-7 w-7" onClick={() => setQtyByProduct((p) => ({ ...p, [product.id]: qty + 1 }))} aria-label="Aumentar cantidad" data-testid={`button-order-qty-plus-${product.id}`}>
+                        <Button type="button" variant="outline" size="icon" className="h-8 w-8" onClick={() => setQtyByProduct((p) => ({ ...p, [product.id]: qty + 1 }))} aria-label="Aumentar cantidad" data-testid={`button-order-qty-plus-${product.id}`}>
                           <Plus className="h-3.5 w-3.5" />
                         </Button>
                         <Button type="button" size="sm" className="h-7 px-2.5 text-xs" onClick={() => addLine(product)} data-testid={`button-order-add-${product.id}`}>
@@ -296,7 +296,7 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
                           {line.quantity} unidad{line.quantity !== 1 ? "es" : ""} · {format(line.precio * line.quantity)}
                         </p>
                       </div>
-                      <Button type="button" variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => removeLine(line.productId)} aria-label={`Quitar ${line.productName} del pedido`} data-testid={`button-order-remove-${line.productId}`}>
+                      <Button type="button" variant="ghost" size="icon" className="h-8 w-8 shrink-0" onClick={() => removeLine(line.productId)} aria-label={`Quitar ${line.productName} del pedido`} data-testid={`button-order-remove-${line.productId}`}>
                         <X className="h-4 w-4" />
                       </Button>
                     </div>

@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { MetricCard } from "@/components/MetricCard";
+import { ErrorBlock } from "@/components/ErrorBlock";
 import { apiRequest } from "@/lib/queryClient";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { toDateStr, parseLocalDate } from "@/lib/date";
@@ -245,18 +246,6 @@ function EmptyBlock({ message }: { message: string }) {
     <div className="flex flex-col items-center justify-center py-10 text-center" data-testid="report-empty">
       <Inbox className="h-8 w-8 text-muted-foreground mb-2" />
       <p className="text-muted-foreground text-sm">{message}</p>
-    </div>
-  );
-}
-
-function ErrorBlock({ error }: { error: Error }) {
-  return (
-    <div
-      className="flex flex-col items-center justify-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-6 text-center"
-      data-testid="report-error"
-    >
-      <AlertTriangle className="h-6 w-6 text-destructive" />
-      <p className="text-sm text-destructive">No se pudo cargar este reporte: {error.message}</p>
     </div>
   );
 }

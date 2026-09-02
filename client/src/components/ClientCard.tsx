@@ -2,6 +2,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Phone, Mail, Calendar, ShoppingBag } from "lucide-react";
 import { useHideMoney } from "@/hooks/use-hide-money";
+import { onActivationKeyDown } from "@/lib/utils";
 import type { Client as BaseClient } from "@shared/schema";
 
 export interface Client extends BaseClient {
@@ -29,6 +30,9 @@ export function ClientCard({ client, onClick }: ClientCardProps) {
     <Card
       className="hover-elevate cursor-pointer"
       onClick={() => onClick?.(client)}
+      role="button"
+      tabIndex={0}
+      onKeyDown={onActivationKeyDown(() => onClick?.(client))}
       data-testid={`card-client-${client.id}`}
     >
       <CardContent className="pt-4">

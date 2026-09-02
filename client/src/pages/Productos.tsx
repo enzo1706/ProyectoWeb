@@ -50,7 +50,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import { cn } from "@/lib/utils";
+import { cn, onActivationKeyDown } from "@/lib/utils";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { isLowStock, isReminderActive } from "@shared/stockAlerts";
 import { toDateStr } from "@/lib/date";
@@ -180,13 +180,13 @@ function ProductStockCell({
             type="button"
             variant="ghost"
             size="icon"
-            className="h-6 w-6 shrink-0"
+            className="h-8 w-8 shrink-0"
             title="Editar stock"
             aria-label="Editar stock"
             onClick={startEditingStock}
             data-testid={`button-edit-stock-${product.id}`}
           >
-            <Pencil className="h-3 w-3" />
+            <Pencil className="h-3.5 w-3.5" />
           </Button>
         </div>
       )}
@@ -281,6 +281,9 @@ function ProductRow({
           compact && "pl-4",
         )}
         onClick={onOpen}
+        role="button"
+        tabIndex={0}
+        onKeyDown={onActivationKeyDown(onOpen)}
       >
         {!compact && (
           product.imagen ? (
@@ -377,6 +380,9 @@ function ProductGroup({
       <div
         className="flex items-center gap-3 px-3 py-2.5 hover-elevate cursor-pointer"
         onClick={() => onOpen(primary)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={onActivationKeyDown(() => onOpen(primary))}
         data-testid={`row-group-${primary.id}`}
       >
         {primary.imagen ? (

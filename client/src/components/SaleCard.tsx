@@ -2,6 +2,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { User, Calendar, Package } from "lucide-react";
 import { useHideMoney } from "@/hooks/use-hide-money";
+import { onActivationKeyDown } from "@/lib/utils";
 import type { Sale as BaseSale, SaleItem, SaleInstallment } from "@shared/schema";
 
 export type { SaleItem, SaleInstallment };
@@ -47,6 +48,9 @@ export function SaleCard({ sale, onClick }: SaleCardProps) {
     <Card
       className={`hover-elevate cursor-pointer ${isCancelled ? "opacity-60" : ""}`}
       onClick={() => onClick?.(sale)}
+      role="button"
+      tabIndex={0}
+      onKeyDown={onActivationKeyDown(() => onClick?.(sale))}
       data-testid={`card-sale-${sale.id}`}
     >
       <CardContent className="py-4">

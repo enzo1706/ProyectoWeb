@@ -112,8 +112,21 @@ function AppShell() {
   // se quede mirando páginas que el backend le va a rechazar igual), no la protección en sí:
   // cada endpoint de negocio ya devuelve 403 propio vía requireActiveSubscription. Nunca
   // bloquea /subscription ni sus retornos — es justamente por donde se recupera el acceso.
+  //
+  // Mientras se resuelve el check, se muestra el mismo spinner del auth check en vez de
+  // dejar pasar el dashboard real (con su botón "Registrar venta" bien interactivo) — antes
+  // se veía brevemente el dashboard completo apenas logueaba una consultora con acceso
+  // vencido, hasta que esta consulta resolvía y recién ahí redirigía a /subscription.
+  if (!isAdmin && isSubscriptionStatusLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-background">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      </div>
+    );
+  }
+
   const isSubscriptionRoute = !isAdmin && location.startsWith("/subscription");
-  if (!isAdmin && !isSubscriptionStatusLoading && subscriptionStatus && !subscriptionStatus.hasAccess && !isSubscriptionRoute) {
+  if (!isAdmin && subscriptionStatus && !subscriptionStatus.hasAccess && !isSubscriptionRoute) {
     return <Redirect to="/subscription" />;
   }
 
