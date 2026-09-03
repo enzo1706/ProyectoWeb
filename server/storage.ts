@@ -1095,7 +1095,7 @@ export class DatabaseStorage implements IStorage {
         location: input.location ?? null,
         notes: input.notes ?? null,
       })
-      .where(eq(appointments.id, id))
+      .where(and(eq(appointments.id, id), eq(appointments.consultantId, consultantId)))
       .returning();
     return updated;
   }
@@ -1297,7 +1297,7 @@ export class DatabaseStorage implements IStorage {
     const [appointmentCount] = await db.select({ value: count() }).from(appointments).where(eq(appointments.clientId, id));
     if ((appointmentCount?.value ?? 0) > 0) return "has_relations";
 
-    await db.delete(clients).where(eq(clients.id, id));
+    await db.delete(clients).where(and(eq(clients.id, id), eq(clients.consultantId, consultantId)));
     return "deleted";
   }
 
@@ -1912,7 +1912,7 @@ export class DatabaseStorage implements IStorage {
           installmentFrequency: installmentAmounts.length > 1 ? input.installmentFrequency ?? null : null,
           notes: input.notes ?? null,
         })
-        .where(eq(sales.id, id))
+        .where(and(eq(sales.id, id), eq(sales.consultantId, consultantId)))
         .returning();
 
       return updated;
@@ -1952,7 +1952,11 @@ export class DatabaseStorage implements IStorage {
         }
       }
 
-      const [updated] = await tx.update(sales).set({ status: "cancelada" }).where(eq(sales.id, id)).returning();
+      const [updated] = await tx
+        .update(sales)
+        .set({ status: "cancelada" })
+        .where(and(eq(sales.id, id), eq(sales.consultantId, consultantId)))
+        .returning();
       return updated;
     });
   }
@@ -1974,7 +1978,7 @@ export class DatabaseStorage implements IStorage {
     const [updated] = await db
       .update(saleInstallments)
       .set({ status })
-      .where(eq(saleInstallments.id, installmentId))
+      .where(and(eq(saleInstallments.id, installmentId), eq(saleInstallments.saleId, saleId)))
       .returning();
     return updated;
   }
