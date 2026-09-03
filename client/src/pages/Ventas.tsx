@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { SaleCard, type Sale, type SaleDetails } from "@/components/SaleCard";
 import { NewSaleDialog } from "@/components/NewSaleDialog";
 import { SaleDetailDialog } from "@/components/SaleDetailDialog";
+import { ErrorBlock } from "@/components/ErrorBlock";
 import { Plus, Search, Filter } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -46,15 +47,17 @@ export default function Ventas() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const { data: sales = [] } = useQuery<Sale[]>({ queryKey: ["/api/sales"] });
+  const { data: sales = [], isError: errorSales } = useQuery<Sale[]>({ queryKey: ["/api/sales"] });
   const { data: products = [] } = useQuery<Product[]>({ queryKey: ["/api/products"] });
-  const { data: topProducts = [] } = useQuery<TopProductByCategory[]>({
+  const { data: topProducts = [], isError: errorTopProducts } = useQuery<TopProductByCategory[]>({
     queryKey: ["/api/sales/top-products", "top5"],
     queryFn: async () => {
       const res = await apiRequest("GET", "/api/sales/top-products?limit=5");
       return res.json();
     },
   });
+
+  const hasLoadError = errorSales || errorTopProducts;
 
   const filteredSales = sales.filter((s) => {
     const matchesSearch = s.clientName.toLowerCase().includes(search.toLowerCase());
@@ -72,7 +75,9 @@ export default function Ventas() {
         <div>
           <h1 className="text-3xl font-bold">Ventas</h1>
           <p className="text-muted-foreground">
-            {sales.length} ventas registradas | {pendingCount} pendientes
+            {errorSales
+              ? "No pudimos calcular tus totales"
+              : `${sales.length} ventas registradas | ${pendingCount} pendientes`}
           </p>
         </div>
         <Button onClick={() => setDialogOpen(true)} data-testid="button-add-sale">
@@ -80,6 +85,10 @@ export default function Ventas() {
           Nueva Venta
         </Button>
       </div>
+
+      {hasLoadError && (
+        <ErrorBlock message="No pudimos cargar parte de tu información de ventas. Tus datos siguen intactos — probá recargar la página." />
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <Card>
@@ -89,7 +98,11 @@ export default function Ventas() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold tabular-nums">{format(totalSales)}</p>
+            {errorSales ? (
+              <p className="text-sm text-destructive">No se pudo calcular</p>
+            ) : (
+              <p className="text-2xl font-bold tabular-nums">{format(totalSales)}</p>
+            )}
           </CardContent>
         </Card>
         <Card>
@@ -99,9 +112,13 @@ export default function Ventas() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-2xl font-bold text-green-600 dark:text-green-400 tabular-nums">
-              {format(totalProfit)}
-            </p>
+            {errorSales ? (
+              <p className="text-sm text-destructive">No se pudo calcular</p>
+            ) : (
+              <p className="text-2xl font-bold text-green-600 dark:text-green-400 tabular-nums">
+                {format(totalProfit)}
+              </p>
+            )}
           </CardContent>
         </Card>
         <Card data-testid="card-top-products">
@@ -111,7 +128,9 @@ export default function Ventas() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {topProducts.length === 0 ? (
+            {errorTopProducts ? (
+              <p className="text-sm text-destructive">No se pudo cargar</p>
+            ) : topProducts.length === 0 ? (
               <p className="text-sm text-muted-foreground">Todavía no hay ventas registradas</p>
             ) : (
               <ol className="space-y-1.5">
@@ -160,16 +179,20 @@ export default function Ventas() {
         </Select>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {filteredSales.map((sale) => (
-          <SaleCard key={sale.id} sale={sale} onClick={(s) => setSelectedSaleId(s.id)} />
-        ))}
-      </div>
+      {!errorSales && (
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {filteredSales.map((sale) => (
+              <SaleCard key={sale.id} sale={sale} onClick={(s) => setSelectedSaleId(s.id)} />
+            ))}
+          </div>
 
-      {filteredSales.length === 0 && (
-        <div className="text-center py-12 text-muted-foreground">
-          No se encontraron ventas
-        </div>
+          {filteredSales.length === 0 && (
+            <div className="text-center py-12 text-muted-foreground">
+              No se encontraron ventas
+            </div>
+          )}
+        </>
       )}
 
       <NewSaleDialog

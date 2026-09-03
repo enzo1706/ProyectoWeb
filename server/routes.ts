@@ -907,16 +907,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  app.post("/api/dashboard/seed-demo", async (req: Request, res: Response) => {
-    try {
-      await storage.seedDashboardDemoData(req.consultantId!);
-      res.json({ message: "Datos de demostración cargados" });
-    } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: "Error al cargar datos de demostración" });
-    }
-  });
-
   app.patch("/api/products/:id/discount", async (req: Request, res: Response) => {
     try {
       const id = parseInt(req.params.id, 10);

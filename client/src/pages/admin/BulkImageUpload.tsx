@@ -42,6 +42,7 @@ import {
 import { cn } from "@/lib/utils";
 import { apiRequest, extractFriendlyErrorMessage, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
+import { ErrorBlock } from "@/components/ErrorBlock";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { runWithConcurrency } from "@/lib/concurrency";
 import {
@@ -376,7 +377,7 @@ function makeKey(file: File): string {
 }
 
 export default function BulkImageUpload() {
-  const { data: products = [], isLoading } = useQuery<GlobalProduct[]>({
+  const { data: products = [], isLoading, isError } = useQuery<GlobalProduct[]>({
     queryKey: ["/api/admin/products"],
   });
   const productsById = useMemo(() => new Map(products.map((p) => [p.id, p])), [products]);
@@ -551,6 +552,10 @@ export default function BulkImageUpload() {
           </p>
         </div>
       </div>
+
+      {isError && (
+        <ErrorBlock message="No pudimos cargar el catálogo global — sin él no se puede emparejar ni asignar imágenes. Probá recargar la página." />
+      )}
 
       <ImageMatchFinder />
 

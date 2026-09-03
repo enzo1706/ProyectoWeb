@@ -197,13 +197,17 @@ describe("requireActiveSubscription — gate de acceso por suscripción", () => 
     sub.currentPeriodEnd = null;
     sub.trialEndAt = new Date(Date.now() - 1 * DAY_MS);
 
+    // /api/dashboard no tiene ningún endpoint concreto propio (el único que tuvo, seed-demo,
+    // se eliminó en la Etapa I-B.2 por no tener consumidor real) — igual sigue montado con la
+    // misma cadena de middleware que los otros 5 prefijos, así que golpear el prefijo pelado
+    // sigue siendo la forma correcta de probar que ese gate lo cubre también.
     const [products, clients, sales, appointments, reports, dashboard] = await Promise.all([
       fetch(`${baseUrl}/api/products`, { headers: { Cookie: sharedCookie } }),
       fetch(`${baseUrl}/api/clients`, { headers: { Cookie: sharedCookie } }),
       fetch(`${baseUrl}/api/sales`, { headers: { Cookie: sharedCookie } }),
       fetch(`${baseUrl}/api/appointments`, { headers: { Cookie: sharedCookie } }),
       fetch(`${baseUrl}/api/reports/sales-summary?start=2026-01-01&end=2026-12-31`, { headers: { Cookie: sharedCookie } }),
-      fetch(`${baseUrl}/api/dashboard/seed-demo`, { method: "POST", headers: { Cookie: sharedCookie } }),
+      fetch(`${baseUrl}/api/dashboard`, { headers: { Cookie: sharedCookie } }),
     ]);
     for (const res of [products, clients, sales, appointments, reports, dashboard]) {
       expect(res.status).toBe(403);

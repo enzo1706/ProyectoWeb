@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { MetricCard } from "@/components/MetricCard";
+import { ErrorBlock } from "@/components/ErrorBlock";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Users, Package, UserCheck, Shield } from "lucide-react";
 import { Link } from "wouter";
@@ -12,7 +13,7 @@ interface AdminStats {
 }
 
 export default function AdminDashboard() {
-  const { data: stats, isLoading } = useQuery<AdminStats>({
+  const { data: stats, isLoading, isError } = useQuery<AdminStats>({
     queryKey: ["/api/admin/stats"],
   });
 
@@ -33,10 +34,14 @@ export default function AdminDashboard() {
         </div>
       </div>
 
+      {isError && (
+        <ErrorBlock message="No pudimos cargar las métricas del panel. Probá recargar la página." />
+      )}
+
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         <MetricCard
           title="Total Consultoras"
-          value={isLoading ? "—" : String(stats?.totalConsultants ?? 0)}
+          value={isLoading || isError ? "—" : String(stats?.totalConsultants ?? 0)}
           icon={Users}
           subtitle={
             stats
@@ -46,13 +51,13 @@ export default function AdminDashboard() {
         />
         <MetricCard
           title="Productos Activos"
-          value={isLoading ? "—" : String(stats?.activeProducts ?? 0)}
+          value={isLoading || isError ? "—" : String(stats?.activeProducts ?? 0)}
           icon={Package}
           subtitle="En catálogo global"
         />
         <MetricCard
           title="Consultoras Activas"
-          value={isLoading ? "—" : String(stats?.activeConsultants ?? 0)}
+          value={isLoading || isError ? "—" : String(stats?.activeConsultants ?? 0)}
           icon={UserCheck}
           subtitle="Pueden acceder al sistema"
         />

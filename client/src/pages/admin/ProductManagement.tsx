@@ -34,6 +34,7 @@ import { Input } from "@/components/ui/input";
 import { Upload, FileSpreadsheet, Package, CheckCircle2, AlertTriangle, X, ImagePlus } from "lucide-react";
 import { apiRequest, extractFriendlyErrorMessage, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
+import { ErrorBlock } from "@/components/ErrorBlock";
 import { cn } from "@/lib/utils";
 import { bulkProductSchema } from "@shared/schema";
 import { slugify } from "@shared/slug";
@@ -429,7 +430,7 @@ function ProductImageDialog({
 }
 
 function GlobalCatalogList() {
-  const { data: products = [], isLoading } = useQuery<GlobalProduct[]>({
+  const { data: products = [], isLoading, isError } = useQuery<GlobalProduct[]>({
     queryKey: ["/api/admin/products"],
   });
   const [selected, setSelected] = useState<GlobalProduct | null>(null);
@@ -454,6 +455,8 @@ function GlobalCatalogList() {
       <CardContent>
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Cargando...</p>
+        ) : isError ? (
+          <ErrorBlock message="No pudimos cargar el catálogo global. Probá recargar la página." />
         ) : products.length === 0 ? (
           <p className="text-sm text-muted-foreground" data-testid="empty-global-catalog">
             Todavía no hay productos globales cargados.

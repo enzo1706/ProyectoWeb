@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { ErrorBlock } from "@/components/ErrorBlock";
 import { UserPlus, Users } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
@@ -38,7 +39,7 @@ export default function UserManagement() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
 
-  const { data: consultants = [], isLoading } = useQuery<Consultant[]>({
+  const { data: consultants = [], isLoading, isError } = useQuery<Consultant[]>({
     queryKey: ["/api/admin/users"],
   });
 
@@ -101,6 +102,8 @@ export default function UserManagement() {
         <div className="rounded-lg border bg-card shadow-sm p-8 text-center text-muted-foreground">
           Cargando consultoras...
         </div>
+      ) : isError ? (
+        <ErrorBlock message="No pudimos cargar el listado de consultoras. Probá recargar la página." />
       ) : consultants.length === 0 ? (
         <div className="rounded-lg border bg-card shadow-sm p-8 text-center text-muted-foreground">
           No hay consultoras registradas. Crea la primera con el botón superior.

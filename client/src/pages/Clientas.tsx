@@ -14,6 +14,7 @@ import { ClientCard, type Client } from "@/components/ClientCard";
 import { ClientDialog } from "@/components/ClientDialog";
 import { ClientDetailSheet } from "@/components/ClientDetailSheet";
 import { NewSaleDialog } from "@/components/NewSaleDialog";
+import { ErrorBlock } from "@/components/ErrorBlock";
 import { Plus, Search } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
@@ -48,7 +49,7 @@ export default function Clientas() {
     return () => clearTimeout(timeout);
   }, [search]);
 
-  const { data: clients = [], isLoading } = useQuery<Client[]>({
+  const { data: clients = [], isLoading, isError } = useQuery<Client[]>({
     queryKey: ["/api/clients", debouncedSearch],
     queryFn: async () => {
       const params = new URLSearchParams({ limit: "100" });
@@ -149,7 +150,9 @@ export default function Clientas() {
         <div>
           <h1 className="text-3xl font-bold">Clientas</h1>
           <p className="text-muted-foreground">
-            {filteredClients.length} clientas | Total facturado: {format(totalRevenue)}
+            {isError
+              ? "No pudimos calcular tus totales"
+              : `${filteredClients.length} clientas | Total facturado: ${format(totalRevenue)}`}
           </p>
         </div>
         <Button onClick={handleNewClient} data-testid="button-add-client">
@@ -193,6 +196,8 @@ export default function Clientas() {
 
       {isLoading ? (
         <div className="text-center py-12 text-muted-foreground">Cargando clientas...</div>
+      ) : isError ? (
+        <ErrorBlock message="No pudimos cargar tus clientas. Tus datos siguen intactos — probá recargar la página." />
       ) : (
         <>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
