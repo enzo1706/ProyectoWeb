@@ -96,11 +96,30 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
   const [installmentFrequency, setInstallmentFrequency] = useState<InstallmentFrequency | null>(null);
   const [orderDiscountPct, setOrderDiscountPct] = useState("");
   const [orderSurchargePct, setOrderSurchargePct] = useState("");
-  const [shippingCost, setShippingCost] = useState<number | null>(null);
+  // Etapa I-B.7-D-C: dos conceptos separados — lo que se le cobra a la clienta por el envío
+  // (afecta el total y suma a la ganancia) y lo que le cuesta realmente el envío a la
+  // consultora (resta de la ganancia; puede quedar sin informar, `null`).
+  const [shippingCharged, setShippingCharged] = useState<number | null>(null);
+  const [shippingCostReal, setShippingCostReal] = useState<number | null>(null);
   const [notes, setNotes] = useState("");
 
   const [productSubView, setProductSubView] = useState<ProductSubView>("category");
   const productStepRef = useRef<SaleProductStepHandle>(null);
+
+  // Clave de idempotencia de este intento de venta (Etapa I-B.6): un solo UUID por intento
+  // lógico, generado recién al primer submit (no al abrir el diálogo, para no gastar uno si
+  // la consultora abre el wizard y lo cierra sin llegar a confirmar). Si el submit falla o la
+  // respuesta se pierde, `resetAndClose` NO corre (el diálogo queda abierto, ver
+  // `saveSaleMutation.onError` más abajo) — el mismo ref sigue vivo y el reintento reutiliza
+  // el mismo UUID. Recién se limpia en `resetAndClose`, que corre tanto al confirmar con éxito
+  // como al cerrar/cancelar el diálogo — ahí sí es un intento nuevo la próxima vez que se abra.
+  const clientRequestIdRef = useRef<string | null>(null);
+  const getOrCreateClientRequestId = () => {
+    if (!clientRequestIdRef.current) {
+      clientRequestIdRef.current = crypto.randomUUID();
+    }
+    return clientRequestIdRef.current;
+  };
 
   const [clientSearch, setClientSearch] = useState("");
   const [debouncedClientSearch, setDebouncedClientSearch] = useState("");
@@ -150,7 +169,8 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
       setOrderSurchargePct(
         existingSale.orderSurchargeType === "percent" && existingSale.orderSurchargeValue ? String(existingSale.orderSurchargeValue) : "",
       );
-      setShippingCost(existingSale.shippingCost ?? null);
+      setShippingCharged(existingSale.shippingCharged ?? null);
+      setShippingCostReal(existingSale.shippingCost ?? null);
       setNotes(existingSale.notes ?? "");
       setDate(parseLocalDate(existingSale.date));
     } else if (open && !existingSale) {
@@ -201,7 +221,7 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
   const orderSurcharge: OrderAdjustment | null = orderSurchargePct ? { type: "percent", value: Number(orderSurchargePct) } : null;
 
   const subtotal = computeSubtotal(lines.map((l) => ({ quantity: l.quantity, unitPrice: getLineFinalPrice(l) })));
-  const totals = computeSaleTotals({ subtotal, orderDiscount, orderSurcharge, shippingCost });
+  const totals = computeSaleTotals({ subtotal, orderDiscount, orderSurcharge, shippingCharged });
   const effectiveInstallments = installmentsCount === 1 ? [totals.total] : installmentAmounts;
   const installmentsValid = installmentsSumMatches(effectiveInstallments, totals.total);
 
@@ -253,11 +273,13 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
     setInstallmentFrequency(null);
     setOrderDiscountPct("");
     setOrderSurchargePct("");
-    setShippingCost(null);
+    setShippingCharged(null);
+    setShippingCostReal(null);
     setNotes("");
     setStepIndex(0);
     setProductSubView("category");
     setClientSearch("");
+    clientRequestIdRef.current = null;
     onOpenChange(false);
   };
 
@@ -267,7 +289,6 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
     queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
     queryClient.invalidateQueries({ queryKey: ["/api/sales/top-products"] });
     queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
-    queryClient.invalidateQueries({ queryKey: ["/api/clients/top"] });
     queryClient.invalidateQueries({
       predicate: (query) => typeof query.queryKey[0] === "string" && query.queryKey[0].startsWith("/api/reports"),
     });
@@ -283,7 +304,8 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
           items: lines.map((l) => ({ productId: l.productId, quantity: l.quantity, unitPrice: getLineFinalPrice(l) })),
           orderDiscount,
           orderSurcharge,
-          shippingCost: shippingCost ?? undefined,
+          shippingCharged: shippingCharged ?? undefined,
+          shippingCost: shippingCostReal ?? undefined,
           paymentMethod,
           installments: effectiveInstallments.map((amount) => ({ amount })),
           installmentFrequency: installmentsCount > 1 ? installmentFrequency ?? undefined : undefined,
@@ -299,12 +321,14 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
         items: lines.map((l) => ({ productId: l.productId, quantity: l.quantity, unitPrice: getLineFinalPrice(l) })),
         orderDiscount,
         orderSurcharge,
-        shippingCost: shippingCost ?? undefined,
+        shippingCharged: shippingCharged ?? undefined,
+        shippingCost: shippingCostReal ?? undefined,
         paymentMethod,
         installments: effectiveInstallments.map((amount) => ({ amount })),
         installmentFrequency: installmentsCount > 1 ? installmentFrequency ?? undefined : undefined,
         notes: notes.trim() ? notes.trim() : undefined,
         status: "pendiente",
+        clientRequestId: getOrCreateClientRequestId(),
       };
       const res = await apiRequest("POST", "/api/sales", payload);
       return res.json();
@@ -492,18 +516,34 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
                   <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">%</span>
                 </div>
               </div>
-              <div className="flex items-center justify-between py-3">
-                <Label htmlFor="wizard-shipping">Costo de envío</Label>
+              <div className="flex items-center justify-between border-b py-3">
+                <Label htmlFor="wizard-shipping-charged">Envío cobrado</Label>
                 <div className="relative w-28">
                   <Input
-                    id="wizard-shipping"
+                    id="wizard-shipping-charged"
                     type="number"
                     min={0}
                     placeholder="0"
                     className="pr-7 text-right"
-                    value={shippingCost !== null ? shippingCost / 100 : ""}
-                    onChange={(e) => setShippingCost(e.target.value ? Math.round(Number(e.target.value) * 100) : null)}
-                    data-testid="input-shipping-cost"
+                    value={shippingCharged !== null ? shippingCharged / 100 : ""}
+                    onChange={(e) => setShippingCharged(e.target.value ? Math.round(Number(e.target.value) * 100) : null)}
+                    data-testid="input-shipping-charged"
+                  />
+                  <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">$</span>
+                </div>
+              </div>
+              <div className="flex items-center justify-between py-3">
+                <Label htmlFor="wizard-shipping-cost">Costo real del envío</Label>
+                <div className="relative w-28">
+                  <Input
+                    id="wizard-shipping-cost"
+                    type="number"
+                    min={0}
+                    placeholder="Sin informar"
+                    className="pr-7 text-right"
+                    value={shippingCostReal !== null ? shippingCostReal / 100 : ""}
+                    onChange={(e) => setShippingCostReal(e.target.value ? Math.round(Number(e.target.value) * 100) : null)}
+                    data-testid="input-shipping-cost-real"
                   />
                   <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">$</span>
                 </div>
@@ -526,10 +566,10 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
                     <span>+ {format(totals.surchargeAmount)}</span>
                   </div>
                 )}
-                {totals.shippingCost > 0 && (
+                {totals.shippingCharged > 0 && (
                   <div className="flex justify-between text-sm text-emerald-600 dark:text-emerald-400">
                     <span>Envío</span>
-                    <span>+ {format(totals.shippingCost)}</span>
+                    <span>+ {format(totals.shippingCharged)}</span>
                   </div>
                 )}
                 <div className="flex justify-between border-t pt-2 text-base font-bold">
@@ -633,10 +673,10 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
                   <span className="font-medium">+{orderSurchargePct}% ({format(totals.surchargeAmount)})</span>
                 </div>
               )}
-              {totals.shippingCost > 0 && (
+              {totals.shippingCharged > 0 && (
                 <div className="flex justify-between text-sm">
                   <span className="text-muted-foreground">Envío</span>
-                  <span className="font-medium">{format(totals.shippingCost)}</span>
+                  <span className="font-medium">{format(totals.shippingCharged)}</span>
                 </div>
               )}
               <div className="flex justify-between text-sm">

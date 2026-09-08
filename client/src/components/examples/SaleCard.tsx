@@ -11,6 +11,7 @@ const mockSale: Sale = {
   orderDiscountValue: null,
   orderSurchargeType: null,
   orderSurchargeValue: null,
+  shippingCharged: null,
   shippingCost: null,
   total: 10100,
   profit: 4550,
@@ -19,6 +20,7 @@ const mockSale: Sale = {
   installmentFrequency: null,
   status: "pagado",
   notes: null,
+  clientRequestId: null,
   itemCount: 3,
 };
 

@@ -48,7 +48,9 @@ export default function Ventas() {
   }, []);
 
   const { data: sales = [], isError: errorSales } = useQuery<Sale[]>({ queryKey: ["/api/sales"] });
-  const { data: products = [] } = useQuery<Product[]>({ queryKey: ["/api/products"] });
+  // Etapa I-B.8-E (F5): sin errorProducts, un fallo acá dejaba el diálogo de nueva/editar venta
+  // con el catálogo vacío en silencio, en vez de avisar que algo no cargó.
+  const { data: products = [], isError: errorProducts } = useQuery<Product[]>({ queryKey: ["/api/products"] });
   const { data: topProducts = [], isError: errorTopProducts } = useQuery<TopProductByCategory[]>({
     queryKey: ["/api/sales/top-products", "top5"],
     queryFn: async () => {
@@ -57,7 +59,7 @@ export default function Ventas() {
     },
   });
 
-  const hasLoadError = errorSales || errorTopProducts;
+  const hasLoadError = errorSales || errorTopProducts || errorProducts;
 
   const filteredSales = sales.filter((s) => {
     const matchesSearch = s.clientName.toLowerCase().includes(search.toLowerCase());
@@ -65,8 +67,13 @@ export default function Ventas() {
     return matchesSearch && matchesStatus;
   });
 
-  const totalSales = sales.reduce((sum, s) => sum + s.total, 0);
-  const totalProfit = sales.reduce((sum, s) => sum + s.profit, 0);
+  // Etapa I-B.7-D-B: excluye canceladas, igual que TODOS los endpoints de /api/reports/*
+  // (ver server/storage.ts, `ne(sales.status, "cancelada")`) — antes de este fix, esta tarjeta
+  // sumaba ventas canceladas mientras Reportes no, dando números distintos para el mismo
+  // período en dos pantallas del mismo sistema (hallazgo I-B.7-D-A [F2]).
+  const nonCancelledSales = sales.filter((s) => s.status !== "cancelada");
+  const totalSales = nonCancelledSales.reduce((sum, s) => sum + s.total, 0);
+  const totalProfit = nonCancelledSales.reduce((sum, s) => sum + s.profit, 0);
   const pendingCount = sales.filter((s) => s.status === "pendiente").length;
 
   return (

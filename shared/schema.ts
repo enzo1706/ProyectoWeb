@@ -1,5 +1,6 @@
-import { pgTable, serial, text, integer, boolean, timestamp, jsonb, index, unique } from "drizzle-orm/pg-core";
+import { pgTable, serial, text, integer, boolean, timestamp, jsonb, index, unique, uniqueIndex } from "drizzle-orm/pg-core";
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
+import { sql } from "drizzle-orm";
 import { z } from "zod";
 import { CUSTOM_EVENT_TYPE_MAX_LENGTH } from "./eventTypes";
 
@@ -57,9 +58,21 @@ export const products = pgTable("products", {
   // "manual": la consultora lo cargó ella misma (consultantId siempre el suyo).
   source: text("source").notNull().default("import"),
 }, (table) => ({
-  // Sigue sirviendo para deduplicar productos MANUALES entre sí (por consultora). Los
-  // globales (consultantId null) se dedupean aparte en el import — ver bulkInsertProducts.
+  // Sigue sirviendo para deduplicar productos MANUALES entre sí (por consultora). NO protege
+  // los globales: en Postgres dos filas con consultant_id NULL nunca son "iguales" para un
+  // UNIQUE normal (NULL <> NULL), así que este constraint jamás dispara entre dos globales con
+  // el mismo código — ver globalCodigoUnique más abajo, que sí cubre ese caso.
   consultantCodigoUnique: unique("products_consultant_codigo_unique").on(table.consultantId, table.codigo),
+  // Etapa I-B.8-D: índice único PARCIAL — unicidad de `codigo` SOLO entre productos globales
+  // (consultant_id IS NULL). Resuelve el TOCTOU de `bulkInsertProducts` (hallazgo F3, auditoría
+  // I-B.8-A): dos imports concurrentes que verifican "no existe" y después insertan podían
+  // crear dos filas globales con el mismo código, porque el UNIQUE de arriba no las alcanzaba.
+  // Deliberadamente NO es `unique(codigo)` a secas — eso rompería la semántica multi-tenant
+  // (cada consultora puede tener su propio producto manual con el mismo código que otra, o que
+  // el catálogo global). Solo aplica cuando consultant_id es NULL.
+  globalCodigoUnique: uniqueIndex("products_global_codigo_unique_idx")
+    .on(table.codigo)
+    .where(sql`${table.consultantId} IS NULL`),
   consultantIdx: index("products_consultant_id_idx").on(table.consultantId),
 }));
 
@@ -152,6 +165,16 @@ export const sales = pgTable("sales", {
   orderDiscountValue: integer("order_discount_value"),
   orderSurchargeType: text("order_surcharge_type"),
   orderSurchargeValue: integer("order_surcharge_value"),
+  // Etapa I-B.7-D-C: importe de envío COBRADO a la clienta — siempre suma al `total` que paga.
+  // Antes de esta etapa, esto era lo que se guardaba en la columna `shipping_cost` (que en la
+  // práctica siempre representó lo cobrado, nunca un costo real — ver auditoría I-B.7-D-A). El
+  // backfill de esta etapa copió los valores históricos de `shipping_cost` acá y los dejó en
+  // `shipping_cost = NULL` — ningún valor fue inventado, ver `script/backfill-shipping-charged.ts`.
+  shippingCharged: integer("shipping_charged"),
+  // Etapa I-B.7-D-C: costo REAL del envío para la consultora — nullable porque no siempre se
+  // conoce (si no se informa, el cálculo de `profit` lo trata como 0, pero el dato en sí queda
+  // `NULL`, nunca se inventa un valor). Ventas anteriores a esta etapa quedan con `NULL` acá —
+  // ese costo histórico no es reconstruible con la información que existía entonces.
   shippingCost: integer("shipping_cost"),
   total: integer("total").notNull(),
   profit: integer("profit").notNull(),
@@ -160,9 +183,22 @@ export const sales = pgTable("sales", {
   installmentFrequency: text("installment_frequency"),
   status: text("status").notNull().default("pendiente"),
   notes: text("notes"),
+  // Nullable: ventas históricas y cualquier cliente que no lo mande siguen funcionando igual.
+  // UUID generado por el frontend (un valor por intento lógico de venta, ver NewSaleDialog) —
+  // permite reintentar el mismo POST /api/sales (doble pestaña, retry tras perder la
+  // respuesta) sin crear una segunda venta ni descontar stock dos veces (Etapa I-B.6).
+  // UNIQUE compuesto con consultantId, nunca solo: cada navegador genera sus propios UUID de
+  // forma independiente, así que dos consultoras distintas pueden coincidir en el mismo valor
+  // sin que eso sea un conflicto real. Postgres no exige unicidad entre NULLs, así que las
+  // ventas legacy (sin este campo) nunca chocan entre sí.
+  clientRequestId: text("client_request_id"),
 }, (table) => ({
   consultantDateIdx: index("sales_consultant_id_date_idx").on(table.consultantId, table.date),
   consultantClientIdx: index("sales_consultant_id_client_id_idx").on(table.consultantId, table.clientId),
+  consultantClientRequestIdUnique: unique("sales_consultant_id_client_request_id_unique").on(
+    table.consultantId,
+    table.clientRequestId,
+  ),
 }));
 
 export const saleItems = pgTable("sale_items", {
@@ -174,6 +210,13 @@ export const saleItems = pgTable("sale_items", {
   quantity: integer("quantity").notNull(),
   originalPrice: integer("original_price").notNull(),
   price: integer("price").notNull(),
+  // Etapa I-B.7-D-D: costo unitario histórico del producto en el momento de crear o
+  // recalcular esta línea (misma fuente que ya usa `profit`: `productStock.costPrice ??
+  // product.precio`) — resuelve F4 (auditoría I-B.7-D-A): antes de esta etapa solo existía
+  // `sales.profit` como agregado de toda la venta, sin forma de reconstruir cuánto costó cada
+  // producto específico. Nullable: líneas de ventas anteriores a esta etapa quedan en NULL —
+  // ese costo histórico por ítem nunca fue registrado y no se inventa retroactivamente.
+  costPrice: integer("cost_price"),
 }, (table) => ({
   saleIdIdx: index("sale_items_sale_id_idx").on(table.saleId),
   productIdIdx: index("sale_items_product_id_idx").on(table.productId),
@@ -296,6 +339,12 @@ export const insertProductSchema = createInsertSchema(products);
 export const selectProductSchema = createSelectSchema(products);
 export const insertClientSchema = createInsertSchema(clients).omit({ id: true }).extend({
   phone: z.string().regex(PHONE_REGEX, PHONE_ERROR_MESSAGE),
+  // Etapa I-B.8-E (F6): el frontend ya validaba el FORMATO de email (ClientDialog.tsx), el
+  // backend no lo espejaba — aceptaba cualquier string. Se preserva exactamente el mismo
+  // conjunto de valores ya aceptados (string vacío, null, undefined) — solo se rechaza un
+  // string NO VACÍO con formato inválido. No se vuelve obligatorio, no se toca la detección de
+  // duplicados (findDuplicateClient), no se convierte "" a null.
+  email: z.union([z.literal(""), z.string().trim().email("Ingresá un email válido")]).nullable().optional(),
 });
 /** El `consultantId` de una clienta lo decide siempre el backend a partir de la sesión
  * (nunca el body) — este schema es el que de verdad se usa para crear/editar, así que ni
@@ -370,6 +419,23 @@ export const createProductSchema = z.object({
   stockMinimo: z.number().int().positive().optional(),
 });
 
+// Etapa I-B.8-C: edición de los campos CORE de un producto MANUAL ya creado (resuelve F2 de
+// la auditoría I-B.8-A). Deliberadamente NO incluye: id/consultantId (ownership, lo deriva el
+// backend de la sesión, nunca el body — mismo criterio que clientWriteSchema), imagen/puntos/
+// variante (no pedidos, fuera de este alcance), costPrice/selectedDiscount/discontinued/
+// unidades/stockMinimo (se administran por sus propios endpoints ya existentes — /discount,
+// /discontinued, /stock, /stock/increment, /stock-reminder — nunca se mezclan acá). Todos los
+// campos son opcionales (PATCH parcial), pero al menos uno debe venir.
+export const updateProductSchema = z
+  .object({
+    seccion: z.string().trim().min(1, "La categoría es obligatoria").optional(),
+    linea: z.string().trim().optional(),
+    producto: z.string().trim().min(1, "El nombre del producto es obligatorio").optional(),
+    precio: z.number().int().nonnegative().optional(),
+    codigo: z.string().trim().min(1).optional(),
+  })
+  .refine((data) => Object.keys(data).length > 0, { message: "No hay campos para actualizar" });
+
 export const toggleProductDiscontinuedSchema = z.object({
   discontinued: z.boolean(),
 });
@@ -381,15 +447,32 @@ export const setProductStockSchema = z.object({
   stockMinimo: z.number().int().positive().nullable().optional(),
 });
 
+export const incrementProductStockSchema = z.object({
+  // Etapa I-B.8-B: delta atómico, nunca un valor absoluto — positivo entra mercadería, negativo
+  // sale. 0 no tiene ningún caso de uso identificado (no movería stock), así que se rechaza acá,
+  // antes de llegar a la base de datos.
+  delta: z.number().int().refine((d) => d !== 0, "El delta no puede ser 0"),
+});
+
 export const setProductStockReminderSchema = z.object({
   // Fecha YYYY-MM-DD hasta la que posponer la alerta de este producto, o null para cancelarla.
   remindAt: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Fecha inválida").nullable(),
 });
 
+// Hardening post-I-B.8-F: "value" es compartido entre "percent" y "fixed", pero solo el
+// primero tiene un techo natural (100%) — un descuento/recargo "fixed" sigue sin límite
+// numérico propio (un monto en centavos desproporcionado ya queda absorbido por el
+// `max(0, ...)` de computeSaleTotals, y no es lo que este hardening pidió tocar). Antes de
+// esto, un typo como "500" en vez de "50" pasaba sin avisar y silenciosamente dejaba el total
+// en $0 — no rompía nada, pero tampoco avisaba del error de carga.
 const orderAdjustmentSchema = z
   .object({
     type: z.enum(adjustmentTypes),
     value: z.number().nonnegative(),
+  })
+  .refine((adjustment) => adjustment.type !== "percent" || adjustment.value <= 100, {
+    message: "El porcentaje no puede ser mayor a 100",
+    path: ["value"],
   })
   .nullable()
   .optional();
@@ -406,12 +489,22 @@ export const createSaleSchema = z.object({
   items: z.array(createSaleItemSchema).min(1, "La venta debe tener al menos un producto"),
   orderDiscount: orderAdjustmentSchema,
   orderSurcharge: orderAdjustmentSchema,
-  shippingCost: z.number().int().nonnegative().optional(),
+  // Etapa I-B.7-D-C: importe de envío cobrado a la clienta — reemplaza al viejo campo
+  // `shippingCost` del contrato de API (que en realidad siempre significó esto). Opcional:
+  // ausente/0 = sin envío.
+  shippingCharged: z.number().int().nonnegative().optional(),
+  // Costo REAL del envío para la consultora — opcional Y nullable: `undefined`/ausente y
+  // `null` se tratan igual (no informado, el cálculo de profit lo trata como 0 sin inventar
+  // el dato). Nunca negativo cuando se informa.
+  shippingCost: z.number().int().nonnegative().nullable().optional(),
   paymentMethod: z.enum(paymentMethods),
   installments: z.array(z.object({ amount: z.number().int().nonnegative() })).min(1),
   installmentFrequency: z.enum(installmentFrequencies).optional(),
   status: z.enum(["pendiente", "entregado", "pagado"]).default("pendiente"),
   notes: z.string().max(1000).optional(),
+  // Opcional (compatibilidad con clientes viejos): clave de idempotencia generada por el
+  // frontend — ver `sales.clientRequestId` en el schema de arriba y la Etapa I-B.6.
+  clientRequestId: z.string().uuid("clientRequestId debe ser un UUID válido").optional(),
 });
 
 // Edición de una venta ya existente: mismo cuerpo que la creación, salvo clienta/fecha/status
@@ -420,7 +513,8 @@ export const updateSaleSchema = z.object({
   items: z.array(createSaleItemSchema).min(1, "La venta debe tener al menos un producto"),
   orderDiscount: orderAdjustmentSchema,
   orderSurcharge: orderAdjustmentSchema,
-  shippingCost: z.number().int().nonnegative().optional(),
+  shippingCharged: z.number().int().nonnegative().optional(),
+  shippingCost: z.number().int().nonnegative().nullable().optional(),
   paymentMethod: z.enum(paymentMethods),
   installments: z.array(z.object({ amount: z.number().int().nonnegative() })).min(1),
   installmentFrequency: z.enum(installmentFrequencies).optional(),
@@ -438,7 +532,21 @@ export const createConsultantSchema = z.object({
 
 export const updateBusinessSettingsSchema = z.object({
   businessName: z.string().trim().min(1, "El nombre del negocio no puede estar vacío").max(120),
-  currency: z.string().trim().length(3, "Usá un código de moneda ISO de 3 letras (ej. ARS, USD)").toUpperCase(),
+  // Etapa I-B.8-E (F9): antes solo exigía "3 letras mayúsculas" — cualquier string inventado
+  // (ej. "ZZZ") pasaba y después rompía `formatPrice` en TODA la app, porque
+  // `Intl.NumberFormat` tira RangeError ante un código ISO 4217 que no existe. Se valida contra
+  // el registro real del propio motor JS (`Intl.supportedValuesOf`, sin dependencias externas
+  // ni una lista propia hardcodeada que quedaría desactualizada) — sigue soportando cualquier
+  // moneda real, no solo ARS, así que no le pone un techo artificial a la app.
+  currency: z
+    .string()
+    .trim()
+    .length(3, "Usá un código de moneda ISO de 3 letras (ej. ARS, USD)")
+    .toUpperCase()
+    .refine(
+      (code) => (typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("currency").includes(code) : true),
+      "Ese código de moneda no existe (ISO 4217) — probá ARS, USD, etc.",
+    ),
   monthlyGoal: z.number().int().nonnegative().nullable().optional(),
   defaultLowStockThreshold: z.number().int().positive().nullable().optional(),
 });

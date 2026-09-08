@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useLocation } from "wouter";
 import { useForm } from "react-hook-form";
@@ -8,7 +8,7 @@ import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { useSaleCart } from "@/hooks/use-sale-cart";
 import type { Product } from "@shared/schema";
 import { discountOptions, createProductSchema } from "@shared/schema";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import {
   Card,
   CardContent,
@@ -39,6 +39,16 @@ import {
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogFooter,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogAction,
+  AlertDialogCancel,
+} from "@/components/ui/alert-dialog";
 import {
   Form,
   FormControl,
@@ -75,6 +85,8 @@ import {
   AlertTriangle,
   Clock,
   ChevronDown,
+  MoreVertical,
+  Trash2,
 } from "lucide-react";
 
 const MANUAL_FILTER = "__manual";
@@ -254,6 +266,11 @@ interface StockActions {
   isSettingStock: (id: number) => boolean;
   onSetReminder: (id: number, remindAt: string | null) => void;
   isSettingReminder: (id: number) => boolean;
+  // Etapa I-B.8-C: edición/borrado de campos core — solo aplican a productos MANUALES
+  // (product.source === "manual"), nunca al catálogo global. Ambas abren un diálogo a nivel
+  // de página, no mutan directo desde acá (mismo criterio que onOpen).
+  onEditProduct: (product: Product) => void;
+  onDeleteProduct: (product: Product) => void;
 }
 
 /** Fila compacta de un producto puntual (sin tonos, o un tono dentro de un grupo expandido).
@@ -342,6 +359,38 @@ function ProductRow({
         >
           <ShoppingBag className="h-4 w-4" />
         </Button>
+        {product.source === "manual" && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8 shrink-0"
+                title="Más acciones"
+                aria-label="Más acciones"
+                onClick={(e) => e.stopPropagation()}
+                data-testid={`button-product-menu-${product.id}`}
+              >
+                <MoreVertical className="h-4 w-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+              <DropdownMenuItem onClick={() => actions.onEditProduct(product)} data-testid={`option-edit-product-${product.id}`}>
+                <Pencil className="h-4 w-4 mr-2" />
+                Editar producto
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => actions.onDeleteProduct(product)}
+                className="text-destructive focus:text-destructive"
+                data-testid={`option-delete-product-${product.id}`}
+              >
+                <Trash2 className="h-4 w-4 mr-2" />
+                Eliminar producto
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
       </div>
       <ProductStockAlerts
         product={product}
@@ -710,6 +759,162 @@ function AddProductDialog({ open, onOpenChange }: { open: boolean; onOpenChange:
   );
 }
 
+// Etapa I-B.8-C: edición de campos core de un producto MANUAL ya creado (resuelve F2). A
+// propósito NO es el mismo diálogo que AddProductDialog: ese tiene el selector de "descuento
+// de compra" que solo tiene sentido al crear (fija costPrice), y mezclarlo acá violaría la
+// regla explícita de esta etapa de no tocar costPrice/stock desde la edición de producto.
+const editProductFormSchema = z.object({
+  seccion: z.string().trim().min(1, "La categoría es obligatoria"),
+  linea: z.string().optional(),
+  producto: z.string().trim().min(1, "El nombre del producto es obligatorio"),
+  precio: z.string().min(1, "El precio es obligatorio"),
+  codigo: z.string().optional(),
+});
+type EditProductFormData = z.infer<typeof editProductFormSchema>;
+
+function EditProductDialog({
+  open,
+  onOpenChange,
+  product,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  product: Product | null;
+}) {
+  const { toast } = useToast();
+  const form = useForm<EditProductFormData>({
+    resolver: zodResolver(editProductFormSchema),
+    defaultValues: { seccion: "", linea: "", producto: "", precio: "", codigo: "" },
+  });
+
+  useEffect(() => {
+    if (product) {
+      form.reset({
+        seccion: product.seccion,
+        linea: product.linea ?? "",
+        producto: product.producto,
+        precio: String(product.precio / 100),
+        codigo: product.codigo,
+      });
+    }
+  }, [product, form]);
+
+  const updateMutation = useGuardedMutation({
+    mutationFn: async (data: EditProductFormData) => {
+      if (!product) throw new Error("Producto no seleccionado");
+      const res = await apiRequest("PATCH", `/api/products/${product.id}`, {
+        seccion: data.seccion,
+        linea: data.linea || undefined,
+        producto: data.producto,
+        precio: Math.round(Number(data.precio) * 100),
+        codigo: data.codigo || undefined,
+      });
+      return res.json() as Promise<Product>;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      toast({ title: "Producto actualizado" });
+      onOpenChange(false);
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo actualizar el producto", description: err.message, variant: "destructive" });
+    },
+  });
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-md" data-testid="dialog-edit-product">
+        <DialogHeader>
+          <DialogTitle>Editar producto</DialogTitle>
+        </DialogHeader>
+        <Form {...form}>
+          <form
+            onSubmit={form.handleSubmit((data) => updateMutation.mutate(data))}
+            className="space-y-4 flex-1 min-h-0 overflow-y-auto overscroll-contain px-1 -mx-1"
+          >
+            <FormField
+              control={form.control}
+              name="seccion"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Categoría</FormLabel>
+                  <FormControl>
+                    <Input {...field} data-testid="input-edit-seccion" />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="linea"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Línea (opcional)</FormLabel>
+                  <FormControl>
+                    <Input {...field} data-testid="input-edit-linea" />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="producto"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Nombre del producto</FormLabel>
+                  <FormControl>
+                    <Input {...field} data-testid="input-edit-producto" />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <div className="grid grid-cols-2 gap-4">
+              <FormField
+                control={form.control}
+                name="precio"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Precio público</FormLabel>
+                    <FormControl>
+                      <Input {...field} type="number" min={0} step="0.01" data-testid="input-edit-precio" />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="codigo"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Código (opcional)</FormLabel>
+                    <FormControl>
+                      <Input {...field} data-testid="input-edit-codigo" />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+
+            <DialogFooter className="border-t pt-4">
+              <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+                Cancelar
+              </Button>
+              <Button type="submit" disabled={updateMutation.isPending} data-testid="button-save-edit-product">
+                {updateMutation.isPending ? "Guardando..." : "Guardar cambios"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </Form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export default function Productos() {
   const { toast } = useToast();
   const { format } = useHideMoney();
@@ -723,6 +928,8 @@ export default function Productos() {
   const [addProductOpen, setAddProductOpen] = useState(false);
   const [loadOrderOpen, setLoadOrderOpen] = useState(false);
   const [bulkReminderDate, setBulkReminderDate] = useState("");
+  const [editingProduct, setEditingProduct] = useState<Product | null>(null);
+  const [deletingProduct, setDeletingProduct] = useState<Product | null>(null);
 
   const { data: products = [], isLoading, isError, error } = useQuery<Product[]>({
     queryKey: ["/api/products"],
@@ -836,11 +1043,30 @@ export default function Productos() {
     onSettled: () => setSettingReminderId(null),
   });
 
+  const deleteMutation = useGuardedMutation({
+    mutationFn: async (product: Product) => {
+      await apiRequest("DELETE", `/api/products/${product.id}`);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
+      toast({ title: "Producto eliminado" });
+      setDeletingProduct(null);
+    },
+    onError: (err: Error) => {
+      // 409 = tiene ventas asociadas (has_relations) — el mensaje del backend ya explica que
+      // "Descontinuar" es la alternativa correcta, así que se muestra tal cual llega.
+      toast({ title: "No se pudo eliminar el producto", description: err.message, variant: "destructive" });
+    },
+  });
+
   const stockActions: StockActions = {
     onSetStock: (id, unidades, stockMinimo) => setStockMutation.mutate({ id, unidades, stockMinimo }),
     isSettingStock: (id) => settingStockId === id,
     onSetReminder: (id, remindAt) => setReminderMutation.mutate({ id, remindAt }),
     isSettingReminder: (id) => settingReminderId === id,
+    onEditProduct: (product) => setEditingProduct(product),
+    onDeleteProduct: (product) => setDeletingProduct(product),
   };
 
   // lowStockRaw ya viene filtrado server-side a productos realmente comprados alguna vez
@@ -1035,6 +1261,38 @@ export default function Productos() {
       />
 
       <AddProductDialog open={addProductOpen} onOpenChange={setAddProductOpen} />
+
+      <EditProductDialog
+        open={editingProduct !== null}
+        onOpenChange={(open) => !open && setEditingProduct(null)}
+        product={editingProduct}
+      />
+
+      <AlertDialog open={deletingProduct !== null} onOpenChange={(open) => !open && setDeletingProduct(null)}>
+        <AlertDialogContent data-testid="dialog-confirm-delete-product">
+          <AlertDialogHeader>
+            <AlertDialogTitle>¿Eliminar {deletingProduct?.producto}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Esta acción no se puede deshacer. Si el producto tiene ventas registradas, no se va a poder eliminar
+              — en ese caso usá "Descontinuar" desde el stock para dejar de venderlo sin perder el historial.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel data-testid="button-confirm-delete-product-no">No, volver</AlertDialogCancel>
+            <AlertDialogAction
+              className={buttonVariants({ variant: "destructive" })}
+              onClick={(e) => {
+                e.preventDefault();
+                if (deletingProduct) deleteMutation.mutate(deletingProduct);
+              }}
+              disabled={deleteMutation.isPending}
+              data-testid="button-confirm-delete-product-yes"
+            >
+              {deleteMutation.isPending ? "Eliminando..." : "Sí, eliminar"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <LoadOrderDialog open={loadOrderOpen} onOpenChange={setLoadOrderOpen} products={products} />
 

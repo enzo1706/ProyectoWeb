@@ -26,7 +26,13 @@ declare module "express-session" {
  * DatabaseStorage.getDb() en storage.ts).
  */
 async function createPostgresSessionStore(): Promise<Store> {
-  const { pool } = await import("./db");
+  // Igual criterio que DatabaseStorage.getDb() (Etapa I-B.5.1): si TEST_DATABASE_URL está
+  // seteada (solo pasa en los tests de Postgres real, después de pasar el guard de
+  // test-db-guard.ts), la tabla "session" de esos tests vive en la base de test, aislada de
+  // la real — producción nunca tiene esa variable, así que este branch nunca se activa ahí.
+  const pool = process.env.TEST_DATABASE_URL
+    ? (await import("./test-db")).testPool
+    : (await import("./db")).pool;
   const PgSession = connectPgSimple(session);
   return new PgSession({ pool, tableName: "session", createTableIfMissing: true });
 }

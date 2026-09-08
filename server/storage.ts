@@ -16,6 +16,7 @@ import {
   updateAppointmentSchema,
   updateBusinessSettingsSchema,
   createProductSchema,
+  updateProductSchema,
   appointmentStatuses,
   subscriptionStatuses,
   paymentStatuses,
@@ -39,6 +40,8 @@ import {
 import {
   computeSubtotal,
   computeSaleTotals,
+  computeProductCost,
+  computeSaleProfit,
   installmentsSumMatches,
   computeInstallmentDueDate,
 } from "@shared/saleCalculations";
@@ -54,6 +57,94 @@ import { TRIAL_DAYS, PERIOD_DAYS } from "./config/subscription";
 
 export class SaleValidationError extends Error {}
 export class AppointmentValidationError extends Error {}
+/** Mismo `clientRequestId` que una venta ya existente, pero con un payload distinto — no es
+ * un reintento legítimo (ver Etapa I-B.6, sección "Payload diferente con el mismo
+ * clientRequestId"). Separada de `SaleValidationError` porque mapea a 409, no a 400. */
+export class SaleRequestConflictError extends Error {}
+/** Etapa I-B.8-C: violación del unique `(consultantId, codigo)` al editar un producto — mapea
+ * a 409 (conflicto de estado), no a 400 (el payload en sí era válido). */
+export class ProductConflictError extends Error {}
+
+const SALE_CLIENT_REQUEST_ID_CONSTRAINT = "sales_consultant_id_client_request_id_unique";
+
+/** Señal interna: esta transacción perdió la carrera de INSERT contra otra con el mismo
+ * `(consultantId, clientRequestId)` — el UNIQUE de Postgres la abortó. Nunca sale de
+ * `createSale`; se captura para ir a buscar la fila que sí ganó (ver Etapa I-B.6, sección 4). */
+class ClientRequestIdRaceLostError extends Error {}
+
+/** `pg` no tipa sus errores — un violation de constraint UNIQUE llega como un objeto plano con
+ * `code: "23505"` y `constraint: <nombre del índice>`. Comparamos el nombre exacto para no
+ * confundir esta violación con cualquier otra (ej. si en el futuro se agrega otro UNIQUE a
+ * `sales`) — ver advertencia explícita del pedido de la Etapa I-B.6. */
+function isUniqueViolationOn(err: unknown, constraintName: string): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { code?: unknown }).code === "23505" &&
+    (err as { constraint?: unknown }).constraint === constraintName
+  );
+}
+
+/** Normaliza y compara items por `(productId, quantity)` — orden no importa. El precio unitario
+ * solo se exige si el request nuevo lo mandó explícitamente: si vino `undefined`, no hay forma
+ * de verificarlo sin volver a resolver el catálogo, así que no se lo usa para rechazar un
+ * reintento legítimo (ver Etapa I-B.6, sección 5). */
+function saleItemsMatchInput(
+  inputItems: { productId: number; quantity: number; unitPrice?: number }[],
+  existingItems: { productId: number | null; quantity: number; price: number }[],
+): boolean {
+  if (inputItems.length !== existingItems.length) return false;
+  const sortByProduct = <T extends { productId: number | null }>(items: T[]) =>
+    [...items].sort((a, b) => (a.productId ?? -1) - (b.productId ?? -1));
+  const sortedInput = sortByProduct(inputItems);
+  const sortedExisting = sortByProduct(existingItems);
+  return sortedInput.every((item, i) => {
+    const existing = sortedExisting[i];
+    if (item.productId !== existing.productId || item.quantity !== existing.quantity) return false;
+    if (item.unitPrice === undefined) return true;
+    return item.unitPrice === existing.price;
+  });
+}
+
+/**
+ * Determina si un POST que repite un `clientRequestId` ya usado es el MISMO intento lógico de
+ * venta (reintento legítimo → se devuelve la venta existente) o una operación distinta (409 —
+ * ver Etapa I-B.6, sección 5). Compara contra columnas ya persistidas/calculadas de la venta
+ * original — no reinventa el cálculo de totales, solo reutiliza lo que `createSale` ya guardó.
+ */
+function saleRequestMatchesExisting(
+  input: CreateSaleInput,
+  existing: Pick<
+    Sale,
+    | "clientId"
+    | "date"
+    | "paymentMethod"
+    | "orderDiscountType"
+    | "orderDiscountValue"
+    | "orderSurchargeType"
+    | "orderSurchargeValue"
+    | "shippingCharged"
+    | "shippingCost"
+    | "installmentsCount"
+  >,
+  existingItems: { productId: number | null; quantity: number; price: number }[],
+): boolean {
+  if (existing.clientId !== input.clientId) return false;
+  if (existing.date !== input.date) return false;
+  if (existing.paymentMethod !== input.paymentMethod) return false;
+  if ((existing.orderDiscountType ?? null) !== (input.orderDiscount?.type ?? null)) return false;
+  if ((existing.orderDiscountValue ?? null) !== (input.orderDiscount?.value ?? null)) return false;
+  if ((existing.orderSurchargeType ?? null) !== (input.orderSurcharge?.type ?? null)) return false;
+  if ((existing.orderSurchargeValue ?? null) !== (input.orderSurcharge?.value ?? null)) return false;
+  // Etapa I-B.7-D-C: `shippingCharged` es el que afecta `total` (lo que la clienta paga) —
+  // reemplaza acá al viejo `shippingCost`, que cumplía ese mismo rol antes de esta etapa.
+  // `shippingCost` (costo real) también se compara: más estricto es más seguro para decidir
+  // "misma operación lógica" — nunca reduce ninguna garantía de idempotencia ya existente.
+  if ((existing.shippingCharged ?? null) !== (input.shippingCharged ?? null)) return false;
+  if ((existing.shippingCost ?? null) !== (input.shippingCost ?? null)) return false;
+  if (existing.installmentsCount !== input.installments.length) return false;
+  return saleItemsMatchInput(input.items, existingItems);
+}
 
 /** Citas que todavía requieren atención — se excluyen las que ya no están "pendientes de que pase algo". */
 const UPCOMING_APPOINTMENT_STATUSES: AppointmentStatus[] = appointmentStatuses.filter(
@@ -74,6 +165,7 @@ export type CreateAppointmentInput = z.infer<typeof createAppointmentSchema>;
 export type UpdateAppointmentInput = z.infer<typeof updateAppointmentSchema>;
 export type UpdateBusinessSettingsInput = z.infer<typeof updateBusinessSettingsSchema>;
 export type CreateProductInput = z.infer<typeof createProductSchema>;
+export type UpdateProductInput = z.infer<typeof updateProductSchema>;
 export type SubscriptionUpdate = Partial<
   Pick<
     Subscription,
@@ -103,6 +195,16 @@ export type ApplyApprovedPaymentResult =
   | { outcome: "applied"; payment: Payment }
   | { outcome: "already_processed"; payment: Payment }
   | { outcome: "preapproval_mismatch" };
+
+/** Etapa de hardening post-I-B.8-F: `PATCH /api/admin/users/:id/toggle-status` es exclusivo
+ * para administrar cuentas de CONSULTORA — nunca cuentas admin. `"forbidden"` cubre tanto "un
+ * admin desactiva a otro admin" como "un admin se desactiva a sí mismo": quien llama acá
+ * siempre es admin (requireAdmin), así que si el target también es admin, alcanza con chequear
+ * el rol del target — no hace falta comparar IDs por separado. */
+export type ToggleUserStatusResult =
+  | { outcome: "toggled"; user: User }
+  | { outcome: "not_found" }
+  | { outcome: "forbidden" };
 
 /** Admin-only: una fila por consultora para el panel de Suscripciones. `subscription` es
  * null solo si la consultora todavía no tiene fila (no debería pasar en uso normal, pero se
@@ -311,7 +413,7 @@ export interface IStorage {
   createUser(user: InsertUser): Promise<User>;
   updateUserPassword(id: number, newHash: string): Promise<void>;
   getConsultants(): Promise<User[]>;
-  toggleUserStatus(id: number): Promise<User | undefined>;
+  toggleUserStatus(id: number): Promise<ToggleUserStatusResult>;
   /** Para el bootstrap del primer admin: si ya existe alguno, el script no debe crear otro. */
   hasAdminAccount(): Promise<boolean>;
   getProductCount(): Promise<number>;
@@ -354,6 +456,21 @@ export interface IStorage {
   getLowStockProducts(consultantId: number): Promise<Product[]>;
   applyProductDiscount(consultantId: number, productId: number, discountPercent: number): Promise<Product | undefined>;
   createProduct(consultantId: number, input: CreateProductInput): Promise<Product>;
+  /**
+   * Etapa I-B.8-C: edita los campos CORE (nombre/precio/sección/línea/código) de un producto
+   * MANUAL propio — nunca uno global (`consultantId` null), esos son catálogo compartido y no
+   * se editan desde acá. `undefined` si no existe o no es de esta consultora (mismo criterio
+   * de ownership que `updateClient`). Nunca toca stock/costo/descuento/discontinued: eso sigue
+   * viviendo exclusivamente en sus propios endpoints.
+   */
+  updateProduct(consultantId: number, id: number, input: UpdateProductInput): Promise<Product | undefined>;
+  /**
+   * Etapa I-B.8-C: borrado físico de un producto MANUAL propio, solo si nunca tuvo ventas
+   * (`sale_items`) — si las tiene, se rechaza (`"has_relations"`) para no romper historial
+   * financiero; la baja lógica ya existente (`setProductDiscontinued`) sigue siendo la vía
+   * correcta para ese caso. Mismo patrón/firma que `deleteClient`.
+   */
+  deleteProduct(consultantId: number, id: number): Promise<"deleted" | "not_found" | "has_relations">;
   setProductDiscontinued(consultantId: number, productId: number, discontinued: boolean): Promise<Product | undefined>;
   /** La consultora fija su propio stock sobre un producto (global o manual propio). `stockMinimo`
    * es opcional: si viene, actualiza también el umbral propio del producto (null lo borra). */
@@ -366,6 +483,16 @@ export interface IStorage {
   /** Pospone la alerta de stock bajo de este producto hasta `remindAt` (YYYY-MM-DD), o la
    * cancela si `remindAt` es null. */
   setProductStockReminder(consultantId: number, productId: number, remindAt: string | null): Promise<Product | undefined>;
+  /**
+   * Etapa I-B.8-B: incremento/decremento ATÓMICO de stock — `unidades = unidades + delta`,
+   * calculado siempre por la base de datos, nunca por TypeScript a partir de un valor leído
+   * previamente (eso es exactamente la carrera que esta operación reemplaza, ver
+   * `LoadOrderDialog.tsx` y el hallazgo F1 de la auditoría I-B.8-A). Distinta de
+   * `setProductStock`, que sigue siendo un SET ABSOLUTO para ajustes manuales — no la
+   * reemplaza, coexisten. Tira `SaleValidationError` si el delta dejaría el stock negativo
+   * (mismo error de dominio que ya usa `createSale`/`updateSale` para "stock insuficiente").
+   */
+  incrementProductStock(consultantId: number, productId: number, delta: number): Promise<Product | undefined>;
   /** Admin-only: catálogo global completo (sin stock, eso es por consultora) para la pantalla de imágenes. */
   listGlobalProducts(): Promise<ProductRow[]>;
   /** Admin-only: solo aplica a productos globales — las imágenes de productos manuales las
@@ -420,7 +547,13 @@ export class DatabaseStorage implements IStorage {
   private dbPromise: Promise<Database> | undefined;
 
   private async getDb(): Promise<Database> {
-    this.dbPromise ??= import("./db").then((module) => module.db);
+    // TEST_DATABASE_URL solo existe cuando un test la seteó explícitamente y pasó el guard
+    // de server/test-db-guard.ts (host loopback + nombre "*_test") — producción real nunca
+    // la tiene, así que este branch nunca se activa fuera de los tests de Postgres real
+    // (client-isolation/stock-concurrency/tenant-isolation-deep, ver Etapa I-B.5.1).
+    this.dbPromise ??= process.env.TEST_DATABASE_URL
+      ? import("./test-db").then((module) => module.testDb)
+      : import("./db").then((module) => module.db);
     return this.dbPromise;
   }
 
@@ -480,9 +613,10 @@ export class DatabaseStorage implements IStorage {
       .where(ne(users.role, "admin"));
   }
 
-  async toggleUserStatus(id: number): Promise<User | undefined> {
+  async toggleUserStatus(id: number): Promise<ToggleUserStatusResult> {
     const existing = await this.getUser(id);
-    if (!existing) return undefined;
+    if (!existing) return { outcome: "not_found" };
+    if (existing.role === "admin") return { outcome: "forbidden" };
 
     const db = await this.getDb();
     const [updated] = await db
@@ -490,7 +624,7 @@ export class DatabaseStorage implements IStorage {
       .set({ status: !existing.status })
       .where(eq(users.id, id))
       .returning();
-    return updated;
+    return { outcome: "toggled", user: updated };
   }
 
   async hasAdminAccount(): Promise<boolean> {
@@ -727,41 +861,57 @@ export class DatabaseStorage implements IStorage {
     return rows.map((r) => withStockDefaults(r.product, r.stock));
   }
 
-  /** Admin-only: carga/actualiza el catálogo GLOBAL. `unique(consultantId, codigo)` no alcanza
-   * para deduplicar filas globales (dos NULL nunca son "iguales" en SQL), así que en vez de un
-   * ON CONFLICT con índice parcial (no verificable contra Postgres real en este entorno) se hace
-   * un select-then-upsert explícito por código — mismo resultado, portable a MemoryStorage. */
+  /** Admin-only: carga/actualiza el catálogo GLOBAL. El select-then-upsert por código sigue
+   * siendo la validación anticipada (da mensajes claros y dedupea correctamente DENTRO de un
+   * mismo batch, ya que el SELECT ve las propias escrituras aún no comiteadas de esta misma
+   * transacción). Pero ESA validación sola no alcanza contra dos llamadas concurrentes a este
+   * método: dos transacciones pueden hacer el mismo SELECT antes de que cualquiera comitee su
+   * INSERT y las dos insertar el mismo código global (hallazgo F3, auditoría I-B.8-A — TOCTOU
+   * real, no teórico). La defensa final es `products_global_codigo_unique_idx` (índice único
+   * PARCIAL en `shared/schema.ts`, `WHERE consultant_id IS NULL`) — verificado contra Postgres
+   * real en Etapa I-B.8-D. Atómico: todo el lote va en UNA transacción, así que si cualquier
+   * item choca contra esa constraint, se revierte el batch completo (nunca queda una
+   * importación parcialmente aplicada). */
   async bulkInsertProducts(items: InsertProduct[]): Promise<number> {
     if (items.length === 0) return 0;
 
     const db = await this.getDb();
     let changed = 0;
-    await db.transaction(async (tx) => {
-      for (const item of items) {
-        const [existing] = await tx
-          .select({ id: products.id })
-          .from(products)
-          .where(and(isNull(products.consultantId), eq(products.codigo, item.codigo)));
+    try {
+      await db.transaction(async (tx) => {
+        for (const item of items) {
+          const [existing] = await tx
+            .select({ id: products.id })
+            .from(products)
+            .where(and(isNull(products.consultantId), eq(products.codigo, item.codigo)));
 
-        if (existing) {
-          await tx
-            .update(products)
-            .set({
-              seccion: item.seccion,
-              linea: item.linea ?? null,
-              producto: item.producto,
-              variante: item.variante ?? "Estándar",
-              puntos: item.puntos ?? 0,
-              precio: item.precio,
-              imagen: item.imagen ?? null,
-            })
-            .where(eq(products.id, existing.id));
-        } else {
-          await tx.insert(products).values({ ...item, consultantId: null, source: "import" });
+          if (existing) {
+            await tx
+              .update(products)
+              .set({
+                seccion: item.seccion,
+                linea: item.linea ?? null,
+                producto: item.producto,
+                variante: item.variante ?? "Estándar",
+                puntos: item.puntos ?? 0,
+                precio: item.precio,
+                imagen: item.imagen ?? null,
+              })
+              .where(eq(products.id, existing.id));
+          } else {
+            await tx.insert(products).values({ ...item, consultantId: null, source: "import" });
+          }
+          changed++;
         }
-        changed++;
+      });
+    } catch (err) {
+      if (isUniqueViolationOn(err, "products_global_codigo_unique_idx")) {
+        throw new ProductConflictError(
+          "Conflicto al importar: otra importación concurrente ya creó un producto global con uno de estos códigos. No se guardó ningún producto de este lote — reintentá la importación.",
+        );
       }
-    });
+      throw err;
+    }
 
     return changed;
   }
@@ -908,6 +1058,61 @@ export class DatabaseStorage implements IStorage {
     return withStockDefaults(created, stock, await this.getDefaultThreshold(db, consultantId));
   }
 
+  async updateProduct(consultantId: number, id: number, input: UpdateProductInput): Promise<Product | undefined> {
+    const db = await this.getDb();
+    let updated: ProductRow | undefined;
+    try {
+      // Ownership en el propio WHERE (igual que updateClient) — nunca matchea un producto
+      // global (consultantId null) ni uno de otra consultora, sin necesidad de un chequeo
+      // separado antes del UPDATE.
+      [updated] = await db
+        .update(products)
+        .set(input)
+        .where(and(eq(products.id, id), eq(products.consultantId, consultantId)))
+        .returning();
+    } catch (err) {
+      if (isUniqueViolationOn(err, "products_consultant_codigo_unique")) {
+        throw new ProductConflictError("Ya existe otro producto tuyo con ese código");
+      }
+      throw err;
+    }
+    if (!updated) return undefined;
+
+    const [stock] = await db
+      .select()
+      .from(productStock)
+      .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, id)));
+    return withStockDefaults(updated, stock, await this.getDefaultThreshold(db, consultantId));
+  }
+
+  async deleteProduct(consultantId: number, id: number): Promise<"deleted" | "not_found" | "has_relations"> {
+    const db = await this.getDb();
+    const [product] = await db.select().from(products).where(and(eq(products.id, id), eq(products.consultantId, consultantId)));
+    if (!product) return "not_found";
+
+    const [itemCount] = await db.select({ value: count() }).from(saleItems).where(eq(saleItems.productId, id));
+    if ((itemCount?.value ?? 0) > 0) return "has_relations";
+
+    try {
+      return await db.transaction(async (tx) => {
+        await tx.delete(productStock).where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, id)));
+        const deleted = await tx
+          .delete(products)
+          .where(and(eq(products.id, id), eq(products.consultantId, consultantId)))
+          .returning();
+        return deleted.length > 0 ? "deleted" : "not_found";
+      });
+    } catch (err) {
+      // Defensa ante una carrera real: una venta pudo insertar un sale_item referenciando este
+      // producto justo entre el chequeo de arriba y este DELETE — el FK de Postgres (sin
+      // onDelete, ver shared/schema.ts) lo bloquea igual, nunca deja un huérfano.
+      if (typeof err === "object" && err !== null && (err as { code?: unknown }).code === "23503") {
+        return "has_relations";
+      }
+      throw err;
+    }
+  }
+
   async setProductDiscontinued(consultantId: number, productId: number, discontinued: boolean): Promise<Product | undefined> {
     const db = await this.getDb();
     const product = await this.findVisibleProduct(db, consultantId, productId);
@@ -945,6 +1150,42 @@ export class DatabaseStorage implements IStorage {
         set: setFields,
       })
       .returning();
+    return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
+  }
+
+  async incrementProductStock(consultantId: number, productId: number, delta: number): Promise<Product | undefined> {
+    if (delta === 0) {
+      throw new SaleValidationError("El delta de stock no puede ser 0");
+    }
+    const db = await this.getDb();
+    const product = await this.findVisibleProduct(db, consultantId, productId);
+    if (!product) return undefined;
+
+    // UPSERT atómico: `unidades = unidades + delta` lo calcula Postgres en la misma sentencia,
+    // nunca TypeScript a partir de un valor leído antes — esa es exactamente la carrera que esta
+    // operación reemplaza (ver LoadOrderDialog.tsx, hallazgo F1 de la auditoría I-B.8-A). Si el
+    // producto todavía no tiene fila en product_stock, el INSERT usa el delta crudo (no
+    // GREATEST(delta,0)): así un decremento sobre stock inexistente también da negativo y lo
+    // atrapa el mismo chequeo de abajo, sin duplicar la fila (mismo target de conflicto que ya
+    // usan setProductStock/applyProductDiscount/etc.).
+    //
+    // La transacción es necesaria para poder deshacer la escritura si el resultado da negativo:
+    // el UPSERT por sí solo ya habría comiteado el valor antes de que este código lo revise.
+    const stock = await db.transaction(async (tx) => {
+      const [stock] = await tx
+        .insert(productStock)
+        .values({ consultantId, productId, unidades: delta })
+        .onConflictDoUpdate({
+          target: [productStock.consultantId, productStock.productId],
+          set: { unidades: sql`${productStock.unidades} + ${delta}` },
+        })
+        .returning();
+      if (stock.unidades < 0) {
+        throw new SaleValidationError(`Stock insuficiente: quedarían ${stock.unidades} unidades`);
+      }
+      return stock;
+    });
+
     return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
   }
 
@@ -1654,8 +1895,42 @@ export class DatabaseStorage implements IStorage {
     return { ...sale, items, installments };
   }
 
+  /** Busca una venta ya registrada con este `(consultantId, clientRequestId)` y resuelve si el
+   * request actual es un reintento legítimo (devuelve la existente) o un conflicto real (409) —
+   * ver Etapa I-B.6, secciones 4 y 5. `undefined` si no había ninguna venta con ese ID todavía. */
+  private async resolveExistingSaleByClientRequestId(
+    db: Database,
+    consultantId: number,
+    input: CreateSaleInput,
+  ): Promise<Sale | undefined> {
+    if (!input.clientRequestId) return undefined;
+    const [existing] = await db
+      .select()
+      .from(sales)
+      .where(and(eq(sales.consultantId, consultantId), eq(sales.clientRequestId, input.clientRequestId)));
+    if (!existing) return undefined;
+
+    const existingItems = await db
+      .select({ productId: saleItems.productId, quantity: saleItems.quantity, price: saleItems.price })
+      .from(saleItems)
+      .where(eq(saleItems.saleId, existing.id));
+
+    if (saleRequestMatchesExisting(input, existing, existingItems)) {
+      return existing;
+    }
+    throw new SaleRequestConflictError("El clientRequestId ya fue utilizado para otra venta");
+  }
+
   async createSale(consultantId: number, input: CreateSaleInput): Promise<Sale> {
     const db = await this.getDb();
+
+    // Camino rápido: si este clientRequestId ya se procesó (reintento humano tras perder la
+    // respuesta, doble pestaña, etc.), no hace falta abrir transacción ni tocar stock — ver
+    // Etapa I-B.6. Esto NO es la garantía definitiva contra una carrera real (dos requests
+    // concurrentes pueden pasar este SELECT los dos, ver más abajo el catch del INSERT), solo
+    // evita el trabajo redundante en el caso, largamente más común, de un reintento secuencial.
+    const earlyMatch = await this.resolveExistingSaleByClientRequestId(db, consultantId, input);
+    if (earlyMatch) return earlyMatch;
 
     const productIds = Array.from(new Set(input.items.map((i) => i.productId)));
 
@@ -1674,7 +1949,8 @@ export class DatabaseStorage implements IStorage {
     if (!client) throw new SaleValidationError("Clienta no encontrada");
     const clientName = client.name ?? client.phone;
 
-    return db.transaction(async (tx) => {
+    try {
+      return await db.transaction(async (tx) => {
       // SELECT ... FOR UPDATE: bloquea las filas de stock involucradas hasta el commit. Si
       // dos ventas del mismo producto llegan a la vez, la segunda queda esperando acá y
       // recién lee (y valida) el stock ya descontado por la primera — nunca las dos ven el
@@ -1710,7 +1986,7 @@ export class DatabaseStorage implements IStorage {
         subtotal,
         orderDiscount: input.orderDiscount ?? null,
         orderSurcharge: input.orderSurcharge ?? null,
-        shippingCost: input.shippingCost ?? null,
+        shippingCharged: input.shippingCharged ?? null,
       });
 
       const installmentAmounts = input.installments.map((i) => i.amount);
@@ -1718,33 +1994,55 @@ export class DatabaseStorage implements IStorage {
         throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
       }
 
-      const profit = lines.reduce((sum, l) => {
-        const cost = l.costPrice ?? l.product.precio;
-        return sum + (l.unitPrice - cost) * l.quantity;
-      }, 0);
+      // Etapa I-B.7-D-C: profit real — total autoritativo (ya incluye descuento/recargo/envío
+      // cobrado) menos el costo real de mercadería y el costo real de envío. Mismo fallback de
+      // costo por línea que ya existía (`costPrice ?? product.precio`), ahora usado para COGS
+      // en vez de para un cálculo de profit por línea que ignoraba el resto de la orden.
+      const productCost = computeProductCost(
+        lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice ?? l.product.precio })),
+      );
+      const profit = computeSaleProfit({ total: totals.total, productCost, shippingCost: input.shippingCost ?? null });
 
-      const [sale] = await tx
-        .insert(sales)
-        .values({
-          consultantId,
-          clientId: client.id,
-          clientName,
-          date: input.date,
-          subtotal,
-          orderDiscountType: input.orderDiscount?.type ?? null,
-          orderDiscountValue: input.orderDiscount?.value ?? null,
-          orderSurchargeType: input.orderSurcharge?.type ?? null,
-          orderSurchargeValue: input.orderSurcharge?.value ?? null,
-          shippingCost: input.shippingCost ?? null,
-          total: totals.total,
-          profit,
-          paymentMethod: input.paymentMethod,
-          installmentsCount: input.installments.length,
-          installmentFrequency: input.installments.length > 1 ? input.installmentFrequency ?? null : null,
-          status: input.status,
-          notes: input.notes ?? null,
-        })
-        .returning();
+      // Última línea de defensa contra una carrera real (dos requests concurrentes con el
+      // mismo consultantId+clientRequestId, ninguno de los dos vio al otro en el SELECT previo
+      // porque ambos corrieron antes de que cualquiera hiciera commit): el UNIQUE de Postgres
+      // deja pasar solo uno de los dos INSERT. El que pierde levanta acá una excepción de
+      // violación de constraint — la capturamos, pero SOLO si es específicamente esta
+      // constraint (nunca cualquier otro 23505), y la convertimos en una señal interna que
+      // aborta esta transacción de forma controlada (no queda ninguna escritura a medias:
+      // todavía no se insertó nada más, ni sale_items ni el stock). Ver Etapa I-B.6, sección 4.
+      let sale: Sale;
+      try {
+        [sale] = await tx
+          .insert(sales)
+          .values({
+            consultantId,
+            clientId: client.id,
+            clientName,
+            date: input.date,
+            subtotal,
+            orderDiscountType: input.orderDiscount?.type ?? null,
+            orderDiscountValue: input.orderDiscount?.value ?? null,
+            orderSurchargeType: input.orderSurcharge?.type ?? null,
+            orderSurchargeValue: input.orderSurcharge?.value ?? null,
+            shippingCharged: input.shippingCharged ?? null,
+            shippingCost: input.shippingCost ?? null,
+            total: totals.total,
+            profit,
+            paymentMethod: input.paymentMethod,
+            installmentsCount: input.installments.length,
+            installmentFrequency: input.installments.length > 1 ? input.installmentFrequency ?? null : null,
+            status: input.status,
+            notes: input.notes ?? null,
+            clientRequestId: input.clientRequestId ?? null,
+          })
+          .returning();
+      } catch (err) {
+        if (input.clientRequestId && isUniqueViolationOn(err, SALE_CLIENT_REQUEST_ID_CONSTRAINT)) {
+          throw new ClientRequestIdRaceLostError();
+        }
+        throw err;
+      }
 
       await tx.insert(saleItems).values(
         lines.map((l) => ({
@@ -1755,6 +2053,10 @@ export class DatabaseStorage implements IStorage {
           quantity: l.quantity,
           originalPrice: l.product.precio,
           price: l.unitPrice,
+          // Etapa I-B.7-D-D: mismo costo, misma expresión, que ya usa `computeProductCost`
+          // más arriba — nunca una fuente distinta para lo que se persiste vs. lo que se
+          // calculó.
+          costPrice: l.costPrice ?? l.product.precio,
         })),
       );
 
@@ -1776,7 +2078,19 @@ export class DatabaseStorage implements IStorage {
       }
 
       return sale;
-    });
+      });
+    } catch (err) {
+      if (err instanceof ClientRequestIdRaceLostError) {
+        // Perdimos la carrera: la transacción de arriba ya hizo ROLLBACK (drizzle lo hace
+        // automáticamente al propagarse una excepción desde el callback), así que no quedó
+        // ninguna escritura nuestra. Para cuando llegamos acá, la otra transacción YA hizo
+        // commit — Postgres solo reporta 23505 una vez que la fila conflictiva es visible, así
+        // que esta relectura siempre encuentra a la ganadora, sin necesidad de reintentar.
+        const winner = await this.resolveExistingSaleByClientRequestId(db, consultantId, input);
+        if (winner) return winner;
+      }
+      throw err;
+    }
   }
 
   /**
@@ -1789,10 +2103,39 @@ export class DatabaseStorage implements IStorage {
     const db = await this.getDb();
 
     return db.transaction(async (tx) => {
-      const [existingSale] = await tx.select().from(sales).where(and(eq(sales.id, id), eq(sales.consultantId, consultantId)));
+      // Etapa I-B.7-C: `FOR UPDATE` acá también — mismo orden global de locks que
+      // `cancelSale`/`updateInstallmentStatus` (sales siempre primero, antes de cualquier
+      // recurso secundario). Sin este lock, una edición y una cancelación concurrentes podían
+      // leer la venta como "pendiente" las dos, y la que terminaba después seguía escribiendo
+      // sobre una venta que la otra ya había cancelado (hallazgo I-B.7-A [5-E]). Con el lock,
+      // la segunda en llegar espera acá y relee el estado ya resuelto por la primera.
+      const [existingSale] = await tx
+        .select()
+        .from(sales)
+        .where(and(eq(sales.id, id), eq(sales.consultantId, consultantId)))
+        .for("update");
       if (!existingSale) return undefined;
       if (existingSale.status === "cancelada") {
         throw new SaleValidationError("No se puede editar una venta cancelada");
+      }
+
+      // Etapa I-B.7-B: una venta con al menos una cuota ya cobrada no puede editarse — el
+      // flujo de abajo borra y recrea TODAS las cuotas como "pendiente", así que editar sin
+      // este chequeo resetearía en silencio dinero que ya se registró como cobrado (hallazgo
+      // P0 de la auditoría I-B.7-A). `FOR UPDATE` acá, no un SELECT simple: cierra la ventana
+      // donde `updateInstallmentStatus` marca una cuota "pagado" justo en el medio de esta
+      // transacción — esa marca, al no tener transacción propia, queda bloqueada por este
+      // lock hasta que esta transacción termine; si terminamos viendo 0 cuotas pagadas y
+      // seguimos, el UPDATE de esa marca (cuando se desbloquea) ya no encuentra la fila vieja
+      // (fue borrada y reemplazada) y no tiene efecto — nunca un "pagado" que se pierde en
+      // silencio con una respuesta 200 exitosa, que es lo que pasa hoy sin este lock.
+      const existingInstallments = await tx
+        .select()
+        .from(saleInstallments)
+        .where(eq(saleInstallments.saleId, id))
+        .for("update");
+      if (existingInstallments.some((i) => i.status === "pagado")) {
+        throw new SaleValidationError("No se puede editar una venta que tiene cuotas pagadas.");
       }
 
       const existingItems = await tx.select().from(saleItems).where(eq(saleItems.saleId, id));
@@ -1850,7 +2193,7 @@ export class DatabaseStorage implements IStorage {
         subtotal,
         orderDiscount: input.orderDiscount ?? null,
         orderSurcharge: input.orderSurcharge ?? null,
-        shippingCost: input.shippingCost ?? null,
+        shippingCharged: input.shippingCharged ?? null,
       });
 
       const installmentAmounts = input.installments.map((i) => i.amount);
@@ -1858,10 +2201,13 @@ export class DatabaseStorage implements IStorage {
         throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
       }
 
-      const profit = lines.reduce((sum, l) => {
-        const cost = l.costPrice ?? l.product.precio;
-        return sum + (l.unitPrice - cost) * l.quantity;
-      }, 0);
+      // Etapa I-B.7-D-C: misma fórmula que createSale — total autoritativo menos costo real
+      // de mercadería (con costos ACTUALES de productStock, ya releídos arriba bajo el lock)
+      // menos costo real de envío informado en esta edición.
+      const productCost = computeProductCost(
+        lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice ?? l.product.precio })),
+      );
+      const profit = computeSaleProfit({ total: totals.total, productCost, shippingCost: input.shippingCost ?? null });
 
       // A partir de acá ya está todo validado: recién ahora se escribe.
       for (const productId of involvedIds) {
@@ -1883,6 +2229,11 @@ export class DatabaseStorage implements IStorage {
           quantity: l.quantity,
           originalPrice: l.product.precio,
           price: l.unitPrice,
+          // Etapa I-B.7-D-D: costo vigente al momento de esta edición (releído de
+          // productStock bajo el mismo lock, arriba) — misma fuente que computeProductCost.
+          // Una edición reemplaza la composición completa, así que el snapshot viejo de la
+          // línea anterior no se conserva (mismo criterio ya vigente para el resto de la fila).
+          costPrice: l.costPrice ?? l.product.precio,
         })),
       );
 
@@ -1904,6 +2255,7 @@ export class DatabaseStorage implements IStorage {
           orderDiscountValue: input.orderDiscount?.value ?? null,
           orderSurchargeType: input.orderSurcharge?.type ?? null,
           orderSurchargeValue: input.orderSurcharge?.value ?? null,
+          shippingCharged: input.shippingCharged ?? null,
           shippingCost: input.shippingCost ?? null,
           total: totals.total,
           profit,
@@ -1919,12 +2271,28 @@ export class DatabaseStorage implements IStorage {
     });
   }
 
-  /** No elimina la venta: la conserva para auditoría, solo cambia su estado y devuelve el stock. */
+  /**
+   * No elimina la venta: la conserva para auditoría, solo cambia su estado y devuelve el
+   * stock. Etapa I-B.7-C: `FOR UPDATE` sobre `sales` es el primer lock de la transacción —
+   * mismo orden global que `updateSale`/`updateInstallmentStatus` (sales primero, siempre),
+   * así que dos cancelaciones concurrentes sobre la misma venta se serializan ACÁ, antes de
+   * que ninguna de las dos llegue a tocar `product_stock`: la segunda espera, y cuando
+   * obtiene el lock ya ve `status==="cancelada"` (escrito por la primera) y rechaza sin
+   * volver a restaurar stock. Sin este lock, ambas podían leer "pendiente" a la vez y las
+   * dos restauraban el mismo stock (hallazgo I-B.7-A [1]). También resuelve, como efecto
+   * lateral necesario, que el SELECT de `sale_items` de más abajo (que corre después de
+   * adquirir este lock) nunca vea una composición a medio reemplazar por un `updateSale`
+   * concurrente — ver informe de esta etapa, Paso 5/Test 3.
+   */
   async cancelSale(consultantId: number, id: number): Promise<Sale | undefined> {
     const db = await this.getDb();
 
     return db.transaction(async (tx) => {
-      const [existingSale] = await tx.select().from(sales).where(and(eq(sales.id, id), eq(sales.consultantId, consultantId)));
+      const [existingSale] = await tx
+        .select()
+        .from(sales)
+        .where(and(eq(sales.id, id), eq(sales.consultantId, consultantId)))
+        .for("update");
       if (!existingSale) return undefined;
       if (existingSale.status === "cancelada") {
         throw new SaleValidationError("La venta ya está cancelada");
@@ -1961,26 +2329,40 @@ export class DatabaseStorage implements IStorage {
     });
   }
 
+  /**
+   * Etapa I-B.7-C: antes eran 3 statements sueltos sin transacción ni lock — una carrera real
+   * con `cancelSale` podía dejar `sale.status="cancelada"` + `installment.status="pagado"` (la
+   * cancelación committeaba en el medio, entre el chequeo de acá y el UPDATE final, sin que
+   * esta función se enterara). Ahora todo corre dentro de una transacción con el mismo primer
+   * lock que `cancelSale`/`updateSale` (`sales` `FOR UPDATE`) — mismo orden global de locks,
+   * así que las tres operaciones se serializan entre sí en este punto antes de tocar nada más.
+   */
   async updateInstallmentStatus(consultantId: number, saleId: number, installmentId: number, status: "pendiente" | "pagado"): Promise<SaleInstallment | undefined> {
     const db = await this.getDb();
-    const [sale] = await db.select().from(sales).where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)));
-    if (!sale) return undefined;
-    if (sale.status === "cancelada") {
-      throw new SaleValidationError("No se puede modificar una cuota de una venta cancelada");
-    }
+    return db.transaction(async (tx) => {
+      const [sale] = await tx
+        .select()
+        .from(sales)
+        .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+        .for("update");
+      if (!sale) return undefined;
+      if (sale.status === "cancelada") {
+        throw new SaleValidationError("No se puede modificar una cuota de una venta cancelada");
+      }
 
-    const [installment] = await db
-      .select()
-      .from(saleInstallments)
-      .where(and(eq(saleInstallments.id, installmentId), eq(saleInstallments.saleId, saleId)));
-    if (!installment) return undefined;
+      const [installment] = await tx
+        .select()
+        .from(saleInstallments)
+        .where(and(eq(saleInstallments.id, installmentId), eq(saleInstallments.saleId, saleId)));
+      if (!installment) return undefined;
 
-    const [updated] = await db
-      .update(saleInstallments)
-      .set({ status })
-      .where(and(eq(saleInstallments.id, installmentId), eq(saleInstallments.saleId, saleId)))
-      .returning();
-    return updated;
+      const [updated] = await tx
+        .update(saleInstallments)
+        .set({ status })
+        .where(and(eq(saleInstallments.id, installmentId), eq(saleInstallments.saleId, saleId)))
+        .returning();
+      return updated;
+    });
   }
 
 }
@@ -2085,12 +2467,13 @@ export class MemoryStorage implements IStorage {
     return this.users.filter((user) => user.role !== "admin");
   }
 
-  async toggleUserStatus(id: number): Promise<User | undefined> {
+  async toggleUserStatus(id: number): Promise<ToggleUserStatusResult> {
     const user = await this.getUser(id);
-    if (!user) return undefined;
+    if (!user) return { outcome: "not_found" };
+    if (user.role === "admin") return { outcome: "forbidden" };
 
     user.status = !user.status;
-    return user;
+    return { outcome: "toggled", user };
   }
 
   async hasAdminAccount(): Promise<boolean> {
@@ -2417,6 +2800,34 @@ export class MemoryStorage implements IStorage {
     return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
+  async updateProduct(consultantId: number, id: number, input: UpdateProductInput): Promise<Product | undefined> {
+    const product = this.products.find((p) => p.id === id && p.consultantId === consultantId);
+    if (!product) return undefined;
+
+    if (input.codigo !== undefined) {
+      const duplicate = this.products.some((p) => p.id !== id && p.consultantId === consultantId && p.codigo === input.codigo);
+      if (duplicate) {
+        throw new ProductConflictError("Ya existe otro producto tuyo con ese código");
+      }
+    }
+
+    Object.assign(product, input);
+    const stock = this.productStock.find((s) => s.consultantId === consultantId && s.productId === id);
+    return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
+  }
+
+  async deleteProduct(consultantId: number, id: number): Promise<"deleted" | "not_found" | "has_relations"> {
+    const product = this.products.find((p) => p.id === id && p.consultantId === consultantId);
+    if (!product) return "not_found";
+
+    const hasSaleItems = this.saleItems.some((i) => i.productId === id);
+    if (hasSaleItems) return "has_relations";
+
+    this.products = this.products.filter((p) => p.id !== id);
+    this.productStock = this.productStock.filter((s) => !(s.consultantId === consultantId && s.productId === id));
+    return "deleted";
+  }
+
   async setProductDiscontinued(consultantId: number, productId: number, discontinued: boolean): Promise<Product | undefined> {
     const product = this.findVisibleProduct(consultantId, productId);
     if (!product) return undefined;
@@ -2436,6 +2847,24 @@ export class MemoryStorage implements IStorage {
     const stock = this.getOrCreateStock(consultantId, productId);
     stock.unidades = unidades;
     if (stockMinimo !== undefined) stock.stockMinimo = stockMinimo;
+    return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
+  }
+
+  async incrementProductStock(consultantId: number, productId: number, delta: number): Promise<Product | undefined> {
+    if (delta === 0) {
+      throw new SaleValidationError("El delta de stock no puede ser 0");
+    }
+    const product = this.findVisibleProduct(consultantId, productId);
+    if (!product) return undefined;
+    const stock = this.getOrCreateStock(consultantId, productId);
+    // Misma semántica que la versión atómica de Postgres: `actual = actual + delta`, y si el
+    // resultado da negativo se rechaza SIN tocar la fila (no hay "commit parcial" que deshacer,
+    // simplemente no se asigna hasta después de validar).
+    const nextUnidades = stock.unidades + delta;
+    if (nextUnidades < 0) {
+      throw new SaleValidationError(`Stock insuficiente: quedarían ${nextUnidades} unidades`);
+    }
+    stock.unidades = nextUnidades;
     return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
@@ -2967,7 +3396,29 @@ export class MemoryStorage implements IStorage {
     };
   }
 
+  /** Misma semántica que `DatabaseStorage.resolveExistingSaleByClientRequestId` (Etapa I-B.6),
+   * sin necesidad de manejar una carrera real: `MemoryStorage` no tiene ningún `await` entre
+   * este chequeo y el `push` que registra la venta, así que no hay ventana de interleaving
+   * posible (Node es single-threaded) — no hace falta un UNIQUE ni capturar su violación. */
+  private resolveExistingSaleByClientRequestId(consultantId: number, input: CreateSaleInput): Sale | undefined {
+    if (!input.clientRequestId) return undefined;
+    const existing = this.sales.find((s) => s.consultantId === consultantId && s.clientRequestId === input.clientRequestId);
+    if (!existing) return undefined;
+
+    const existingItems = this.saleItems
+      .filter((i) => i.saleId === existing.id)
+      .map((i) => ({ productId: i.productId, quantity: i.quantity, price: i.price }));
+
+    if (saleRequestMatchesExisting(input, existing, existingItems)) {
+      return existing;
+    }
+    throw new SaleRequestConflictError("El clientRequestId ya fue utilizado para otra venta");
+  }
+
   async createSale(consultantId: number, input: CreateSaleInput): Promise<Sale> {
+    const earlyMatch = this.resolveExistingSaleByClientRequestId(consultantId, input);
+    if (earlyMatch) return earlyMatch;
+
     const productIds = input.items.map((i) => i.productId);
     const productById = new Map((await this.getProductsByIds(consultantId, productIds)).map((p) => [p.id, p]));
 
@@ -2985,7 +3436,7 @@ export class MemoryStorage implements IStorage {
       subtotal,
       orderDiscount: input.orderDiscount ?? null,
       orderSurcharge: input.orderSurcharge ?? null,
-      shippingCost: input.shippingCost ?? null,
+      shippingCharged: input.shippingCharged ?? null,
     });
 
     const installmentAmounts = input.installments.map((i) => i.amount);
@@ -2997,10 +3448,11 @@ export class MemoryStorage implements IStorage {
     if (!client) throw new SaleValidationError("Clienta no encontrada");
     const clientName = client.name ?? client.phone;
 
-    const profit = lines.reduce((sum, l) => {
-      const cost = l.product.costPrice ?? l.product.precio;
-      return sum + (l.unitPrice - cost) * l.quantity;
-    }, 0);
+    // Etapa I-B.7-D-C: misma fórmula que DatabaseStorage — ver shared/saleCalculations.ts.
+    const productCost = computeProductCost(
+      lines.map((l) => ({ quantity: l.quantity, costPrice: l.product.costPrice ?? l.product.precio })),
+    );
+    const profit = computeSaleProfit({ total: totals.total, productCost, shippingCost: input.shippingCost ?? null });
 
     const sale: Sale = {
       id: this.nextSaleId++,
@@ -3013,6 +3465,7 @@ export class MemoryStorage implements IStorage {
       orderDiscountValue: input.orderDiscount?.value ?? null,
       orderSurchargeType: input.orderSurcharge?.type ?? null,
       orderSurchargeValue: input.orderSurcharge?.value ?? null,
+      shippingCharged: input.shippingCharged ?? null,
       shippingCost: input.shippingCost ?? null,
       total: totals.total,
       profit,
@@ -3021,6 +3474,7 @@ export class MemoryStorage implements IStorage {
       installmentFrequency: input.installments.length > 1 ? input.installmentFrequency ?? null : null,
       status: input.status,
       notes: input.notes ?? null,
+      clientRequestId: input.clientRequestId ?? null,
     };
     this.sales.push(sale);
 
@@ -3034,6 +3488,8 @@ export class MemoryStorage implements IStorage {
         quantity: line.quantity,
         originalPrice: line.product.precio,
         price: line.unitPrice,
+        // Etapa I-B.7-D-D: misma fuente que computeProductCost más arriba.
+        costPrice: line.product.costPrice ?? line.product.precio,
       });
       const stock = this.getOrCreateStock(consultantId, line.product.id);
       stock.unidades -= line.quantity;
@@ -3058,6 +3514,17 @@ export class MemoryStorage implements IStorage {
     if (!existingSale) return undefined;
     if (existingSale.status === "cancelada") {
       throw new SaleValidationError("No se puede editar una venta cancelada");
+    }
+
+    // Etapa I-B.7-B: misma regla que DatabaseStorage — una venta con al menos una cuota ya
+    // cobrada no puede editarse (el flujo de abajo reemplaza todas las cuotas por
+    // "pendiente"). Sin lock especial: no hay ningún `await` entre este chequeo y las
+    // mutaciones de más abajo, así que no existe ventana de interleaving posible (Node es
+    // single-threaded) — el mismo motivo por el que `createSale`/`cancelSale` en memoria
+    // tampoco necesitan uno.
+    const existingInstallments = this.saleInstallments.filter((i) => i.saleId === id);
+    if (existingInstallments.some((i) => i.status === "pagado")) {
+      throw new SaleValidationError("No se puede editar una venta que tiene cuotas pagadas.");
     }
 
     const existingItems = this.saleItems.filter((i) => i.saleId === id);
@@ -3096,7 +3563,7 @@ export class MemoryStorage implements IStorage {
       subtotal,
       orderDiscount: input.orderDiscount ?? null,
       orderSurcharge: input.orderSurcharge ?? null,
-      shippingCost: input.shippingCost ?? null,
+      shippingCharged: input.shippingCharged ?? null,
     });
 
     const installmentAmounts = input.installments.map((i) => i.amount);
@@ -3104,10 +3571,11 @@ export class MemoryStorage implements IStorage {
       throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
     }
 
-    const profit = lines.reduce((sum, l) => {
-      const cost = l.product.costPrice ?? l.product.precio;
-      return sum + (l.unitPrice - cost) * l.quantity;
-    }, 0);
+    // Etapa I-B.7-D-C: misma fórmula que DatabaseStorage.updateSale.
+    const productCost = computeProductCost(
+      lines.map((l) => ({ quantity: l.quantity, costPrice: l.product.costPrice ?? l.product.precio })),
+    );
+    const profit = computeSaleProfit({ total: totals.total, productCost, shippingCost: input.shippingCost ?? null });
 
     // A partir de acá ya está todo validado: recién ahora se muta estado.
     stockById.forEach((newStock, productId) => {
@@ -3128,6 +3596,9 @@ export class MemoryStorage implements IStorage {
         quantity: line.quantity,
         originalPrice: line.product.precio,
         price: line.unitPrice,
+        // Etapa I-B.7-D-D: costo vigente al momento de esta edición — misma fuente que
+        // computeProductCost más arriba. La composición se reemplaza por completo.
+        costPrice: line.product.costPrice ?? line.product.precio,
       });
     }
 
@@ -3147,6 +3618,7 @@ export class MemoryStorage implements IStorage {
     existingSale.orderDiscountValue = input.orderDiscount?.value ?? null;
     existingSale.orderSurchargeType = input.orderSurcharge?.type ?? null;
     existingSale.orderSurchargeValue = input.orderSurcharge?.value ?? null;
+    existingSale.shippingCharged = input.shippingCharged ?? null;
     existingSale.shippingCost = input.shippingCost ?? null;
     existingSale.total = totals.total;
     existingSale.profit = profit;

@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { eq } from "drizzle-orm";
 import type { AddressInfo } from "net";
 import type { Server } from "http";
-import { db, pool } from "../db";
+import { testDb as db, testPool as pool } from "../test-db";
 import { consultants, users, clients, subscriptions } from "@shared/schema";
 import { DatabaseStorage } from "../storage";
 

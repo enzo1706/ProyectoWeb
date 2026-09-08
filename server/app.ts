@@ -50,11 +50,21 @@ export async function createApp(): Promise<{ app: Express; httpServer: Server }>
   app.use((req, res, next) => {
     const start = Date.now();
     const path = req.path;
-    let capturedJsonResponse: Record<string, any> | undefined = undefined;
+    // Hardening post-I-B.8-F: antes se logueaba el JSON completo de cada respuesta /api/* —
+    // hoy no filtra nada sensible (passwords ya se omiten con omitPassword, MP nunca devuelve
+    // el Access Token, ver server/routes.ts), pero era una superficie latente: un endpoint
+    // futuro que se olvide de sanear algo quedaría expuesto en logs sin que nadie lo note. Se
+    // mide el TAMAÑO de la respuesta (útil para detectar payloads inesperadamente grandes) sin
+    // volver a loguear su contenido.
+    let responseSize: number | undefined;
 
     const originalResJson = res.json;
     res.json = function (bodyJson, ...args) {
-      capturedJsonResponse = bodyJson;
+      try {
+        responseSize = JSON.stringify(bodyJson).length;
+      } catch {
+        responseSize = undefined;
+      }
       return originalResJson.apply(res, [bodyJson, ...args]);
     };
 
@@ -62,8 +72,8 @@ export async function createApp(): Promise<{ app: Express; httpServer: Server }>
       const duration = Date.now() - start;
       if (path.startsWith("/api")) {
         let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
-        if (capturedJsonResponse) {
-          logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+        if (responseSize !== undefined) {
+          logLine += ` (${responseSize}b)`;
         }
 
         log(logLine);
@@ -81,7 +91,11 @@ export async function createApp(): Promise<{ app: Express; httpServer: Server }>
       return res.json({ status: "ok", database: "memory" });
     }
     try {
-      const { pool } = await import("./db");
+      // Mismo criterio que DatabaseStorage.getDb() (Etapa I-B.5.1) — producción nunca tiene
+      // TEST_DATABASE_URL, así que acá siempre entra por "./db".
+      const pool = process.env.TEST_DATABASE_URL
+        ? (await import("./test-db")).testPool
+        : (await import("./db")).pool;
       await pool.query("SELECT 1");
       res.json({ status: "ok", database: "connected" });
     } catch (error) {

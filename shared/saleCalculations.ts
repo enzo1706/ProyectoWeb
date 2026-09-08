@@ -12,14 +12,18 @@ export interface SaleTotalsInput {
   subtotal: number;
   orderDiscount?: OrderAdjustment | null;
   orderSurcharge?: OrderAdjustment | null;
-  shippingCost?: number | null;
+  /** Importe de envío COBRADO a la clienta — no confundir con el costo real del envío
+   * (`shippingCost`, ver `computeSaleProfit`). Siempre suma al total, es dinero que la
+   * clienta paga. Etapa I-B.7-D-C: antes de esta etapa este mismo concepto se llamaba
+   * `shippingCost`, que en la práctica siempre representó lo cobrado, nunca el costo real. */
+  shippingCharged?: number | null;
 }
 
 export interface SaleTotals {
   subtotal: number;
   discountAmount: number;
   surchargeAmount: number;
-  shippingCost: number;
+  shippingCharged: number;
   total: number;
 }
 
@@ -42,9 +46,43 @@ export function computeSubtotal(items: SaleLineInput[]): number {
 export function computeSaleTotals(input: SaleTotalsInput): SaleTotals {
   const discountAmount = computeAdjustmentAmount(input.subtotal, input.orderDiscount);
   const surchargeAmount = computeAdjustmentAmount(input.subtotal, input.orderSurcharge);
-  const shippingCost = input.shippingCost ?? 0;
-  const total = Math.max(0, input.subtotal - discountAmount + surchargeAmount + shippingCost);
-  return { subtotal: input.subtotal, discountAmount, surchargeAmount, shippingCost, total };
+  const shippingCharged = input.shippingCharged ?? 0;
+  const total = Math.max(0, input.subtotal - discountAmount + surchargeAmount + shippingCharged);
+  return { subtotal: input.subtotal, discountAmount, surchargeAmount, shippingCharged, total };
+}
+
+export interface SaleCostLineInput {
+  quantity: number;
+  costPrice: number;
+}
+
+/** Costo de mercadería vendida (COGS): Σ(quantity × costPrice) — el costo real de cada
+ * producto vendido, resuelto por el caller con el mismo fallback que ya existía
+ * (`costPrice ?? product.precio`) antes de llamar a esta función. */
+export function computeProductCost(items: SaleCostLineInput[]): number {
+  return items.reduce((sum, item) => sum + item.quantity * item.costPrice, 0);
+}
+
+export interface SaleProfitInput {
+  total: number;
+  productCost: number;
+  /** Costo REAL del envío para la consultora — null cuando todavía no fue informado (no
+   * inventado como 0 en el dato, pero tratado como 0 en este cálculo; ver Etapa I-B.7-D-C). */
+  shippingCost?: number | null;
+}
+
+/**
+ * Ganancia real de la venta (Etapa I-B.7-D-C): a diferencia del cálculo anterior
+ * (`(unitPrice-cost)*quantity` por línea, que ignoraba descuento/recargo/envío de toda la
+ * orden), esta fórmula parte del `total` ya autoritativo (que sí incluye descuento, recargo
+ * y `shippingCharged`) y le resta el costo real de mercadería y el costo real de envío —
+ * matemáticamente equivalente a:
+ *   subtotal − discountAmount + surchargeAmount + shippingCharged − productCost − shippingCost
+ * `shippingCost` null se trata como 0 (el costo real de envío todavía no fue informado, no se
+ * inventa un valor) — la ganancia resultante no descuenta ese costo hasta que se informe.
+ */
+export function computeSaleProfit(input: SaleProfitInput): number {
+  return input.total - input.productCost - (input.shippingCost ?? 0);
 }
 
 /** Lo que le cuesta el producto a la consultora según su descuento de compra — misma fórmula

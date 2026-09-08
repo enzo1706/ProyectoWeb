@@ -104,17 +104,14 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
         throw new Error("Falta elegir el descuento del pedido");
       }
       const chosenDiscount = discount;
-      // Traemos el catálogo más fresco posible justo antes de aplicar los cambios — la app no
-      // tiene un endpoint atómico de "sumar stock", así que minimizamos la ventana de carrera
-      // usando el dato más reciente disponible en vez del que se cacheó al abrir el diálogo.
-      const freshProducts = await queryClient.fetchQuery<Product[]>({ queryKey: ["/api/products"] });
-      const freshById = new Map(freshProducts.map((p) => [p.id, p]));
       const failed: string[] = [];
 
       for (const line of lines) {
-        const currentUnidades = freshById.get(line.productId)?.unidades ?? 0;
         try {
-          await apiRequest("PATCH", `/api/products/${line.productId}/stock`, { unidades: currentUnidades + line.quantity });
+          // Delta atómico: el backend hace `unidades = unidades + quantity` en la misma
+          // sentencia, así que no hace falta leer el stock actual acá ni hay ventana de carrera
+          // con otra carga concurrente (Etapa I-B.8-B, hallazgo F1 de la auditoría I-B.8-A).
+          await apiRequest("PATCH", `/api/products/${line.productId}/stock/increment`, { delta: line.quantity });
           await apiRequest("PATCH", `/api/products/${line.productId}/discount`, { discountPercent: chosenDiscount });
         } catch {
           failed.push(line.productName);

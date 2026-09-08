@@ -4,7 +4,7 @@ import type { z } from "zod";
 import bcrypt from "bcryptjs";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
-import { storage, SaleValidationError, AppointmentValidationError, isBcryptHash } from "./storage";
+import { storage, SaleValidationError, SaleRequestConflictError, ProductConflictError, AppointmentValidationError, isBcryptHash } from "./storage";
 import { uploadProductImage, deleteProductImage, isValidImageBuffer, listProductImageFiles, extractStoragePath } from "./image-storage";
 import { findProductImageMatches } from "@shared/imageMatching";
 import {
@@ -23,8 +23,10 @@ import {
   adminBulkImportSchema,
   assignProductImageMatchesSchema,
   createProductSchema,
+  updateProductSchema,
   toggleProductDiscontinuedSchema,
   setProductStockSchema,
+  incrementProductStockSchema,
   setProductStockReminderSchema,
   startSubscriptionSchema,
   paymentStatuses,
@@ -432,6 +434,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     // DIAGNÓSTICO TEMPORAL — Etapa D: confirmar empíricamente si Railway altera x-request-id
     // antes de que llegue a Express. Solo presencia/nombres, NUNCA valores de firma/secreto.
     // Sacar este bloque en cuanto quede confirmado (ver informe de Etapa D).
+    // Re-evaluado en el hardening final post-I-B.8-F: sigue siendo necesario. `verifyWebhookSignature`
+    // depende de que x-request-id llegue intacto — si el proxy de Railway lo altera, TODOS los
+    // webhooks reales de Mercado Pago fallarían la validación de firma en producción, en
+    // silencio. Esta app todavía no tiene ningún deploy accesible bajo esta cuenta (verificado
+    // por lectura contra Railway, sin encontrar el servicio) — el diagnóstico nunca disparó
+    // contra tráfico real, así que la pregunta que responde sigue genuinamente sin contestar.
+    // No se achica más: ya son solo 2 IDs públicos + 3 booleans de presencia de headers.
     console.log(
       "Webhook received",
       JSON.stringify({
@@ -508,6 +517,63 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al crear el producto" });
+    }
+  });
+
+  // Etapa I-B.8-C: edita los campos core (nombre/precio/sección/línea/código) de un producto
+  // MANUAL propio — resuelve F2 (auditoría I-B.8-A). Nunca toca stock/costo/descuento/
+  // discontinued (endpoints propios) ni permite tocar un producto global o de otra consultora
+  // (404, mismo criterio que /discount, /stock, etc.).
+  app.patch("/api/products/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const parsed = updateProductSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const updated = await storage.updateProduct(req.consultantId!, id, parsed.data);
+      if (!updated) {
+        return res.status(404).json({ error: "Producto no encontrado" });
+      }
+
+      res.json(updated);
+    } catch (error) {
+      if (error instanceof ProductConflictError) {
+        return res.status(409).json({ error: error.message });
+      }
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar el producto" });
+    }
+  });
+
+  // Etapa I-B.8-C: borrado físico, solo si el producto (MANUAL propio) nunca tuvo ventas — si
+  // las tiene, se rechaza (409) y se conserva para no romper historial financiero; la baja
+  // lógica ya existente (PATCH /discontinued) sigue siendo la vía correcta para ese caso.
+  app.delete("/api/products/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const result = await storage.deleteProduct(req.consultantId!, id);
+      if (result === "not_found") {
+        return res.status(404).json({ error: "Producto no encontrado" });
+      }
+      if (result === "has_relations") {
+        return res.status(409).json({
+          error: "No se puede eliminar: el producto tiene ventas asociadas. Usá 'Descontinuar' para dejar de venderlo sin perder el historial.",
+        });
+      }
+      res.status(204).send();
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al eliminar el producto" });
     }
   });
 
@@ -641,16 +707,6 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al eliminar la cita" });
-    }
-  });
-
-  app.get("/api/clients/top", async (req: Request, res: Response) => {
-    try {
-      const list = await storage.getTopClients(req.consultantId!);
-      res.json(list);
-    } catch (error) {
-      console.error(error);
-      res.status(500).json({ error: "Error al obtener mejores clientes" });
     }
   });
 
@@ -807,6 +863,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const sale = await storage.createSale(req.consultantId!, parsed.data);
       res.status(201).json(sale);
     } catch (error) {
+      if (error instanceof SaleRequestConflictError) {
+        return res.status(409).json({ error: error.message });
+      }
       if (error instanceof SaleValidationError) {
         return res.status(400).json({ error: error.message });
       }
@@ -979,6 +1038,37 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // Etapa I-B.8-B: incremento/decremento ATÓMICO (delta), calculado por la base de datos —
+  // reemplaza el patrón SELECT-en-frontend + PATCH-absoluto que usaba LoadOrderDialog.tsx y que
+  // podía perder unidades bajo carga concurrente (hallazgo F1, auditoría I-B.8-A). No reemplaza
+  // /stock de arriba, que sigue siendo el ajuste manual con SET absoluto.
+  app.patch("/api/products/:id/stock/increment", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const parsed = incrementProductStockSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const updated = await storage.incrementProductStock(req.consultantId!, id, parsed.data.delta);
+      if (!updated) {
+        return res.status(404).json({ error: "Producto no encontrado" });
+      }
+
+      res.json(updated);
+    } catch (error) {
+      if (error instanceof SaleValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar el stock" });
+    }
+  });
+
   app.patch("/api/products/:id/stock-reminder", async (req: Request, res: Response) => {
     try {
       const id = parseInt(req.params.id, 10);
@@ -1061,12 +1151,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "ID inválido" });
       }
 
-      const updated = await storage.toggleUserStatus(id);
-      if (!updated) {
+      const result = await storage.toggleUserStatus(id);
+      if (result.outcome === "not_found") {
         return res.status(404).json({ error: "Consultora no encontrada" });
       }
+      if (result.outcome === "forbidden") {
+        return res.status(403).json({ error: "No se puede activar/desactivar una cuenta de administrador" });
+      }
 
-      res.json(omitPassword(updated));
+      res.json(omitPassword(result.user));
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al actualizar estado" });
@@ -1208,6 +1301,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const count = await storage.bulkInsertProducts(items);
       res.json({ message: "Catálogo cargado correctamente", count });
     } catch (error) {
+      if (error instanceof ProductConflictError) {
+        return res.status(409).json({ error: error.message });
+      }
       console.error(error);
       res.status(500).json({ error: "Error en carga masiva" });
     }

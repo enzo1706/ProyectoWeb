@@ -1,0 +1,32 @@
+# Postgres LOCAL, exclusivo para los tests que necesitan Postgres real (client-isolation,
+# stock-concurrency, tenant-isolation-deep). Nunca es la base de desarrollo/producción —
+# son credenciales fijas y sin valor porque este contenedor nunca sale de tu máquina.
+#
+# Uso:
+#   npm run db:test:up      # levanta el contenedor
+#   npm run db:test:push    # aplica el schema (una vez, o después de cambiar shared/schema.ts)
+#   npm test                # con TEST_DATABASE_URL configurada en tu .env
+#   npm run db:test:down    # lo apaga (los datos son efímeros, no hace falta "limpiar")
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: marykaymanager-test-db
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: marykaymanager_test
+    ports:
+      # 55433, ni 5432 ni 5433 — evita chocar con cualquier Postgres local que ya tengas
+      # corriendo (confirmado con evidencia: 5433 estaba ocupado por otro proceso en esta
+      # misma máquina durante la Etapa I-B.5.1, causaba fallos de autenticación confusos
+      # porque la conexión caía en el servidor equivocado, no en este contenedor).
+      - "55433:5432"
+    tmpfs:
+      # A propósito efímero: cada `docker compose down` borra los datos. Es una base de
+      # test, no hace falta persistirla — el próximo `up` arranca limpia.
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test -d marykaymanager_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

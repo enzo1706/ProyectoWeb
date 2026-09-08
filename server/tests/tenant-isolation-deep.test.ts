@@ -1,9 +1,10 @@
 import "../load-env";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { eq, inArray, isNull } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
+import { and, eq, inArray } from "drizzle-orm";
 import type { AddressInfo } from "net";
 import type { Server } from "http";
-import { db, pool } from "../db";
+import { testDb as db, testPool as pool } from "../test-db";
 import {
   consultants,
   users,
@@ -45,6 +46,7 @@ let cookieA: string;
 let cookieB: string;
 
 // Recursos reales de B (la víctima) — todos creados acá, nunca datos reales.
+let clientAId: number; // solo se usa en el bloque de aislamiento de clientRequestId, Etapa I-B.6
 let clientBId: number;
 let manualProductBId: number;
 let appointmentBId: number;
@@ -113,10 +115,34 @@ beforeAll(async () => {
   manualProductBId = manualProductB.id;
   await db.insert(productStock).values({ consultantId: consultantBId, productId: manualProductBId, unidades: 10, stockMinimo: 0, costPrice: 2500 });
 
-  // Producto global real (catálogo compartido, 182 productos reales) — solo se lee su id,
-  // nunca se toca la fila del catálogo en sí, solo el overlay de stock propio de cada tenant.
-  const [anyGlobalProduct] = await db.select({ id: products.id }).from(products).where(isNull(products.consultantId)).limit(1);
-  globalProductId = anyGlobalProduct.id;
+  // Producto global (consultantId null = catálogo compartido). Antes de la Etapa I-B.5.1
+  // esto leía un producto real del catálogo compartido (182 productos reales en la base
+  // real) — ahora que los tests de Postgres corren contra una base de test aislada y vacía
+  // (ver docs/TESTING_POSTGRES.md), no hay ningún catálogo preexistente que leer: se crea
+  // el producto global acá mismo, como cualquier otro fixture del test.
+  const [globalProduct] = await db
+    .insert(products)
+    .values({
+      consultantId: null,
+      seccion: "VITEST",
+      producto: "Producto global VITEST",
+      variante: "Estándar",
+      codigo: `vitest-tiso-global-${Date.now()}`,
+      puntos: 0,
+      precio: 8000,
+      source: "import",
+    })
+    .returning();
+  globalProductId = globalProduct.id;
+
+  // Fixtures propias de A, solo para el bloque de aislamiento de clientRequestId (Etapa I-B.6)
+  // — necesita poder crear SU PROPIA venta, no solo atacar las de B.
+  const [clientA] = await db
+    .insert(clients)
+    .values({ consultantId: consultantAId, name: "Clienta VITEST Tenant A", phone: "9990000001" })
+    .returning();
+  clientAId = clientA.id;
+  await db.insert(productStock).values({ consultantId: consultantAId, productId: globalProductId, unidades: 10, stockMinimo: 0, costPrice: 4000 });
 
   const [apptB] = await db
     .insert(appointments)
@@ -158,6 +184,10 @@ afterAll(async () => {
   await db.delete(appointments).where(inArray(appointments.consultantId, [consultantAId, consultantBId]));
   await db.delete(productStock).where(inArray(productStock.consultantId, [consultantAId, consultantBId]));
   await db.delete(products).where(inArray(products.consultantId, [consultantAId, consultantBId]));
+  if (globalProductId) {
+    await db.delete(productStock).where(eq(productStock.productId, globalProductId));
+    await db.delete(products).where(eq(products.id, globalProductId));
+  }
   await db.delete(clients).where(inArray(clients.consultantId, [consultantAId, consultantBId]));
   await db.delete(users).where(inArray(users.id, [userAId, userBId]));
   await db.delete(subscriptions).where(inArray(subscriptions.consultantId, [consultantAId, consultantBId]));
@@ -188,6 +218,7 @@ describe("Tenant isolation profundo — Products", () => {
 
     const attempts = await Promise.all([
       api(cookieA, "PATCH", `/api/products/${manualProductBId}/stock`, { unidades: 999 }),
+      api(cookieA, "PATCH", `/api/products/${manualProductBId}/stock/increment`, { delta: 5 }),
       api(cookieA, "PATCH", `/api/products/${manualProductBId}/discontinued`, { discontinued: true }),
       api(cookieA, "PATCH", `/api/products/${manualProductBId}/stock-reminder`, { remindAt: "2026-01-01" }),
     ]);
@@ -209,6 +240,61 @@ describe("Tenant isolation profundo — Products", () => {
     const listB = await (await api(cookieB, "GET", "/api/products")).json();
     expect(listA.find((p: any) => p.id === globalProductId).unidades).toBe(3);
     expect(listB.find((p: any) => p.id === globalProductId).unidades).toBe(7);
+  });
+
+  // Etapa I-B.8-C (F2): CRUD real de productos — PATCH/DELETE de campos core.
+  it("A no puede editar ni eliminar el producto manual de B (404, sin mutación ni borrado)", async () => {
+    const [before] = await db.select().from(products).where(eq(products.id, manualProductBId));
+
+    const patchRes = await api(cookieA, "PATCH", `/api/products/${manualProductBId}`, { producto: "Hackeado" });
+    expect(patchRes.status).toBe(404);
+    const deleteRes = await api(cookieA, "DELETE", `/api/products/${manualProductBId}`);
+    expect(deleteRes.status).toBe(404);
+
+    const [after] = await db.select().from(products).where(eq(products.id, manualProductBId));
+    expect(after).toEqual(before);
+  });
+
+  it("A no puede editar ni eliminar el producto GLOBAL con PATCH/DELETE de campos core (404 — no es 'suyo', aunque pueda setear su propio stock sobre él)", async () => {
+    const [before] = await db.select().from(products).where(eq(products.id, globalProductId));
+
+    const patchRes = await api(cookieA, "PATCH", `/api/products/${globalProductId}`, { producto: "Hackeado global" });
+    expect(patchRes.status).toBe(404);
+    const deleteRes = await api(cookieA, "DELETE", `/api/products/${globalProductId}`);
+    expect(deleteRes.status).toBe(404);
+
+    const [after] = await db.select().from(products).where(eq(products.id, globalProductId));
+    expect(after).toEqual(before);
+  });
+
+  it("B (dueña real) SÍ puede editar su propio producto manual", async () => {
+    const res = await api(cookieB, "PATCH", `/api/products/${manualProductBId}`, { producto: "Producto manual B editado" });
+    expect(res.status).toBe(200);
+    expect((await res.json()).producto).toBe("Producto manual B editado");
+
+    await db.update(products).set({ producto: "Producto manual Tenant B" }).where(eq(products.id, manualProductBId));
+  });
+
+  it("B (dueña real) NO puede eliminar su propio producto manual porque tiene ventas registradas (409 — mismo dominio que deleteClient)", async () => {
+    const res = await api(cookieB, "DELETE", `/api/products/${manualProductBId}`);
+    expect(res.status).toBe(409);
+    const [stillThere] = await db.select().from(products).where(eq(products.id, manualProductBId));
+    expect(stillThere).toBeDefined();
+  });
+
+  it("mandar consultantId en el body no cambia el ownership — se ignora silenciosamente (Zod strip), sigue siendo de B", async () => {
+    const res = await api(cookieB, "PATCH", `/api/products/${manualProductBId}`, {
+      producto: "Con intento de robo",
+      consultantId: consultantAId,
+    });
+    expect(res.status).toBe(200);
+    const [row] = await db.select().from(products).where(eq(products.id, manualProductBId));
+    expect(row.consultantId).toBe(consultantBId); // nunca cambió
+
+    const attackAfter = await api(cookieA, "PATCH", `/api/products/${manualProductBId}`, { producto: "x" });
+    expect(attackAfter.status).toBe(404); // A sigue sin poder tocarlo después del intento
+
+    await db.update(products).set({ producto: "Producto manual Tenant B" }).where(eq(products.id, manualProductBId));
   });
 });
 
@@ -298,5 +384,81 @@ describe("Tenant isolation profundo — Clients (completa lo que client-isolatio
     const found = list.find((c: any) => c.id === clientBId);
     expect(found).toBeDefined();
     expect(found.name).toBe("Clienta VITEST Tenant B");
+  });
+});
+
+describe("Tenant isolation profundo — clientRequestId (Etapa I-B.6)", () => {
+  const sharedKey = randomUUID();
+  const saleIdsToClean: number[] = [];
+
+  afterAll(async () => {
+    if (saleIdsToClean.length > 0) {
+      await db.delete(saleInstallments).where(inArray(saleInstallments.saleId, saleIdsToClean));
+      await db.delete(saleItems).where(inArray(saleItems.saleId, saleIdsToClean));
+      await db.delete(sales).where(inArray(sales.id, saleIdsToClean));
+    }
+  });
+
+  it("el mismo clientRequestId usado por dos consultoras distintas -> cada una crea su propia venta, sin colisión", async () => {
+    const saleA = await storage.createSale(consultantAId, {
+      clientId: clientAId,
+      date: "2026-09-03",
+      items: [{ productId: globalProductId, quantity: 1 }],
+      orderDiscount: null,
+      orderSurcharge: null,
+      paymentMethod: "efectivo",
+      installments: [{ amount: 8000 }],
+      status: "pendiente",
+      clientRequestId: sharedKey,
+    });
+    saleIdsToClean.push(saleA.id);
+
+    const saleB2 = await storage.createSale(consultantBId, {
+      clientId: clientBId,
+      date: "2026-09-03",
+      items: [{ productId: manualProductBId, quantity: 1 }],
+      orderDiscount: null,
+      orderSurcharge: null,
+      paymentMethod: "efectivo",
+      installments: [{ amount: 5000 }],
+      status: "pendiente",
+      clientRequestId: sharedKey,
+    });
+    saleIdsToClean.push(saleB2.id);
+
+    expect(saleA.id).not.toBe(saleB2.id);
+    expect(saleA.consultantId).toBe(consultantAId);
+    expect(saleB2.consultantId).toBe(consultantBId);
+  });
+
+  it("el lookup de clientRequestId filtra por consultantId: A nunca recibe la venta de B, ni al reintentar su propio POST", async () => {
+    const [matchA] = await db
+      .select()
+      .from(sales)
+      .where(and(eq(sales.consultantId, consultantAId), eq(sales.clientRequestId, sharedKey)));
+    const [matchB] = await db
+      .select()
+      .from(sales)
+      .where(and(eq(sales.consultantId, consultantBId), eq(sales.clientRequestId, sharedKey)));
+    expect(matchA).toBeDefined();
+    expect(matchB).toBeDefined();
+    expect(matchA.id).not.toBe(matchB.id);
+
+    // Reintentar el POST de A con el mismo clientRequestId sigue devolviendo SU propia venta,
+    // nunca la de B — confirma que el UNIQUE/lookup es (consultantId, clientRequestId), no
+    // solo clientRequestId (ver diseño explícito de la Etapa I-B.6, no un UNIQUE global).
+    const replayA = await storage.createSale(consultantAId, {
+      clientId: clientAId,
+      date: "2026-09-03",
+      items: [{ productId: globalProductId, quantity: 1 }],
+      orderDiscount: null,
+      orderSurcharge: null,
+      paymentMethod: "efectivo",
+      installments: [{ amount: 8000 }],
+      status: "pendiente",
+      clientRequestId: sharedKey,
+    });
+    expect(replayA.id).toBe(matchA.id);
+    expect(replayA.id).not.toBe(matchB.id);
   });
 });

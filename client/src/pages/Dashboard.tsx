@@ -211,7 +211,10 @@ export default function Dashboard() {
   const { toast } = useToast();
   const [, setLocation] = useLocation();
 
-  const { data: businessSettings } = useQuery<Consultant>({
+  // Hardening post-I-B.8-F: faltaba isError acá — no rompe nada financiero (businessName ya
+  // caía a user?.username), pero el fallo quedaba invisible en vez de mostrar el ErrorBlock
+  // igual que el resto de las queries de esta página.
+  const { data: businessSettings, isError: errorBusinessSettings } = useQuery<Consultant>({
     queryKey: ["/api/business-settings"],
   });
   const businessName = businessSettings?.businessName || user?.username;
@@ -262,7 +265,7 @@ export default function Dashboard() {
     },
   });
 
-  const { data: previousMonthPoints = [] } = useQuery<SalesSummaryPoint[]>({
+  const { data: previousMonthPoints = [], isError: errorPreviousMonth } = useQuery<SalesSummaryPoint[]>({
     queryKey: ["/api/reports/sales-summary", prevMonthStart, prevMonthEnd],
     queryFn: async () => {
       const res = await apiRequest("GET", `/api/reports/sales-summary?start=${prevMonthStart}&end=${prevMonthEnd}&groupBy=month`);
@@ -270,7 +273,7 @@ export default function Dashboard() {
     },
   });
 
-  const { data: products = [] } = useQuery<Product[]>({ queryKey: ["/api/products"] });
+  const { data: products = [], isError: errorProducts } = useQuery<Product[]>({ queryKey: ["/api/products"] });
 
   const detailAppointment = upcomingAppointments.find((a) => a.id === selectedAppointmentId) ?? null;
 
@@ -344,9 +347,22 @@ export default function Dashboard() {
 
   // Ninguna de estas queries tiene un estado de error visible propio (a diferencia de
   // Reportes.tsx) — sin este flag, un fetch fallido cae en el default `[]` y termina
-  // mostrando "no hay nada pendiente" / "$0 este mes" como si fuera un dato real.
+  // mostrando "no hay nada pendiente" / "$0 este mes" como si fuera un dato real. Etapa
+  // I-B.8-E (F5): previousMonthPoints y products faltaban acá — sin errorProducts, un fallo en
+  // "/api/products" dejaba el diálogo de nueva venta con el catálogo vacío en silencio; sin
+  // errorPreviousMonth, un fallo ahí se mostraba como "$0 el mes pasado" (un dato falso, no un
+  // error). Hardening post-I-B.8-F: businessSettings también faltaba — acá el fallback
+  // (user?.username) no es un dato financiero falso, pero el fallo quedaba invisible igual.
   const hasLoadError =
-    errorLowStock || errorAppointments || errorInstallments || errorBirthdays || errorInactive || errorCurrentMonth;
+    errorLowStock ||
+    errorAppointments ||
+    errorInstallments ||
+    errorBirthdays ||
+    errorInactive ||
+    errorCurrentMonth ||
+    errorPreviousMonth ||
+    errorProducts ||
+    errorBusinessSettings;
 
   const hasNothing =
     !isLoadingAny &&

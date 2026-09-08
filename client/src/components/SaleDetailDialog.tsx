@@ -71,7 +71,6 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
     queryClient.invalidateQueries({ queryKey: ["/api/products"] });
     queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
     queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
-    queryClient.invalidateQueries({ queryKey: ["/api/clients/top"] });
     queryClient.invalidateQueries({
       predicate: (query) => typeof query.queryKey[0] === "string" && query.queryKey[0].startsWith("/api/reports"),
     });
@@ -108,6 +107,10 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
   const open = saleId !== null;
   const sale = saleQuery.data;
   const isCancelled = sale?.status === "cancelada";
+  // Etapa I-B.7-B: solo UX — el backend es quien realmente rechaza esto (ver
+  // DatabaseStorage/MemoryStorage.updateSale). Reutiliza `sale.installments`, ya presente en
+  // la respuesta de GET /api/sales/:id — no hace falta ningún fetch adicional.
+  const hasPaidInstallments = sale?.installments.some((i) => i.status === "pagado") ?? false;
 
   return (
     <>
@@ -151,6 +154,15 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                   </div>
                 )}
 
+                {!isCancelled && hasPaidInstallments && (
+                  <div
+                    className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"
+                    data-testid="banner-sale-has-paid-installments"
+                  >
+                    Esta venta tiene cuotas ya pagadas y no puede editarse.
+                  </div>
+                )}
+
                 <div className="flex items-center gap-3 text-sm">
                   <User className="h-4 w-4 text-muted-foreground shrink-0" />
                   <span>{sale.clientName}</span>
@@ -185,6 +197,18 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                     <span>Subtotal</span>
                     <span>{format(sale.subtotal)}</span>
                   </div>
+                  {!!sale.shippingCharged && sale.shippingCharged > 0 && (
+                    <div className="flex justify-between text-muted-foreground">
+                      <span>Envío cobrado</span>
+                      <span>{format(sale.shippingCharged)}</span>
+                    </div>
+                  )}
+                  {sale.shippingCost !== null && sale.shippingCost !== undefined && (
+                    <div className="flex justify-between text-muted-foreground">
+                      <span>Costo de envío</span>
+                      <span>{format(sale.shippingCost)}</span>
+                    </div>
+                  )}
                   <div className="flex justify-between font-bold pt-1 border-t">
                     <span>Total</span>
                     <span data-testid="text-detail-total">{format(sale.total)}</span>
@@ -257,10 +281,12 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
             </Button>
             {sale && !isCancelled && (
               <>
-                <Button variant="outline" onClick={() => onEdit(sale)} data-testid="button-edit-sale">
-                  <Pencil className="h-4 w-4 mr-2" />
-                  Editar
-                </Button>
+                {!hasPaidInstallments && (
+                  <Button variant="outline" onClick={() => onEdit(sale)} data-testid="button-edit-sale">
+                    <Pencil className="h-4 w-4 mr-2" />
+                    Editar
+                  </Button>
+                )}
                 <Button variant="destructive" onClick={() => setCancelConfirmOpen(true)} data-testid="button-cancel-sale">
                   <Ban className="h-4 w-4 mr-2" />
                   Cancelar Venta
