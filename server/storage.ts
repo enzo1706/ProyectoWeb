@@ -75,14 +75,24 @@ class ClientRequestIdRaceLostError extends Error {}
 /** `pg` no tipa sus errores — un violation de constraint UNIQUE llega como un objeto plano con
  * `code: "23505"` y `constraint: <nombre del índice>`. Comparamos el nombre exacto para no
  * confundir esta violación con cualquier otra (ej. si en el futuro se agrega otro UNIQUE a
- * `sales`) — ver advertencia explícita del pedido de la Etapa I-B.6. */
+ * `sales`) — ver advertencia explícita del pedido de la Etapa I-B.6.
+ *
+ * Etapa I-C.0.1 (remediación de drizzle-orm por GHSA-gpj5-g38j-94v9, 0.39.1 -> 0.45.2): desde
+ * 0.44, drizzle-orm envuelve TODO error del driver en `DrizzleQueryError` (ver
+ * pg-core/session.js, `queryWithCache`) y mueve el error real de `pg` a `.cause` — el código/
+ * constraint ya no están en el objeto que se atrapa directamente. Se revisa primero el error
+ * tal cual (compatibilidad hacia atrás, por si algún día deja de envolver) y si no matchea, se
+ * revisa `.cause` — nunca al revés, para no aflojar la comparación exacta de arriba. */
 function isUniqueViolationOn(err: unknown, constraintName: string): boolean {
-  return (
-    typeof err === "object" &&
-    err !== null &&
-    (err as { code?: unknown }).code === "23505" &&
-    (err as { constraint?: unknown }).constraint === constraintName
-  );
+  const matchesPgError = (candidate: unknown): boolean =>
+    typeof candidate === "object" &&
+    candidate !== null &&
+    (candidate as { code?: unknown }).code === "23505" &&
+    (candidate as { constraint?: unknown }).constraint === constraintName;
+
+  if (matchesPgError(err)) return true;
+  const cause = (err as { cause?: unknown })?.cause;
+  return matchesPgError(cause);
 }
 
 /** Normaliza y compara items por `(productId, quantity)` — orden no importa. El precio unitario
@@ -1106,7 +1116,12 @@ export class DatabaseStorage implements IStorage {
       // Defensa ante una carrera real: una venta pudo insertar un sale_item referenciando este
       // producto justo entre el chequeo de arriba y este DELETE — el FK de Postgres (sin
       // onDelete, ver shared/schema.ts) lo bloquea igual, nunca deja un huérfano.
-      if (typeof err === "object" && err !== null && (err as { code?: unknown }).code === "23503") {
+      // Etapa I-C.0.1: drizzle-orm 0.45.2 envuelve el error real de `pg` en `.cause` (ver
+      // isUniqueViolationOn más arriba) — mismo criterio acá, error directo primero, `.cause`
+      // como fallback.
+      const isForeignKeyViolation = (candidate: unknown): boolean =>
+        typeof candidate === "object" && candidate !== null && (candidate as { code?: unknown }).code === "23503";
+      if (isForeignKeyViolation(err) || isForeignKeyViolation((err as { cause?: unknown })?.cause)) {
         return "has_relations";
       }
       throw err;
