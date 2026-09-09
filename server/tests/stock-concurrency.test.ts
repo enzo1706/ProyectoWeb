@@ -7,10 +7,11 @@ import { consultants, products, productStock, clients, sales, saleItems, saleIns
 import { DatabaseStorage, SaleValidationError, ProductConflictError } from "../storage";
 
 /**
- * Pega contra la base PostgreSQL real (misma DATABASE_URL que usa la app) — no hay forma
- * de probar el lock `FOR UPDATE` de verdad contra memoria, el punto es la concurrencia real
- * de Postgres. Todos los datos son fixtures propios, creados y borrados acá mismo; nunca
- * toca los 182 productos reales, las consultoras reales ni ninguna clienta real.
+ * Pega contra Postgres real vía `TEST_DATABASE_URL` (nunca `DATABASE_URL` — ver
+ * `server/test-db.ts`/`server/test-db-guard.ts`, que exigen host loopback y un nombre de base
+ * terminado en "_test" antes de dejar abrir ninguna conexión) — no hay forma de probar el lock
+ * `FOR UPDATE` de verdad contra memoria, el punto es la concurrencia real de Postgres. Todos
+ * los datos son fixtures propios, creados y borrados acá mismo; nunca toca ningún dato real.
  */
 
 const storage = new DatabaseStorage();

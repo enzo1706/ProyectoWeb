@@ -1,6 +1,20 @@
+/**
+ * Fixture de prueba para el flujo de suscripciones/Mercado Pago (Etapa I-B.7-D).
+ *
+ * Etapa I-C.1.1 (hallazgo F2, auditoría I-C.1): antes `status()`/`teardown()` importaban
+ * `server/db` (la conexión REAL de producción, sin ningún guard) — solo `create()` (vía
+ * `DatabaseStorage.createUser`, que internamente sí respeta `TEST_DATABASE_URL`) quedaba
+ * protegida. Si alguien corría `status`/`teardown` con `DATABASE_URL` apuntando a producción,
+ * el script leía/borraba contra la base real sin ningún aviso.
+ *
+ * Ahora las tres operaciones usan EXCLUSIVAMENTE `server/test-db.ts` — el guard de
+ * `test-db-guard.ts` corre de forma síncrona al importar ese módulo, así que este script ni
+ * siquiera arranca sin una `TEST_DATABASE_URL` válida (host loopback + nombre terminado en
+ * "_test"). Estructuralmente ya no puede tocar producción, sea cual sea el modo que se le pase.
+ */
 import "../server/load-env";
+import { testDb as db, testPool as pool } from "../server/test-db";
 import { DatabaseStorage } from "../server/storage";
-import { db } from "../server/db";
 import { users, consultants, subscriptions, payments } from "@shared/schema";
 import { eq } from "drizzle-orm";
 
@@ -48,8 +62,12 @@ async function teardown() {
 const mode = process.argv[2];
 const fn = mode === "teardown" ? teardown : mode === "status" ? status : create;
 fn()
-  .then(() => process.exit(0))
-  .catch((err) => {
+  .then(async () => {
+    await pool.end();
+    process.exit(0);
+  })
+  .catch(async (err) => {
     console.error(err);
+    await pool.end().catch(() => {});
     process.exit(1);
   });
