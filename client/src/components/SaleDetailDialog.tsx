@@ -205,8 +205,14 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                   )}
                   {sale.shippingCost !== null && sale.shippingCost !== undefined && (
                     <div className="flex justify-between text-muted-foreground">
-                      <span>Costo de envío</span>
+                      <span>Costo real de envío</span>
                       <span>{format(sale.shippingCost)}</span>
+                    </div>
+                  )}
+                  {sale.ingresosBrutos !== null && sale.ingresosBrutos !== undefined && (
+                    <div className="flex justify-between text-muted-foreground">
+                      <span>Ingresos Brutos</span>
+                      <span>{format(sale.ingresosBrutos)}</span>
                     </div>
                   )}
                   <div className="flex justify-between font-bold pt-1 border-t">

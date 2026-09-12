@@ -18,11 +18,20 @@ export const consultants = pgTable("consultants", {
   // Umbral de stock bajo predeterminado para toda la consultora (Configuración). Nullable:
   // sin configurar, se usa el default global de la app (ver DEFAULT_LOW_STOCK_THRESHOLD).
   defaultLowStockThreshold: integer("default_low_stock_threshold"),
-  // Nullable: no existe ningún flujo de alta que lo pida hoy. Se completa recién la primera
-  // vez que la consultora inicia una suscripción (Mercado Pago exige payer_email para crear
-  // el preapproval) — autogestión, no carga del admin. Ver POST /api/subscription/start.
+  // Nullable: hasta la Etapa 3 solo se completaba al iniciar una suscripción (Mercado Pago
+  // exige payer_email). Desde la Etapa 3 también se completa al registrarse — en ambos casos
+  // SIEMPRE normalizado (ver shared/email.ts normalizeEmail, storage.setConsultantEmail) antes
+  // de guardarse, nunca tal cual lo tipeó la consultora.
   email: text("email"),
-});
+}, (table) => ({
+  // Etapa 3: único (parcial — Postgres nunca considera dos NULL "iguales" para UNIQUE, así
+  // que las consultoras sin email todavía, la mayoría histórica, no chocan entre sí) — evita
+  // que dos cuentas se registren con el mismo email normalizado. No se migran/normalizan
+  // masivamente los emails históricos existentes (los pocos que ya se completaron vía
+  // Mercado Pago) — si alguno choca en el futuro, es una situación real a revisar a mano, no
+  // algo para "arreglar" con una migración silenciosa.
+  emailUnique: uniqueIndex("consultants_email_unique_idx").on(table.email).where(sql`${table.email} IS NOT NULL`),
+}));
 
 export const users = pgTable("users", {
   id: serial("id").primaryKey(),
@@ -176,6 +185,12 @@ export const sales = pgTable("sales", {
   // `NULL`, nunca se inventa un valor). Ventas anteriores a esta etapa quedan con `NULL` acá —
   // ese costo histórico no es reconstruible con la información que existía entonces.
   shippingCost: integer("shipping_cost"),
+  // Etapa 4: Ingresos Brutos — importe MANUAL que la consultora informa por venta (impuesto
+  // provincial que ELLA afronta, no un cargo a la clienta). Mismo tratamiento nullable que
+  // shippingCost: resta de `profit`, nunca de `total` — ver shared/saleCalculations.ts para
+  // la decisión de diseño completa. NULL = no informado (ventas anteriores a esta etapa, o
+  // ventas donde la consultora simplemente no lo cargó) — nunca se inventa un valor.
+  ingresosBrutos: integer("ingresos_brutos"),
   total: integer("total").notNull(),
   profit: integer("profit").notNull(),
   paymentMethod: text("payment_method").notNull().default("efectivo"),
@@ -300,6 +315,36 @@ export const subscriptions = pgTable("subscriptions", {
   statusIdx: index("subscriptions_status_idx").on(table.status),
   currentPeriodEndIdx: index("subscriptions_current_period_end_idx").on(table.currentPeriodEnd),
 }));
+
+/**
+ * Etapa 3 — código de recuperación de contraseña (6 dígitos, un solo uso). Nunca se guarda el
+ * código en texto plano, solo su hash bcrypt (mismo mecanismo que ya usa `users.password` —
+ * no se inventa un hashing nuevo). `userId` y no `consultantId`: lo que cambia al resetear es
+ * `users.password`, y el admin (sin `consultantId`) también podría eventualmente necesitar
+ * este flujo si algún día tiene email — no hay motivo para atarlo a la existencia de un tenant.
+ *
+ * Única excepción a la convención de fechas del resto del schema (texto "YYYY-MM-DD"), mismo
+ * criterio ya documentado en `payments`/`subscriptions`: acá se necesita hora exacta para la
+ * expiración de 10 minutos, no alcanza con una fecha.
+ */
+export const passwordResetCodes = pgTable("password_reset_codes", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull().references(() => users.id),
+  codeHash: text("code_hash").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  // Intentos de verificación fallidos sobre ESTE código puntual — al llegar al máximo
+  // (ver MAX_RESET_ATTEMPTS en server/auth-reset.ts) el código queda inutilizable aunque
+  // todavía no haya vencido, sin importar cuántas requests nuevas lleguen.
+  attempts: integer("attempts").notNull().default(0),
+  usedAt: timestamp("used_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+  // Para encontrar rápido "el código activo de este usuario" (siempre el más reciente sin usar).
+  userIdIdx: index("password_reset_codes_user_id_idx").on(table.userId),
+}));
+
+export type PasswordResetCode = typeof passwordResetCodes.$inferSelect;
+export type InsertPasswordResetCode = typeof passwordResetCodes.$inferInsert;
 
 // Tipos para TypeScript
 export type Consultant = typeof consultants.$inferSelect;
@@ -497,6 +542,9 @@ export const createSaleSchema = z.object({
   // `null` se tratan igual (no informado, el cálculo de profit lo trata como 0 sin inventar
   // el dato). Nunca negativo cuando se informa.
   shippingCost: z.number().int().nonnegative().nullable().optional(),
+  // Etapa 4: Ingresos Brutos — mismo criterio que shippingCost (opcional Y nullable, nunca
+  // negativo, resta de profit sin afectar total). Ver shared/saleCalculations.ts.
+  ingresosBrutos: z.number().int().nonnegative().nullable().optional(),
   paymentMethod: z.enum(paymentMethods),
   installments: z.array(z.object({ amount: z.number().int().nonnegative() })).min(1),
   installmentFrequency: z.enum(installmentFrequencies).optional(),
@@ -515,6 +563,7 @@ export const updateSaleSchema = z.object({
   orderSurcharge: orderAdjustmentSchema,
   shippingCharged: z.number().int().nonnegative().optional(),
   shippingCost: z.number().int().nonnegative().nullable().optional(),
+  ingresosBrutos: z.number().int().nonnegative().nullable().optional(),
   paymentMethod: z.enum(paymentMethods),
   installments: z.array(z.object({ amount: z.number().int().nonnegative() })).min(1),
   installmentFrequency: z.enum(installmentFrequencies).optional(),
@@ -580,4 +629,38 @@ export const loginSchema = z.object({
  * Pago exige payer_email para crear el preapproval. Ver POST /api/subscription/start. */
 export const startSubscriptionSchema = z.object({
   email: z.string().trim().min(1, "El email es obligatorio").email("Ingresá un email válido"),
+});
+
+// ---------------------------------------------------------------------------
+// Etapa 3 — registro público + recuperación de contraseña.
+// ---------------------------------------------------------------------------
+
+const emailFieldSchema = z.string().trim().min(1, "El email es obligatorio").email("Ingresá un email válido");
+// Mismos mínimos que createConsultantSchema (alta de consultora por admin) — una sola regla
+// de "qué es una contraseña/usuario válido" en toda la app, nunca dos criterios distintos.
+const usernameFieldSchema = z.string().trim().min(3, "El usuario debe tener al menos 3 caracteres");
+const passwordFieldSchema = z.string().min(6, "La contraseña debe tener al menos 6 caracteres");
+const resetCodeFieldSchema = z.string().regex(/^\d{6}$/, "El código debe tener 6 dígitos");
+
+// Deliberadamente NO incluye role/consultantId/status — el backend los asigna siempre de
+// forma autoritativa (ver POST /api/auth/register), nunca los toma del body.
+export const registerConsultantSchema = z.object({
+  username: usernameFieldSchema,
+  email: emailFieldSchema,
+  password: passwordFieldSchema,
+});
+
+export const forgotPasswordSchema = z.object({
+  email: emailFieldSchema,
+});
+
+export const verifyResetCodeSchema = z.object({
+  email: emailFieldSchema,
+  code: resetCodeFieldSchema,
+});
+
+export const resetPasswordSchema = z.object({
+  email: emailFieldSchema,
+  code: resetCodeFieldSchema,
+  newPassword: passwordFieldSchema,
 });

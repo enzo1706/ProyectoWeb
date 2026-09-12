@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   findProductImageMatches,
+  normalizeProductName,
   type ProductForImageMatching,
   type StorageImageFile,
 } from "@shared/imageMatching";
@@ -138,5 +139,46 @@ describe("findProductImageMatches", () => {
       expect(r.bucket).toBe("revisar");
       expect(r.reason).toBe("archivo_en_disputa");
     }
+  });
+
+  // Etapa 2 (reconocimiento de imágenes) — hallazgo: normalizeProductName colapsaba "/" al
+  // mismo separador genérico que "-"/" ", volviendo indistinguibles dos variantes reales del
+  // catálogo que solo difieren en ese carácter (ej. "(N/S)" vs "(N-S)").
+  it("11. variantes que solo difieren en '(N/S)' vs '(N-S)' no colapsan al mismo candidato", () => {
+    const result = findProductImageMatches(
+      [
+        product(1, "Base TimeWise 3D", { variante: "Luminosa (N/S)" }),
+        product(2, "Base TimeWise 3D", { variante: "Luminosa (N-S)" }),
+      ],
+      [file("Base TimeWise 3D — Luminosa (N/S).jpg")],
+    );
+    const p1 = result.find((r) => r.productId === 1)!;
+    const p2 = result.find((r) => r.productId === 2)!;
+    // El archivo trae "/" literal -> coincidencia exacta SOLO con la variante que también la tiene.
+    expect(p1.bucket).toBe("segura");
+    expect(p1.candidates[0].confidence).toBe("exacta");
+    expect(p2.bucket).not.toBe("segura");
+  });
+});
+
+describe("normalizeProductName", () => {
+  it("conserva la '/' literal en vez de colapsarla como separador genérico", () => {
+    expect(normalizeProductName("Producto ABC (N/G)")).toContain("n/g");
+    expect(normalizeProductName("Producto ABC (N/G)")).not.toBe(normalizeProductName("Producto ABC (N-G)"));
+    expect(normalizeProductName("Producto ABC (N/G)")).not.toBe(normalizeProductName("Producto ABC (N G)"));
+    expect(normalizeProductName("Producto ABC (N/G)")).not.toBe(normalizeProductName("Producto ABC (NG)"));
+  });
+
+  it("sigue colapsando espacios/guiones/guiones bajos entre sí (comportamiento preexistente, sin regresión)", () => {
+    expect(normalizeProductName("Crema Hidratante TimeWise")).toBe(normalizeProductName("crema-hidratante-timewise"));
+    expect(normalizeProductName("Crema Hidratante TimeWise")).toBe(normalizeProductName("CREMA_HIDRATANTE_TIMEWISE"));
+  });
+
+  it("ignora mayúsculas y acentos (comportamiento preexistente, sin regresión)", () => {
+    expect(normalizeProductName("Loción Facial")).toBe(normalizeProductName("Locion Facial"));
+  });
+
+  it("nombre normal sin caracteres especiales se conserva sin cambios estructurales", () => {
+    expect(normalizeProductName("Crema Facial")).toBe("crema-facial");
   });
 });

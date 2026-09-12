@@ -10,6 +10,7 @@ import {
   consultants,
   subscriptions,
   payments,
+  passwordResetCodes,
   createSaleSchema,
   updateSaleSchema,
   createAppointmentSchema,
@@ -36,7 +37,9 @@ import {
   type Subscription,
   type Payment,
   type PaymentStatus,
+  type PasswordResetCode,
 } from "@shared/schema";
+import { normalizeEmail } from "@shared/email";
 import {
   computeSubtotal,
   computeSaleTotals,
@@ -64,6 +67,16 @@ export class SaleRequestConflictError extends Error {}
 /** Etapa I-B.8-C: violación del unique `(consultantId, codigo)` al editar un producto — mapea
  * a 409 (conflicto de estado), no a 400 (el payload en sí era válido). */
 export class ProductConflictError extends Error {}
+/** Etapa 3 (registro): ya existe una cuenta con ese email normalizado — mapea a 409. */
+export class DuplicateEmailError extends Error {}
+/** Etapa 3 (registro): ya existe una cuenta con ese username — mapea a 409. */
+export class DuplicateUsernameError extends Error {}
+
+export interface RegisterConsultantInput {
+  username: string;
+  email: string;
+  password: string;
+}
 
 const SALE_CLIENT_REQUEST_ID_CONSTRAINT = "sales_consultant_id_client_request_id_unique";
 
@@ -434,6 +447,27 @@ export interface IStorage {
   /** Autogestión: la consultora lo carga la primera vez que inicia una suscripción (Mercado
    * Pago exige payer_email) — no hay alta desde el admin. */
   setConsultantEmail(consultantId: number, email: string): Promise<Consultant | undefined>;
+  /**
+   * Etapa 3 — registro público: crea consultant + trial + user en una sola operación
+   * (transaccional en DatabaseStorage), con el email ya normalizado. Deliberadamente separado
+   * de `createUser` (que no acepta email) — no se le agrega un parámetro opcional a un método
+   * ya usado por el alta admin y el bootstrap del admin por defecto, donde el email nunca
+   * aplica. Tira `DuplicateEmailError`/`DuplicateUsernameError` ante un choque.
+   */
+  registerConsultant(input: RegisterConsultantInput): Promise<{ user: User; consultant: Consultant }>;
+  /** Recuperación de contraseña: el email vive en `consultants.email`, no en `users` — resuelve
+   * el usuario consultora dueño de ese email ya normalizado. undefined si no existe ninguno. */
+  getUserByConsultantEmail(normalizedEmail: string): Promise<User | undefined>;
+  /** Marca usados (sin poder volver a intentarse) todos los códigos de recuperación sin usar
+   * de este usuario — se llama antes de crear uno nuevo (una solicitud nueva invalida
+   * cualquier código anterior todavía pendiente) y también después de un reset exitoso. */
+  invalidateActivePasswordResetCodes(userId: number): Promise<void>;
+  createPasswordResetCode(userId: number, codeHash: string, expiresAt: Date): Promise<PasswordResetCode>;
+  /** El código más reciente de este usuario (usado o no, vencido o no) — la decisión de si
+   * sigue siendo válido vive en server/auth-reset.ts, no acá. */
+  getLatestPasswordResetCode(userId: number): Promise<PasswordResetCode | undefined>;
+  incrementPasswordResetCodeAttempts(id: number): Promise<void>;
+  markPasswordResetCodeUsed(id: number): Promise<void>;
   getSubscriptionByConsultantId(consultantId: number): Promise<Subscription | undefined>;
   /** Crea la fila de trial de una consultora recién nacida. Nunca se llama dos veces para la
    * misma consultora — protegido por el unique de consultantId en el schema. */
@@ -687,8 +721,102 @@ export class DatabaseStorage implements IStorage {
 
   async setConsultantEmail(consultantId: number, email: string): Promise<Consultant | undefined> {
     const db = await this.getDb();
-    const [updated] = await db.update(consultants).set({ email }).where(eq(consultants.id, consultantId)).returning();
+    // Etapa 3: siempre normalizado antes de guardar — única forma de que el unique index
+    // parcial (consultants_email_unique_idx) y la búsqueda de recuperación de contraseña
+    // (getUserByConsultantEmail) comparen contra la misma representación.
+    const [updated] = await db
+      .update(consultants)
+      .set({ email: normalizeEmail(email) })
+      .where(eq(consultants.id, consultantId))
+      .returning();
     return updated;
+  }
+
+  async registerConsultant(input: RegisterConsultantInput): Promise<{ user: User; consultant: Consultant }> {
+    const db = await this.getDb();
+    const normalizedEmail = normalizeEmail(input.email);
+    const hashedPassword = await bcrypt.hash(input.password, BCRYPT_SALT_ROUNDS);
+
+    try {
+      // Mismo criterio transaccional que createUser: consultant + trial + user nacen juntos o
+      // no nace ninguno — acá además el email queda seteado desde el vamos, en la misma
+      // transacción (a diferencia del flujo de suscripción, que lo completa después).
+      return await db.transaction(async (tx) => {
+        const [consultant] = await tx
+          .insert(consultants)
+          .values({ businessName: input.username, currency: "ARS", monthlyGoal: null, email: normalizedEmail })
+          .returning();
+
+        const trialStartAt = new Date();
+        const trialEndAt = new Date(trialStartAt.getTime() + TRIAL_DAYS * 24 * 60 * 60 * 1000);
+        await tx
+          .insert(subscriptions)
+          .values({ consultantId: consultant.id, status: subscriptionStatuses[0], trialStartAt, trialEndAt });
+
+        const [user] = await tx
+          .insert(users)
+          .values({ username: input.username, password: hashedPassword, role: "consultant", status: true, consultantId: consultant.id })
+          .returning();
+
+        return { user, consultant };
+      });
+    } catch (err) {
+      if (isUniqueViolationOn(err, "consultants_email_unique_idx")) {
+        throw new DuplicateEmailError("Ya existe una cuenta con ese email");
+      }
+      if (isUniqueViolationOn(err, "users_username_unique")) {
+        throw new DuplicateUsernameError("Ese nombre de usuario ya está en uso");
+      }
+      throw err;
+    }
+  }
+
+  async getUserByConsultantEmail(normalizedEmail: string): Promise<User | undefined> {
+    const db = await this.getDb();
+    const [row] = await db
+      .select({ user: users })
+      .from(consultants)
+      .innerJoin(users, eq(users.consultantId, consultants.id))
+      .where(and(eq(consultants.email, normalizedEmail), eq(users.role, "consultant")));
+    return row?.user;
+  }
+
+  async invalidateActivePasswordResetCodes(userId: number): Promise<void> {
+    const db = await this.getDb();
+    await db
+      .update(passwordResetCodes)
+      .set({ usedAt: new Date() })
+      .where(and(eq(passwordResetCodes.userId, userId), isNull(passwordResetCodes.usedAt)));
+  }
+
+  async createPasswordResetCode(userId: number, codeHash: string, expiresAt: Date): Promise<PasswordResetCode> {
+    const db = await this.getDb();
+    const [row] = await db.insert(passwordResetCodes).values({ userId, codeHash, expiresAt }).returning();
+    return row;
+  }
+
+  async getLatestPasswordResetCode(userId: number): Promise<PasswordResetCode | undefined> {
+    const db = await this.getDb();
+    const [row] = await db
+      .select()
+      .from(passwordResetCodes)
+      .where(eq(passwordResetCodes.userId, userId))
+      .orderBy(desc(passwordResetCodes.createdAt))
+      .limit(1);
+    return row;
+  }
+
+  async incrementPasswordResetCodeAttempts(id: number): Promise<void> {
+    const db = await this.getDb();
+    await db
+      .update(passwordResetCodes)
+      .set({ attempts: sql`${passwordResetCodes.attempts} + 1` })
+      .where(eq(passwordResetCodes.id, id));
+  }
+
+  async markPasswordResetCodeUsed(id: number): Promise<void> {
+    const db = await this.getDb();
+    await db.update(passwordResetCodes).set({ usedAt: new Date() }).where(eq(passwordResetCodes.id, id));
   }
 
   async getSubscriptionByConsultantId(consultantId: number): Promise<Subscription | undefined> {
@@ -2016,7 +2144,12 @@ export class DatabaseStorage implements IStorage {
       const productCost = computeProductCost(
         lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice ?? l.product.precio })),
       );
-      const profit = computeSaleProfit({ total: totals.total, productCost, shippingCost: input.shippingCost ?? null });
+      const profit = computeSaleProfit({
+        total: totals.total,
+        productCost,
+        shippingCost: input.shippingCost ?? null,
+        ingresosBrutos: input.ingresosBrutos ?? null,
+      });
 
       // Última línea de defensa contra una carrera real (dos requests concurrentes con el
       // mismo consultantId+clientRequestId, ninguno de los dos vio al otro en el SELECT previo
@@ -2042,6 +2175,7 @@ export class DatabaseStorage implements IStorage {
             orderSurchargeValue: input.orderSurcharge?.value ?? null,
             shippingCharged: input.shippingCharged ?? null,
             shippingCost: input.shippingCost ?? null,
+            ingresosBrutos: input.ingresosBrutos ?? null,
             total: totals.total,
             profit,
             paymentMethod: input.paymentMethod,
@@ -2222,7 +2356,12 @@ export class DatabaseStorage implements IStorage {
       const productCost = computeProductCost(
         lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice ?? l.product.precio })),
       );
-      const profit = computeSaleProfit({ total: totals.total, productCost, shippingCost: input.shippingCost ?? null });
+      const profit = computeSaleProfit({
+        total: totals.total,
+        productCost,
+        shippingCost: input.shippingCost ?? null,
+        ingresosBrutos: input.ingresosBrutos ?? null,
+      });
 
       // A partir de acá ya está todo validado: recién ahora se escribe.
       for (const productId of involvedIds) {
@@ -2272,6 +2411,7 @@ export class DatabaseStorage implements IStorage {
           orderSurchargeValue: input.orderSurcharge?.value ?? null,
           shippingCharged: input.shippingCharged ?? null,
           shippingCost: input.shippingCost ?? null,
+          ingresosBrutos: input.ingresosBrutos ?? null,
           total: totals.total,
           profit,
           paymentMethod: input.paymentMethod,
@@ -2394,6 +2534,7 @@ export class MemoryStorage implements IStorage {
   private saleInstallments: SaleInstallment[] = [];
   private subscriptions: Subscription[] = [];
   private payments: Payment[] = [];
+  private passwordResetCodes: PasswordResetCode[] = [];
   private nextUserId = 1;
   private nextConsultantId = 1;
   private nextProductId = 1;
@@ -2405,6 +2546,7 @@ export class MemoryStorage implements IStorage {
   private nextSaleInstallmentId = 1;
   private nextSubscriptionId = 1;
   private nextPaymentId = 1;
+  private nextPasswordResetCodeId = 1;
 
   /** Fila de stock de la consultora sobre un producto, creándola con defaults si no existe. */
   private getOrCreateStock(consultantId: number, productId: number): ProductStock {
@@ -2520,8 +2662,89 @@ export class MemoryStorage implements IStorage {
   async setConsultantEmail(consultantId: number, email: string): Promise<Consultant | undefined> {
     const consultant = this.consultants.find((c) => c.id === consultantId);
     if (!consultant) return undefined;
-    consultant.email = email;
+    consultant.email = normalizeEmail(email);
     return consultant;
+  }
+
+  async registerConsultant(input: RegisterConsultantInput): Promise<{ user: User; consultant: Consultant }> {
+    const normalizedEmail = normalizeEmail(input.email);
+    if (this.users.some((u) => u.username === input.username)) {
+      throw new DuplicateUsernameError("Ese nombre de usuario ya está en uso");
+    }
+    if (this.consultants.some((c) => c.email === normalizedEmail)) {
+      throw new DuplicateEmailError("Ya existe una cuenta con ese email");
+    }
+
+    const hashedPassword = await bcrypt.hash(input.password, BCRYPT_SALT_ROUNDS);
+
+    const consultant: Consultant = {
+      id: this.nextConsultantId++,
+      businessName: input.username,
+      currency: "ARS",
+      monthlyGoal: null,
+      defaultLowStockThreshold: null,
+      email: normalizedEmail,
+    };
+    this.consultants.push(consultant);
+
+    const trialStartAt = new Date();
+    const trialEndAt = new Date(trialStartAt.getTime() + TRIAL_DAYS * 24 * 60 * 60 * 1000);
+    await this.createTrialSubscription(consultant.id, trialStartAt, trialEndAt);
+
+    const user: User = {
+      id: this.nextUserId++,
+      username: input.username,
+      password: hashedPassword,
+      role: "consultant",
+      status: true,
+      consultantId: consultant.id,
+    };
+    this.users.push(user);
+
+    return { user, consultant };
+  }
+
+  async getUserByConsultantEmail(normalizedEmail: string): Promise<User | undefined> {
+    const consultant = this.consultants.find((c) => c.email === normalizedEmail);
+    if (!consultant) return undefined;
+    return this.users.find((u) => u.consultantId === consultant.id && u.role === "consultant");
+  }
+
+  async invalidateActivePasswordResetCodes(userId: number): Promise<void> {
+    const now = new Date();
+    for (const code of this.passwordResetCodes) {
+      if (code.userId === userId && code.usedAt === null) code.usedAt = now;
+    }
+  }
+
+  async createPasswordResetCode(userId: number, codeHash: string, expiresAt: Date): Promise<PasswordResetCode> {
+    const row: PasswordResetCode = {
+      id: this.nextPasswordResetCodeId++,
+      userId,
+      codeHash,
+      expiresAt,
+      attempts: 0,
+      usedAt: null,
+      createdAt: new Date(),
+    };
+    this.passwordResetCodes.push(row);
+    return row;
+  }
+
+  async getLatestPasswordResetCode(userId: number): Promise<PasswordResetCode | undefined> {
+    return this.passwordResetCodes
+      .filter((c) => c.userId === userId)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
+  }
+
+  async incrementPasswordResetCodeAttempts(id: number): Promise<void> {
+    const code = this.passwordResetCodes.find((c) => c.id === id);
+    if (code) code.attempts += 1;
+  }
+
+  async markPasswordResetCodeUsed(id: number): Promise<void> {
+    const code = this.passwordResetCodes.find((c) => c.id === id);
+    if (code) code.usedAt = new Date();
   }
 
   async getSubscriptionByConsultantId(consultantId: number): Promise<Subscription | undefined> {
@@ -3467,7 +3690,12 @@ export class MemoryStorage implements IStorage {
     const productCost = computeProductCost(
       lines.map((l) => ({ quantity: l.quantity, costPrice: l.product.costPrice ?? l.product.precio })),
     );
-    const profit = computeSaleProfit({ total: totals.total, productCost, shippingCost: input.shippingCost ?? null });
+    const profit = computeSaleProfit({
+      total: totals.total,
+      productCost,
+      shippingCost: input.shippingCost ?? null,
+      ingresosBrutos: input.ingresosBrutos ?? null,
+    });
 
     const sale: Sale = {
       id: this.nextSaleId++,
@@ -3482,6 +3710,7 @@ export class MemoryStorage implements IStorage {
       orderSurchargeValue: input.orderSurcharge?.value ?? null,
       shippingCharged: input.shippingCharged ?? null,
       shippingCost: input.shippingCost ?? null,
+      ingresosBrutos: input.ingresosBrutos ?? null,
       total: totals.total,
       profit,
       paymentMethod: input.paymentMethod,
@@ -3590,7 +3819,12 @@ export class MemoryStorage implements IStorage {
     const productCost = computeProductCost(
       lines.map((l) => ({ quantity: l.quantity, costPrice: l.product.costPrice ?? l.product.precio })),
     );
-    const profit = computeSaleProfit({ total: totals.total, productCost, shippingCost: input.shippingCost ?? null });
+    const profit = computeSaleProfit({
+      total: totals.total,
+      productCost,
+      shippingCost: input.shippingCost ?? null,
+      ingresosBrutos: input.ingresosBrutos ?? null,
+    });
 
     // A partir de acá ya está todo validado: recién ahora se muta estado.
     stockById.forEach((newStock, productId) => {
@@ -3635,6 +3869,7 @@ export class MemoryStorage implements IStorage {
     existingSale.orderSurchargeValue = input.orderSurcharge?.value ?? null;
     existingSale.shippingCharged = input.shippingCharged ?? null;
     existingSale.shippingCost = input.shippingCost ?? null;
+    existingSale.ingresosBrutos = input.ingresosBrutos ?? null;
     existingSale.total = totals.total;
     existingSale.profit = profit;
     existingSale.paymentMethod = input.paymentMethod;

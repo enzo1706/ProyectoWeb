@@ -42,6 +42,7 @@ import { useToast } from "@/hooks/use-toast";
 import { ToastAction } from "@/components/ui/toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { getEventTypeColorClass, getEventTypeLabel } from "./AppointmentCard";
+import { WhatsAppButton } from "./WhatsAppButton";
 import type { Appointment } from "@shared/schema";
 import type { Client } from "./ClientCard";
 import type { SaleDetails } from "./SaleCard";
@@ -231,9 +232,12 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
           </SheetHeader>
 
           <div className="mt-6 space-y-4">
-            <div className="flex items-center gap-3 text-sm">
-              <Phone className="h-4 w-4 text-muted-foreground" />
-              <span>{client.phone}</span>
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3 text-sm">
+                <Phone className="h-4 w-4 text-muted-foreground" />
+                <span>{client.phone}</span>
+              </div>
+              <WhatsAppButton phone={client.phone} variant="full" />
             </div>
             {client.email && (
               <div className="flex items-center gap-3 text-sm">

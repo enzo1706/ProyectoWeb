@@ -1,10 +1,12 @@
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Link } from "wouter";
 import { useQuery } from "@tanstack/react-query";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { readSheet } from "read-excel-file/browser";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { MetricCard } from "@/components/MetricCard";
+import { Badge } from "@/components/ui/badge";
 import {
   Select,
   SelectContent,
@@ -31,7 +33,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
-import { Upload, FileSpreadsheet, Package, CheckCircle2, AlertTriangle, X, ImagePlus } from "lucide-react";
+import { Upload, FileSpreadsheet, Package, CheckCircle2, AlertTriangle, X, ImagePlus, Image, ImageOff, Tags } from "lucide-react";
 import { apiRequest, extractFriendlyErrorMessage, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { ErrorBlock } from "@/components/ErrorBlock";
@@ -429,6 +431,75 @@ function ProductImageDialog({
   );
 }
 
+/** Desglose por categoría/sección — misma clasificación que usa el importador (FIELD_ALIASES.seccion
+ * más arriba) y que carga cada producto global, no una columna "category" separada. */
+function groupByCategory(products: GlobalProduct[]): { seccion: string; count: number }[] {
+  const counts = new Map<string, number>();
+  for (const p of products) {
+    counts.set(p.seccion, (counts.get(p.seccion) ?? 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .map(([seccion, count]) => ({ seccion, count }))
+    .sort((a, b) => b.count - a.count);
+}
+
+/** Mismo criterio que ya usa el resto del catálogo (GlobalCatalogList/ProductImageDialog) para
+ * decidir si un producto "tiene imagen": truthy sobre `imagen` — cubre null y string vacío por
+ * igual, sin inventar una condición nueva. */
+function CatalogMetrics() {
+  const { data: products = [], isLoading, isError } = useQuery<GlobalProduct[]>({
+    queryKey: ["/api/admin/products"],
+  });
+
+  const { total, byCategory, withPhoto, withoutPhoto } = useMemo(() => {
+    const withPhotoCount = products.filter((p) => Boolean(p.imagen)).length;
+    return {
+      total: products.length,
+      byCategory: groupByCategory(products),
+      withPhoto: withPhotoCount,
+      withoutPhoto: products.length - withPhotoCount,
+    };
+  }, [products]);
+
+  if (isError) {
+    return <ErrorBlock message="No pudimos cargar las métricas del catálogo. Probá recargar la página." />;
+  }
+
+  const displayValue = (n: number) => (isLoading ? "—" : String(n));
+
+  return (
+    <div className="space-y-4" data-testid="section-catalog-metrics">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <MetricCard title="Total de productos" value={displayValue(total)} icon={Package} />
+        <MetricCard title="Con foto" value={displayValue(withPhoto)} icon={Image} />
+        <MetricCard title="Sin foto" value={displayValue(withoutPhoto)} icon={ImageOff} />
+      </div>
+
+      <Card className="shadow-sm" data-testid="card-catalog-by-category">
+        <CardHeader className="flex flex-row items-center gap-2 space-y-0 pb-2">
+          <Tags className="h-4 w-4 text-muted-foreground" />
+          <CardTitle className="text-sm font-medium text-muted-foreground">Por categoría</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {isLoading ? (
+            <p className="text-sm text-muted-foreground">Cargando...</p>
+          ) : byCategory.length === 0 ? (
+            <p className="text-sm text-muted-foreground">Todavía no hay categorías cargadas.</p>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {byCategory.map(({ seccion, count }) => (
+                <Badge key={seccion} variant="secondary" className="font-normal" data-testid={`badge-category-${seccion}`}>
+                  {seccion} — {count}
+                </Badge>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 function GlobalCatalogList() {
   const { data: products = [], isLoading, isError } = useQuery<GlobalProduct[]>({
     queryKey: ["/api/admin/products"],
@@ -620,6 +691,8 @@ export default function ProductManagement() {
           Sube el catálogo global de productos — queda visible para todas las consultoras
         </p>
       </div>
+
+      <CatalogMetrics />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <Card className="lg:col-span-2 shadow-sm">

@@ -69,20 +69,29 @@ export interface SaleProfitInput {
   /** Costo REAL del envío para la consultora — null cuando todavía no fue informado (no
    * inventado como 0 en el dato, pero tratado como 0 en este cálculo; ver Etapa I-B.7-D-C). */
   shippingCost?: number | null;
+  /** Etapa 4: Ingresos Brutos — importe MANUAL que la consultora informa por venta (impuesto
+   * provincial que le toca afrontar a ella, no un cargo que se le suma a lo que paga la
+   * clienta). Mismo tratamiento que `shippingCost`: es un COSTO real de la consultora, resta
+   * de la ganancia, nunca toca `total` (a diferencia de `shippingCharged`, que sí es dinero
+   * que la clienta paga). null cuando no fue informado — tratado como 0 en este cálculo, sin
+   * inventar el dato. Decisión de diseño documentada en el informe de la Etapa 4: el pedido
+   * agrupaba explícitamente "Ingresos Brutos y costo de envío" bajo el mismo concepto de
+   * "costo adicional" — nunca lo describió como algo que se le cobra a la clienta. */
+  ingresosBrutos?: number | null;
 }
 
 /**
- * Ganancia real de la venta (Etapa I-B.7-D-C): a diferencia del cálculo anterior
- * (`(unitPrice-cost)*quantity` por línea, que ignoraba descuento/recargo/envío de toda la
- * orden), esta fórmula parte del `total` ya autoritativo (que sí incluye descuento, recargo
- * y `shippingCharged`) y le resta el costo real de mercadería y el costo real de envío —
- * matemáticamente equivalente a:
- *   subtotal − discountAmount + surchargeAmount + shippingCharged − productCost − shippingCost
- * `shippingCost` null se trata como 0 (el costo real de envío todavía no fue informado, no se
- * inventa un valor) — la ganancia resultante no descuenta ese costo hasta que se informe.
+ * Ganancia real de la venta (Etapa I-B.7-D-C, extendida en Etapa 4): a diferencia del cálculo
+ * anterior (`(unitPrice-cost)*quantity` por línea, que ignoraba descuento/recargo/envío de
+ * toda la orden), esta fórmula parte del `total` ya autoritativo (que sí incluye descuento,
+ * recargo y `shippingCharged`) y le resta el costo real de mercadería, el costo real de envío,
+ * y el importe de Ingresos Brutos — matemáticamente equivalente a:
+ *   subtotal − discountAmount + surchargeAmount + shippingCharged − productCost − shippingCost − ingresosBrutos
+ * `shippingCost`/`ingresosBrutos` null se tratan como 0 (todavía no informados, no se inventa
+ * un valor) — la ganancia resultante no descuenta esos costos hasta que se informen.
  */
 export function computeSaleProfit(input: SaleProfitInput): number {
-  return input.total - input.productCost - (input.shippingCost ?? 0);
+  return input.total - input.productCost - (input.shippingCost ?? 0) - (input.ingresosBrutos ?? 0);
 }
 
 /** Lo que le cuesta el producto a la consultora según su descuento de compra — misma fórmula

@@ -32,6 +32,10 @@ const SubscriptionSuccess = lazy(() => import("@/pages/subscription/Subscription
 const SubscriptionFailure = lazy(() => import("@/pages/subscription/SubscriptionFailure"));
 const SubscriptionPending = lazy(() => import("@/pages/subscription/SubscriptionPending"));
 const AdminRouter = lazy(() => import("@/pages/admin/AdminRouter"));
+// Etapa 3: registro y recuperación de contraseña — rutas públicas, poco frecuentes, mismo
+// criterio de code-splitting que el resto de las páginas secundarias.
+const Register = lazy(() => import("@/pages/auth/Register"));
+const ForgotPassword = lazy(() => import("@/pages/auth/ForgotPassword"));
 
 function PageLoader() {
   return (
@@ -70,6 +74,11 @@ function AppShell() {
   const [location] = useLocation();
   const { user, isLoading, logout } = useAuth();
   const isLoginRoute = location === "/login";
+  // Etapa 3: mismo trato que /login — accesibles sin sesión, y si ya hay una sesión activa
+  // se redirige a home en vez de dejar crear una segunda cuenta o resetear por las dudas.
+  const isRegisterRoute = location === "/register";
+  const isForgotPasswordRoute = location === "/recuperar-contrasena";
+  const isPublicAuthRoute = isLoginRoute || isRegisterRoute || isForgotPasswordRoute;
   const isAdminUser = user?.role === "admin";
 
   // Se pide siempre (nunca condicionado a un early return, para no romper el orden de
@@ -89,9 +98,14 @@ function AppShell() {
     );
   }
 
-  if (isLoginRoute) {
+  if (isPublicAuthRoute) {
     if (user) return <Redirect to={getHomeRoute(user.role)} />;
-    return <Login />;
+    if (isLoginRoute) return <Login />;
+    return (
+      <Suspense fallback={<PageLoader />}>
+        {isRegisterRoute ? <Register /> : <ForgotPassword />}
+      </Suspense>
+    );
   }
 
   if (!user) {

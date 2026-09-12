@@ -1,13 +1,10 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useLocation } from "wouter";
-import { apiRequest, queryClient } from "@/lib/queryClient";
+import { apiRequest } from "@/lib/queryClient";
 import { useAuth } from "@/hooks/useAuth";
-import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
-import { useToast } from "@/hooks/use-toast";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { LowStockDialog } from "@/components/LowStockDialog";
 import { ErrorBlock } from "@/components/ErrorBlock";
@@ -124,63 +121,6 @@ function TaskRow({ task }: { task: TaskItem }) {
   );
 }
 
-/** Fila de alerta de stock bajo con la opción de posponerla — "Recordarme comprar". */
-function StockAlertRow({
-  product,
-  onOpenLowStock,
-  onSetReminder,
-  isSettingReminder,
-}: {
-  product: Product;
-  onOpenLowStock: () => void;
-  onSetReminder: (productId: number, remindAt: string) => void;
-  isSettingReminder: boolean;
-}) {
-  const [remindInput, setRemindInput] = useState("");
-  const today = toDateStr(new Date());
-
-  return (
-    <div className="flex flex-wrap items-center gap-2 py-2.5" data-testid={`task-row-low-stock-${product.id}`}>
-      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-destructive/10 text-destructive">
-        <Package className="h-4 w-4" />
-      </div>
-      <div className="min-w-0 flex-1">
-        <button
-          type="button"
-          className="block truncate text-left text-sm font-semibold text-foreground hover:underline"
-          onClick={onOpenLowStock}
-          data-testid={`button-view-low-stock-${product.id}`}
-        >
-          {product.producto} tiene poco stock
-        </button>
-        <p className="truncate text-sm text-muted-foreground">
-          Quedan {product.unidades} unidad{product.unidades !== 1 ? "es" : ""}
-        </p>
-      </div>
-      <Input
-        type="date"
-        min={today}
-        value={remindInput}
-        onChange={(e) => setRemindInput(e.target.value)}
-        className="h-8 w-32 shrink-0 px-2 text-xs"
-        aria-label={`Fecha para recordarme comprar ${product.producto}`}
-        data-testid={`input-remind-date-${product.id}`}
-      />
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        className="h-8 shrink-0 px-3 text-xs"
-        disabled={!remindInput || isSettingReminder}
-        onClick={() => remindInput && onSetReminder(product.id, remindInput)}
-        data-testid={`button-remind-${product.id}`}
-      >
-        Recordar
-      </Button>
-    </div>
-  );
-}
-
 function Section({
   title,
   icon: Icon,
@@ -208,7 +148,6 @@ function Section({
 export default function Dashboard() {
   const { user } = useAuth();
   const { format } = useHideMoney();
-  const { toast } = useToast();
   const [, setLocation] = useLocation();
 
   // Hardening post-I-B.8-F: faltaba isError acá — no rompe nada financiero (businessName ya
@@ -281,24 +220,6 @@ export default function Dashboard() {
     setSelectedAppointmentId(appointment.id);
     setAppointmentDetailOpen(true);
   };
-
-  const [settingReminderId, setSettingReminderId] = useState<number | null>(null);
-  const setReminderMutation = useGuardedMutation({
-    mutationFn: async ({ productId, remindAt }: { productId: number; remindAt: string }) => {
-      setSettingReminderId(productId);
-      const res = await apiRequest("PATCH", `/api/products/${productId}/stock-reminder`, { remindAt });
-      return res.json() as Promise<Product>;
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
-      toast({ title: "Te vamos a recordar comprarlo" });
-    },
-    onError: (err: Error) => {
-      toast({ title: "No se pudo guardar el recordatorio", description: err.message, variant: "destructive" });
-    },
-    onSettled: () => setSettingReminderId(null),
-  });
 
   // 1) Alertas importantes: cuotas vencidas/hoy + stock bajo (sin contar los productos con
   // un recordatorio activo todavía sin vencer — ver isReminderActive).
@@ -413,15 +334,19 @@ export default function Dashboard() {
           {alertTasks.map((task) => (
             <TaskRow key={task.key} task={task} />
           ))}
-          {stockAlertProducts.map((product) => (
-            <StockAlertRow
-              key={product.id}
-              product={product}
-              onOpenLowStock={() => setLowStockOpen(true)}
-              onSetReminder={(productId, remindAt) => setReminderMutation.mutate({ productId, remindAt })}
-              isSettingReminder={settingReminderId === product.id}
+          {stockAlertProducts.length > 0 && (
+            <TaskRow
+              task={{
+                key: "low-stock-summary",
+                icon: Package,
+                colorClass: "bg-destructive/10 text-destructive",
+                title: "Productos con bajo stock",
+                subtitle: `${stockAlertProducts.length} producto${stockAlertProducts.length !== 1 ? "s" : ""} necesitan reposición`,
+                actionLabel: "Ver",
+                onAction: () => setLowStockOpen(true),
+              }}
             />
-          ))}
+          )}
         </Section>
       )}
 

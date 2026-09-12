@@ -5,18 +5,19 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Shield, Loader2 } from "lucide-react";
+import { UserPlus, Loader2 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
-export default function Login() {
-  const { login } = useAuth();
+export default function Register() {
+  const { register } = useAuth();
   const [, setLocation] = useLocation();
   const { toast } = useToast();
   const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
-  // Guarda sincrónico: `disabled={isSubmitting}` no alcanza para bloquear un
-  // doble-submit real (ver client/src/hooks/use-guarded-mutation.ts).
+  // Mismo guard sincrónico que Login.tsx — disabled={isSubmitting} solo no alcanza para
+  // bloquear un doble-submit real (ver client/src/hooks/use-guarded-mutation.ts).
   const isSubmittingRef = useRef(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -26,12 +27,12 @@ export default function Login() {
     setIsSubmitting(true);
 
     try {
-      const loggedIn = await login(username, password);
-      setLocation(loggedIn.role === "admin" ? "/admin" : "/");
+      await register({ username, email, password });
+      setLocation("/");
     } catch (error) {
       toast({
-        title: "Error de acceso",
-        description: error instanceof Error ? error.message : "Credenciales inválidas",
+        title: "No se pudo crear la cuenta",
+        description: error instanceof Error ? error.message : "Intentá nuevamente.",
         variant: "destructive",
       });
     } finally {
@@ -43,7 +44,7 @@ export default function Login() {
   return (
     <div
       className="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-[hsl(330,25%,97%)] via-white to-[hsl(220,30%,96%)]"
-      data-testid="page-login"
+      data-testid="page-register"
     >
       <div className="w-full max-w-md space-y-6">
         <div className="text-center space-y-2">
@@ -51,78 +52,82 @@ export default function Login() {
             <span className="text-primary-foreground font-bold text-xl">MK</span>
           </div>
           <h1 className="text-2xl font-bold text-[hsl(220,55%,22%)]">Mary Kay Manager</h1>
-          <p className="text-sm text-muted-foreground">Inicia sesión para continuar</p>
+          <p className="text-sm text-muted-foreground">Creá tu cuenta de consultora</p>
         </div>
 
         <Card className="border-[hsl(330,15%,90%)] shadow-lg bg-white/90 backdrop-blur-sm">
           <CardHeader className="space-y-1 pb-4">
             <CardTitle className="text-lg text-[hsl(220,55%,22%)] flex items-center gap-2">
-              <Shield className="h-5 w-5 text-primary" />
-              Iniciar Sesión
+              <UserPlus className="h-5 w-5 text-primary" />
+              Registrarse
             </CardTitle>
-            <CardDescription>
-              Ingresa tus credenciales de consultora o administrador
-            </CardDescription>
+            <CardDescription>10 días de prueba gratis, sin tarjeta</CardDescription>
           </CardHeader>
           <CardContent>
             <form onSubmit={handleSubmit} className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="username">Usuario</Label>
+                <Label htmlFor="register-username">Usuario</Label>
                 <Input
-                  id="username"
+                  id="register-username"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   placeholder="tu.usuario"
+                  minLength={3}
                   required
                   autoComplete="username"
-                  data-testid="input-login-username"
+                  data-testid="input-register-username"
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="password">Contraseña</Label>
+                <Label htmlFor="register-email">Email</Label>
                 <Input
-                  id="password"
+                  id="register-email"
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="tu@email.com"
+                  required
+                  autoComplete="email"
+                  data-testid="input-register-email"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="register-password">Contraseña</Label>
+                <Input
+                  id="register-password"
                   type="password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="••••••••"
+                  minLength={6}
                   required
-                  autoComplete="current-password"
-                  data-testid="input-login-password"
+                  autoComplete="new-password"
+                  data-testid="input-register-password"
                 />
               </div>
               <Button
                 type="submit"
                 className="w-full"
                 disabled={isSubmitting}
-                data-testid="button-login-submit"
+                data-testid="button-register-submit"
               >
                 {isSubmitting ? (
                   <>
                     <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                    Ingresando...
+                    Creando cuenta...
                   </>
                 ) : (
-                  "Ingresar"
+                  "Crear cuenta"
                 )}
               </Button>
-              <p className="text-center">
-                <Link
-                  href="/recuperar-contrasena"
-                  className="text-sm text-muted-foreground hover:text-primary hover:underline"
-                  data-testid="link-forgot-password"
-                >
-                  ¿Olvidaste tu contraseña?
-                </Link>
-              </p>
             </form>
           </CardContent>
         </Card>
 
         <p className="text-center text-sm text-muted-foreground">
-          ¿No tenés una cuenta?{" "}
-          <Link href="/register" className="font-medium text-primary hover:underline" data-testid="link-go-register">
-            Registrarse
+          ¿Ya tenés una cuenta?{" "}
+          <Link href="/login" className="font-medium text-primary hover:underline" data-testid="link-go-login">
+            Iniciar sesión
           </Link>
         </p>
       </div>

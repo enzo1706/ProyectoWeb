@@ -10,7 +10,8 @@ import { useHideMoney } from "@/hooks/use-hide-money";
 import { cn } from "@/lib/utils";
 import { getProductCategories } from "@/lib/productCategories";
 import { discountOptions, type Product } from "@shared/schema";
-import { Minus, Package, Plus, Search, X } from "lucide-react";
+import { Minus, Package, Plus, Search, Upload, X } from "lucide-react";
+import { ImportProductsDialog, type ImportedOrderLine } from "./ImportProductsDialog";
 
 interface LoadOrderDialogProps {
   open: boolean;
@@ -47,6 +48,7 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
   const [search, setSearch] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("Todas");
   const [qtyByProduct, setQtyByProduct] = useState<Record<number, number>>({});
+  const [importDialogOpen, setImportDialogOpen] = useState(false);
 
   const categories = useMemo(() => getProductCategories(products), [products]);
 
@@ -91,10 +93,29 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
     setLines((prev) => prev.filter((l) => l.productId !== productId));
   };
 
+  /** Etapa 5 — mismo criterio de merge que addLine (suma cantidad si el producto ya estaba
+   * en el pedido, agrega línea nueva si no) — así da igual si la consultora arma el pedido
+   * a mano, importando un archivo, o combinando ambos. */
+  const handleImport = (imported: ImportedOrderLine[]) => {
+    setLines((prev) => {
+      const next = [...prev];
+      for (const line of imported) {
+        const idx = next.findIndex((l) => l.productId === line.productId);
+        if (idx !== -1) {
+          next[idx] = { ...next[idx], quantity: next[idx].quantity + line.quantity };
+        } else {
+          next.push(line);
+        }
+      }
+      return next;
+    });
+  };
+
   const resetAndClose = () => {
     setStepIndex(0);
     setDiscount(undefined);
     setLines([]);
+    setImportDialogOpen(false);
     onOpenChange(false);
   };
 
@@ -228,6 +249,17 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
                   data-testid="input-order-search"
                 />
               </div>
+
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full border-dashed"
+                onClick={() => setImportDialogOpen(true)}
+                data-testid="button-open-import-products"
+              >
+                <Upload className="mr-2 h-4 w-4" />
+                Importar desde Excel, CSV o PDF
+              </Button>
 
               <div className="flex gap-2 overflow-x-auto pb-1">
                 {["Todas", ...categories].map((cat) => (
@@ -368,6 +400,13 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
           )}
         </div>
       </DialogContent>
+
+      <ImportProductsDialog
+        open={importDialogOpen}
+        onOpenChange={setImportDialogOpen}
+        products={products}
+        onImport={handleImport}
+      />
     </Dialog>
   );
 }

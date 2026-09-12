@@ -101,6 +101,10 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
   // consultora (resta de la ganancia; puede quedar sin informar, `null`).
   const [shippingCharged, setShippingCharged] = useState<number | null>(null);
   const [shippingCostReal, setShippingCostReal] = useState<number | null>(null);
+  // Etapa 4: Ingresos Brutos — importe MANUAL, costo que afronta la consultora (nunca se le
+  // suma a lo que paga la clienta, no participa de `computeSaleTotals`/`totals.total`, ver
+  // shared/saleCalculations.ts). Mismo patrón nullable que shippingCostReal.
+  const [ingresosBrutos, setIngresosBrutos] = useState<number | null>(null);
   const [notes, setNotes] = useState("");
 
   const [productSubView, setProductSubView] = useState<ProductSubView>("category");
@@ -171,6 +175,7 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
       );
       setShippingCharged(existingSale.shippingCharged ?? null);
       setShippingCostReal(existingSale.shippingCost ?? null);
+      setIngresosBrutos(existingSale.ingresosBrutos ?? null);
       setNotes(existingSale.notes ?? "");
       setDate(parseLocalDate(existingSale.date));
     } else if (open && !existingSale) {
@@ -275,6 +280,7 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
     setOrderSurchargePct("");
     setShippingCharged(null);
     setShippingCostReal(null);
+    setIngresosBrutos(null);
     setNotes("");
     setStepIndex(0);
     setProductSubView("category");
@@ -306,6 +312,7 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
           orderSurcharge,
           shippingCharged: shippingCharged ?? undefined,
           shippingCost: shippingCostReal ?? undefined,
+          ingresosBrutos: ingresosBrutos ?? undefined,
           paymentMethod,
           installments: effectiveInstallments.map((amount) => ({ amount })),
           installmentFrequency: installmentsCount > 1 ? installmentFrequency ?? undefined : undefined,
@@ -323,6 +330,7 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
         orderSurcharge,
         shippingCharged: shippingCharged ?? undefined,
         shippingCost: shippingCostReal ?? undefined,
+        ingresosBrutos: ingresosBrutos ?? undefined,
         paymentMethod,
         installments: effectiveInstallments.map((amount) => ({ amount })),
         installmentFrequency: installmentsCount > 1 ? installmentFrequency ?? undefined : undefined,
@@ -516,6 +524,27 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
                   <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">%</span>
                 </div>
               </div>
+              <div className="border-b py-3 space-y-1">
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="wizard-ingresos-brutos">Ingresos Brutos</Label>
+                  <div className="relative w-28">
+                    <Input
+                      id="wizard-ingresos-brutos"
+                      type="number"
+                      min={0}
+                      placeholder="Sin informar"
+                      className="pr-7 text-right"
+                      value={ingresosBrutos !== null ? ingresosBrutos / 100 : ""}
+                      onChange={(e) => setIngresosBrutos(e.target.value ? Math.round(Number(e.target.value) * 100) : null)}
+                      data-testid="input-ingresos-brutos"
+                    />
+                    <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">$</span>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Opcional. Es un costo que afrontás vos — no se le suma a lo que paga la clienta.
+                </p>
+              </div>
               <div className="flex items-center justify-between border-b py-3">
                 <Label htmlFor="wizard-shipping-charged">Envío cobrado</Label>
                 <div className="relative w-28">
@@ -532,21 +561,26 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
                   <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">$</span>
                 </div>
               </div>
-              <div className="flex items-center justify-between py-3">
-                <Label htmlFor="wizard-shipping-cost">Costo real del envío</Label>
-                <div className="relative w-28">
-                  <Input
-                    id="wizard-shipping-cost"
-                    type="number"
-                    min={0}
-                    placeholder="Sin informar"
-                    className="pr-7 text-right"
-                    value={shippingCostReal !== null ? shippingCostReal / 100 : ""}
-                    onChange={(e) => setShippingCostReal(e.target.value ? Math.round(Number(e.target.value) * 100) : null)}
-                    data-testid="input-shipping-cost-real"
-                  />
-                  <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">$</span>
+              <div className="py-3 space-y-1">
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="wizard-shipping-cost">Costo real del envío</Label>
+                  <div className="relative w-28">
+                    <Input
+                      id="wizard-shipping-cost"
+                      type="number"
+                      min={0}
+                      placeholder="Sin informar"
+                      className="pr-7 text-right"
+                      value={shippingCostReal !== null ? shippingCostReal / 100 : ""}
+                      onChange={(e) => setShippingCostReal(e.target.value ? Math.round(Number(e.target.value) * 100) : null)}
+                      data-testid="input-shipping-cost-real"
+                    />
+                    <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">$</span>
+                  </div>
                 </div>
+                <p className="text-xs text-muted-foreground">
+                  Opcional. Lo que te cuesta a vos el envío — no es lo que le cobrás a la clienta.
+                </p>
               </div>
 
               <div className="space-y-1.5 rounded-xl bg-muted/60 p-4">

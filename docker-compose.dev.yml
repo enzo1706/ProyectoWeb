@@ -1,0 +1,39 @@
+# Postgres LOCAL para desarrollo interactivo (`npm run dev`, `npm run db:push`).
+#
+# Por qué existe este archivo: la Etapa I-C.1 confirmó con evidencia que hasta ahora el
+# DATABASE_URL local y el de producción en Railway eran literalmente la misma base de
+# Supabase — cualquier `npm run dev`/`npm run db:push` corrido en esta máquina escribía
+# directo sobre datos reales. Este contenedor reemplaza esa base: es la NUEVA base a la que
+# tiene que apuntar `DATABASE_URL` en tu `.env` local, nunca Supabase de nuevo.
+#
+# A diferencia de docker-compose.test.yml (efímero a propósito, se borra en cada `down`),
+# este usa un volumen nombrado — los datos sobreviven entre reinicios, porque acá sí querés
+# conservar lo que vas cargando mientras desarrollás.
+#
+# Uso:
+#   npm run db:dev:up      # levanta el contenedor
+#   npm run db:push        # aplica el schema (drizzle-kit push ya lee DATABASE_URL de tu .env)
+#   npm run dev             # con DATABASE_URL de tu .env apuntando a este contenedor
+#   npm run db:dev:down    # lo apaga (los datos quedan, gracias al volumen)
+services:
+  postgres-dev:
+    image: postgres:16-alpine
+    container_name: marykaymanager-dev-db
+    environment:
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: marykaymanager_dev
+    ports:
+      # 55432: ni 5432 (puede haber otro Postgres local ya escuchando ahí) ni 55433 (ya
+      # ocupado por docker-compose.test.yml) — mismo criterio que dejó documentado ese archivo.
+      - "55432:5432"
+    volumes:
+      - marykaymanager-dev-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev -d marykaymanager_dev"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  marykaymanager-dev-db-data:

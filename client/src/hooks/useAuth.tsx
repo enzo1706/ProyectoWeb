@@ -12,6 +12,8 @@ interface AuthContextValue {
   user: AuthUser | null;
   isLoading: boolean;
   login: (username: string, password: string) => Promise<AuthUser>;
+  /** Etapa 3: registro público — igual que login, deja la sesión iniciada. */
+  register: (input: { username: string; email: string; password: string }) => Promise<AuthUser>;
   logout: () => Promise<void>;
 }
 
@@ -50,13 +52,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return data;
   };
 
+  const register = async (input: { username: string; email: string; password: string }): Promise<AuthUser> => {
+    const res = await apiRequest("POST", "/api/auth/register", input);
+    const data = await res.json();
+    setUser(data);
+    return data;
+  };
+
   const logout = async () => {
     await apiRequest("POST", "/api/auth/logout");
     setUser(null);
   };
 
   return (
-    <AuthContext.Provider value={{ user, isLoading, login, logout }}>
+    <AuthContext.Provider value={{ user, isLoading, login, register, logout }}>
       {children}
     </AuthContext.Provider>
   );

@@ -6,12 +6,20 @@ export function stripImageExtension(filename: string): string {
 }
 
 /** Normalización reutilizable para comparar un nombre de producto contra un nombre de
- * archivo: minúsculas, sin acentos (slugify), y cualquier separador (espacio, guión, guión
- * bajo, punto, paréntesis, símbolos) colapsado a un solo "-". No saca palabras del nombre
- * del producto — solo homogeneiza separadores y mayúsculas/acentos. */
+ * archivo: minúsculas, sin acentos (slugify), y cualquier separador genérico (espacio,
+ * guión, guión bajo, punto, paréntesis, símbolos) colapsado a un solo "-".
+ *
+ * La "/" es la única excepción deliberada: se preserva literal, nunca se colapsa a "-".
+ * Etapa 2 (reconocimiento de imágenes): esta función coincidía "Producto (N/G)" con
+ * "Producto (N-G)" y con "Producto (N G)" — los tres colapsaban al mismo string normalizado,
+ * porque "/" recibía el mismo trato genérico que cualquier otro separador. Eso rompe
+ * catálogos reales donde la "/" es significativa (ver server/tests/imageMatching.test.ts
+ * caso 10, variantes "(N/S)"/"(C/G)") — dos productos que solo difieren en ese carácter
+ * quedaban indistinguibles para el matching. No saca palabras del nombre del producto —
+ * solo homogeneiza separadores (salvo "/") y mayúsculas/acentos. */
 export function normalizeProductName(value: string): string {
   return slugify(value)
-    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/[^a-z0-9/-]+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
 }

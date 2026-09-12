@@ -3,6 +3,7 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Phone, Mail, Calendar, ShoppingBag } from "lucide-react";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { onActivationKeyDown } from "@/lib/utils";
+import { WhatsAppButton } from "./WhatsAppButton";
 import type { Client as BaseClient } from "@shared/schema";
 
 export interface Client extends BaseClient {
@@ -49,9 +50,12 @@ export function ClientCard({ client, onClick }: ClientCardProps) {
               </h3>
             </div>
             <div className="mt-2 space-y-1">
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Phone className="h-3 w-3" />
-                <span>{client.phone}</span>
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-sm text-muted-foreground min-w-0">
+                  <Phone className="h-3 w-3 shrink-0" />
+                  <span className="truncate">{client.phone}</span>
+                </div>
+                <WhatsAppButton phone={client.phone} className="-my-2" />
               </div>
               {client.email && (
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">

@@ -363,6 +363,219 @@ describe("Ganancia (profit) — Etapa I-B.7-D-C", () => {
   });
 });
 
+describe("Ingresos Brutos — Etapa 4", () => {
+  // Mismo producto compartido (costPrice=600) — mismo criterio de reset de stock que los
+  // demás describe de este archivo, para no depender del remanente acumulado.
+  beforeAll(async () => {
+    const res = await api("PATCH", `/api/products/${productId}/stock`, { unidades: 100 });
+    expect(res.status).toBe(200);
+  });
+
+  it("1. venta sin Ingresos Brutos ni envío: queda null, profit sin descontar nada extra", async () => {
+    const res = await api("POST", "/api/sales", baseSale({ items: [{ productId, quantity: 1 }], installments: [{ amount: 1000 }] }));
+    expect(res.status).toBe(201);
+    const sale = await res.json();
+    expect(sale.ingresosBrutos).toBeNull();
+    expect(sale.total).toBe(1000);
+    expect(sale.profit).toBe(400); // 1000 - 600(costo), sin IIBB
+  });
+
+  it("2. venta con Ingresos Brutos: se persiste, resta de profit, NUNCA se suma a total (a diferencia de shippingCharged)", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({ items: [{ productId, quantity: 1 }], ingresosBrutos: 80, installments: [{ amount: 1000 }] }),
+    );
+    expect(res.status).toBe(201);
+    const sale = await res.json();
+    expect(sale.ingresosBrutos).toBe(80);
+    expect(sale.total).toBe(1000); // IIBB no participa del total que paga la clienta
+    expect(sale.profit).toBe(320); // 1000 - 600(costo) - 80(IIBB)
+  });
+
+  it("5+6. venta con Ingresos Brutos + envío cobrado + costo real de envío distinto: profit descuenta ambos costos, total solo suma lo cobrado", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        items: [{ productId, quantity: 1 }],
+        shippingCharged: 200,
+        shippingCost: 120,
+        ingresosBrutos: 50,
+        installments: [{ amount: 1200 }],
+      }),
+    );
+    expect(res.status).toBe(201);
+    const sale = await res.json();
+    expect(sale.total).toBe(1200); // 1000 + 200 (shippingCharged) -- shippingCost/IIBB no tocan total
+    expect(sale.shippingCharged).toBe(200);
+    expect(sale.shippingCost).toBe(120);
+    expect(sale.ingresosBrutos).toBe(50);
+    expect(sale.profit).toBe(430); // 1200 - 600(costo) - 120(envío real) - 50(IIBB)
+  });
+
+  it("8. edición de venta editable: Ingresos Brutos se puede agregar/cambiar y recalcula profit sin perder otros valores", async () => {
+    const createRes = await api(
+      "POST",
+      "/api/sales",
+      baseSale({ items: [{ productId, quantity: 1 }], shippingCharged: 100, installments: [{ amount: 1100 }] }),
+    );
+    const sale = await createRes.json();
+    expect(sale.ingresosBrutos).toBeNull();
+
+    const patchRes = await api("PATCH", `/api/sales/${sale.id}`, {
+      items: [{ productId, quantity: 1 }],
+      orderDiscount: null,
+      orderSurcharge: null,
+      shippingCharged: 100,
+      ingresosBrutos: 40,
+      paymentMethod: "efectivo",
+      installments: [{ amount: 1100 }],
+    });
+    expect(patchRes.status).toBe(200);
+    const updated = await patchRes.json();
+    expect(updated.total).toBe(1100); // sin cambios (shippingCharged sigue igual)
+    expect(updated.shippingCharged).toBe(100); // no se perdió al editar solo IIBB
+    expect(updated.ingresosBrutos).toBe(40);
+    expect(updated.profit).toBe(460); // 1100 - 600 - 40(IIBB), shippingCost sigue null
+  });
+
+  it("9. una venta con cuota pagada rechaza el PATCH aunque solo se intente cambiar Ingresos Brutos", async () => {
+    const createRes = await api(
+      "POST",
+      "/api/sales",
+      baseSale({ items: [{ productId, quantity: 1 }], installments: [{ amount: 1000 }] }),
+    );
+    const sale = await createRes.json();
+    const detail = await (await api("GET", `/api/sales/${sale.id}`)).json();
+    const installmentId = detail.installments[0].id;
+
+    const markPaidRes = await api("PATCH", `/api/sales/${sale.id}/installments/${installmentId}`, { status: "pagado" });
+    expect(markPaidRes.status).toBe(200);
+
+    const patchRes = await api("PATCH", `/api/sales/${sale.id}`, {
+      items: [{ productId, quantity: 1 }],
+      orderDiscount: null,
+      orderSurcharge: null,
+      ingresosBrutos: 999,
+      paymentMethod: "efectivo",
+      installments: [{ amount: 1000 }],
+    });
+    expect(patchRes.status).toBe(400);
+    expect((await patchRes.json()).error).toMatch(/cuotas pagadas/i);
+
+    const after = await (await api("GET", `/api/sales/${sale.id}`)).json();
+    expect(after.ingresosBrutos).toBeNull(); // no se coló el intento de cambio
+  });
+
+  it("7. venta cancelada con Ingresos Brutos queda excluida de los totales financieros del período", async () => {
+    const date = "2026-01-15";
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({ date, items: [{ productId, quantity: 1 }], ingresosBrutos: 70, installments: [{ amount: 1000 }] }),
+    );
+    const sale = await res.json();
+
+    const before = await (
+      await api("GET", `/api/reports/sales-summary?start=2026-01-01&end=2026-02-01&groupBy=month`)
+    ).json();
+    const totalBefore = before.reduce((sum: number, p: any) => sum + p.totalSales, 0);
+    expect(totalBefore).toBeGreaterThanOrEqual(1000);
+
+    const cancelRes = await api("POST", `/api/sales/${sale.id}/cancel`);
+    expect(cancelRes.status).toBe(200);
+
+    const after = await (
+      await api("GET", `/api/reports/sales-summary?start=2026-01-01&end=2026-02-01&groupBy=month`)
+    ).json();
+    const totalAfter = after.reduce((sum: number, p: any) => sum + p.totalSales, 0);
+    expect(totalAfter).toBe(totalBefore - 1000); // la venta cancelada sale del total, sin importar ingresosBrutos
+  });
+
+  it("10. tenant A no puede modificar (ni inyectar Ingresos Brutos en) una venta de tenant B", async () => {
+    const { storage } = await import("../storage");
+    const userB = await storage.createUser({
+      username: `vitest_iibb_tenantb_${Date.now()}`,
+      password: "vitest-test-password-123",
+      role: "consultant",
+      status: true,
+    });
+    const loginB = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: userB.username, password: "vitest-test-password-123" }),
+    });
+    const cookieB = loginB.headers.get("set-cookie")!.split(";")[0];
+    const clientB = await (
+      await fetch(`${baseUrl}/api/clients`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookieB },
+        body: JSON.stringify({ name: "Clienta de B", phone: "9990000099" }),
+      })
+    ).json();
+    const productB = await (
+      await fetch(`${baseUrl}/api/products`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookieB },
+        body: JSON.stringify({ seccion: "VITEST-B", producto: "Producto de B", precio: 500, unidades: 10 }),
+      })
+    ).json();
+    const saleB = await (
+      await fetch(`${baseUrl}/api/sales`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: cookieB },
+        body: JSON.stringify(
+          baseSale({ clientId: clientB.id, items: [{ productId: productB.id, quantity: 1 }], installments: [{ amount: 500 }] }),
+        ),
+      })
+    ).json();
+
+    // A (la sesión por defecto de este archivo) intenta editar la venta de B.
+    const attackRes = await api("PATCH", `/api/sales/${saleB.id}`, {
+      items: [{ productId: productB.id, quantity: 1 }],
+      orderDiscount: null,
+      orderSurcharge: null,
+      ingresosBrutos: 999,
+      paymentMethod: "efectivo",
+      installments: [{ amount: 500 }],
+    });
+    expect(attackRes.status).toBe(404); // ni siquiera revela que existe
+
+    const stillB = await (await fetch(`${baseUrl}/api/sales/${saleB.id}`, { headers: { Cookie: cookieB } })).json();
+    expect(stillB.ingresosBrutos).toBeNull();
+  });
+
+  it("11. idempotencia de creación sigue funcionando con Ingresos Brutos en el payload", async () => {
+    const clientRequestId = randomUUID();
+    const payload = baseSale({
+      items: [{ productId, quantity: 1 }],
+      ingresosBrutos: 30,
+      installments: [{ amount: 1000 }],
+      clientRequestId,
+    });
+
+    const first = await api("POST", "/api/sales", payload);
+    expect(first.status).toBe(201);
+    const firstSale = await first.json();
+
+    const second = await api("POST", "/api/sales", payload);
+    expect(second.status).toBe(201); // mismo criterio ya existente: reintento -> misma venta
+    const secondSale = await second.json();
+    expect(secondSale.id).toBe(firstSale.id);
+    expect(secondSale.ingresosBrutos).toBe(30);
+  });
+
+  it("12. Ingresos Brutos negativo es rechazado por el backend, no crea la venta", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({ items: [{ productId, quantity: 1 }], ingresosBrutos: -1, installments: [{ amount: 1000 }] }),
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
 describe("POST /api/sales — idempotencia (clientRequestId, Etapa I-B.6)", () => {
   it("Caso 1: mismo clientRequestId repetido -> misma venta, no duplica items/cuotas, stock descontado una sola vez", async () => {
     const key = randomUUID();

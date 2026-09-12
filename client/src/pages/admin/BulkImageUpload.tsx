@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "wouter";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -310,7 +310,7 @@ function MatchRow({
     <div className="rounded-lg border p-3 space-y-2" data-testid={`match-row-${match.productId}`}>
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <p className="font-medium truncate">{match.productLabel}</p>
+          <p className="font-medium break-words">{match.productLabel}</p>
           {match.reason && MATCH_REASON_LABEL[match.reason] && (
             <p className="text-xs text-muted-foreground">{MATCH_REASON_LABEL[match.reason]}</p>
           )}
@@ -331,7 +331,7 @@ function MatchRow({
             <div key={c.filePath} className="flex items-center gap-2 rounded-md bg-muted/40 p-2">
               <img src={c.fileUrl} alt={c.fileName} className="h-10 w-10 rounded object-cover shrink-0 border bg-background" />
               <div className="min-w-0 flex-1">
-                <p className="text-xs font-mono truncate" title={c.fileName}>
+                <p className="text-xs font-mono break-words" title={c.fileName}>
                   {c.fileName}
                 </p>
                 <p className="text-xs text-muted-foreground">
@@ -374,6 +374,19 @@ const CONCURRENCY_LIMIT = 4;
 
 function makeKey(file: File): string {
   return `${file.name}__${file.size}__${file.lastModified}__${Math.random().toString(36).slice(2)}`;
+}
+
+/** Etapa 2 (reconocimiento de imágenes): agrupa las filas para que las que necesitan
+ * atención del usuario (sin coincidencia o ambiguas — nunca tienen productId todavía)
+ * aparezcan siempre primero, sin importar el orden en que se agregaron los archivos. Las
+ * inválidas van al final: no son un problema de reconocimiento, son archivos que ni
+ * siquiera se van a subir. */
+type RowGroup = "no_reconocido" | "reconocido" | "resto";
+
+function rowGroup(row: Row): RowGroup {
+  if (row.matchStatus === "invalido") return "resto";
+  if (row.matchStatus === "reconocida") return "reconocido";
+  return "no_reconocido"; // sin_coincidencia | ambigua — todavía sin productId asignado
 }
 
 export default function BulkImageUpload() {
@@ -458,6 +471,13 @@ export default function BulkImageUpload() {
       ),
     );
   };
+
+  // Etapa 2: orden de despliegue — no reconocidos primero, reconocidos después, inválidos
+  // al final. Se recalcula en cada render (no en el mismo array `rows`) para que una fila
+  // se reubique sola en cuanto el usuario le asigna un producto manualmente.
+  const noReconocidoRows = rows.filter((r) => rowGroup(r) === "no_reconocido");
+  const reconocidoRows = rows.filter((r) => rowGroup(r) === "reconocido");
+  const restoRows = rows.filter((r) => rowGroup(r) === "resto");
 
   const validRows = rows.filter((r) => r.matchStatus !== "invalido");
   const invalidCount = rows.length - validRows.length;
@@ -649,7 +669,47 @@ export default function BulkImageUpload() {
                     </tr>
                   </thead>
                   <tbody>
-                    {rows.map((row) => (
+                    {noReconocidoRows.length > 0 && (
+                      <GroupHeaderRow
+                        label={`⚠️ Necesitan tu atención (${noReconocidoRows.length})`}
+                        className="border-amber-500/30 bg-amber-500/5 text-amber-700 dark:text-amber-400"
+                      />
+                    )}
+                    {noReconocidoRows.map((row) => (
+                      <RowView
+                        key={row.key}
+                        row={row}
+                        products={products}
+                        productsById={productsById}
+                        onAssign={assignProduct}
+                        onRemove={removeRow}
+                        disabled={isUploading}
+                      />
+                    ))}
+                    {reconocidoRows.length > 0 && (
+                      <GroupHeaderRow
+                        label={`✓ Reconocidos (${reconocidoRows.length})`}
+                        className="border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400"
+                      />
+                    )}
+                    {reconocidoRows.map((row) => (
+                      <RowView
+                        key={row.key}
+                        row={row}
+                        products={products}
+                        productsById={productsById}
+                        onAssign={assignProduct}
+                        onRemove={removeRow}
+                        disabled={isUploading}
+                      />
+                    ))}
+                    {restoRows.length > 0 && (
+                      <GroupHeaderRow
+                        label={`✕ Archivos inválidos (${restoRows.length})`}
+                        className="border-destructive/30 bg-destructive/5 text-destructive"
+                      />
+                    )}
+                    {restoRows.map((row) => (
                       <RowView
                         key={row.key}
                         row={row}
@@ -664,18 +724,52 @@ export default function BulkImageUpload() {
                 </table>
               </div>
 
-              <div className="sm:hidden space-y-3">
-                {rows.map((row) => (
-                  <RowCard
-                    key={row.key}
-                    row={row}
-                    products={products}
-                    productsById={productsById}
-                    onAssign={assignProduct}
-                    onRemove={removeRow}
-                    disabled={isUploading}
-                  />
-                ))}
+              <div className="sm:hidden space-y-4">
+                {noReconocidoRows.length > 0 && (
+                  <RowCardGroup label={`⚠️ Necesitan tu atención (${noReconocidoRows.length})`} tone="amber">
+                    {noReconocidoRows.map((row) => (
+                      <RowCard
+                        key={row.key}
+                        row={row}
+                        products={products}
+                        productsById={productsById}
+                        onAssign={assignProduct}
+                        onRemove={removeRow}
+                        disabled={isUploading}
+                      />
+                    ))}
+                  </RowCardGroup>
+                )}
+                {reconocidoRows.length > 0 && (
+                  <RowCardGroup label={`✓ Reconocidos (${reconocidoRows.length})`} tone="emerald">
+                    {reconocidoRows.map((row) => (
+                      <RowCard
+                        key={row.key}
+                        row={row}
+                        products={products}
+                        productsById={productsById}
+                        onAssign={assignProduct}
+                        onRemove={removeRow}
+                        disabled={isUploading}
+                      />
+                    ))}
+                  </RowCardGroup>
+                )}
+                {restoRows.length > 0 && (
+                  <RowCardGroup label={`✕ Archivos inválidos (${restoRows.length})`} tone="destructive">
+                    {restoRows.map((row) => (
+                      <RowCard
+                        key={row.key}
+                        row={row}
+                        products={products}
+                        productsById={productsById}
+                        onAssign={assignProduct}
+                        onRemove={removeRow}
+                        disabled={isUploading}
+                      />
+                    ))}
+                  </RowCardGroup>
+                )}
               </div>
             </CardContent>
           </Card>
@@ -763,6 +857,43 @@ export default function BulkImageUpload() {
   );
 }
 
+/** Encabezado de grupo dentro de la tabla desktop — una fila que ocupa todas las columnas,
+ * mismo criterio de color que ya usan los badges de estado (StatusBadge) para esa categoría. */
+function GroupHeaderRow({ label, className }: { label: string; className: string }) {
+  return (
+    <tr className={cn("border-b", className)}>
+      <td colSpan={7} className="p-2 text-xs font-semibold">
+        {label}
+      </td>
+    </tr>
+  );
+}
+
+/** Mismo agrupamiento que GroupHeaderRow, para la lista de tarjetas mobile. */
+function RowCardGroup({
+  label,
+  tone,
+  children,
+}: {
+  label: string;
+  tone: "amber" | "emerald" | "destructive";
+  children: ReactNode;
+}) {
+  const toneClass =
+    tone === "amber"
+      ? "border-amber-500/30 bg-amber-500/5 text-amber-700 dark:text-amber-400"
+      : tone === "emerald"
+        ? "border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400"
+        : "border-destructive/30 bg-destructive/5 text-destructive";
+
+  return (
+    <div className="space-y-2">
+      <div className={cn("rounded-md border px-3 py-1.5 text-xs font-semibold", toneClass)}>{label}</div>
+      <div className="space-y-3">{children}</div>
+    </div>
+  );
+}
+
 function RowView({
   row,
   products,
@@ -792,8 +923,8 @@ function RowView({
           )}
         </div>
       </td>
-      <td className="p-2 max-w-[160px]">
-        <p className="truncate font-mono text-xs" title={row.file.name}>
+      <td className="p-2 max-w-[220px]">
+        <p className="break-words font-mono text-xs" title={row.file.name}>
           {row.file.name}
         </p>
         {row.invalidReason && <p className="text-xs text-destructive">{row.invalidReason}</p>}
@@ -855,7 +986,7 @@ function RowCard({
           )}
         </div>
         <div className="min-w-0 flex-1 space-y-0.5">
-          <p className="truncate font-mono text-xs text-muted-foreground" title={row.file.name}>
+          <p className="break-words font-mono text-xs text-muted-foreground" title={row.file.name}>
             {row.file.name}
           </p>
           {row.invalidReason ? (
@@ -981,6 +1112,7 @@ function ProductPicker({
 }) {
   const [open, setOpen] = useState(false);
   const selected = value !== null ? products.find((p) => p.id === value) : undefined;
+  const selectedLabel = selected ? `#${selected.id} ${formatProductLabel(selected)}` : undefined;
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -990,6 +1122,7 @@ function ProductPicker({
           role="combobox"
           disabled={disabled}
           className="w-full justify-between font-normal"
+          title={selectedLabel}
           data-testid="button-product-picker"
         >
           {selected ? (
@@ -1002,7 +1135,9 @@ function ProductPicker({
           <ChevronsUpDown className="h-4 w-4 opacity-50 shrink-0" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-[320px] p-0">
+      {/* Etapa 2: ancho mayor + texto con wrap (nunca truncate) — este es el momento en que
+       * el usuario tiene que leer el nombre completo para elegir el producto correcto. */}
+      <PopoverContent className="w-[320px] sm:w-[420px] p-0">
         <Command>
           <CommandInput placeholder="Buscar por nombre o ID..." data-testid="input-product-picker-search" />
           <CommandList>
@@ -1016,11 +1151,12 @@ function ProductPicker({
                     onSelect(p.id);
                     setOpen(false);
                   }}
+                  className="items-start"
                   data-testid={`option-product-${p.id}`}
                 >
-                  <Check className={cn("mr-2 h-4 w-4", value === p.id ? "opacity-100" : "opacity-0")} />
-                  <Package className="mr-2 h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                  <span className="truncate">
+                  <Check className={cn("mr-2 h-4 w-4 mt-0.5 shrink-0", value === p.id ? "opacity-100" : "opacity-0")} />
+                  <Package className="mr-2 h-3.5 w-3.5 text-muted-foreground shrink-0 mt-0.5" />
+                  <span className="whitespace-normal break-words leading-snug">
                     <span className="text-muted-foreground">#{p.id}</span> {formatProductLabel(p)}
                   </span>
                 </CommandItem>

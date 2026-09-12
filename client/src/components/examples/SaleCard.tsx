@@ -13,6 +13,7 @@ const mockSale: Sale = {
   orderSurchargeValue: null,
   shippingCharged: null,
   shippingCost: null,
+  ingresosBrutos: null,
   total: 10100,
   profit: 4550,
   paymentMethod: "efectivo",

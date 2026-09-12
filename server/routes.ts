@@ -4,9 +4,12 @@ import type { z } from "zod";
 import bcrypt from "bcryptjs";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
-import { storage, SaleValidationError, SaleRequestConflictError, ProductConflictError, AppointmentValidationError, isBcryptHash } from "./storage";
+import { storage, SaleValidationError, SaleRequestConflictError, ProductConflictError, AppointmentValidationError, isBcryptHash, DuplicateEmailError, DuplicateUsernameError } from "./storage";
+import { requestPasswordReset, verifyResetCode, resetPassword } from "./auth-reset";
 import { uploadProductImage, deleteProductImage, isValidImageBuffer, listProductImageFiles, extractStoragePath } from "./image-storage";
 import { findProductImageMatches } from "@shared/imageMatching";
+import { matchImportedProducts, type ImportCatalogProduct } from "@shared/importMatching";
+import { parseExcelImportRows, parseCsvImportRows, parsePdfImportRows, ImportParseError } from "./importParsers";
 import {
   bulkProductSchema,
   createConsultantSchema,
@@ -29,6 +32,10 @@ import {
   incrementProductStockSchema,
   setProductStockReminderSchema,
   startSubscriptionSchema,
+  registerConsultantSchema,
+  forgotPasswordSchema,
+  verifyResetCodeSchema,
+  resetPasswordSchema,
   paymentStatuses,
   type InsertProduct,
   type PaymentStatus,
@@ -49,11 +56,63 @@ const loginRateLimiter = rateLimit({
   message: { error: "Demasiados intentos de inicio de sesión. Probá de nuevo en unos minutos." },
 });
 
+// Etapa 3 — registro/recuperación de contraseña. Misma ventana de 15' que loginRateLimiter,
+// límites más bajos porque son acciones mucho menos frecuentes en el uso normal que un login.
+const registerRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiados intentos de registro. Probá de nuevo en unos minutos." },
+});
+
+// Cubre spam de solicitudes (un email ajeno recibiendo códigos sin haberlos pedido).
+const forgotPasswordRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiadas solicitudes. Probá de nuevo en unos minutos." },
+});
+
+// Capa de defensa por IP contra fuerza bruta del código de 6 dígitos — la defensa real (por
+// intento, no por IP) es el contador `attempts` de cada código en sí (ver server/auth-reset.ts,
+// MAX_RESET_ATTEMPTS), que ninguna rotación de IP puede esquivar. Esta es una capa adicional,
+// no la única.
+const resetCodeRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 15,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiados intentos. Probá de nuevo en unos minutos." },
+});
+
 const ALLOWED_IMAGE_TYPES: Record<string, string> = {
   "image/jpeg": "jpg",
   "image/png": "png",
   "image/webp": "webp",
 };
+
+// Etapa 5 — mismo patrón que imageUpload (memoria, 5MB, mismo límite ya establecido para
+// uploads en esta app — no se inventa un número nuevo). Nunca toca disco: el buffer se
+// procesa en memoria y se descarta, nunca se persiste el archivo en sí.
+const ALLOWED_IMPORT_DOC_TYPES: Record<string, "excel" | "csv" | "pdf"> = {
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "excel",
+  "application/vnd.ms-excel": "excel",
+  "text/csv": "csv",
+  "application/csv": "csv",
+  "application/pdf": "pdf",
+};
+const importDocUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (!ALLOWED_IMPORT_DOC_TYPES[file.mimetype]) {
+      return cb(new Error("Formato no permitido. Usá Excel (.xlsx), CSV o PDF."));
+    }
+    cb(null, true);
+  },
+});
 
 // Memoria, nunca disco: el buffer va directo a Supabase Storage — el server no debe depender
 // de un disco persistente (los contenedores de hosting como Railway no lo garantizan entre
@@ -260,6 +319,117 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al iniciar sesión" });
+    }
+  });
+
+  /**
+   * Etapa 3 — registro público. El backend asigna SIEMPRE role="consultant" (nunca lee
+   * req.body.role) y deja que storage.registerConsultant cree su propio consultant/tenant
+   * (nunca acepta un consultantId del body) — no hay forma de que quien se registra termine
+   * siendo admin ni compartiendo tenant con otra cuenta. Éxito → auto-login, mismo criterio
+   * que login (misma forma de respuesta, omitPassword).
+   */
+  app.post("/api/auth/register", registerRateLimiter, async (req: Request, res: Response) => {
+    try {
+      const parsed = registerConsultantSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const existingUsername = await storage.getUserByUsername(parsed.data.username);
+      if (existingUsername) {
+        return res.status(409).json({ error: "Ese nombre de usuario ya está en uso" });
+      }
+
+      const { user } = await storage.registerConsultant({
+        username: parsed.data.username,
+        email: parsed.data.email,
+        password: parsed.data.password,
+      });
+
+      req.session.userId = user.id;
+      res.status(201).json(omitPassword(user));
+    } catch (error) {
+      if (error instanceof DuplicateEmailError) {
+        return res.status(409).json({ error: "Ya existe una cuenta con ese email" });
+      }
+      if (error instanceof DuplicateUsernameError) {
+        return res.status(409).json({ error: "Ese nombre de usuario ya está en uso" });
+      }
+      console.error(error);
+      res.status(500).json({ error: "No se pudo crear la cuenta. Intentá nuevamente." });
+    }
+  });
+
+  /**
+   * Etapa 3 — recuperación de contraseña, paso 1. La respuesta pública es SIEMPRE la misma
+   * exista o no una cuenta con ese email (ver requestPasswordReset en server/auth-reset.ts) —
+   * nunca se debe poder usar este endpoint para averiguar qué emails están registrados.
+   */
+  app.post("/api/auth/forgot-password", forgotPasswordRateLimiter, async (req: Request, res: Response) => {
+    const GENERIC_MESSAGE = "Si existe una cuenta asociada a ese email, vas a recibir un código.";
+    try {
+      const parsed = forgotPasswordSchema.safeParse(req.body);
+      if (!parsed.success) {
+        // Formato de email inválido sí se informa — no es información sobre CUENTAS, es
+        // validación de formato del dato que la propia usuaria tipeó.
+        return res.status(400).json({ error: "Ingresá un email válido" });
+      }
+
+      await requestPasswordReset(parsed.data.email);
+      res.json({ message: GENERIC_MESSAGE });
+    } catch (error) {
+      console.error("Error al solicitar recuperación de contraseña:", error);
+      // Mismo mensaje genérico también ante un error interno real — no hay forma correcta de
+      // distinguir "no existe la cuenta" de "algo salió mal" sin filtrar información.
+      res.json({ message: GENERIC_MESSAGE });
+    }
+  });
+
+  /**
+   * Etapa 3 — paso 2 (UX): confirma si el código es válido SIN todavía cambiar la contraseña.
+   * Comparte el mismo contador de intentos que el paso final (ver checkResetCode) — probar acá
+   * y después en /reset-password no da intentos extra.
+   */
+  app.post("/api/auth/verify-reset-code", resetCodeRateLimiter, async (req: Request, res: Response) => {
+    try {
+      const parsed = verifyResetCodeSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Código inválido" });
+      }
+
+      const valid = await verifyResetCode(parsed.data.email, parsed.data.code);
+      if (!valid) {
+        return res.status(400).json({ error: "Código inválido o vencido" });
+      }
+      res.json({ valid: true });
+    } catch (error) {
+      console.error("Error al verificar código de recuperación:", error);
+      res.status(400).json({ error: "Código inválido o vencido" });
+    }
+  });
+
+  /**
+   * Etapa 3 — paso final: valida el código otra vez (mismo núcleo, mismo contador de intentos)
+   * y, si es válido, cambia la contraseña e invalida sesiones anteriores. El mensaje de error
+   * es genérico a propósito — nunca distingue "código vencido" de "email inexistente" de
+   * "demasiados intentos": ese detalle solo importa para logs internos (server/auth-reset.ts).
+   */
+  app.post("/api/auth/reset-password", resetCodeRateLimiter, async (req: Request, res: Response) => {
+    try {
+      const parsed = resetPasswordSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos" });
+      }
+
+      const outcome = await resetPassword(parsed.data.email, parsed.data.code, parsed.data.newPassword);
+      if (outcome === "invalid") {
+        return res.status(400).json({ error: "Código inválido o vencido" });
+      }
+      res.json({ message: "Contraseña actualizada correctamente" });
+    } catch (error) {
+      console.error("Error al restablecer contraseña:", error);
+      res.status(400).json({ error: "Código inválido o vencido" });
     }
   });
 
@@ -1069,6 +1239,69 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  /**
+   * Etapa 5 — importación de productos/pedido desde Excel/CSV/PDF. SOLO parsea y matchea
+   * contra el catálogo real (global + propio de esta consultora, mismo scope que
+   * getAllProducts) — nunca escribe nada. El precio/puntos que viaja en la respuesta es
+   * SIEMPRE el del catálogo (nunca el del archivo, que ni siquiera se extrae). La
+   * confirmación real (incrementar stock) la hace el frontend después, llamando al endpoint
+   * YA existente PATCH /api/products/:id/stock/increment por cada línea que la consultora
+   * confirme — este endpoint no crea ni modifica ninguna fila.
+   */
+  app.post(
+    "/api/products/import/parse",
+    handleImportDocUpload,
+    async (req: Request, res: Response) => {
+      try {
+        if (!req.file) {
+          return res.status(400).json({ error: "Falta el archivo" });
+        }
+
+        const kind = ALLOWED_IMPORT_DOC_TYPES[req.file.mimetype];
+        let rows;
+        try {
+          if (kind === "pdf") {
+            rows = await parsePdfImportRows(req.file.buffer);
+          } else if (kind === "excel") {
+            rows = await parseExcelImportRows(req.file.buffer);
+          } else {
+            rows = parseCsvImportRows(req.file.buffer);
+          }
+        } catch (err) {
+          if (err instanceof ImportParseError) {
+            return res.status(400).json({ error: err.message });
+          }
+          throw err;
+        }
+
+        const catalogProducts = await storage.getAllProducts(req.consultantId!);
+        const catalog: ImportCatalogProduct[] = catalogProducts.map((p) => ({
+          id: p.id,
+          producto: p.producto,
+          variante: p.variante,
+          seccion: p.seccion,
+          precio: p.precio,
+          puntos: p.puntos,
+          imagen: p.imagen,
+        }));
+
+        const matches = matchImportedProducts(rows, catalog);
+        const summary = {
+          total: matches.length,
+          matched: matches.filter((m) => m.status === "matched").length,
+          ambiguous: matches.filter((m) => m.status === "ambiguous").length,
+          notFound: matches.filter((m) => m.status === "not_found").length,
+          zeroQuantity: matches.filter((m) => m.quantity === 0).length,
+        };
+
+        res.json({ summary, matches });
+      } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: "Error al procesar el archivo" });
+      }
+    },
+  );
+
   app.patch("/api/products/:id/stock-reminder", async (req: Request, res: Response) => {
     try {
       const id = parseInt(req.params.id, 10);
@@ -1325,6 +1558,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const message =
         err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE"
           ? "La imagen no puede superar los 5MB."
+          : err instanceof Error
+            ? err.message
+            : "No se pudo procesar el archivo.";
+      res.status(400).json({ error: message });
+    });
+  }
+
+  // Etapa 5 — mismo patrón que handleImageUpload, para el archivo de importación de productos.
+  function handleImportDocUpload(req: Request, res: Response, next: NextFunction) {
+    importDocUpload.single("file")(req, res, (err: unknown) => {
+      if (!err) return next();
+      const message =
+        err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE"
+          ? "El archivo no puede superar los 5MB."
           : err instanceof Error
             ? err.message
             : "No se pudo procesar el archivo.";
