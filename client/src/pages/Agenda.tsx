@@ -147,6 +147,17 @@ export default function Agenda() {
   const selectedAppointments = filteredAppointments.filter(a => a.date === selectedDate);
 
   const handleSaveAppointment = (input: AppointmentSavePayload) => {
+    // Etapa 7.5 — prevención visual, sobre lo que ya está cargado (el mes en vista): backend
+    // sigue siendo la autoridad real (índice único de Postgres), esto solo evita el viaje al
+    // servidor en el caso obvio. Si el turno elegido cae fuera del rango ya cargado, esta
+    // verificación simplemente no aplica y el backend la resuelve igual.
+    const hasConflict = appointments.some(
+      (a) => a.date === input.date && a.time === input.time && a.status !== "cancelada" && a.id !== editingAppointment?.id,
+    );
+    if (hasConflict) {
+      toast({ title: "Ya existe un turno en ese horario", variant: "destructive" });
+      return;
+    }
     if (editingAppointment) {
       updateMutation.mutate({ id: editingAppointment.id, input });
     } else {

@@ -95,11 +95,15 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
 
   /** Etapa 5 — mismo criterio de merge que addLine (suma cantidad si el producto ya estaba
    * en el pedido, agrega línea nueva si no) — así da igual si la consultora arma el pedido
-   * a mano, importando un archivo, o combinando ambos. */
+   * a mano, importando un archivo, o combinando ambos. Etapa 7.2: una línea con cantidad 0
+   * (posible si la consultora tildó a mano una fila "sin stock en el archivo" en
+   * ImportProductsDialog) nunca se agrega — no representa ninguna entrada de mercadería real,
+   * y el batch de confirmación exige delta positivo en cada línea. */
   const handleImport = (imported: ImportedOrderLine[]) => {
     setLines((prev) => {
       const next = [...prev];
       for (const line of imported) {
+        if (line.quantity <= 0) continue;
         const idx = next.findIndex((l) => l.productId === line.productId);
         if (idx !== -1) {
           next[idx] = { ...next[idx], quantity: next[idx].quantity + line.quantity };
@@ -125,31 +129,48 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
         throw new Error("Falta elegir el descuento del pedido");
       }
       const chosenDiscount = discount;
-      const failed: string[] = [];
 
+      // Etapa 7.2 — UNA sola llamada atómica para el stock: todo o nada. Reemplaza el loop de
+      // PATCH /stock/increment por línea (hallazgo P2, Etapa 6) — si cualquier línea fuera
+      // inválida, el backend revierte la transacción completa y acá no se aplica NADA, ni las
+      // líneas que "hubieran pasado" antes en el loop viejo.
+      await apiRequest("PATCH", "/api/products/stock/increment-batch", {
+        lines: lines.map((l) => ({ productId: l.productId, delta: l.quantity })),
+      });
+
+      // El descuento es un SET idempotente por producto (costPrice se recalcula siempre desde
+      // el mismo discountPercent, nunca un delta) — a diferencia del stock, reintentar una
+      // línea de descuento no duplica ni corrompe nada, así que una falla acá no forma parte
+      // del "todo o nada" de esta etapa (que es específicamente sobre stock, ver Etapa 7.2,
+      // sección 20) y no debe bloquear que el pedido quede cargado.
+      const discountFailed: string[] = [];
       for (const line of lines) {
         try {
-          // Delta atómico: el backend hace `unidades = unidades + quantity` en la misma
-          // sentencia, así que no hace falta leer el stock actual acá ni hay ventana de carrera
-          // con otra carga concurrente (Etapa I-B.8-B, hallazgo F1 de la auditoría I-B.8-A).
-          await apiRequest("PATCH", `/api/products/${line.productId}/stock/increment`, { delta: line.quantity });
           await apiRequest("PATCH", `/api/products/${line.productId}/discount`, { discountPercent: chosenDiscount });
         } catch {
-          failed.push(line.productName);
+          discountFailed.push(line.productName);
         }
       }
-      if (failed.length > 0) {
-        throw new Error(`No se pudo actualizar: ${failed.join(", ")}`);
-      }
+      return { discountFailed };
     },
-    onSuccess: () => {
+    onSuccess: ({ discountFailed }) => {
       queryClient.invalidateQueries({ queryKey: ["/api/products"] });
       queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
-      toast({ title: "Pedido cargado", description: "El stock se actualizó correctamente." });
+      if (discountFailed.length > 0) {
+        toast({
+          title: "Pedido cargado, con un detalle",
+          description: `El stock se actualizó correctamente. No se pudo aplicar el descuento a: ${discountFailed.join(", ")}.`,
+          variant: "destructive",
+        });
+      } else {
+        toast({ title: "Pedido cargado", description: "El stock se actualizó correctamente." });
+      }
       resetAndClose();
     },
     onError: (err: Error) => {
-      // Puede haber quedado una actualización parcial aplicada — reflejamos el estado real.
+      // Acá SOLO se llega si la operación de stock (atómica) falló entera — el backend no
+      // aplicó ninguna línea, así que no hace falta "reflejar un estado parcial": no lo hay.
+      // El diálogo queda abierto a propósito para poder reintentar.
       queryClient.invalidateQueries({ queryKey: ["/api/products"] });
       toast({ title: "Hubo un problema al cargar el pedido", description: err.message, variant: "destructive" });
     },

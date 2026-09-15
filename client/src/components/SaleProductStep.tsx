@@ -34,7 +34,12 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
   ref,
 ) {
   const { format } = useHideMoney();
-  const categories = useMemo(() => getProductCategories(products), [products]);
+  // Etapa 7.4: un producto discontinuado no debe ofrecerse como opción normal para una venta
+  // nueva (sección 21) — se filtra acá, en el único lugar donde se arma la lista para
+  // "elegir producto". El backend (createSale/updateSale) es la protección real; esto es
+  // solo para reducir errores evitando que aparezca en el picker.
+  const sellableProducts = useMemo(() => products.filter((p) => !p.discontinued), [products]);
+  const categories = useMemo(() => getProductCategories(sellableProducts), [sellableProducts]);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
   const [selectedTone, setSelectedTone] = useState<Product | null>(null);
@@ -42,8 +47,8 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
   const [priceInput, setPriceInput] = useState("");
 
   const toneSiblings = useMemo(
-    () => (selectedProduct ? getToneSiblings(selectedProduct, products) : []),
-    [selectedProduct, products],
+    () => (selectedProduct ? getToneSiblings(selectedProduct, sellableProducts) : []),
+    [selectedProduct, sellableProducts],
   );
   const hasTones = toneSiblings.length > 1;
   const activeProduct = selectedTone ?? selectedProduct;
@@ -83,7 +88,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
     setSelectedTone(null);
     setQuantity(1);
     setPriceInput(String(product.precio / 100));
-    const siblings = getToneSiblings(product, products);
+    const siblings = getToneSiblings(product, sellableProducts);
     onSubViewChange(siblings.length > 1 ? "tone" : "qty");
   };
 
@@ -162,7 +167,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
   }
 
   if (subView === "product") {
-    const visibleProducts = products.filter((p) => p.seccion === selectedCategory);
+    const visibleProducts = sellableProducts.filter((p) => p.seccion === selectedCategory);
     return (
       <div className="space-y-3">
         <p className="text-sm text-muted-foreground">{selectedCategory}</p>

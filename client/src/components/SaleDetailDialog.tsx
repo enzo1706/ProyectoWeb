@@ -19,6 +19,7 @@ import { User, Calendar, FileText, AlertTriangle, Pencil, Ban } from "lucide-rea
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
+import { computeAdjustmentAmount, computeHistoricalProductCost, type OrderAdjustment } from "@shared/saleCalculations";
 import type { SaleDetails } from "./SaleCard";
 
 interface SaleDetailDialogProps {
@@ -112,6 +113,24 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
   // la respuesta de GET /api/sales/:id — no hace falta ningún fetch adicional.
   const hasPaidInstallments = sale?.installments.some((i) => i.status === "pagado") ?? false;
 
+  // Etapa 7.7 — descuento/recargo de la orden no se guardan como monto ($) en `sales`, solo
+  // como tipo+valor (`orderDiscountType`/`orderDiscountValue`) — se resuelven acá con el mismo
+  // helper (`computeAdjustmentAmount`) que ya usa NewSaleDialog para la preview, nunca una
+  // fórmula nueva.
+  const orderDiscount: OrderAdjustment | null = sale?.orderDiscountType
+    ? { type: sale.orderDiscountType as "percent" | "fixed", value: sale.orderDiscountValue ?? 0 }
+    : null;
+  const orderSurcharge: OrderAdjustment | null = sale?.orderSurchargeType
+    ? { type: sale.orderSurchargeType as "percent" | "fixed", value: sale.orderSurchargeValue ?? 0 }
+    : null;
+  const discountAmount = sale ? computeAdjustmentAmount(sale.subtotal, orderDiscount) : 0;
+  const surchargeAmount = sale ? computeAdjustmentAmount(sale.subtotal, orderSurcharge) : 0;
+
+  // Etapa 7.7 — COGS histórico: sale_items.costPrice es el snapshot al momento de la venta
+  // (nunca el costo actual del producto/productStock). Ver computeHistoricalProductCost para
+  // el criterio de "no disponible" cuando falta el snapshot de algún ítem.
+  const productCost = sale ? computeHistoricalProductCost(sale.items) : null;
+
   return (
     <>
       <Dialog open={open} onOpenChange={(next) => !next && onOpenChange(false)}>
@@ -186,6 +205,12 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                         <p className="text-xs text-muted-foreground">
                           {item.quantity} x {format(item.price)}
                         </p>
+                        <p className="text-xs text-muted-foreground" data-testid={`text-item-cost-${item.id}`}>
+                          Costo:{" "}
+                          {item.costPrice !== null
+                            ? `${item.quantity} x ${format(item.costPrice)} = ${format(item.quantity * item.costPrice)}`
+                            : "No disponible"}
+                        </p>
                       </div>
                       <p className="font-medium tabular-nums shrink-0">{format(item.quantity * item.price)}</p>
                     </div>
@@ -197,12 +222,34 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                     <span>Subtotal</span>
                     <span>{format(sale.subtotal)}</span>
                   </div>
+                  {discountAmount > 0 && (
+                    <div className="flex justify-between text-destructive">
+                      <span>Descuento</span>
+                      <span>− {format(discountAmount)}</span>
+                    </div>
+                  )}
+                  {surchargeAmount > 0 && (
+                    <div className="flex justify-between text-emerald-600 dark:text-emerald-400">
+                      <span>Recargo</span>
+                      <span>+ {format(surchargeAmount)}</span>
+                    </div>
+                  )}
                   {!!sale.shippingCharged && sale.shippingCharged > 0 && (
                     <div className="flex justify-between text-muted-foreground">
                       <span>Envío cobrado</span>
                       <span>{format(sale.shippingCharged)}</span>
                     </div>
                   )}
+                  <div className="flex justify-between font-bold pt-1 border-t">
+                    <span>Total</span>
+                    <span data-testid="text-detail-total">{format(sale.total)}</span>
+                  </div>
+                  <div className="flex justify-between text-muted-foreground">
+                    <span>Costo de mercadería</span>
+                    <span data-testid="text-detail-product-cost">
+                      {productCost !== null ? format(productCost) : "No disponible"}
+                    </span>
+                  </div>
                   {sale.shippingCost !== null && sale.shippingCost !== undefined && (
                     <div className="flex justify-between text-muted-foreground">
                       <span>Costo real de envío</span>
@@ -215,10 +262,6 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                       <span>{format(sale.ingresosBrutos)}</span>
                     </div>
                   )}
-                  <div className="flex justify-between font-bold pt-1 border-t">
-                    <span>Total</span>
-                    <span data-testid="text-detail-total">{format(sale.total)}</span>
-                  </div>
                   <div className="flex justify-between text-green-600 dark:text-green-400">
                     <span>Ganancia</span>
                     <span>{format(sale.profit)}</span>

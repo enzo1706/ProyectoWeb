@@ -1,12 +1,19 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { AddressInfo } from "net";
 import type { Server } from "http";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 
 /**
  * Etapa 5 — POST /api/products/import/parse a nivel HTTP real (memoria, sin Postgres real —
  * no hace falta para probar tenant isolation ni auth, mismo criterio que subscription-routes/
  * auth-register). Nunca sube el PDF real de 108KB acá (ver importParsers.test.ts para eso) —
  * estos tests usan CSV, mucho más liviano para armar en memoria por caso.
+ *
+ * Etapa 7.1: sí sube el .xlsx REAL (pedido-modelo.xlsx, ~3KB) en un único test dedicado —
+ * el punto de esa prueba es recorrer el camino completo que usaría una consultora real
+ * (archivo -> multer -> parseExcelImportRows real -> matching real -> catálogo real), no solo
+ * el parser aislado (eso ya está cubierto en importParsers.test.ts).
  */
 process.env.NODE_ENV = "test";
 process.env.DATABASE_MODE = "memory";
@@ -30,6 +37,17 @@ async function createConsultant(username: string) {
 function csvFile(content: string, filename = "pedido.csv"): FormData {
   const form = new FormData();
   form.append("file", new Blob([content], { type: "text/csv" }), filename);
+  return form;
+}
+
+async function xlsxFile(fixtureName: string, filename = "pedido.xlsx"): Promise<FormData> {
+  const buffer = await readFile(path.join(__dirname, "fixtures", fixtureName));
+  const form = new FormData();
+  form.append(
+    "file",
+    new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
+    filename,
+  );
   return form;
 }
 
@@ -93,6 +111,38 @@ describe("POST /api/products/import/parse", () => {
     expect(body.matches[0].quantity).toBe(3); // del archivo
     expect(body.matches[0].product.precio).toBe(27000); // del catálogo, NUNCA 999999 del CSV
     expect(body.matches[0].product.puntos).toBe(12); // del catálogo
+  });
+
+  it("Etapa 7.1 — .xlsx REAL (pedido-modelo.xlsx): match correcto end-to-end, precio y puntos vienen del catálogo, nunca del archivo", async () => {
+    const { cookie } = await createConsultant(`vitest_import_xlsx_${Date.now()}`);
+    // "Perfume Belara" (no "Base de Maquillaje At Play", que ya usa otro test de este mismo
+    // archivo contra el mismo storage en memoria — usar el mismo nombre lo volvería
+    // "ambiguous" por colisión entre tests, no por el comportamiento real bajo prueba).
+    // El propio fixture trae una columna "Precio" (999999 para esa fila) que
+    // parseExcelImportRows ni siquiera extrae — este test prueba, con bytes .xlsx reales
+    // subidos por HTTP, que el camino completo (multer -> parser real -> matching real)
+    // nunca la usa.
+    await storage.bulkInsertProducts([
+      { seccion: "Test", producto: "Perfume Belara", variante: "Estándar", codigo: "PERF-BEL-XLSX", puntos: 9, precio: 18500, source: "import" },
+    ]);
+
+    const res = await fetch(`${baseUrl}/api/products/import/parse`, {
+      method: "POST",
+      headers: { Cookie: cookie },
+      body: await xlsxFile("pedido-modelo.xlsx"),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    const match = body.matches.find((m: { sourceName: string }) => m.sourceName === "Perfume Belara");
+    expect(match).toBeDefined();
+    expect(match.status).toBe("matched");
+    expect(match.quantity).toBe(0); // del archivo (cantidad 0, fila válida igual)
+    expect(match.product.precio).toBe(18500); // del catálogo, nunca 15000 del archivo
+    expect(match.product.puntos).toBe(9); // del catálogo
+
+    // El resto de las filas válidas del archivo también llegaron (aunque no matcheen catálogo).
+    expect(body.summary.matched + body.summary.notFound + body.summary.ambiguous).toBe(8);
   });
 
   it("tenant isolation: consultora A nunca matchea contra un producto MANUAL privado de consultora B", async () => {

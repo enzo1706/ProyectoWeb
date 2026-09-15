@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { computeSubtotal, computeSaleTotals, computeProductCost, computeSaleProfit } from "@shared/saleCalculations";
+import {
+  computeSubtotal,
+  computeSaleTotals,
+  computeProductCost,
+  computeSaleProfit,
+  computeHistoricalProductCost,
+} from "@shared/saleCalculations";
 
 /**
  * Etapa I-B.7-D-C — tests puros del modelo financiero (sin DB, sin storage): reproduce
@@ -87,5 +93,50 @@ describe("Modelo financiero — Etapa I-B.7-D-C", () => {
     expect(withZero.totals.total).toBe(1200);
     // El envío cobrado siempre suma al total independientemente del costo real informado.
     expect(withZero.profit).toBe(withZero.totals.total - withZero.productCost - 0);
+  });
+});
+
+describe("COGS de SaleDetail (sale_items.costPrice histórico) — Etapa 7.7", () => {
+  it("computeProductCost con múltiples productos: A qty2×5000 + B qty3×2000 = 16000", () => {
+    const cost = computeProductCost([
+      { quantity: 2, costPrice: 5000 },
+      { quantity: 3, costPrice: 2000 },
+    ]);
+    expect(cost).toBe(16000);
+  });
+
+  it("computeHistoricalProductCost: usa el costo histórico persistido, nunca el costo actual del producto (el caller nunca le pasa el costo actual, solo lo que ya está guardado en sale_items)", () => {
+    // Ejemplo del pedido: cantidad 2, costo histórico guardado 6.000/u, costo actual 8.000/u —
+    // acá ni siquiera se le pasa el costo actual, porque la fuente es siempre sale_items.
+    const cost = computeHistoricalProductCost([{ quantity: 2, costPrice: 6000 }]);
+    expect(cost).toBe(12000); // nunca 16000 (lo que daría con el costo actual)
+  });
+
+  it("computeHistoricalProductCost: todas las líneas con costo conocido -> suma normal", () => {
+    const cost = computeHistoricalProductCost([
+      { quantity: 2, costPrice: 5000 },
+      { quantity: 3, costPrice: 2000 },
+    ]);
+    expect(cost).toBe(16000);
+  });
+
+  it("computeHistoricalProductCost: UNA sola línea con costPrice null -> null (no se suman solo las conocidas, no se inventa un total parcial)", () => {
+    const cost = computeHistoricalProductCost([
+      { quantity: 2, costPrice: 5000 },
+      { quantity: 1, costPrice: null },
+    ]);
+    expect(cost).toBeNull();
+  });
+
+  it("computeHistoricalProductCost: todas las líneas con costPrice null -> null", () => {
+    const cost = computeHistoricalProductCost([
+      { quantity: 1, costPrice: null },
+      { quantity: 2, costPrice: null },
+    ]);
+    expect(cost).toBeNull();
+  });
+
+  it("computeHistoricalProductCost: sin ítems -> null (nunca 0, que se leería como 'sin costo' en vez de 'sin datos')", () => {
+    expect(computeHistoricalProductCost([])).toBeNull();
   });
 });

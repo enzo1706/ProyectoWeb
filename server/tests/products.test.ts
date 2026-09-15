@@ -414,6 +414,16 @@ describe("PATCH /api/products/:id/discontinued", () => {
     const after = (await (await api("GET", "/api/products")).json()).find((p: any) => p.id === productId);
     expect(after.discontinued).toBe(before.discontinued);
   });
+
+  it("13. discontinuar/reactivar NUNCA toca el stock — un producto con stock 5 sigue con stock 5 en ambos estados", async () => {
+    await api("PATCH", `/api/products/${productId}/stock`, { unidades: 7 });
+
+    const res1 = await api("PATCH", `/api/products/${productId}/discontinued`, { discontinued: true });
+    expect((await res1.json()).unidades).toBe(7); // discontinuado, sigue teniendo 7 unidades físicas
+
+    const res2 = await api("PATCH", `/api/products/${productId}/discontinued`, { discontinued: false });
+    expect((await res2.json()).unidades).toBe(7); // reactivado, el stock nunca se tocó
+  });
 });
 
 describe("PATCH /api/products/:id/stock-reminder", () => {

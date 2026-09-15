@@ -56,11 +56,18 @@ export async function requestPasswordReset(rawEmail: string): Promise<void> {
   await storage.invalidateActivePasswordResetCodes(user.id);
   const record = await storage.createPasswordResetCode(user.id, codeHash, expiresAt);
 
-  try {
-    // El código real SOLO viaja por acá — nunca en la respuesta HTTP, nunca en un log fuera
-    // del adapter de desarrollo de server/email.ts (que a su vez nunca lo imprime en producción).
-    await sendPasswordResetCode(email, code, RESET_CODE_EXPIRY_MINUTES);
-  } catch (err) {
+  // Etapa 7.6 — timing side-channel (hallazgo P2, Etapa 6): hasta acá, esta rama esperaba el
+  // round-trip de red completo a Resend (típicamente cientos de ms) antes de responder,
+  // mientras que la rama "no existe" de arriba solo espera un bcrypt.hash local (decenas de
+  // ms) — una diferencia de tiempo de respuesta grande y fácil de medir estadísticamente,
+  // aunque el CONTENIDO de la respuesta fuera idéntico. El envío en sí (I/O de red, la mayor
+  // fuente de esa diferencia) ahora corre DESPUÉS de que esta función ya haya resuelto lo que
+  // el endpoint necesita para responder — nunca bloquea la respuesta HTTP. Las 2 escrituras a
+  // DB de arriba SÍ se esperan (quedan igual que antes): su costo real es comparable al del
+  // bcrypt.hash con el que ya se iguala la rama "no existe", así que no vale la pena la
+  // complejidad de moverlas también a background. Esto no es "timing perfecto" — ver el
+  // reporte de la etapa para la limitación real que queda.
+  void sendPasswordResetCode(email, code, RESET_CODE_EXPIRY_MINUTES).catch(async (err) => {
     // Etapa 3.1: si el proveedor de email falla, el código YA existe en DB pero la consultora
     // nunca lo recibió — no lo dejamos "vivo" (nadie podría usarlo igual, pero tampoco tiene
     // sentido dejar un código quemado ocupando el lugar del único activo). Se marca usado y la
@@ -70,9 +77,9 @@ export async function requestPasswordReset(rawEmail: string): Promise<void> {
     console.error(
       `No se pudo enviar el código de recuperación (código invalidado, no queda utilizable): ${err instanceof Error ? err.message : "error desconocido"}`,
     );
-    // Nunca se propaga hacia el endpoint — la respuesta pública sigue siendo la genérica
-    // (ver POST /api/auth/forgot-password en routes.ts), nunca revela que el envío falló.
-  }
+    // Nunca se propaga hacia el endpoint (ya respondió) — la respuesta pública fue siempre la
+    // genérica (ver POST /api/auth/forgot-password en routes.ts), nunca revela que el envío falló.
+  });
 }
 
 interface ResetCodeCheckOk {

@@ -63,6 +63,23 @@ export function computeProductCost(items: SaleCostLineInput[]): number {
   return items.reduce((sum, item) => sum + item.quantity * item.costPrice, 0);
 }
 
+export interface SaleCostLineHistorical {
+  quantity: number;
+  /** sale_items.costPrice tal como quedó guardado — null en ventas anteriores a la Etapa
+   * I-B.7-D-D, cuando esta columna todavía no existía (nunca se completa retroactivamente). */
+  costPrice: number | null;
+}
+
+/** COGS histórico de una venta ya persistida (Etapa 7.7 — SaleDetail): a diferencia de
+ * `computeProductCost`, acepta líneas con costo desconocido. Si CUALQUIER línea no tiene
+ * costPrice, el total se considera no disponible en vez de sumar solo las líneas conocidas —
+ * un total parcial se mostraría como si fuera completo, y sería un dato falso. */
+export function computeHistoricalProductCost(items: SaleCostLineHistorical[]): number | null {
+  if (items.length === 0) return null;
+  if (items.some((item) => item.costPrice === null)) return null;
+  return computeProductCost(items.map((item) => ({ quantity: item.quantity, costPrice: item.costPrice as number })));
+}
+
 export interface SaleProfitInput {
   total: number;
   productCost: number;

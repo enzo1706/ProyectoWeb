@@ -4,11 +4,12 @@ import type { z } from "zod";
 import bcrypt from "bcryptjs";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
-import { storage, SaleValidationError, SaleRequestConflictError, ProductConflictError, AppointmentValidationError, isBcryptHash, DuplicateEmailError, DuplicateUsernameError } from "./storage";
+import { storage, SaleValidationError, SaleRequestConflictError, ProductConflictError, AppointmentValidationError, AppointmentConflictError, isBcryptHash, DuplicateEmailError, DuplicateUsernameError } from "./storage";
 import { requestPasswordReset, verifyResetCode, resetPassword } from "./auth-reset";
 import { uploadProductImage, deleteProductImage, isValidImageBuffer, listProductImageFiles, extractStoragePath } from "./image-storage";
 import { findProductImageMatches } from "@shared/imageMatching";
 import { matchImportedProducts, type ImportCatalogProduct } from "@shared/importMatching";
+import { isBalanceFilter, isStaleFilter } from "@shared/clientFilters";
 import { parseExcelImportRows, parseCsvImportRows, parsePdfImportRows, ImportParseError } from "./importParsers";
 import {
   bulkProductSchema,
@@ -30,6 +31,7 @@ import {
   toggleProductDiscontinuedSchema,
   setProductStockSchema,
   incrementProductStockSchema,
+  incrementProductStockBatchSchema,
   setProductStockReminderSchema,
   startSubscriptionSchema,
   registerConsultantSchema,
@@ -47,6 +49,13 @@ import { slugify } from "@shared/slug";
 import { SUBSCRIPTION_PRICE_ARS, PLAN_NAME } from "./config/subscription";
 import { getConsultantAccessStatus, generateExternalReference, parseConsultantIdFromExternalReference } from "./subscription";
 import { createSubscriptionPreapproval, getMercadoPagoPayment, verifyWebhookSignature, InvalidWebhookSignatureError } from "./mercadopago";
+
+// Etapa 7.6: hash bcrypt (10 rounds, mismo costo que BCRYPT_SALT_ROUNDS) de un valor fijo
+// arbitrario — NUNCA corresponde a ninguna cuenta real, existe solo para que bcrypt.compare()
+// tenga algo válido contra qué comparar cuando el login recibe un usuario inexistente (ver
+// POST /api/auth/login). Generado una sola vez offline, no es un secreto (su propósito es
+// exactamente que cualquiera pueda verlo sin que eso sirva de nada).
+const DUMMY_BCRYPT_HASH = "$2b$10$DrS1JmJgqSN2HraB9QByJ.iysozknotp/lGES/YW/MNPT8CY2R9j.";
 
 const loginRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -273,9 +282,17 @@ function omitPassword<T extends { password?: string }>(user: T) {
   return safe;
 }
 
+// Etapa 7.8 — fechas de negocio "YYYY-MM-DD" (locales, ver shared/saleCalculations y
+// Reportes.tsx: toDateStr/parseLocalDate). Un valor que no matchea este formato se trata como
+// ausente (nunca se lo deja llegar tal cual a gte/lt de Drizzle) — antes, un query param
+// malformado silenciosamente producía 0 resultados o un filtro incorrecto sin ningún error.
+const DATE_STR_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
 function parseDateRange(req: Request): { start?: string; end?: string } {
-  const start = typeof req.query.start === "string" && req.query.start ? req.query.start : undefined;
-  const end = typeof req.query.end === "string" && req.query.end ? req.query.end : undefined;
+  const rawStart = typeof req.query.start === "string" ? req.query.start : undefined;
+  const rawEnd = typeof req.query.end === "string" ? req.query.end : undefined;
+  const start = rawStart && DATE_STR_PATTERN.test(rawStart) ? rawStart : undefined;
+  const end = rawEnd && DATE_STR_PATTERN.test(rawEnd) ? rawEnd : undefined;
   return { start, end };
 }
 
@@ -290,6 +307,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
       const user = await storage.getUserByUsername(parsed.data.username);
       if (!user) {
+        // Etapa 7.6: mismo criterio anti-timing que ya usa requestPasswordReset (server/
+        // auth-reset.ts) — sin esto, "usuario inexistente" respondía casi al instante
+        // (ningún bcrypt de por medio) mientras "usuario existente + password incorrecta"
+        // esperaba un bcrypt.compare real (~decenas de ms), una diferencia de tiempo
+        // observable que permite distinguir cuentas existentes sin ver el mensaje. DUMMY_HASH
+        // es un hash bcrypt válido cualquiera (nunca corresponde a ninguna cuenta real) — el
+        // costo de compare() depende del factor de costo embebido en el hash, no de su valor.
+        await bcrypt.compare(parsed.data.password, DUMMY_BCRYPT_HASH);
         return res.status(401).json({ error: "Credenciales inválidas" });
       }
 
@@ -351,7 +376,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       res.status(201).json(omitPassword(user));
     } catch (error) {
       if (error instanceof DuplicateEmailError) {
-        return res.status(409).json({ error: "Ya existe una cuenta con ese email" });
+        // Etapa 7.6: antes decía "Ya existe una cuenta con ese email" — confirmaba sin
+        // ambigüedad que ese email está registrado (hallazgo P2, Etapa 6). El username sigue
+        // devolviendo un mensaje específico a propósito (es un dato público, no sensible, y la
+        // UX de elegir un usuario se rompe si no se avisa cuál campo chocó) — pero el email es
+        // exactamente el dato que no queremos confirmar. El mensaje ahora da una salida
+        // accionable sin confirmar la existencia de la cuenta en la misma frase; sigue siendo
+        // un 409 (no se fuerza a 200/201, sería mentirle a la propia usuaria sobre si su cuenta
+        // se creó) — `registerRateLimiter` ya existente sigue acotando cuántos intentos por IP
+        // son posibles. No elimina el vector por completo (ver reporte de la etapa).
+        return res.status(409).json({ error: "No pudimos crear la cuenta con esos datos. Si ya tenés una cuenta, iniciá sesión o recuperá tu contraseña." });
       }
       if (error instanceof DuplicateUsernameError) {
         return res.status(409).json({ error: "Ese nombre de usuario ya está en uso" });
@@ -808,6 +842,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       res.status(201).json(appointment);
     } catch (error) {
+      if (error instanceof AppointmentConflictError) {
+        return res.status(409).json({ error: error.message });
+      }
       console.error(error);
       res.status(500).json({ error: "Error al crear la cita" });
     }
@@ -833,6 +870,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       if (error instanceof AppointmentValidationError) {
         return res.status(400).json({ error: error.message });
+      }
+      if (error instanceof AppointmentConflictError) {
+        return res.status(409).json({ error: error.message });
       }
       console.error(error);
       res.status(500).json({ error: "Error al actualizar la cita" });
@@ -895,9 +935,34 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/clients", async (req: Request, res: Response) => {
     try {
       const search = typeof req.query.search === "string" ? req.query.search : "";
-      const limit = typeof req.query.limit === "string" ? parseInt(req.query.limit, 10) : undefined;
-      const list = await storage.searchClients(req.consultantId!, search, limit && !isNaN(limit) ? limit : undefined);
-      res.json(list);
+
+      // Modo típeahead (combobox de Agenda/Nueva venta): sin `page`, devuelve un array plano
+      // truncado a `limit` — comportamiento sin cambios para no romper esos consumidores.
+      if (typeof req.query.page !== "string") {
+        const limit = typeof req.query.limit === "string" ? parseInt(req.query.limit, 10) : undefined;
+        const list = await storage.searchClients(req.consultantId!, search, limit && !isNaN(limit) ? limit : undefined);
+        return res.json(list);
+      }
+
+      // Modo listado paginado (pantalla de Clientas, Etapa 7.1): `page` presente -> devuelve
+      // el sobre {items, total, page, pageSize, totalPages}.
+      const page = parseInt(req.query.page, 10);
+      if (isNaN(page) || page < 1) {
+        return res.status(400).json({ error: "page inválido" });
+      }
+      const pageSizeRaw = typeof req.query.pageSize === "string" ? parseInt(req.query.pageSize, 10) : NaN;
+      const pageSize = !isNaN(pageSizeRaw) && pageSizeRaw >= 1 ? pageSizeRaw : undefined;
+      const balanceFilter = isBalanceFilter(req.query.balanceFilter) ? req.query.balanceFilter : undefined;
+      const staleFilter = isStaleFilter(req.query.staleFilter) ? req.query.staleFilter : undefined;
+
+      const result = await storage.searchClientsPaginated(req.consultantId!, {
+        query: search,
+        page,
+        pageSize: pageSize ?? 25,
+        balanceFilter,
+        staleFilter,
+      });
+      res.json(result);
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al buscar clientas" });
@@ -1230,6 +1295,33 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
 
       res.json(updated);
+    } catch (error) {
+      if (error instanceof SaleValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar el stock" });
+    }
+  });
+
+  /**
+   * Etapa 7.2 — confirmación de un pedido/importación (manual, Excel, CSV o PDF, todas
+   * convergen acá) como UNA sola operación atómica: todo o nada. Reemplaza el loop de
+   * `/stock/increment` por línea que LoadOrderDialog.tsx hacía antes — si una línea
+   * intermedia fallaba, las anteriores podían quedar aplicadas (hallazgo P2, Etapa 6). No
+   * toca precio/puntos/costPrice/selectedDiscount de ningún producto — solo la cantidad de
+   * stock, con el mismo delta atómico calculado por Postgres que ya usaba el endpoint de a
+   * un producto (nunca un SELECT + cálculo en JS + UPDATE absoluto).
+   */
+  app.patch("/api/products/stock/increment-batch", async (req: Request, res: Response) => {
+    try {
+      const parsed = incrementProductStockBatchSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const result = await storage.incrementProductStockBatch(req.consultantId!, parsed.data.lines);
+      res.json(result);
     } catch (error) {
       if (error instanceof SaleValidationError) {
         return res.status(400).json({ error: error.message });
@@ -1791,6 +1883,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/reports/top-clients", async (req: Request, res: Response) => {
     try {
       const { start, end } = parseDateRange(req);
+      // Etapa 7.8: antes, omitir start/end acá hacía que storage.getTopClients cayera en un
+      // fallback silencioso al mes calendario actual (getCurrentMonthRange) — inconsistente
+      // con el resto de los reportes de este mismo módulo (top-categories/top-products/
+      // payment-methods simplemente no filtran por fecha si no se los pasan, nunca sustituyen
+      // un período distinto sin avisar). Se exige acá, igual que sales-summary/
+      // appointments-summary, para que nunca haya un período "invisible" aplicado.
+      if (!start || !end) {
+        return res.status(400).json({ error: "Los parámetros start y end son requeridos" });
+      }
       const limit = typeof req.query.limit === "string" ? parseInt(req.query.limit, 10) : undefined;
       const list = await storage.getTopClients(req.consultantId!, limit && !isNaN(limit) ? limit : undefined, start, end);
       res.json(list);
@@ -1879,6 +1980,43 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al obtener cuotas pendientes" });
+    }
+  });
+
+  // Etapa 7.8 — COGS agregado del período seleccionado (Σ quantity×sale_items.costPrice),
+  // consistente con SaleDetail (Etapa 7.7): nunca reconstruye el costo con el catálogo actual.
+  app.get("/api/reports/product-cost-summary", async (req: Request, res: Response) => {
+    try {
+      const { start, end } = parseDateRange(req);
+      const summary = await storage.getProductCostSummary(req.consultantId!, start, end);
+      res.json(summary);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener el costo de mercadería" });
+    }
+  });
+
+  // Etapa 7.8 — dinero efectivamente cobrado (cuotas "pagado"), diferenciado de facturación.
+  // Sin start/end a propósito: ver doc de CollectedPayments en storage.ts.
+  app.get("/api/reports/collected-payments", async (req: Request, res: Response) => {
+    try {
+      const summary = await storage.getCollectedPayments(req.consultantId!);
+      res.json(summary);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener el total cobrado" });
+    }
+  });
+
+  // Etapa 7.8 — totales reales de cuotas pendientes/vencidas (getPendingInstallments de arriba
+  // devuelve un listado truncado por `limit`, nunca el total real).
+  app.get("/api/reports/pending-installments-totals", async (req: Request, res: Response) => {
+    try {
+      const totals = await storage.getPendingInstallmentsTotals(req.consultantId!);
+      res.json(totals);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener los totales de cuotas pendientes" });
     }
   });
 

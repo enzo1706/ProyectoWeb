@@ -127,6 +127,20 @@ interface PendingInstallmentRow {
   dueDate: string;
   isOverdue: boolean;
 }
+// Etapa 7.8 — ver documentación completa de cada forma en server/storage.ts.
+interface ProductCostSummary {
+  productCost: number;
+  hasIncompleteCostData: boolean;
+}
+interface CollectedPayments {
+  totalCollected: number;
+}
+interface PendingInstallmentsTotals {
+  totalPendingAmount: number;
+  totalPendingCount: number;
+  overdueAmount: number;
+  overdueCount: number;
+}
 
 type PeriodPreset = "today" | "week" | "month" | "quarter" | "year" | "custom";
 type GroupBy = "day" | "week" | "month";
@@ -413,6 +427,39 @@ export default function Reportes() {
     enabled: hasValidRange,
   });
 
+  // Etapa 7.8 — costo de mercadería (COGS) del período: Σ(quantity × sale_items.costPrice),
+  // igual criterio que SaleDetail (Etapa 7.7). Sí depende del período seleccionado.
+  const productCostQuery = useQuery<ProductCostSummary>({
+    queryKey: ["/api/reports/product-cost-summary", start, end],
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/reports/product-cost-summary?start=${start}&end=${end}`);
+      return res.json();
+    },
+    enabled: hasValidRange,
+  });
+
+  // Etapa 7.8 — "Cobrado" (cuotas efectivamente pagadas): acumulado a hoy, deliberadamente NO
+  // depende del período seleccionado (ver server/storage.ts CollectedPayments) — mismo criterio
+  // que stockValuationQuery, más abajo.
+  const collectedPaymentsQuery = useQuery<CollectedPayments>({
+    queryKey: ["/api/reports/collected-payments"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/reports/collected-payments");
+      return res.json();
+    },
+  });
+
+  // Etapa 7.8 — totales reales de cuotas pendientes/vencidas (pendingInstallmentsQuery, más
+  // abajo, solo trae un listado truncado). Tampoco depende del período: es el saldo pendiente
+  // AL DÍA DE HOY, no "lo que venció durante el período elegido".
+  const pendingInstallmentsTotalsQuery = useQuery<PendingInstallmentsTotals>({
+    queryKey: ["/api/reports/pending-installments-totals"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/reports/pending-installments-totals");
+      return res.json();
+    },
+  });
+
   // Reportes "foto del estado actual": no dependen del período elegido arriba.
   const stockValuationQuery = useQuery<StockValuationData>({
     queryKey: ["/api/reports/stock-valuation"],
@@ -497,6 +544,7 @@ export default function Reportes() {
         ["Ganancia Total", format(kpis.totalProfit)],
         ["Ticket Promedio", format(kpis.avgTicket)],
         ["Cantidad de Ventas", kpis.salesCount],
+        ["Costo de Mercadería", productCostQuery.data ? format(productCostQuery.data.productCost) : "No disponible"],
       ],
     );
   };
@@ -550,6 +598,15 @@ export default function Reportes() {
         ["Contado", installmentsQuery.data.singlePayment.salesCount, format(installmentsQuery.data.singlePayment.totalSales)],
         ["Financiado (2+ cuotas)", installmentsQuery.data.financed.salesCount, format(installmentsQuery.data.financed.totalSales)],
       ],
+    );
+  };
+
+  const handleExportCollectedPayments = () => {
+    if (!collectedPaymentsQuery.data) return;
+    exportToCsv(
+      "reportes-cobrado.csv",
+      ["Métrica", "Valor"],
+      [["Total Cobrado (a hoy)", format(collectedPaymentsQuery.data.totalCollected)]],
     );
   };
 
@@ -702,9 +759,9 @@ export default function Reportes() {
             </div>
           )}
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            {salesSummaryQuery.isLoading ? (
-              Array.from({ length: 4 }).map((_, i) => <Skeleton key={i} className="h-[104px] rounded-lg" />)
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+            {salesSummaryQuery.isLoading || productCostQuery.isLoading ? (
+              Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-[104px] rounded-lg" />)
             ) : (
               <>
                 <div>
@@ -717,6 +774,24 @@ export default function Reportes() {
                   <MetricCard title="Ganancia Total" value={format(kpis.totalProfit)} icon={TrendingUp} />
                   {comparePeriod && previousKpis && (
                     <TrendDelta current={kpis.totalProfit} previous={previousKpis.totalProfit} format={format} />
+                  )}
+                </div>
+                <div>
+                  {/* Etapa 7.8 — COGS histórico del período (nunca el costo actual del catálogo,
+                      mismo criterio que SaleDetail/Etapa 7.7). Si alguna venta del período no
+                      tiene costPrice registrado, se avisa en vez de mostrar un total silenciosamente
+                      incompleto como si fuera exacto. */}
+                  {productCostQuery.isError ? (
+                    <ErrorBlock error={productCostQuery.error as Error} />
+                  ) : (
+                    <>
+                      <MetricCard title="Costo de Mercadería" value={format(productCostQuery.data?.productCost ?? 0)} icon={Package} />
+                      {productCostQuery.data?.hasIncompleteCostData && (
+                        <p className="text-xs text-muted-foreground mt-1.5" data-testid="text-cost-incomplete-warning">
+                          Algunas ventas del período no tienen costo histórico registrado — este total puede estar incompleto.
+                        </p>
+                      )}
+                    </>
                   )}
                 </div>
                 <div>
@@ -975,6 +1050,32 @@ export default function Reportes() {
             </CardContent>
           </Card>
 
+          <Card data-testid="card-collected-payments">
+            <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0">
+              <CardTitle className="text-lg">Cobrado</CardTitle>
+              <ExportButton onClick={handleExportCollectedPayments} testId="button-export-collected-payments" />
+            </CardHeader>
+            <CardContent>
+              {/* Etapa 7.8 — a diferencia de "Ventas por Cuotas" de arriba (facturación: lo
+                  vendido), esto es dinero EFECTIVAMENTE cobrado (cuotas marcadas "pagado").
+                  Acumulado a la fecha, no depende del período elegido arriba — mismo criterio
+                  que "Stock Valorizado" más abajo (ver storage.ts CollectedPayments). */}
+              {collectedPaymentsQuery.isLoading ? (
+                <Skeleton className="h-[88px] rounded-lg" />
+              ) : collectedPaymentsQuery.isError ? (
+                <ErrorBlock error={collectedPaymentsQuery.error as Error} />
+              ) : (
+                <div className="rounded-lg border p-4 max-w-xs">
+                  <p className="text-sm text-muted-foreground">Total cobrado (a hoy)</p>
+                  <p className="text-2xl font-bold tabular-nums mt-1" data-testid="text-total-collected">
+                    {format(collectedPaymentsQuery.data?.totalCollected ?? 0)}
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">Suma de cuotas efectivamente pagadas, no depende del período seleccionado</p>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
           <Card data-testid="card-appointments-summary">
             <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0">
               <CardTitle className="text-lg">Resumen de Citas</CardTitle>
@@ -1126,9 +1227,40 @@ export default function Reportes() {
               <ExportButton onClick={handleExportPendingInstallments} testId="button-export-pending-installments" />
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="rounded-lg border bg-muted p-3 text-xs text-muted-foreground">
-                Este reporte depende de la funcionalidad de administración de cuotas, prevista para una etapa posterior.
-              </div>
+              {/* Etapa 7.8 — totales reales (getPendingInstallments, más abajo, trae un listado
+                  truncado a `limit` filas — sin esto no había forma de saber el saldo pendiente
+                  real si había más cuotas que las mostradas). "Vencido" es el subconjunto de
+                  "Pendiente" cuyo vencimiento ya pasó, nunca una categoría aparte. Acumulado a
+                  hoy, no depende del período seleccionado arriba (mismo criterio que "Cobrado"). */}
+              {pendingInstallmentsTotalsQuery.isLoading ? (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <Skeleton className="h-20 rounded-md" />
+                  <Skeleton className="h-20 rounded-md" />
+                </div>
+              ) : pendingInstallmentsTotalsQuery.isError ? (
+                <ErrorBlock error={pendingInstallmentsTotalsQuery.error as Error} />
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="rounded-lg border p-4">
+                    <p className="text-sm text-muted-foreground">Total pendiente (a hoy)</p>
+                    <p className="text-2xl font-bold tabular-nums mt-1" data-testid="text-total-pending">
+                      {format(pendingInstallmentsTotalsQuery.data?.totalPendingAmount ?? 0)}
+                    </p>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {pendingInstallmentsTotalsQuery.data?.totalPendingCount ?? 0} cuota{(pendingInstallmentsTotalsQuery.data?.totalPendingCount ?? 0) !== 1 ? "s" : ""}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-4">
+                    <p className="text-sm text-muted-foreground">De eso, vencido</p>
+                    <p className="text-2xl font-bold tabular-nums mt-1 text-destructive" data-testid="text-total-overdue">
+                      {format(pendingInstallmentsTotalsQuery.data?.overdueAmount ?? 0)}
+                    </p>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {pendingInstallmentsTotalsQuery.data?.overdueCount ?? 0} cuota{(pendingInstallmentsTotalsQuery.data?.overdueCount ?? 0) !== 1 ? "s" : ""}
+                    </p>
+                  </div>
+                </div>
+              )}
               {pendingInstallmentsQuery.isLoading ? (
                 <div className="space-y-3">
                   {Array.from({ length: 3 }).map((_, i) => <Skeleton key={i} className="h-12 rounded-md" />)}

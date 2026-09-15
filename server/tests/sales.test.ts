@@ -1026,3 +1026,98 @@ describe("Snapshot histórico de costo por ítem (saleItem.costPrice) — Etapa 
     await api("PATCH", `/api/products/${productId}/discount`, { discountPercent: 40 });
   });
 });
+
+describe("Productos discontinuados en ventas — Etapa 7.4", () => {
+  let activeProductId: number; // se discontinúa a mitad de los tests de este describe
+  let alwaysActiveProductId: number;
+
+  beforeAll(async () => {
+    const p1 = await api("POST", "/api/products", { seccion: "VITEST", producto: "Producto 7.4 — se discontinúa", precio: 1000, unidades: 20 });
+    activeProductId = (await p1.json()).id;
+    const p2 = await api("POST", "/api/products", { seccion: "VITEST", producto: "Producto 7.4 — siempre activo", precio: 1000, unidades: 20 });
+    alwaysActiveProductId = (await p2.json()).id;
+  });
+
+  it("9. se puede crear una venta con un producto ACTIVO (regresión, sin cambios de comportamiento)", async () => {
+    const res = await api("POST", "/api/sales", baseSale({ items: [{ productId: alwaysActiveProductId, quantity: 1 }], installments: [{ amount: 1000 }] }));
+    expect(res.status).toBe(201);
+  });
+
+  it("8. NO se puede crear una venta NUEVA con un producto discontinuado (400, mensaje claro, stock intacto)", async () => {
+    await api("PATCH", `/api/products/${activeProductId}/discontinued`, { discontinued: true });
+
+    const before = (await (await api("GET", "/api/products")).json()).find((p: any) => p.id === activeProductId);
+    const res = await api("POST", "/api/sales", baseSale({ items: [{ productId: activeProductId, quantity: 1 }], installments: [{ amount: 1000 }] }));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toMatch(/discontinuado/i);
+
+    // Stock intacto — la venta rechazada no debe haber descontado nada.
+    const after = (await (await api("GET", "/api/products")).json()).find((p: any) => p.id === activeProductId);
+    expect(after.unidades).toBe(before.unidades);
+  });
+
+  it("10. editar una venta existente que YA contiene un producto discontinuado sigue siendo posible (histórico válido)", async () => {
+    // Reactiva momentáneamente para poder crear la venta original con este producto.
+    await api("PATCH", `/api/products/${activeProductId}/discontinued`, { discontinued: false });
+    const createRes = await api("POST", "/api/sales", baseSale({ items: [{ productId: activeProductId, quantity: 2 }], installments: [{ amount: 2000 }] }));
+    const sale = await createRes.json();
+
+    // Se discontinúa DESPUÉS de que ya forma parte de la venta.
+    await api("PATCH", `/api/products/${activeProductId}/discontinued`, { discontinued: true });
+
+    // Editar manteniendo el mismo producto (cambiando solo la cantidad) debe seguir andando.
+    const patchRes = await api("PATCH", `/api/sales/${sale.id}`, {
+      items: [{ productId: activeProductId, quantity: 3 }],
+      orderDiscount: null,
+      orderSurcharge: null,
+      paymentMethod: "efectivo",
+      installments: [{ amount: 3000 }],
+    });
+    expect(patchRes.status).toBe(200);
+    const edited = await patchRes.json();
+    expect(edited.total).toBe(3000);
+  });
+
+  it("11. agregar un producto discontinuado NUEVO durante una edición falla (400), la venta queda exactamente como estaba", async () => {
+    // activeProductId sigue discontinuado desde el test anterior.
+    const createRes = await api("POST", "/api/sales", baseSale({ items: [{ productId: alwaysActiveProductId, quantity: 1 }], installments: [{ amount: 1000 }] }));
+    const sale = await createRes.json();
+    const before = await (await api("GET", `/api/sales/${sale.id}`)).json();
+
+    const patchRes = await api("PATCH", `/api/sales/${sale.id}`, {
+      items: [
+        { productId: alwaysActiveProductId, quantity: 1 },
+        { productId: activeProductId, quantity: 1 }, // discontinuado, NUEVO en esta edición
+      ],
+      orderDiscount: null,
+      orderSurcharge: null,
+      paymentMethod: "efectivo",
+      installments: [{ amount: 2000 }],
+    });
+    expect(patchRes.status).toBe(400);
+    const body = await patchRes.json();
+    expect(body.error).toMatch(/discontinuado/i);
+
+    // Rollback completo: la venta sigue teniendo exactamente su composición original.
+    const after = await (await api("GET", `/api/sales/${sale.id}`)).json();
+    expect(after.items).toHaveLength(1);
+    expect(after.items[0].productId).toBe(alwaysActiveProductId);
+    expect(after.total).toBe(before.total);
+  });
+
+  it("12. cancelar una venta con un producto discontinuado sigue funcionando (restaura stock igual que siempre)", async () => {
+    await api("PATCH", `/api/products/${activeProductId}/discontinued`, { discontinued: false });
+    const stockBefore = (await (await api("GET", "/api/products")).json()).find((p: any) => p.id === activeProductId).unidades;
+
+    const createRes = await api("POST", "/api/sales", baseSale({ items: [{ productId: activeProductId, quantity: 2 }], installments: [{ amount: 2000 }] }));
+    const sale = await createRes.json();
+    await api("PATCH", `/api/products/${activeProductId}/discontinued`, { discontinued: true });
+
+    const cancelRes = await api("POST", `/api/sales/${sale.id}/cancel`);
+    expect(cancelRes.status).toBe(200);
+
+    const stockAfter = (await (await api("GET", "/api/products")).json()).find((p: any) => p.id === activeProductId).unidades;
+    expect(stockAfter).toBe(stockBefore); // restaurado, sin importar que el producto esté discontinuado
+  });
+});

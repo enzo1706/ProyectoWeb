@@ -90,6 +90,11 @@ export function ProductSelectionModal({
   const priceCents = priceInput ? Math.round(Number(priceInput) * 100) : 0;
   const subtotal = priceCents * quantity;
   const exceedsStock = quantity > maxQty;
+  // Etapa 7.4: este modal se abre tocando cualquier fila del catálogo administrativo, que SÍ
+  // mantiene visibles los productos discontinuados (sección 4) — acá, que es el punto donde
+  // se decide agregarlo a una venta, hay que bloquearlo igual que en SaleProductStep. El
+  // backend (createSale/updateSale) sigue siendo la protección real.
+  const isDiscontinued = activeProduct.discontinued;
 
   const adjust = (delta: number) => {
     setQuantity((q) => {
@@ -110,7 +115,7 @@ export function ProductSelectionModal({
   };
 
   const handleAdd = () => {
-    if (outOfStock || exceedsStock || priceCents < 0 || quantity < 1) return;
+    if (isDiscontinued || outOfStock || exceedsStock || priceCents < 0 || quantity < 1) return;
 
     if (globalDiscount !== null) {
       discountMutation.mutate({ productId: activeProduct.id, discountPercent: globalDiscount });
@@ -140,6 +145,11 @@ export function ProductSelectionModal({
         </DialogHeader>
 
         <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain space-y-4 px-1 -mx-1">
+          {isDiscontinued && (
+            <div className="rounded-md bg-muted px-3 py-2 text-sm text-muted-foreground" data-testid="text-modal-discontinued">
+              Este producto está discontinuado y no está disponible para nuevas ventas.
+            </div>
+          )}
           <div className="flex items-center gap-2">
             {activeProduct.imagen ? (
               <img src={activeProduct.imagen} alt={activeProduct.producto} className="h-14 w-14 rounded-md object-cover shrink-0" />
@@ -250,7 +260,7 @@ export function ProductSelectionModal({
           <Button
             type="button"
             onClick={handleAdd}
-            disabled={outOfStock || exceedsStock || priceCents < 0}
+            disabled={isDiscontinued || outOfStock || exceedsStock || priceCents < 0}
             data-testid="button-modal-add"
           >
             Agregar

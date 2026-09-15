@@ -49,6 +49,14 @@ import {
   computeInstallmentDueDate,
 } from "@shared/saleCalculations";
 import { resolveLowStockThreshold, DEFAULT_LOW_STOCK_THRESHOLD } from "@shared/stockAlerts";
+import {
+  type BalanceFilter,
+  type StaleFilter,
+  STALE_THRESHOLDS,
+  matchesBalanceFilter,
+  matchesStaleFilter,
+  MAX_CLIENTS_PAGE_SIZE,
+} from "@shared/clientFilters";
 import { isKnownEventType, normalizeCustomEventTypeName, KNOWN_EVENT_TYPES } from "@shared/eventTypes";
 import type { z } from "zod";
 import { eq, ne, count, sql, and, gt, gte, lt, asc, desc, isNotNull, isNull, inArray, notInArray, ilike, or } from "drizzle-orm";
@@ -60,6 +68,11 @@ import { TRIAL_DAYS, PERIOD_DAYS } from "./config/subscription";
 
 export class SaleValidationError extends Error {}
 export class AppointmentValidationError extends Error {}
+/** Etapa 7.5: mismo horario (consultantId+date+time) ya ocupado por otro turno activo — mapea
+ * a 409 (conflicto de estado), no a 400, mismo criterio que ProductConflictError/
+ * SaleRequestConflictError. Separada de AppointmentValidationError porque es una categoría de
+ * error distinta ("ya existe algo ahí"), no un dato inválido. */
+export class AppointmentConflictError extends Error {}
 /** Mismo `clientRequestId` que una venta ya existente, pero con un payload distinto — no es
  * un reintento legítimo (ver Etapa I-B.6, sección "Payload diferente con el mismo
  * clientRequestId"). Separada de `SaleValidationError` porque mapea a 409, no a 400. */
@@ -302,6 +315,25 @@ export interface ClientWithStats extends Client {
   pendingBalance: number;
 }
 
+export interface SearchClientsPaginatedParams {
+  query?: string;
+  page: number;
+  pageSize: number;
+  balanceFilter?: BalanceFilter;
+  staleFilter?: StaleFilter;
+}
+
+export interface PaginatedClients {
+  items: ClientWithStats[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  /** Suma de totalPurchases sobre TODO el conjunto filtrado (no solo la página) — antes se
+   * calculaba en el frontend sobre el subset truncado a 100, ahora es el total real. */
+  totalRevenue: number;
+}
+
 export interface SaleWithItemCount extends Sale {
   itemCount: number;
 }
@@ -386,6 +418,37 @@ export interface PendingInstallmentRow {
   amount: number;
   dueDate: string;
   isOverdue: boolean;
+}
+
+/** Etapa 7.8 — COGS agregado de Reportes: Σ(quantity × sale_items.costPrice) de ventas no
+ * canceladas del período. `hasIncompleteCostData` es true si alguna línea del período no tiene
+ * costPrice (venta anterior a la Etapa I-B.7-D-D) — en ese caso `productCost` es la suma de
+ * SOLO las líneas conocidas, nunca inventa el resto, y el frontend debe advertirlo (ver Fase 7,
+ * Etapa 7.8: "evitar presentar un número aparentemente exacto"). */
+export interface ProductCostSummary {
+  productCost: number;
+  hasIncompleteCostData: boolean;
+}
+
+/** Etapa 7.8 — "dinero efectivamente cobrado", diferenciado de facturación (sales.total).
+ * Deliberadamente NO acepta start/end: sale_installments no tiene una fecha de cuándo se pagó
+ * (solo `status` y `dueDate`), así que no hay forma de saber si un pago caído dentro de
+ * [start,end) ocurrió en ese rango — es un acumulado "a hoy", mismo criterio que
+ * getStockValuation. Ver reporte final de la Etapa 7.8 para la limitación completa. */
+export interface CollectedPayments {
+  totalCollected: number;
+}
+
+/** Etapa 7.8 — totales reales de cuotas pendientes/vencidas (no el listado capado de
+ * getPendingInstallments, que trunca en `limit`). `totalPendingAmount`/`totalPendingCount`
+ * incluyen TODAS las cuotas con status "pendiente" (vencidas o no); `overdueAmount`/
+ * `overdueCount` son el subconjunto cuyo `dueDate` ya pasó — "vencido" es un caso particular
+ * de "pendiente", nunca una categoría separada que se sume aparte. */
+export interface PendingInstallmentsTotals {
+  totalPendingAmount: number;
+  totalPendingCount: number;
+  overdueAmount: number;
+  overdueCount: number;
 }
 
 function getCurrentMonthRange(): { monthStart: string; monthEnd: string } {
@@ -537,6 +600,15 @@ export interface IStorage {
    * (mismo error de dominio que ya usa `createSale`/`updateSale` para "stock insuficiente").
    */
   incrementProductStock(consultantId: number, productId: number, delta: number): Promise<Product | undefined>;
+  /** Etapa 7.2 — confirmación de pedido/importación como UNA sola operación atómica (todo o
+   * nada), en vez del loop de `incrementProductStock` por línea que podía dejar una
+   * importación aplicada a medias si una línea intermedia fallaba (hallazgo P2, Etapa 6).
+   * Reusa el mismo patrón de UPSERT con delta calculado por Postgres (nunca leído y sumado en
+   * JS) que ya usa `incrementProductStock`, solo que ahora las líneas comparten una única
+   * transacción. Si cualquier línea es inválida (producto no visible para este consultantId,
+   * o el resultado quedaría negativo), tira `SaleValidationError` y NINGUNA línea queda
+   * aplicada — ni las que "ya habían pasado" antes en el loop. */
+  incrementProductStockBatch(consultantId: number, lines: { productId: number; delta: number }[]): Promise<{ updated: number }>;
   /** Admin-only: catálogo global completo (sin stock, eso es por consultora) para la pantalla de imágenes. */
   listGlobalProducts(): Promise<ProductRow[]>;
   /** Admin-only: solo aplica a productos globales — las imágenes de productos manuales las
@@ -554,6 +626,11 @@ export interface IStorage {
   getTopClients(consultantId: number, limit?: number, start?: string, end?: string): Promise<TopClient[]>;
   getClientById(consultantId: number, id: number): Promise<Client | undefined>;
   searchClients(consultantId: number, query?: string, limit?: number): Promise<ClientWithStats[]>;
+  /** Listado paginado real (a diferencia de searchClients, que trunca a `limit` para los
+   * combobox de búsqueda rápida) — usado por la pantalla de Clientas. Orden determinístico,
+   * total real, y soporta los mismos filtros de saldo/antigüedad que antes vivían solo en el
+   * frontend (Etapa 7.1 — ver shared/clientFilters.ts). */
+  searchClientsPaginated(consultantId: number, params: SearchClientsPaginatedParams): Promise<PaginatedClients>;
   createClient(consultantId: number, input: InsertClient): Promise<Client>;
   updateClient(consultantId: number, id: number, input: Partial<InsertClient>): Promise<Client | undefined>;
   findDuplicateClient(consultantId: number, phone: string, email: string | null, excludeId?: number): Promise<Client | undefined>;
@@ -583,6 +660,9 @@ export interface IStorage {
   getUpcomingBirthdays(consultantId: number, days: number): Promise<UpcomingBirthday[]>;
   getAppointmentsSummary(consultantId: number, start: string, end: string): Promise<AppointmentsSummary>;
   getPendingInstallments(consultantId: number, limit?: number): Promise<PendingInstallmentRow[]>;
+  getProductCostSummary(consultantId: number, start?: string, end?: string): Promise<ProductCostSummary>;
+  getCollectedPayments(consultantId: number): Promise<CollectedPayments>;
+  getPendingInstallmentsTotals(consultantId: number): Promise<PendingInstallmentsTotals>;
 }
 
 type Database = typeof database;
@@ -1332,6 +1412,71 @@ export class DatabaseStorage implements IStorage {
     return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
   }
 
+  async incrementProductStockBatch(consultantId: number, lines: { productId: number; delta: number }[]): Promise<{ updated: number }> {
+    if (lines.length === 0) {
+      throw new SaleValidationError("El lote no puede estar vacío");
+    }
+
+    // Duplicados: se combinan (nunca dos escrituras separadas para el mismo producto) — mismo
+    // criterio pedido en Etapa 7.2, sección 8. Este es el punto de verdad, no confía en que
+    // LoadOrderDialog ya haya fusionado antes de enviar.
+    const deltaByProductId = new Map<number, number>();
+    for (const line of lines) {
+      if (!Number.isInteger(line.delta) || line.delta <= 0) {
+        throw new SaleValidationError(`Delta inválido para el producto ${line.productId}: tiene que ser un entero positivo`);
+      }
+      deltaByProductId.set(line.productId, (deltaByProductId.get(line.productId) ?? 0) + line.delta);
+    }
+
+    // Orden ascendente de productId antes de tocar cualquier fila — mismo criterio de lock
+    // ordering que ya usa el resto del storage (createSale/updateSale/cancelSale, Etapa
+    // I-B.7-C) para que dos batches concurrentes con productos solapados en distinto orden
+    // nunca se bloqueen en cruz (deadlock). Acá no hace falta un SELECT ... FOR UPDATE previo
+    // como en createSale: cada UPSERT de abajo ya toma su propio lock de fila al ejecutarse,
+    // así que basta con procesarlas siempre en el mismo orden dentro de la transacción.
+    const orderedProductIds = Array.from(deltaByProductId.keys()).sort((a, b) => a - b);
+
+    const db = await this.getDb();
+
+    // Visibilidad de catálogo (global o propio) ANTES de abrir la transacción — igual criterio
+    // que createSale: el catálogo no lo modifica ninguna venta/import concurrente, no hace
+    // falta bloquearlo. Un producto de OTRO consultantId (privado, no global) da exactamente
+    // el mismo error que uno inexistente — nunca se distingue, para no filtrar si existe.
+    const catalogRows = await db
+      .select({ id: products.id })
+      .from(products)
+      .where(and(inArray(products.id, orderedProductIds), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
+    const visibleIds = new Set(catalogRows.map((p) => p.id));
+    for (const productId of orderedProductIds) {
+      if (!visibleIds.has(productId)) {
+        throw new SaleValidationError(`Producto ${productId} no encontrado`);
+      }
+    }
+
+    // TODO o NADA: las N líneas comparten una única transacción. Si cualquiera tira
+    // SaleValidationError (stock insuficiente), Postgres revierte TODAS las escrituras ya
+    // hechas por líneas anteriores de este mismo batch — nunca queda una importación aplicada
+    // a medias (hallazgo P2, Etapa 6).
+    await db.transaction(async (tx) => {
+      for (const productId of orderedProductIds) {
+        const delta = deltaByProductId.get(productId)!;
+        const [stock] = await tx
+          .insert(productStock)
+          .values({ consultantId, productId, unidades: delta })
+          .onConflictDoUpdate({
+            target: [productStock.consultantId, productStock.productId],
+            set: { unidades: sql`${productStock.unidades} + ${delta}` },
+          })
+          .returning();
+        if (stock.unidades < 0) {
+          throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${stock.unidades} unidades`);
+        }
+      }
+    });
+
+    return { updated: orderedProductIds.length };
+  }
+
   async setProductStockReminder(consultantId: number, productId: number, remindAt: string | null): Promise<Product | undefined> {
     const db = await this.getDb();
     const product = await this.findVisibleProduct(db, consultantId, productId);
@@ -1426,6 +1571,35 @@ export class DatabaseStorage implements IStorage {
     return normalizeCustomEventTypeName(rawType, existingCustomTypes);
   }
 
+  /** Etapa 7.5: choque EXACTO de horario (mismo consultantId+date+time, turno activo — no
+   * cancelado). El modelo actual no tiene campo de fin/duración en ningún lado de la app, así
+   * que "conflicto" acá es punto-a-punto, no solapamiento de intervalos. Este SELECT es solo
+   * la respuesta rápida/amigable para el caso común (secuencial) — la garantía real contra la
+   * carrera concurrente la da `appointments_consultant_active_slot_unique_idx` (constraint de
+   * Postgres), verificada más abajo capturando el 23505. `excludeId` se usa en updateAppointment
+   * para no detectarse a sí mismo. */
+  private async findConflictingAppointment(
+    db: Database,
+    consultantId: number,
+    date: string,
+    time: string,
+    excludeId?: number,
+  ) {
+    const [conflict] = await db
+      .select({ id: appointments.id })
+      .from(appointments)
+      .where(
+        and(
+          eq(appointments.consultantId, consultantId),
+          eq(appointments.date, date),
+          eq(appointments.time, time),
+          ne(appointments.status, "cancelada"),
+          excludeId !== undefined ? ne(appointments.id, excludeId) : undefined,
+        ),
+      );
+    return conflict;
+  }
+
   async createAppointment(consultantId: number, input: CreateAppointmentInput): Promise<Appointment | undefined> {
     const db = await this.getDb();
     const [client] = await db
@@ -1436,20 +1610,34 @@ export class DatabaseStorage implements IStorage {
     const clientName = client.name ?? client.phone;
     const type = await this.resolveEventType(consultantId, input.type);
 
-    const [appointment] = await db
-      .insert(appointments)
-      .values({
-        consultantId,
-        clientId: client.id,
-        clientName,
-        date: input.date,
-        time: input.time,
-        type,
-        location: input.location ?? null,
-        notes: input.notes ?? null,
-      })
-      .returning();
-    return appointment;
+    if (await this.findConflictingAppointment(db, consultantId, input.date, input.time)) {
+      throw new AppointmentConflictError("Ya existe un turno en ese horario");
+    }
+
+    try {
+      const [appointment] = await db
+        .insert(appointments)
+        .values({
+          consultantId,
+          clientId: client.id,
+          clientName,
+          date: input.date,
+          time: input.time,
+          type,
+          location: input.location ?? null,
+          notes: input.notes ?? null,
+        })
+        .returning();
+      return appointment;
+    } catch (err) {
+      // Última línea de defensa contra la carrera real (dos creaciones concurrentes que
+      // pasaron el SELECT de arriba las dos, ninguna vio a la otra porque ninguna había
+      // comiteado todavía) — el índice único parcial deja pasar solo una.
+      if (isUniqueViolationOn(err, "appointments_consultant_active_slot_unique_idx")) {
+        throw new AppointmentConflictError("Ya existe un turno en ese horario");
+      }
+      throw err;
+    }
   }
 
   async updateAppointment(consultantId: number, id: number, input: UpdateAppointmentInput): Promise<Appointment | undefined> {
@@ -1468,20 +1656,31 @@ export class DatabaseStorage implements IStorage {
     const clientName = client.name ?? client.phone;
     const type = input.type === existing.type ? existing.type : await this.resolveEventType(consultantId, input.type);
 
-    const [updated] = await db
-      .update(appointments)
-      .set({
-        clientId: client.id,
-        clientName,
-        date: input.date,
-        time: input.time,
-        type,
-        location: input.location ?? null,
-        notes: input.notes ?? null,
-      })
-      .where(and(eq(appointments.id, id), eq(appointments.consultantId, consultantId)))
-      .returning();
-    return updated;
+    if (await this.findConflictingAppointment(db, consultantId, input.date, input.time, id)) {
+      throw new AppointmentConflictError("Ya existe un turno en ese horario");
+    }
+
+    try {
+      const [updated] = await db
+        .update(appointments)
+        .set({
+          clientId: client.id,
+          clientName,
+          date: input.date,
+          time: input.time,
+          type,
+          location: input.location ?? null,
+          notes: input.notes ?? null,
+        })
+        .where(and(eq(appointments.id, id), eq(appointments.consultantId, consultantId)))
+        .returning();
+      return updated;
+    } catch (err) {
+      if (isUniqueViolationOn(err, "appointments_consultant_active_slot_unique_idx")) {
+        throw new AppointmentConflictError("Ya existe un turno en ese horario");
+      }
+      throw err;
+    }
   }
 
   async updateAppointmentStatus(consultantId: number, id: number, status: AppointmentStatus): Promise<Appointment | undefined> {
@@ -1566,32 +1765,21 @@ export class DatabaseStorage implements IStorage {
     return client;
   }
 
-  async searchClients(consultantId: number, query = "", limit = 20): Promise<ClientWithStats[]> {
+  /** Compartido por searchClients (combobox, truncado) y searchClientsPaginated (listado
+   * real) — dos queries agregadas separadas (nunca un JOIN sales+saleInstallments directo,
+   * que produciría un fan-out y falsearía las sumas) unidas en JS por clientId. */
+  private async computeClientStats(
+    consultantId: number,
+    clientIds: number[],
+  ): Promise<{
+    statsByClient: Map<number | null, { totalAmount: number; lastDate: string | null }>;
+    balanceByClient: Map<number | null, number>;
+  }> {
     const db = await this.getDb();
-    const term = query.trim();
+    if (clientIds.length === 0) {
+      return { statsByClient: new Map(), balanceByClient: new Map() };
+    }
 
-    const rows = term
-      ? await db
-          .select()
-          .from(clients)
-          .where(
-            and(
-              eq(clients.consultantId, consultantId),
-              or(
-                ilike(clients.name, `%${term}%`),
-                ilike(clients.phone, `%${term}%`),
-                ilike(clients.email, `%${term}%`),
-                ilike(clients.address, `%${term}%`),
-                ilike(clients.notes, `%${term}%`),
-              ),
-            ),
-          )
-          .limit(limit)
-      : await db.select().from(clients).where(eq(clients.consultantId, consultantId)).limit(limit);
-
-    if (rows.length === 0) return [];
-
-    const clientIds = rows.map((r) => r.id);
     const statsRows = await db
       .select({
         clientId: sales.clientId,
@@ -1625,12 +1813,126 @@ export class DatabaseStorage implements IStorage {
 
     const balanceByClient = new Map(balanceRows.map((b) => [b.clientId, Number(b.pendingBalance)]));
 
+    return { statsByClient, balanceByClient };
+  }
+
+  async searchClients(consultantId: number, query = "", limit = 20): Promise<ClientWithStats[]> {
+    const db = await this.getDb();
+    const term = query.trim();
+
+    const rows = term
+      ? await db
+          .select()
+          .from(clients)
+          .where(
+            and(
+              eq(clients.consultantId, consultantId),
+              or(
+                ilike(clients.name, `%${term}%`),
+                ilike(clients.phone, `%${term}%`),
+                ilike(clients.email, `%${term}%`),
+                ilike(clients.address, `%${term}%`),
+                ilike(clients.notes, `%${term}%`),
+              ),
+            ),
+          )
+          .orderBy(asc(clients.name), asc(clients.id))
+          .limit(limit)
+      : await db
+          .select()
+          .from(clients)
+          .where(eq(clients.consultantId, consultantId))
+          .orderBy(asc(clients.name), asc(clients.id))
+          .limit(limit);
+
+    if (rows.length === 0) return [];
+
+    const { statsByClient, balanceByClient } = await this.computeClientStats(consultantId, rows.map((r) => r.id));
+
     return rows.map((row) => ({
       ...row,
       totalPurchases: Number(statsByClient.get(row.id)?.totalAmount ?? 0),
       lastPurchase: statsByClient.get(row.id)?.lastDate ?? null,
       pendingBalance: balanceByClient.get(row.id) ?? 0,
     }));
+  }
+
+  /** Listado real de Clientas (Etapa 7.1 — cierra el P1 de la auditoría: antes truncaba
+   * silenciosamente a 100 filas sin ORDER BY determinístico). A diferencia de searchClients
+   * (pensado para combobox chicos, trunca en SQL con LIMIT), acá el orden/saldo/antigüedad
+   * dependen de agregados que no viven en la tabla clients, así que se trae el universo
+   * completo que matchea la búsqueda (siempre acotado a un único consultantId, nunca global),
+   * se filtra/ordena/pagina en memoria, y recién ahí se corta a la página pedida. Para el
+   * volumen real de una consultora (cientos, no millones) esto es simple y correcto; no vale
+   * la pena la complejidad de un HAVING con sub-selects para este caso de uso. */
+  async searchClientsPaginated(consultantId: number, params: SearchClientsPaginatedParams): Promise<PaginatedClients> {
+    const db = await this.getDb();
+    const term = (params.query ?? "").trim();
+    const page = Number.isFinite(params.page) && params.page >= 1 ? Math.floor(params.page) : 1;
+    const pageSize = Number.isFinite(params.pageSize)
+      ? Math.min(Math.max(Math.floor(params.pageSize), 1), MAX_CLIENTS_PAGE_SIZE)
+      : MAX_CLIENTS_PAGE_SIZE;
+    const balanceFilter: BalanceFilter = params.balanceFilter ?? "todas";
+    const staleFilter: StaleFilter = params.staleFilter ?? "todas";
+
+    const matched = term
+      ? await db
+          .select()
+          .from(clients)
+          .where(
+            and(
+              eq(clients.consultantId, consultantId),
+              or(
+                ilike(clients.name, `%${term}%`),
+                ilike(clients.phone, `%${term}%`),
+                ilike(clients.email, `%${term}%`),
+                ilike(clients.address, `%${term}%`),
+                ilike(clients.notes, `%${term}%`),
+              ),
+            ),
+          )
+      : await db.select().from(clients).where(eq(clients.consultantId, consultantId));
+
+    if (matched.length === 0) {
+      return { items: [], total: 0, page, pageSize, totalPages: 0, totalRevenue: 0 };
+    }
+
+    const { statsByClient, balanceByClient } = await this.computeClientStats(consultantId, matched.map((r) => r.id));
+
+    let withStats: ClientWithStats[] = matched.map((row) => ({
+      ...row,
+      totalPurchases: Number(statsByClient.get(row.id)?.totalAmount ?? 0),
+      lastPurchase: statsByClient.get(row.id)?.lastDate ?? null,
+      pendingBalance: balanceByClient.get(row.id) ?? 0,
+    }));
+
+    if (balanceFilter !== "todas") {
+      withStats = withStats.filter((c) => matchesBalanceFilter(c.pendingBalance, balanceFilter));
+    }
+
+    if (staleFilter !== "todas") {
+      const cutoff = toDateStr(new Date(Date.now() - STALE_THRESHOLDS[staleFilter] * 86400000));
+      withStats = withStats.filter((c) => matchesStaleFilter(c.lastPurchase, staleFilter, cutoff));
+    }
+
+    // Orden estable y reproducible: mismo criterio de display que el resto de la app (nombre,
+    // o teléfono si no tiene nombre cargado — ClientCard/ClientCombobox ya usan ese fallback),
+    // con id como desempate para que el orden nunca dependa de un empate de nombre/hora de
+    // inserción de Postgres.
+    withStats.sort((a, b) => {
+      const keyA = (a.name?.trim() || a.phone).toLowerCase();
+      const keyB = (b.name?.trim() || b.phone).toLowerCase();
+      if (keyA !== keyB) return keyA < keyB ? -1 : 1;
+      return a.id - b.id;
+    });
+
+    const total = withStats.length;
+    const totalPages = Math.ceil(total / pageSize);
+    const totalRevenue = withStats.reduce((sum, c) => sum + c.totalPurchases, 0);
+    const start = (page - 1) * pageSize;
+    const items = withStats.slice(start, start + pageSize);
+
+    return { items, total, page, pageSize, totalPages, totalRevenue };
   }
 
   async createClient(consultantId: number, input: InsertClient): Promise<Client> {
@@ -2007,6 +2309,67 @@ export class DatabaseStorage implements IStorage {
     return rows.map((row) => ({ ...row, isOverdue: row.dueDate < today }));
   }
 
+  /** Etapa 7.8 — COGS agregado del período: Σ(quantity × costPrice), igual criterio de join +
+   * exclusión de canceladas que getTopCategories/getTopProductsByCategory. `sum()` de Postgres
+   * ignora NULL automáticamente, así que `productCost` ya es "solo líneas con costo conocido"
+   * sin necesitar un filtro aparte — el flag de abajo es lo único que hace falta calcular extra. */
+  async getProductCostSummary(consultantId: number, start?: string, end?: string): Promise<ProductCostSummary> {
+    const db = await this.getDb();
+    const conditions = [eq(sales.consultantId, consultantId), ne(sales.status, "cancelada")];
+    if (start) conditions.push(gte(sales.date, start));
+    if (end) conditions.push(lt(sales.date, end));
+
+    const [row] = await db
+      .select({
+        productCost: sql<number>`coalesce(sum(${saleItems.quantity} * ${saleItems.costPrice}), 0)`,
+        unknownCostLines: sql<number>`count(*) filter (where ${saleItems.costPrice} is null)`,
+      })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .where(and(...conditions));
+
+    return {
+      productCost: Number(row?.productCost ?? 0),
+      hasIncompleteCostData: Number(row?.unknownCostLines ?? 0) > 0,
+    };
+  }
+
+  /** Etapa 7.8 — ver doc de CollectedPayments: acumulado a hoy, nunca filtrado por período. */
+  async getCollectedPayments(consultantId: number): Promise<CollectedPayments> {
+    const db = await this.getDb();
+    const [row] = await db
+      .select({ totalCollected: sql<number>`coalesce(sum(${saleInstallments.amount}), 0)` })
+      .from(saleInstallments)
+      .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
+      .where(and(eq(sales.consultantId, consultantId), eq(saleInstallments.status, "pagado"), ne(sales.status, "cancelada")));
+
+    return { totalCollected: Number(row?.totalCollected ?? 0) };
+  }
+
+  /** Etapa 7.8 — totales reales (no capados por `limit` como getPendingInstallments). */
+  async getPendingInstallmentsTotals(consultantId: number): Promise<PendingInstallmentsTotals> {
+    const db = await this.getDb();
+    const today = toDateStr(new Date());
+
+    const [row] = await db
+      .select({
+        totalAmount: sql<number>`coalesce(sum(${saleInstallments.amount}), 0)`,
+        totalCount: count(saleInstallments.id),
+        overdueAmount: sql<number>`coalesce(sum(${saleInstallments.amount}) filter (where ${saleInstallments.dueDate} < ${today}), 0)`,
+        overdueCount: sql<number>`coalesce(count(*) filter (where ${saleInstallments.dueDate} < ${today}), 0)`,
+      })
+      .from(saleInstallments)
+      .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
+      .where(and(eq(sales.consultantId, consultantId), eq(saleInstallments.status, "pendiente"), ne(sales.status, "cancelada")));
+
+    return {
+      totalPendingAmount: Number(row?.totalAmount ?? 0),
+      totalPendingCount: Number(row?.totalCount ?? 0),
+      overdueAmount: Number(row?.overdueAmount ?? 0),
+      overdueCount: Number(row?.overdueCount ?? 0),
+    };
+  }
+
   async getAllSales(consultantId: number): Promise<SaleWithItemCount[]> {
     const db = await this.getDb();
     const salesRows = await db.select().from(sales).where(eq(sales.consultantId, consultantId)).orderBy(desc(sales.date), desc(sales.id));
@@ -2111,6 +2474,13 @@ export class DatabaseStorage implements IStorage {
         const product = catalogById.get(item.productId);
         if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
         const stock = stockByProductId.get(item.productId);
+        // Etapa 7.4: un producto discontinuado no es vendible en una venta NUEVA — se
+        // comprueba con el mismo `stock` ya releído bajo el `FOR UPDATE` de arriba, nunca con
+        // una consulta previa fuera de la transacción (evita la ventana de carrera entre
+        // "discontinuar" y "vender" descripta en la auditoría).
+        if (stock?.discontinued) {
+          throw new SaleValidationError(`"${product.producto}" está discontinuado y no está disponible para nuevas ventas`);
+        }
         const available = stock?.unidades ?? 0;
         if (available < item.quantity) {
           throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);
@@ -2289,6 +2659,15 @@ export class DatabaseStorage implements IStorage {
 
       const existingItems = await tx.select().from(saleItems).where(eq(saleItems.saleId, id));
 
+      // Etapa 7.4: un producto discontinuado que YA formaba parte de esta venta es histórico
+      // válido (se puede seguir editando su cantidad, o dejarlo tal cual) — pero si la edición
+      // intenta agregar por PRIMERA VEZ un producto que está discontinuado, se rechaza igual
+      // que en createSale. La distinción es exactamente esta: ¿el productId ya estaba en
+      // existingItems antes de esta edición, o es nuevo en `input.items`?
+      const existingProductIds = new Set(
+        existingItems.map((i) => i.productId).filter((pid): pid is number => pid !== null),
+      );
+
       const involvedIds = Array.from(
         new Set([
           ...existingItems.map((i) => i.productId).filter((pid): pid is number => pid !== null),
@@ -2328,6 +2707,11 @@ export class DatabaseStorage implements IStorage {
       const lines = input.items.map((item) => {
         const product = productById.get(item.productId);
         if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
+        // Solo se rechaza si es un producto NUEVO en esta edición — uno que ya era parte de
+        // la venta sigue siendo histórico válido aunque hoy esté discontinuado (sección 14).
+        if (stockRowById.get(item.productId)?.discontinued && !existingProductIds.has(item.productId)) {
+          throw new SaleValidationError(`"${product.producto}" está discontinuado y no está disponible para nuevas ventas`);
+        }
         const available = stockById.get(item.productId) ?? 0;
         if (available < item.quantity) {
           throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);
@@ -3106,6 +3490,48 @@ export class MemoryStorage implements IStorage {
     return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
+  async incrementProductStockBatch(consultantId: number, lines: { productId: number; delta: number }[]): Promise<{ updated: number }> {
+    if (lines.length === 0) {
+      throw new SaleValidationError("El lote no puede estar vacío");
+    }
+
+    const deltaByProductId = new Map<number, number>();
+    for (const line of lines) {
+      if (!Number.isInteger(line.delta) || line.delta <= 0) {
+        throw new SaleValidationError(`Delta inválido para el producto ${line.productId}: tiene que ser un entero positivo`);
+      }
+      deltaByProductId.set(line.productId, (deltaByProductId.get(line.productId) ?? 0) + line.delta);
+    }
+
+    const orderedProductIds = Array.from(deltaByProductId.keys()).sort((a, b) => a - b);
+
+    // Lógicamente atómico sin transacción real (no hay DB acá): DOS pasadas. La primera valida
+    // TODO (visibilidad + resultado no negativo) sin escribir nada; recién si las N líneas
+    // pasan, la segunda pasada aplica todas. Si cualquiera falla en la primera pasada, no se
+    // mutó ni una sola fila — nunca queda "línea por línea, aborta a la mitad" (Etapa 7.2,
+    // sección 17).
+    const planned: { stock: ProductStock; nextUnidades: number }[] = [];
+    for (const productId of orderedProductIds) {
+      const product = this.findVisibleProduct(consultantId, productId);
+      if (!product) {
+        throw new SaleValidationError(`Producto ${productId} no encontrado`);
+      }
+      const stock = this.getOrCreateStock(consultantId, productId);
+      const delta = deltaByProductId.get(productId)!;
+      const nextUnidades = stock.unidades + delta;
+      if (nextUnidades < 0) {
+        throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${nextUnidades} unidades`);
+      }
+      planned.push({ stock, nextUnidades });
+    }
+
+    for (const { stock, nextUnidades } of planned) {
+      stock.unidades = nextUnidades;
+    }
+
+    return { updated: orderedProductIds.length };
+  }
+
   async setProductStockReminder(consultantId: number, productId: number, remindAt: string | null): Promise<Product | undefined> {
     const product = this.findVisibleProduct(consultantId, productId);
     if (!product) return undefined;
@@ -3170,11 +3596,29 @@ export class MemoryStorage implements IStorage {
     return normalizeCustomEventTypeName(rawType, existingCustomTypes);
   }
 
+  /** Espejo de DatabaseStorage.findConflictingAppointment — sin lock explícito (Node es
+   * single-threaded, no hay ventana de interleaving entre este chequeo y el push/mutación de
+   * más abajo, mismo criterio que el resto de MemoryStorage). */
+  private hasConflictingAppointment(consultantId: number, date: string, time: string, excludeId?: number): boolean {
+    return this.appointments.some(
+      (a) =>
+        a.consultantId === consultantId &&
+        a.date === date &&
+        a.time === time &&
+        a.status !== "cancelada" &&
+        a.id !== excludeId,
+    );
+  }
+
   async createAppointment(consultantId: number, input: CreateAppointmentInput): Promise<Appointment | undefined> {
     const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
     if (!client) return undefined;
     const clientName = client.name ?? client.phone;
     const type = await this.resolveEventType(consultantId, input.type);
+
+    if (this.hasConflictingAppointment(consultantId, input.date, input.time)) {
+      throw new AppointmentConflictError("Ya existe un turno en ese horario");
+    }
 
     const appointment: Appointment = {
       id: this.nextAppointmentId++,
@@ -3200,6 +3644,10 @@ export class MemoryStorage implements IStorage {
     if (!client) throw new AppointmentValidationError("Clienta no encontrada");
     const clientName = client.name ?? client.phone;
     const type = input.type === existing.type ? existing.type : await this.resolveEventType(consultantId, input.type);
+
+    if (this.hasConflictingAppointment(consultantId, input.date, input.time, id)) {
+      throw new AppointmentConflictError("Ya existe un turno en ese horario");
+    }
 
     existing.clientId = client.id;
     existing.clientName = clientName;
@@ -3268,33 +3716,105 @@ export class MemoryStorage implements IStorage {
     return this.clients.find((c) => c.id === id && c.consultantId === consultantId);
   }
 
-  async searchClients(consultantId: number, query = "", limit = 20): Promise<ClientWithStats[]> {
+  private matchClients(consultantId: number, query: string): Client[] {
     const term = query.trim().toLowerCase();
     const ownClients = this.clients.filter((c) => c.consultantId === consultantId);
-    const filtered = term
-      ? ownClients.filter(
-          (c) =>
-            (c.name ?? "").toLowerCase().includes(term) ||
-            c.phone.includes(term) ||
-            (c.email ?? "").toLowerCase().includes(term) ||
-            (c.address ?? "").toLowerCase().includes(term) ||
-            (c.notes ?? "").toLowerCase().includes(term),
-        )
-      : ownClients;
+    if (!term) return ownClients;
+    return ownClients.filter(
+      (c) =>
+        (c.name ?? "").toLowerCase().includes(term) ||
+        c.phone.includes(term) ||
+        (c.email ?? "").toLowerCase().includes(term) ||
+        (c.address ?? "").toLowerCase().includes(term) ||
+        (c.notes ?? "").toLowerCase().includes(term),
+    );
+  }
 
-    return filtered.slice(0, limit).map((c) => {
-      const clientSales = this.sales.filter((s) => s.clientId === c.id && s.status !== "cancelada");
-      const totalPurchases = clientSales.reduce((sum, s) => sum + s.total, 0);
-      const lastPurchase = clientSales.length
-        ? clientSales.map((s) => s.date).sort().slice(-1)[0]
-        : null;
+  /** Espejo de DatabaseStorage.computeClientStats. */
+  private computeClientStatsMemory(clientIds: number[]): { statsByClient: Map<number, { totalAmount: number; lastDate: string | null }>; balanceByClient: Map<number, number> } {
+    const idSet = new Set(clientIds);
+    const statsByClient = new Map<number, { totalAmount: number; lastDate: string | null }>();
+    const balanceByClient = new Map<number, number>();
+
+    for (const clientId of Array.from(idSet)) {
+      const clientSales = this.sales.filter((s) => s.clientId === clientId && s.status !== "cancelada");
+      const totalAmount = clientSales.reduce((sum, s) => sum + s.total, 0);
+      const lastDate = clientSales.length ? clientSales.map((s) => s.date).sort().slice(-1)[0] : null;
+      statsByClient.set(clientId, { totalAmount, lastDate });
+
       // Misma condición que getPendingInstallments (cuota "pendiente" de una venta no cancelada).
       const clientSaleIds = new Set(clientSales.map((s) => s.id));
       const pendingBalance = this.saleInstallments
         .filter((i) => i.status === "pendiente" && clientSaleIds.has(i.saleId))
         .reduce((sum, i) => sum + i.amount, 0);
-      return { ...c, totalPurchases, lastPurchase, pendingBalance };
+      balanceByClient.set(clientId, pendingBalance);
+    }
+
+    return { statsByClient, balanceByClient };
+  }
+
+  private static sortClientsDeterministically<T extends { id: number; name: string | null; phone: string }>(rows: T[]): T[] {
+    return [...rows].sort((a, b) => {
+      const keyA = (a.name?.trim() || a.phone).toLowerCase();
+      const keyB = (b.name?.trim() || b.phone).toLowerCase();
+      if (keyA !== keyB) return keyA < keyB ? -1 : 1;
+      return a.id - b.id;
     });
+  }
+
+  async searchClients(consultantId: number, query = "", limit = 20): Promise<ClientWithStats[]> {
+    const filtered = MemoryStorage.sortClientsDeterministically(this.matchClients(consultantId, query));
+    const page = filtered.slice(0, limit);
+    const { statsByClient, balanceByClient } = this.computeClientStatsMemory(page.map((c) => c.id));
+
+    return page.map((c) => ({
+      ...c,
+      totalPurchases: Number(statsByClient.get(c.id)?.totalAmount ?? 0),
+      lastPurchase: statsByClient.get(c.id)?.lastDate ?? null,
+      pendingBalance: balanceByClient.get(c.id) ?? 0,
+    }));
+  }
+
+  async searchClientsPaginated(consultantId: number, params: SearchClientsPaginatedParams): Promise<PaginatedClients> {
+    const page = Number.isFinite(params.page) && params.page >= 1 ? Math.floor(params.page) : 1;
+    const pageSize = Number.isFinite(params.pageSize)
+      ? Math.min(Math.max(Math.floor(params.pageSize), 1), MAX_CLIENTS_PAGE_SIZE)
+      : MAX_CLIENTS_PAGE_SIZE;
+    const balanceFilter: BalanceFilter = params.balanceFilter ?? "todas";
+    const staleFilter: StaleFilter = params.staleFilter ?? "todas";
+
+    const matched = this.matchClients(consultantId, params.query ?? "");
+    if (matched.length === 0) {
+      return { items: [], total: 0, page, pageSize, totalPages: 0, totalRevenue: 0 };
+    }
+
+    const { statsByClient, balanceByClient } = this.computeClientStatsMemory(matched.map((c) => c.id));
+
+    let withStats: ClientWithStats[] = matched.map((c) => ({
+      ...c,
+      totalPurchases: Number(statsByClient.get(c.id)?.totalAmount ?? 0),
+      lastPurchase: statsByClient.get(c.id)?.lastDate ?? null,
+      pendingBalance: balanceByClient.get(c.id) ?? 0,
+    }));
+
+    if (balanceFilter !== "todas") {
+      withStats = withStats.filter((c) => matchesBalanceFilter(c.pendingBalance, balanceFilter));
+    }
+
+    if (staleFilter !== "todas") {
+      const cutoff = toDateStr(new Date(Date.now() - STALE_THRESHOLDS[staleFilter] * 86400000));
+      withStats = withStats.filter((c) => matchesStaleFilter(c.lastPurchase, staleFilter, cutoff));
+    }
+
+    withStats = MemoryStorage.sortClientsDeterministically(withStats);
+
+    const total = withStats.length;
+    const totalPages = Math.ceil(total / pageSize);
+    const totalRevenue = withStats.reduce((sum, c) => sum + c.totalPurchases, 0);
+    const start = (page - 1) * pageSize;
+    const items = withStats.slice(start, start + pageSize);
+
+    return { items, total, page, pageSize, totalPages, totalRevenue };
   }
 
   async createClient(consultantId: number, input: InsertClient): Promise<Client> {
@@ -3611,6 +4131,60 @@ export class MemoryStorage implements IStorage {
       }));
   }
 
+  /** Espejo de DatabaseStorage.getProductCostSummary. */
+  async getProductCostSummary(consultantId: number, start?: string, end?: string): Promise<ProductCostSummary> {
+    const activeSaleById = new Map(
+      this.sales.filter((s) => s.consultantId === consultantId && s.status !== "cancelada").map((s) => [s.id, s]),
+    );
+    let productCost = 0;
+    let hasIncompleteCostData = false;
+    for (const item of this.saleItems) {
+      const sale = activeSaleById.get(item.saleId);
+      if (!sale) continue;
+      if (start && sale.date < start) continue;
+      if (end && sale.date >= end) continue;
+      if (item.costPrice === null) {
+        hasIncompleteCostData = true;
+        continue;
+      }
+      productCost += item.quantity * item.costPrice;
+    }
+    return { productCost, hasIncompleteCostData };
+  }
+
+  /** Espejo de DatabaseStorage.getCollectedPayments. */
+  async getCollectedPayments(consultantId: number): Promise<CollectedPayments> {
+    const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
+    let totalCollected = 0;
+    for (const inst of this.saleInstallments) {
+      const sale = saleById.get(inst.saleId);
+      if (!sale || sale.status === "cancelada" || inst.status !== "pagado") continue;
+      totalCollected += inst.amount;
+    }
+    return { totalCollected };
+  }
+
+  /** Espejo de DatabaseStorage.getPendingInstallmentsTotals. */
+  async getPendingInstallmentsTotals(consultantId: number): Promise<PendingInstallmentsTotals> {
+    const today = toDateStr(new Date());
+    const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
+    let totalPendingAmount = 0;
+    let totalPendingCount = 0;
+    let overdueAmount = 0;
+    let overdueCount = 0;
+    for (const inst of this.saleInstallments) {
+      const sale = saleById.get(inst.saleId);
+      if (!sale || sale.status === "cancelada" || inst.status !== "pendiente") continue;
+      totalPendingAmount += inst.amount;
+      totalPendingCount += 1;
+      if (inst.dueDate < today) {
+        overdueAmount += inst.amount;
+        overdueCount += 1;
+      }
+    }
+    return { totalPendingAmount, totalPendingCount, overdueAmount, overdueCount };
+  }
+
   async getAllSales(consultantId: number): Promise<SaleWithItemCount[]> {
     return this.sales
       .filter((s) => s.consultantId === consultantId)
@@ -3663,6 +4237,11 @@ export class MemoryStorage implements IStorage {
     const lines = input.items.map((item) => {
       const product = productById.get(item.productId);
       if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
+      // Etapa 7.4: mismo criterio que DatabaseStorage — un producto discontinuado no es
+      // vendible en una venta nueva.
+      if (product.discontinued) {
+        throw new SaleValidationError(`"${product.producto}" está discontinuado y no está disponible para nuevas ventas`);
+      }
       if (product.unidades < item.quantity) {
         throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${product.unidades})`);
       }
@@ -3773,6 +4352,13 @@ export class MemoryStorage implements IStorage {
 
     const existingItems = this.saleItems.filter((i) => i.saleId === id);
 
+    // Etapa 7.4: mismo criterio que DatabaseStorage — un producto discontinuado que ya era
+    // parte de esta venta sigue siendo histórico válido; solo se rechaza si es NUEVO en esta
+    // edición.
+    const existingProductIds = new Set(
+      existingItems.map((i) => i.productId).filter((pid): pid is number => pid !== null),
+    );
+
     const involvedIds = Array.from(
       new Set([
         ...existingItems.map((i) => i.productId).filter((pid): pid is number => pid !== null),
@@ -3794,6 +4380,9 @@ export class MemoryStorage implements IStorage {
     const lines = input.items.map((item) => {
       const product = productById.get(item.productId);
       if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
+      if (product.discontinued && !existingProductIds.has(item.productId)) {
+        throw new SaleValidationError(`"${product.producto}" está discontinuado y no está disponible para nuevas ventas`);
+      }
       const available = stockById.get(item.productId) ?? 0;
       if (available < item.quantity) {
         throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);

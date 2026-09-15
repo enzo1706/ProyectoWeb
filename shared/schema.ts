@@ -151,6 +151,18 @@ export const appointments = pgTable("appointments", {
   // Reemplaza el índice solo-por-fecha: toda consulta de agenda ahora filtra primero
   // por consultantId (getAppointmentsInRange/getUpcomingAppointments).
   consultantDateIdx: index("appointments_consultant_id_date_idx").on(table.consultantId, table.date),
+  // Etapa 7.5: el modelo actual de turno es un PUNTO en el tiempo (date+time), sin campo de
+  // fin/duración en ningún lugar de la app (ni schema, ni UI) — así que "conflicto" acá
+  // significa choque EXACTO de horario, no solapamiento de intervalos (eso exigiría agregar
+  // un campo de duración, fuera de alcance de esta etapa). Índice único PARCIAL, mismo patrón
+  // que `products_global_codigo_unique_idx` (Etapa I-B.8-D): resuelve el TOCTOU real de dos
+  // creaciones/ediciones concurrentes que verifican "sin conflicto" y después escriben — acá
+  // la garantía la da Postgres al validar la constraint de forma atómica en el INSERT/UPDATE,
+  // sin necesitar ninguna transacción ni lock explícito nuevo. Parcial porque un turno
+  // cancelado (`status = 'cancelada'`) nunca debe bloquear ese horario para uno nuevo.
+  activeSlotUnique: uniqueIndex("appointments_consultant_active_slot_unique_idx")
+    .on(table.consultantId, table.date, table.time)
+    .where(sql`${table.status} != 'cancelada'`),
 }));
 
 export const paymentMethods = ["efectivo", "transferencia", "tarjeta"] as const;
@@ -497,6 +509,23 @@ export const incrementProductStockSchema = z.object({
   // sale. 0 no tiene ningún caso de uso identificado (no movería stock), así que se rechaza acá,
   // antes de llegar a la base de datos.
   delta: z.number().int().refine((d) => d !== 0, "El delta no puede ser 0"),
+});
+
+// Etapa 7.2: confirmación de un pedido/importación completo en una sola operación atómica
+// (todo o nada) — reemplaza el loop de PATCH /stock/increment por línea que podía dejar una
+// importación aplicada a medias si una línea intermedia fallaba. A diferencia del incremento
+// de a un producto, acá el delta SIEMPRE es positivo: este batch representa exclusivamente
+// "entrada de mercadería" (carga manual o importada), nunca una salida — mismo criterio que
+// ya usa LoadOrderDialog.tsx, que solo genera cantidades positivas.
+export const incrementProductStockBatchSchema = z.object({
+  lines: z
+    .array(
+      z.object({
+        productId: z.number().int().positive(),
+        delta: z.number().int().positive(),
+      }),
+    )
+    .min(1, "El lote no puede estar vacío"),
 });
 
 export const setProductStockReminderSchema = z.object({

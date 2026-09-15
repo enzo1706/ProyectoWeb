@@ -87,10 +87,16 @@ import {
   ChevronDown,
   MoreVertical,
   Trash2,
+  Ban,
+  RotateCcw,
 } from "lucide-react";
 
 const MANUAL_FILTER = "__manual";
 const ALL_FILTER = "__all";
+
+// Etapa 7.4 — filtro de estado del catálogo administrativo (Todos/Activos/Discontinuados).
+type StatusFilter = "todos" | "activos" | "discontinuados";
+const STATUS_FILTER_DEFAULT: StatusFilter = "todos";
 
 /** Stock + umbral + recordatorio de compra de un producto puntual (una fila = un producto,
  * o un tono dentro de un producto con variantes). Misma lógica/mutaciones que ya existían,
@@ -271,6 +277,13 @@ interface StockActions {
   // de página, no mutan directo desde acá (mismo criterio que onOpen).
   onEditProduct: (product: Product) => void;
   onDeleteProduct: (product: Product) => void;
+  // Etapa 7.4: a diferencia de editar/eliminar, discontinuar/reactivar SÍ aplica a cualquier
+  // producto visible (global o manual) — el backend ya lo permite así (cada consultora tiene
+  // su propia fila de product_stock incluso sobre catálogo global). Marcar discontinuado pide
+  // confirmación (cambia disponibilidad comercial); reactivar es una acción directa.
+  onMarkDiscontinued: (product: Product) => void;
+  onReactivate: (product: Product) => void;
+  isTogglingDiscontinued: (id: number) => boolean;
 }
 
 /** Fila compacta de un producto puntual (sin tonos, o un tono dentro de un grupo expandido).
@@ -317,9 +330,20 @@ function ProductRow({
           )
         )}
         <div className="min-w-0 flex-1">
-          <p className="font-medium truncate text-sm" data-testid={`text-name-${product.id}`}>
-            {compact ? product.variante : product.producto}
-          </p>
+          <div className="flex items-center gap-1.5">
+            <p className="font-medium truncate text-sm" data-testid={`text-name-${product.id}`}>
+              {compact ? product.variante : product.producto}
+            </p>
+            {product.discontinued && (
+              <Badge
+                variant="secondary"
+                className="shrink-0 bg-muted text-muted-foreground border-0 text-[10px] px-1.5 py-0"
+                data-testid={`badge-discontinued-${product.id}`}
+              >
+                Discontinuado
+              </Badge>
+            )}
+          </div>
           {!compact && (
             <p className="text-xs text-muted-foreground truncate">
               {product.linea ? `${product.seccion} · ${product.linea}` : product.seccion}
@@ -359,27 +383,47 @@ function ProductRow({
         >
           <ShoppingBag className="h-4 w-4" />
         </Button>
-        {product.source === "manual" && (
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="h-8 w-8 shrink-0"
-                title="Más acciones"
-                aria-label="Más acciones"
-                onClick={(e) => e.stopPropagation()}
-                data-testid={`button-product-menu-${product.id}`}
-              >
-                <MoreVertical className="h-4 w-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 shrink-0"
+              title="Más acciones"
+              aria-label="Más acciones"
+              disabled={actions.isTogglingDiscontinued(product.id)}
+              onClick={(e) => e.stopPropagation()}
+              data-testid={`button-product-menu-${product.id}`}
+            >
+              <MoreVertical className="h-4 w-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+            {product.source === "manual" && (
               <DropdownMenuItem onClick={() => actions.onEditProduct(product)} data-testid={`option-edit-product-${product.id}`}>
                 <Pencil className="h-4 w-4 mr-2" />
                 Editar producto
               </DropdownMenuItem>
+            )}
+            {product.discontinued ? (
+              <DropdownMenuItem
+                onClick={() => actions.onReactivate(product)}
+                data-testid={`option-reactivate-product-${product.id}`}
+              >
+                <RotateCcw className="h-4 w-4 mr-2" />
+                Reactivar producto
+              </DropdownMenuItem>
+            ) : (
+              <DropdownMenuItem
+                onClick={() => actions.onMarkDiscontinued(product)}
+                data-testid={`option-discontinue-product-${product.id}`}
+              >
+                <Ban className="h-4 w-4 mr-2" />
+                Marcar como discontinuado
+              </DropdownMenuItem>
+            )}
+            {product.source === "manual" && (
               <DropdownMenuItem
                 onClick={() => actions.onDeleteProduct(product)}
                 className="text-destructive focus:text-destructive"
@@ -388,9 +432,9 @@ function ProductRow({
                 <Trash2 className="h-4 w-4 mr-2" />
                 Eliminar producto
               </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        )}
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
       <ProductStockAlerts
         product={product}
@@ -423,6 +467,7 @@ function ProductGroup({
   const primary = members[0];
   const totalUnidades = members.reduce((sum, m) => sum + m.unidades, 0);
   const anyLowStock = members.some((m) => isLowStock(m.unidades, m.effectiveStockMinimo) && !isReminderActive(m.remindStockAt, toDateStr(new Date())));
+  const discontinuedCount = members.filter((m) => m.discontinued).length;
 
   return (
     <div data-testid={`group-product-${primary.id}`}>
@@ -447,7 +492,18 @@ function ProductGroup({
           </div>
         )}
         <div className="min-w-0 flex-1">
-          <p className="font-medium truncate text-sm">{primary.producto}</p>
+          <div className="flex items-center gap-1.5">
+            <p className="font-medium truncate text-sm">{primary.producto}</p>
+            {discontinuedCount > 0 && (
+              <Badge
+                variant="secondary"
+                className="shrink-0 bg-muted text-muted-foreground border-0 text-[10px] px-1.5 py-0"
+                data-testid={`badge-discontinued-group-${primary.id}`}
+              >
+                {discontinuedCount === members.length ? "Discontinuado" : `${discontinuedCount} discontinuado${discontinuedCount !== 1 ? "s" : ""}`}
+              </Badge>
+            )}
+          </div>
           <p className="text-xs text-muted-foreground truncate">
             {primary.linea ? `${primary.seccion} · ${primary.linea}` : primary.seccion}
             {" · "}
@@ -922,6 +978,7 @@ export default function Productos() {
   const cart = useSaleCart();
   const [search, setSearch] = useState("");
   const [categoryFilter, setCategoryFilter] = useState<string>(ALL_FILTER);
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>(STATUS_FILTER_DEFAULT);
   // Por defecto solo se ven productos con stock > 0 — el checkbox habilita ver también los de 0.
   const [showOutOfStock, setShowOutOfStock] = useState(false);
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
@@ -930,6 +987,7 @@ export default function Productos() {
   const [bulkReminderDate, setBulkReminderDate] = useState("");
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [deletingProduct, setDeletingProduct] = useState<Product | null>(null);
+  const [discontinuingProduct, setDiscontinuingProduct] = useState<Product | null>(null);
 
   const { data: products = [], isLoading, isError, error } = useQuery<Product[]>({
     queryKey: ["/api/products"],
@@ -957,11 +1015,19 @@ export default function Productos() {
       if (categoryFilter === MANUAL_FILTER) matchesCategory = p.source === "manual";
       else if (categoryFilter !== ALL_FILTER) matchesCategory = p.seccion === categoryFilter;
 
-      const matchesStock = showOutOfStock || p.unidades > 0;
+      let matchesStatus = true;
+      if (statusFilter === "activos") matchesStatus = !p.discontinued;
+      else if (statusFilter === "discontinuados") matchesStatus = p.discontinued;
 
-      return matchesSearch && matchesCategory && matchesStock;
+      // "Ver productos sin stock" y "discontinuado" son estados independientes (sección 23):
+      // al mirar específicamente Discontinuados, un producto sin stock igual debe aparecer —
+      // el checkbox de stock solo tiene sentido para "qué puedo vender hoy", no para revisar
+      // el archivo de productos dados de baja.
+      const matchesStock = showOutOfStock || p.unidades > 0 || statusFilter === "discontinuados";
+
+      return matchesSearch && matchesCategory && matchesStatus && matchesStock;
     });
-  }, [products, search, categoryFilter, showOutOfStock]);
+  }, [products, search, categoryFilter, statusFilter, showOutOfStock]);
 
   // Agrupa por familia (sección+línea+nombre) para que los tonos de un mismo producto
   // aparezcan como una sola fila expandible en vez de una fila por variante — misma
@@ -1060,6 +1126,32 @@ export default function Productos() {
     },
   });
 
+  // Etapa 7.4 — mismo patrón que setReminderMutation (id en estado propio + onSettled, para
+  // poder deshabilitar/mostrar loading por fila sin un mapa de mutations por producto).
+  const [togglingDiscontinuedId, setTogglingDiscontinuedId] = useState<number | null>(null);
+  const toggleDiscontinuedMutation = useGuardedMutation({
+    mutationFn: async ({ id, discontinued }: { id: number; discontinued: boolean }) => {
+      setTogglingDiscontinuedId(id);
+      const res = await apiRequest("PATCH", `/api/products/${id}/discontinued`, { discontinued });
+      return res.json() as Promise<Product>;
+    },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
+      toast({
+        title: variables.discontinued ? "Producto marcado como discontinuado" : "Producto reactivado",
+        description: variables.discontinued
+          ? "Se conserva en el catálogo y en el historial, pero ya no está disponible para nuevas ventas."
+          : "Ya está disponible otra vez para nuevas ventas.",
+      });
+      setDiscontinuingProduct(null);
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo actualizar el estado del producto", description: err.message, variant: "destructive" });
+    },
+    onSettled: () => setTogglingDiscontinuedId(null),
+  });
+
   const stockActions: StockActions = {
     onSetStock: (id, unidades, stockMinimo) => setStockMutation.mutate({ id, unidades, stockMinimo }),
     isSettingStock: (id) => settingStockId === id,
@@ -1067,6 +1159,12 @@ export default function Productos() {
     isSettingReminder: (id) => settingReminderId === id,
     onEditProduct: (product) => setEditingProduct(product),
     onDeleteProduct: (product) => setDeletingProduct(product),
+    // Marcar discontinuado pide confirmación (cambia disponibilidad comercial, sección 7);
+    // reactivar es directo, mismo criterio que "Cancelar recordatorio" (acción restaurativa,
+    // de bajo riesgo).
+    onMarkDiscontinued: (product) => setDiscontinuingProduct(product),
+    onReactivate: (product) => toggleDiscontinuedMutation.mutate({ id: product.id, discontinued: false }),
+    isTogglingDiscontinued: (id) => togglingDiscontinuedId === id,
   };
 
   // lowStockRaw ya viene filtrado server-side a productos realmente comprados alguna vez
@@ -1205,6 +1303,21 @@ export default function Productos() {
               </Select>
             </div>
             <div className="flex items-center gap-2">
+              <Label htmlFor="select-status-filter" className="text-sm text-muted-foreground shrink-0">
+                Estado
+              </Label>
+              <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as StatusFilter)}>
+                <SelectTrigger id="select-status-filter" className="w-full sm:w-[160px]" data-testid="select-status-filter">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="todos" data-testid="option-status-todos">Todos</SelectItem>
+                  <SelectItem value="activos" data-testid="option-status-activos">Activos</SelectItem>
+                  <SelectItem value="discontinuados" data-testid="option-status-discontinuados">Discontinuados</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex items-center gap-2">
               <Checkbox
                 id="check-show-out-of-stock"
                 checked={showOutOfStock}
@@ -1289,6 +1402,31 @@ export default function Productos() {
               data-testid="button-confirm-delete-product-yes"
             >
               {deleteMutation.isPending ? "Eliminando..." : "Sí, eliminar"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={discontinuingProduct !== null} onOpenChange={(open) => !open && setDiscontinuingProduct(null)}>
+        <AlertDialogContent data-testid="dialog-confirm-discontinue-product">
+          <AlertDialogHeader>
+            <AlertDialogTitle>¿Marcar {discontinuingProduct?.producto} como discontinuado?</AlertDialogTitle>
+            <AlertDialogDescription>
+              El producto NO se va a eliminar: se conserva en el catálogo y en el historial de ventas. Solo deja de
+              estar disponible para nuevas ventas — podés reactivarlo cuando quieras.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel data-testid="button-confirm-discontinue-product-no">No, volver</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                if (discontinuingProduct) toggleDiscontinuedMutation.mutate({ id: discontinuingProduct.id, discontinued: true });
+              }}
+              disabled={toggleDiscontinuedMutation.isPending}
+              data-testid="button-confirm-discontinue-product-yes"
+            >
+              {toggleDiscontinuedMutation.isPending ? "Marcando..." : "Sí, marcar como discontinuado"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

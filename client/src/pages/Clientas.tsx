@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { Button } from "@/components/ui/button";
@@ -15,20 +15,23 @@ import { ClientDialog } from "@/components/ClientDialog";
 import { ClientDetailSheet } from "@/components/ClientDetailSheet";
 import { NewSaleDialog } from "@/components/NewSaleDialog";
 import { ErrorBlock } from "@/components/ErrorBlock";
-import { Plus, Search } from "lucide-react";
+import { Plus, Search, ChevronLeft, ChevronRight } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
-import { toDateStr, daysBetween } from "@/lib/date";
 import type { InsertClient, Product } from "@shared/schema";
+import { type BalanceFilter, type StaleFilter, DEFAULT_CLIENTS_PAGE_SIZE } from "@shared/clientFilters";
 
-type BalanceFilter = "todas" | "con_saldo" | "sin_saldo";
-type StaleFilter = "todas" | "mas_2_meses" | "mas_3_meses";
-
-const STALE_THRESHOLDS: Record<Exclude<StaleFilter, "todas">, number> = {
-  mas_2_meses: 60,
-  mas_3_meses: 90,
-};
+// Espejo de PaginatedClients (server/storage.ts) — contrato de GET /api/clients en modo
+// paginado (con `page` presente). Mismo criterio que Reportes.tsx para tipos de respuesta.
+interface PaginatedClientsResponse {
+  items: Client[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  totalRevenue: number;
+}
 
 export default function Clientas() {
   const { toast } = useToast();
@@ -43,42 +46,40 @@ export default function Clientas() {
   const [balanceFilter, setBalanceFilter] = useState<BalanceFilter>("todas");
   const [staleFilter, setStaleFilter] = useState<StaleFilter>("todas");
   const [saleClient, setSaleClient] = useState<Client | null>(null);
+  const [page, setPage] = useState(1);
 
   useEffect(() => {
     const timeout = setTimeout(() => setDebouncedSearch(search), 300);
     return () => clearTimeout(timeout);
   }, [search]);
 
-  const { data: clients = [], isLoading, isError } = useQuery<Client[]>({
-    queryKey: ["/api/clients", debouncedSearch],
+  // Volver a página 1 cada vez que cambia el criterio (búsqueda o filtros) — nunca quedar
+  // parada en la página 5 de un resultado que ahora solo tiene 2 páginas.
+  useEffect(() => {
+    setPage(1);
+  }, [debouncedSearch, balanceFilter, staleFilter]);
+
+  const { data, isLoading, isError } = useQuery<PaginatedClientsResponse>({
+    queryKey: ["/api/clients", debouncedSearch, balanceFilter, staleFilter, page],
     queryFn: async () => {
-      const params = new URLSearchParams({ limit: "100" });
+      const params = new URLSearchParams({
+        page: String(page),
+        pageSize: String(DEFAULT_CLIENTS_PAGE_SIZE),
+      });
       if (debouncedSearch) params.set("search", debouncedSearch);
+      if (balanceFilter !== "todas") params.set("balanceFilter", balanceFilter);
+      if (staleFilter !== "todas") params.set("staleFilter", staleFilter);
       const res = await apiRequest("GET", `/api/clients?${params.toString()}`);
       return res.json();
     },
   });
 
+  const clients = data?.items ?? [];
+  const total = data?.total ?? 0;
+  const totalPages = data?.totalPages ?? 0;
+  const totalRevenue = data?.totalRevenue ?? 0;
+
   const { data: products = [] } = useQuery<Product[]>({ queryKey: ["/api/products"] });
-
-  // Combina ambos filtros con AND. "Nunca compró" (lastPurchase null) nunca matchea un filtro
-  // de antigüedad — solo se distingue de "compró hace tiempo" cuando el filtro está en "Todas".
-  const filteredClients = useMemo(() => {
-    const today = toDateStr(new Date());
-    return clients.filter((client) => {
-      const pendingBalance = client.pendingBalance ?? 0;
-      if (balanceFilter === "con_saldo" && pendingBalance <= 0) return false;
-      if (balanceFilter === "sin_saldo" && pendingBalance > 0) return false;
-
-      if (staleFilter !== "todas") {
-        if (!client.lastPurchase) return false;
-        const daysSinceLastPurchase = daysBetween(client.lastPurchase, today);
-        if (daysSinceLastPurchase <= STALE_THRESHOLDS[staleFilter]) return false;
-      }
-
-      return true;
-    });
-  }, [clients, balanceFilter, staleFilter]);
 
   const createMutation = useGuardedMutation({
     mutationFn: async (data: Partial<InsertClient>) => {
@@ -142,8 +143,6 @@ export default function Clientas() {
     setDetailOpen(false);
   };
 
-  const totalRevenue = filteredClients.reduce((sum, c) => sum + c.totalPurchases, 0);
-
   return (
     <div className="p-6 space-y-6" data-testid="page-clientas">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -152,7 +151,7 @@ export default function Clientas() {
           <p className="text-muted-foreground">
             {isError
               ? "No pudimos calcular tus totales"
-              : `${filteredClients.length} clientas | Total facturado: ${format(totalRevenue)}`}
+              : `${total} ${total === 1 ? "clienta" : "clientas"} | Total facturado: ${format(totalRevenue)}`}
           </p>
         </div>
         <Button onClick={handleNewClient} data-testid="button-add-client">
@@ -201,14 +200,44 @@ export default function Clientas() {
       ) : (
         <>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {filteredClients.map((client) => (
+            {clients.map((client) => (
               <ClientCard key={client.id} client={client} onClick={handleClientClick} />
             ))}
           </div>
 
-          {filteredClients.length === 0 && (
+          {clients.length === 0 && (
             <div className="text-center py-12 text-muted-foreground">
               No se encontraron clientas
+            </div>
+          )}
+
+          {totalPages > 1 && (
+            <div className="flex items-center justify-center gap-3 pt-2" data-testid="clients-pagination">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-10 px-3"
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={page <= 1}
+                data-testid="button-clients-prev-page"
+              >
+                <ChevronLeft className="h-4 w-4 mr-1" />
+                Anterior
+              </Button>
+              <span className="text-sm text-muted-foreground" data-testid="text-clients-page-indicator">
+                Página {page} de {totalPages}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-10 px-3"
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                disabled={page >= totalPages}
+                data-testid="button-clients-next-page"
+              >
+                Siguiente
+                <ChevronRight className="h-4 w-4 ml-1" />
+              </Button>
             </div>
           )}
         </>

@@ -220,13 +220,35 @@ export async function parsePdfImportRows(buffer: Buffer): Promise<ImportedProduc
 
     for (const rowItems of Array.from(byY.values())) {
       const cols: Partial<Record<keyof typeof COLUMN_ANCHORS, string>> = {};
+      // Etapa 7.3 (hallazgo P2, Etapa 6): un nombre de producto puede llegar partido en más de
+      // un fragmento de texto dentro de la misma fila (mismo Y) — ej. un cambio de fuente a
+      // mitad del nombre en el PDF de origen produce dos TextItem separados en vez de uno. Acá
+      // se ACUMULAN todos los fragmentos que clasifican como columna "name" (nunca se
+      // sobreescriben) y recién se reconstruyen al final; el resto de las columnas (qty/
+      // precio/subtotal) mantiene el criterio anterior sin cambios, fuera de alcance de este
+      // bug.
+      const nameFragments: PdfTextItem[] = [];
       for (const item of rowItems) {
-        cols[classifyColumn(item.x)] = item.str;
+        const column = classifyColumn(item.x);
+        if (column === "name") {
+          nameFragments.push(item);
+        } else {
+          cols[column] = item.str;
+        }
       }
-      if (!cols.name || !cols.qty) continue;
+      if (nameFragments.length === 0 || !cols.qty) continue;
+      // Orden por posición X real dentro de la fila — nunca el orden en que pdf.js entregó los
+      // fragmentos (no está garantizado que coincida con el orden visual/semántico). Un solo
+      // fragmento (el caso normal, sin este bug) pasa por el mismo camino sin ningún cambio de
+      // comportamiento: sort/join de un array de longitud 1 devuelve el string tal cual.
+      const name = nameFragments
+        .slice()
+        .sort((a, b) => a.x - b.x)
+        .map((f) => f.str)
+        .join(" ");
       const qtyDigits = cols.qty.replace(/\D/g, "");
       if (!/^\d+$/.test(qtyDigits)) continue;
-      rows.push({ sourceName: cols.name, quantity: Number(qtyDigits) });
+      rows.push({ sourceName: name, quantity: Number(qtyDigits) });
     }
   }
 

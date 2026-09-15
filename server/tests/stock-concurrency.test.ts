@@ -6,6 +6,11 @@ import { testDb as db, testPool as pool } from "../test-db";
 import { consultants, products, productStock, clients, sales, saleItems, saleInstallments } from "@shared/schema";
 import { DatabaseStorage, SaleValidationError, ProductConflictError } from "../storage";
 
+/** Segunda consultora, exclusiva del test de aislamiento de tenant del batch de stock (Etapa
+ * 7.2) — nunca comparte productos con testConsultantId. */
+let otherConsultantId: number;
+let otherProductId: number;
+
 /**
  * Pega contra Postgres real vía `TEST_DATABASE_URL` (nunca `DATABASE_URL` — ver
  * `server/test-db.ts`/`server/test-db-guard.ts`, que exigen host loopback y un nombre de base
@@ -180,9 +185,34 @@ beforeAll(async () => {
     .returning();
   incrementFreshProductId = incrementFreshProduct.id;
   // A propósito, sin insert en product_stock — este producto no tiene fila todavía.
+
+  const [otherConsultant] = await db
+    .insert(consultants)
+    .values({ businessName: "VITEST stock-concurrency — otra consultora (borrar si queda huérfano)", currency: "ARS" })
+    .returning();
+  otherConsultantId = otherConsultant.id;
+
+  const [otherProduct] = await db
+    .insert(products)
+    .values({
+      consultantId: otherConsultantId,
+      seccion: "VITEST",
+      producto: "Producto MANUAL de otra consultora — batch stock",
+      variante: "Estándar",
+      codigo: `vitest-batch-other-tenant-${Date.now()}`,
+      puntos: 0,
+      precio: 1000,
+      source: "manual",
+    })
+    .returning();
+  otherProductId = otherProduct.id;
+  await db.insert(productStock).values({ consultantId: otherConsultantId, productId: otherProductId, unidades: 50, stockMinimo: 0 });
 });
 
 afterAll(async () => {
+  await db.delete(productStock).where(eq(productStock.consultantId, otherConsultantId));
+  await db.delete(products).where(eq(products.consultantId, otherConsultantId));
+  await db.delete(consultants).where(eq(consultants.id, otherConsultantId));
   // Las ventas creadas por el test referencian products/clients por FK — hay que borrarlas
   // primero, o el DELETE de products más abajo falla con una violación de foreign key.
   const testSales = await db.select({ id: sales.id }).from(sales).where(eq(sales.consultantId, testConsultantId));
@@ -1147,5 +1177,432 @@ describe("CRUD real de productos (updateProduct/deleteProduct) — Etapa I-B.8-C
       const [productRow] = await db.select().from(products).where(eq(products.id, raceProduct.id));
       expect(productRow).toBeDefined(); // el producto se conserva: tiene una venta real
     }
+  });
+});
+
+describe("Batch atómico de confirmación de pedido (incrementProductStockBatch) — Etapa 7.2, contra Postgres real", () => {
+  let productAId: number;
+  let productBId: number;
+  let productCId: number;
+
+  beforeAll(async () => {
+    async function makeProduct(label: string, unidades: number) {
+      const [product] = await db
+        .insert(products)
+        .values({
+          consultantId: testConsultantId,
+          seccion: "VITEST",
+          producto: `Producto batch — ${label}`,
+          variante: "Estándar",
+          codigo: `vitest-batch-${label}-${Date.now()}`,
+          puntos: 0,
+          precio: 1000,
+          source: "manual",
+        })
+        .returning();
+      await db.insert(productStock).values({ consultantId: testConsultantId, productId: product.id, unidades, stockMinimo: 0 });
+      return product.id;
+    }
+    productAId = await makeProduct("A", 10);
+    productBId = await makeProduct("B", 20);
+    productCId = await makeProduct("C", 5);
+  });
+
+  describe("Básicos", () => {
+    it("1. batch con una sola línea aplica correctamente", async () => {
+      const result = await storage.incrementProductStockBatch(testConsultantId, [{ productId: productAId, delta: 2 }]);
+      expect(result).toEqual({ updated: 1 });
+      const [row] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
+      expect(row.unidades).toBe(12);
+    });
+
+    it("2. batch con múltiples líneas aplica todas en la misma operación", async () => {
+      const [beforeA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
+      const [beforeB] = await db.select().from(productStock).where(eq(productStock.productId, productBId));
+
+      const result = await storage.incrementProductStockBatch(testConsultantId, [
+        { productId: productAId, delta: 1 },
+        { productId: productBId, delta: 3 },
+      ]);
+      expect(result).toEqual({ updated: 2 });
+
+      const [afterA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
+      const [afterB] = await db.select().from(productStock).where(eq(productStock.productId, productBId));
+      expect(afterA.unidades).toBe(beforeA.unidades + 1);
+      expect(afterB.unidades).toBe(beforeB.unidades + 3);
+    });
+
+    it("3. batch vacío se rechaza con SaleValidationError, sin tocar nada", async () => {
+      await expect(storage.incrementProductStockBatch(testConsultantId, [])).rejects.toBeInstanceOf(SaleValidationError);
+    });
+
+    it("4. producto inexistente en el batch -> se rechaza el batch entero", async () => {
+      await expect(
+        storage.incrementProductStockBatch(testConsultantId, [
+          { productId: productAId, delta: 1 },
+          { productId: 999999999, delta: 1 },
+        ]),
+      ).rejects.toThrow(/no encontrado/i);
+    });
+
+    it("5. producto MANUAL de otra consultora -> se rechaza igual que uno inexistente, nunca se filtra que existe", async () => {
+      await expect(
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: otherProductId, delta: 1 }]),
+      ).rejects.toThrow(/no encontrado/i);
+
+      // El stock de la otra consultora, intacto.
+      const [row] = await db.select().from(productStock).where(eq(productStock.productId, otherProductId));
+      expect(row.unidades).toBe(50);
+    });
+
+    it("6. delta inválido (0, negativo o no entero) se rechaza — este batch es solo entrada de mercadería", async () => {
+      await expect(
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: productAId, delta: 0 }]),
+      ).rejects.toBeInstanceOf(SaleValidationError);
+      await expect(
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: productAId, delta: -1 }]),
+      ).rejects.toBeInstanceOf(SaleValidationError);
+      await expect(
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: productAId, delta: 1.5 }]),
+      ).rejects.toBeInstanceOf(SaleValidationError);
+    });
+
+    it("7. stock válido: varias líneas con deltas positivos dispares aplican exactamente lo esperado", async () => {
+      const [beforeC] = await db.select().from(productStock).where(eq(productStock.productId, productCId));
+      await storage.incrementProductStockBatch(testConsultantId, [{ productId: productCId, delta: 7 }]);
+      const [afterC] = await db.select().from(productStock).where(eq(productStock.productId, productCId));
+      expect(afterC.unidades).toBe(beforeC.unidades + 7);
+    });
+  });
+
+  describe("Atomicidad — el caso central de esta etapa", () => {
+    it("8/9/10. Stock A=10 B=20: batch A+5 B+3 + una tercera línea inválida -> falla ENTERA, A y B quedan EXACTAMENTE igual que antes (nunca A=15 B=23)", async () => {
+      // Nota de diseño: el ejemplo del pedido usa "C+999999" como la línea que "debe fallar",
+      // pero este batch es exclusivamente de ENTRADA de mercadería (sección 9) — un delta
+      // positivo grande no es inválido, es simplemente un incremento grande, así que no sirve
+      // para forzar el fallo. El equivalente real de "una línea intermedia que hace fallar
+      // todo el batch" con este diseño es un producto inexistente/no visible — mismo efecto de
+      // atomicidad, causa distinta (nunca hay un decremento posible en este endpoint).
+      const [beforeA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
+      const [beforeB] = await db.select().from(productStock).where(eq(productStock.productId, productBId));
+
+      await expect(
+        storage.incrementProductStockBatch(testConsultantId, [
+          { productId: productAId, delta: 5 }, // línea 1: válida
+          { productId: productBId, delta: 3 }, // línea 2: válida
+          { productId: 999999999, delta: 1 }, // línea 3: inválida -> todo el batch debe revertir
+        ]),
+      ).rejects.toThrow(/no encontrado/i);
+
+      const [afterA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
+      const [afterB] = await db.select().from(productStock).where(eq(productStock.productId, productBId));
+      // Exactamente lo que pedía el caso del informe: NUNCA A+5 B+3 aplicados a medias.
+      expect(afterA.unidades).toBe(beforeA.unidades);
+      expect(afterB.unidades).toBe(beforeB.unidades);
+    });
+
+    it("línea 1 válida + línea 2 con delta negativo -> el batch entero se rechaza, la línea 1 tampoco queda aplicada", async () => {
+      const [beforeA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
+      const [beforeC] = await db.select().from(productStock).where(eq(productStock.productId, productCId));
+
+      // Un batch de importación solo suma (delta positivo) — para forzar "stock insuficiente"
+      // hace falta vaciar la fila primero y mandar un delta que sería válido salvo por el
+      // chequeo de negativo... como acá el batch NUNCA acepta delta negativo, el camino real
+      // de "stock insuficiente" de este endpoint específico no existe por diseño (ver sección
+      // 9 del pedido: solo entrada de mercadería). Documentamos esa garantía acá en vez de
+      // fabricar un escenario artificial que el propio schema ya impide antes de llegar a
+      // storage.
+      await expect(
+        storage.incrementProductStockBatch(testConsultantId, [
+          { productId: productAId, delta: 1 },
+          { productId: productCId, delta: -1 }, // rechazado por el schema/validación de línea, nunca por stock negativo
+        ]),
+      ).rejects.toBeInstanceOf(SaleValidationError);
+
+      const [afterA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
+      const [afterC] = await db.select().from(productStock).where(eq(productStock.productId, productCId));
+      expect(afterA.unidades).toBe(beforeA.unidades); // línea 1 NO quedó aplicada pese a ser válida
+      expect(afterC.unidades).toBe(beforeC.unidades);
+    });
+
+    it("10. ningún cambio si falla la validación previa (todas las líneas se validan antes de escribir cualquiera)", async () => {
+      const [beforeA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
+
+      // La línea inválida es la PRIMERA acá — si el batch escribiera línea por línea sin
+      // validar todo antes, este caso no probaría nada nuevo respecto al anterior. Puesto
+      // como primera línea a propósito para confirmar que ninguna línea se aplica ni siquiera
+      // cuando la inválida es la que "debería" procesarse primero.
+      await expect(
+        storage.incrementProductStockBatch(testConsultantId, [
+          { productId: 999999999, delta: 1 },
+          { productId: productAId, delta: 5 },
+        ]),
+      ).rejects.toThrow(/no encontrado/i);
+
+      const [afterA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
+      expect(afterA.unidades).toBe(beforeA.unidades);
+    });
+  });
+
+  describe("Duplicados dentro del mismo batch", () => {
+    it("11/12. mismo productId dos veces en el batch -> se combinan los deltas (10+5+3=18), no dos escrituras separadas", async () => {
+      const [before] = await db.select().from(productStock).where(eq(productStock.productId, productBId));
+
+      const result = await storage.incrementProductStockBatch(testConsultantId, [
+        { productId: productBId, delta: 5 },
+        { productId: productBId, delta: 3 },
+      ]);
+      expect(result).toEqual({ updated: 1 }); // un solo producto afectado, no dos líneas separadas
+
+      const [after] = await db.select().from(productStock).where(eq(productStock.productId, productBId));
+      expect(after.unidades).toBe(before.unidades + 8); // 5+3 combinados, nunca solo uno de los dos
+    });
+  });
+
+  describe("Concurrencia real contra Postgres", () => {
+    it("13. dos batches simultáneos sobre el MISMO producto: stock=10, +5 y +7 -> 22, nunca 17/12/20", async () => {
+      const [freshProduct] = await db
+        .insert(products)
+        .values({
+          consultantId: testConsultantId,
+          seccion: "VITEST",
+          producto: "Producto batch — concurrencia mismo producto",
+          variante: "Estándar",
+          codigo: `vitest-batch-concurrency-same-${Date.now()}`,
+          puntos: 0,
+          precio: 1000,
+          source: "manual",
+        })
+        .returning();
+      await db.insert(productStock).values({ consultantId: testConsultantId, productId: freshProduct.id, unidades: 10, stockMinimo: 0 });
+
+      const results = await Promise.all([
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: freshProduct.id, delta: 5 }]),
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: freshProduct.id, delta: 7 }]),
+      ]);
+      expect(results).toEqual([{ updated: 1 }, { updated: 1 }]);
+
+      const [after] = await db.select().from(productStock).where(eq(productStock.productId, freshProduct.id));
+      expect(after.unidades).toBe(22); // 10 + 5 + 7, ninguno perdido bajo concurrencia real
+    });
+
+    it("14/15. batch A toca productos [1,2] en ese orden, batch B toca los MISMOS dos productos en orden [2,1]: sin deadlock, sin pérdida de actualización", async () => {
+      const [freshP1] = await db
+        .insert(products)
+        .values({
+          consultantId: testConsultantId,
+          seccion: "VITEST",
+          producto: "Producto batch — solapado 1",
+          variante: "Estándar",
+          codigo: `vitest-batch-overlap-1-${Date.now()}`,
+          puntos: 0,
+          precio: 1000,
+          source: "manual",
+        })
+        .returning();
+      const [freshP2] = await db
+        .insert(products)
+        .values({
+          consultantId: testConsultantId,
+          seccion: "VITEST",
+          producto: "Producto batch — solapado 2",
+          variante: "Estándar",
+          codigo: `vitest-batch-overlap-2-${Date.now()}`,
+          puntos: 0,
+          precio: 1000,
+          source: "manual",
+        })
+        .returning();
+      await db.insert(productStock).values([
+        { consultantId: testConsultantId, productId: freshP1.id, unidades: 10, stockMinimo: 0 },
+        { consultantId: testConsultantId, productId: freshP2.id, unidades: 10, stockMinimo: 0 },
+      ]);
+
+      // Órdenes de entrada DELIBERADAMENTE opuestos entre los dos batches — es justo el caso
+      // que el ordenamiento ascendente de productId dentro de la transacción (Etapa I-B.7-C)
+      // existe para prevenir: sin ese orden determinístico, un batch podría tomar el lock de
+      // freshP1 mientras el otro tiene el de freshP2 y ambos esperan al otro -> deadlock.
+      const [orderedLow, orderedHigh] = freshP1.id < freshP2.id ? [freshP1, freshP2] : [freshP2, freshP1];
+
+      const results = await Promise.all([
+        storage.incrementProductStockBatch(testConsultantId, [
+          { productId: orderedLow.id, delta: 1 },
+          { productId: orderedHigh.id, delta: 2 },
+        ]),
+        storage.incrementProductStockBatch(testConsultantId, [
+          { productId: orderedHigh.id, delta: 3 },
+          { productId: orderedLow.id, delta: 4 },
+        ]),
+      ]);
+      expect(results).toEqual([{ updated: 2 }, { updated: 2 }]);
+
+      const [afterLow] = await db.select().from(productStock).where(eq(productStock.productId, orderedLow.id));
+      const [afterHigh] = await db.select().from(productStock).where(eq(productStock.productId, orderedHigh.id));
+      expect(afterLow.unidades).toBe(10 + 1 + 4); // los dos incrementos sobre "low", ninguno perdido
+      expect(afterHigh.unidades).toBe(10 + 2 + 3); // los dos incrementos sobre "high", ninguno perdido
+    });
+
+    it("batch A afecta productos 1 y 2, batch B afecta SOLO el producto 2 (subconjunto solapado) -> ambos completan sin pérdida", async () => {
+      const [p1] = await db
+        .insert(products)
+        .values({
+          consultantId: testConsultantId,
+          seccion: "VITEST",
+          producto: "Producto batch — subconjunto 1",
+          variante: "Estándar",
+          codigo: `vitest-batch-subset-1-${Date.now()}`,
+          puntos: 0,
+          precio: 1000,
+          source: "manual",
+        })
+        .returning();
+      const [p2] = await db
+        .insert(products)
+        .values({
+          consultantId: testConsultantId,
+          seccion: "VITEST",
+          producto: "Producto batch — subconjunto 2",
+          variante: "Estándar",
+          codigo: `vitest-batch-subset-2-${Date.now()}`,
+          puntos: 0,
+          precio: 1000,
+          source: "manual",
+        })
+        .returning();
+      await db.insert(productStock).values([
+        { consultantId: testConsultantId, productId: p1.id, unidades: 10, stockMinimo: 0 },
+        { consultantId: testConsultantId, productId: p2.id, unidades: 10, stockMinimo: 0 },
+      ]);
+
+      const results = await Promise.all([
+        storage.incrementProductStockBatch(testConsultantId, [
+          { productId: p1.id, delta: 2 },
+          { productId: p2.id, delta: 2 },
+        ]),
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: p2.id, delta: 5 }]),
+      ]);
+      expect(results).toEqual([{ updated: 2 }, { updated: 1 }]);
+
+      const [afterP1] = await db.select().from(productStock).where(eq(productStock.productId, p1.id));
+      const [afterP2] = await db.select().from(productStock).where(eq(productStock.productId, p2.id));
+      expect(afterP1.unidades).toBe(12); // 10 + 2
+      expect(afterP2.unidades).toBe(17); // 10 + 2 + 5, ninguno perdido
+    });
+  });
+});
+
+describe("Concurrencia discontinuar/reactivar vs. vender — Etapa 7.4, contra Postgres real", () => {
+  it("discontinuar + crear venta simultáneos sobre el mismo producto: nunca un resultado inconsistente, sea cual sea el orden real", async () => {
+    const [product] = await db
+      .insert(products)
+      .values({
+        consultantId: testConsultantId,
+        seccion: "VITEST",
+        producto: "Producto 7.4 — carrera discontinuar+vender",
+        variante: "Estándar",
+        codigo: `vitest-discontinue-race-${Date.now()}`,
+        puntos: 0,
+        precio: 1000,
+        source: "manual",
+      })
+      .returning();
+    await db.insert(productStock).values({ consultantId: testConsultantId, productId: product.id, unidades: 10, stockMinimo: 0 });
+
+    const [discontinueResult, saleResult] = await Promise.allSettled([
+      storage.setProductDiscontinued(testConsultantId, product.id, true),
+      storage.createSale(testConsultantId, {
+        clientId: testClientId,
+        date: "2026-01-01",
+        items: [{ productId: product.id, quantity: 1 }],
+        orderDiscount: null,
+        orderSurcharge: null,
+        paymentMethod: "efectivo",
+        installments: [{ amount: 1000 }],
+        status: "pendiente",
+      }),
+    ]);
+
+    // El "discontinuar" en sí (un UPSERT de una sola sentencia) siempre tiene éxito — nunca
+    // compite por el mismo tipo de validación que la venta.
+    expect(discontinueResult.status).toBe("fulfilled");
+
+    const [finalStock] = await db.select().from(productStock).where(eq(productStock.productId, product.id));
+    expect(finalStock.discontinued).toBe(true);
+
+    // La garantía real: createSale SIEMPRE evalúa `discontinued` contra el valor que ve bajo
+    // su propio `FOR UPDATE` (Etapa 7.4) — nunca un valor leído fuera de esa transacción. Acá
+    // no se puede predecir determinísticamente cuál de las dos operaciones toma el lock de la
+    // fila primero (depende del scheduling real de Postgres), así que el test acepta AMBOS
+    // desenlaces válidos y solo verifica que cada uno sea internamente coherente:
+    if (saleResult.status === "fulfilled") {
+      // La venta ganó el lock primero (vio discontinued=false, todavía consistente en ese
+      // instante) -> se creó una venta real, y el producto queda discontinuado DESPUÉS.
+      const items = await db.select().from(saleItems).where(eq(saleItems.saleId, saleResult.value.id));
+      expect(items).toHaveLength(1);
+      const [stockAfterSale] = await db.select().from(productStock).where(eq(productStock.productId, product.id));
+      expect(stockAfterSale.unidades).toBe(9); // 10 - 1, la venta sí se aplicó
+    } else {
+      // El "discontinuar" ganó el lock primero -> createSale, al tomar el lock después, vio
+      // discontinued=true y rechazó explícitamente — nunca una venta fantasma sobre un
+      // producto ya discontinuado.
+      expect((saleResult as PromiseRejectedResult).reason).toBeInstanceOf(SaleValidationError);
+      expect((saleResult as PromiseRejectedResult).reason.message).toMatch(/discontinuado/i);
+      const [stockUntouched] = await db.select().from(productStock).where(eq(productStock.productId, product.id));
+      expect(stockUntouched.unidades).toBe(10); // stock intacto, la venta rechazada no descontó nada
+    }
+  });
+
+  it("reactivar + crear venta simultáneos sobre un producto YA discontinuado: mismo criterio, sin resultado inconsistente", async () => {
+    const [product] = await db
+      .insert(products)
+      .values({
+        consultantId: testConsultantId,
+        seccion: "VITEST",
+        producto: "Producto 7.4 — carrera reactivar+vender",
+        variante: "Estándar",
+        codigo: `vitest-reactivate-race-${Date.now()}`,
+        puntos: 0,
+        precio: 1000,
+        source: "manual",
+      })
+      .returning();
+    await db.insert(productStock).values({ consultantId: testConsultantId, productId: product.id, unidades: 10, stockMinimo: 0, discontinued: true });
+
+    const [reactivateResult, saleResult] = await Promise.allSettled([
+      storage.setProductDiscontinued(testConsultantId, product.id, false),
+      storage.createSale(testConsultantId, {
+        clientId: testClientId,
+        date: "2026-01-01",
+        items: [{ productId: product.id, quantity: 1 }],
+        orderDiscount: null,
+        orderSurcharge: null,
+        paymentMethod: "efectivo",
+        installments: [{ amount: 1000 }],
+        status: "pendiente",
+      }),
+    ]);
+
+    expect(reactivateResult.status).toBe("fulfilled");
+
+    if (saleResult.status === "fulfilled") {
+      // La reactivación ganó el lock primero -> la venta, al tomar el lock después, ya vio
+      // discontinued=false y pudo completarse normalmente.
+      const [stockAfterSale] = await db.select().from(productStock).where(eq(productStock.productId, product.id));
+      expect(stockAfterSale.unidades).toBe(9);
+    } else {
+      // La venta ganó el lock primero, todavía con discontinued=true -> rechazada
+      // correctamente, aunque la reactivación (que perdió la carrera) haya tenido éxito
+      // un instante después. Nunca una venta "colada" antes de que el producto estuviera
+      // realmente disponible.
+      expect((saleResult as PromiseRejectedResult).reason).toBeInstanceOf(SaleValidationError);
+      expect((saleResult as PromiseRejectedResult).reason.message).toMatch(/discontinuado/i);
+      const [stockUntouched] = await db.select().from(productStock).where(eq(productStock.productId, product.id));
+      expect(stockUntouched.unidades).toBe(10);
+    }
+
+    // Sin importar el orden, la reactivación siempre termina aplicada (es la única operación
+    // que toca ese campo en este test).
+    const [finalStock] = await db.select().from(productStock).where(eq(productStock.productId, product.id));
+    expect(finalStock.discontinued).toBe(false);
   });
 });
