@@ -7,7 +7,6 @@ import {
   ShoppingCart,
   Calendar,
   BarChart3,
-  Shield,
   Settings,
   CreditCard,
 } from "lucide-react";
@@ -26,6 +25,7 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { useAuth } from "@/hooks/useAuth";
+import { BrandLogo } from "@/components/BrandLogo";
 import type { Consultant } from "@shared/schema";
 
 interface MenuItem {
@@ -79,13 +79,7 @@ export function AppSidebar() {
     <Sidebar className="print:hidden">
       <SidebarHeader className="p-4">
         <div className="flex items-center gap-2">
-          <div className="h-8 w-8 rounded-md bg-primary flex items-center justify-center">
-            {isAdmin ? (
-              <Shield className="h-4 w-4 text-primary-foreground" />
-            ) : (
-              <span className="text-primary-foreground font-bold text-sm">MK</span>
-            )}
-          </div>
+          <BrandLogo size={32} />
           <div className="min-w-0">
             <h1 className="font-semibold text-sm truncate">
               {isAdmin ? "Administración" : businessName}

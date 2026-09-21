@@ -8,6 +8,7 @@ import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/AppSidebar";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { HideMoneyToggle } from "@/components/HideMoneyToggle";
+import { BrandLogo } from "@/components/BrandLogo";
 import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import { SaleCartProvider } from "@/hooks/use-sale-cart";
 import { HideMoneyProvider } from "@/hooks/use-hide-money";
@@ -157,6 +158,7 @@ function AppShell() {
           <header className="flex items-center justify-between gap-2 p-2 pt-[max(0.5rem,env(safe-area-inset-top))] border-b shrink-0 bg-background/80 backdrop-blur-sm print:hidden">
             <div className="flex items-center gap-2">
               <SidebarTrigger data-testid="button-sidebar-toggle" />
+              <BrandLogo size={28} alt="Mary Kay Manager" className="md:hidden" />
               {isAdmin && (
                 <span className="text-sm font-medium text-foreground hidden md:inline">
                   Perfil de Administrador

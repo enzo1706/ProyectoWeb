@@ -7,6 +7,7 @@ import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { UserPlus, Loader2 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
+import { BrandLogo } from "@/components/BrandLogo";
 
 export default function Register() {
   const { register } = useAuth();
@@ -48,9 +49,7 @@ export default function Register() {
     >
       <div className="w-full max-w-md space-y-6">
         <div className="text-center space-y-2">
-          <div className="mx-auto h-14 w-14 rounded-2xl bg-primary flex items-center justify-center shadow-md">
-            <span className="text-primary-foreground font-bold text-xl">MK</span>
-          </div>
+          <BrandLogo size={56} className="mx-auto shadow-md" />
           <h1 className="text-2xl font-bold text-[hsl(220,55%,22%)]">Mary Kay Manager</h1>
           <p className="text-sm text-muted-foreground">Creá tu cuenta de consultora</p>
         </div>
