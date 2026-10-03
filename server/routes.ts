@@ -601,8 +601,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(409).json({ error: "Ya se está procesando tu suscripción, esperá unos segundos" });
       }
 
-      await storage.setConsultantEmail(req.consultantId, parsed.data.email);
-
+      // Hallazgo R3 de la auditoría de Mercado Pago (confirmado en producción, Etapa post-MP-2):
+      // acá ANTES se pisaba el email de cuenta/recuperación de la consultora con el
+      // payer_email tipeado en el diálogo, antes siquiera de llamar a MP. Dos problemas reales:
+      // (1) un payer_email que ya pertenece a otra fila de `consultants` (índice único) tiraba
+      // un 500 genérico y la suscripción nunca llegaba a crearse — reproducido en producción el
+      // 2026-10-03, tres veces seguidas, bloqueando el primer alta real de pago. (2) cambiar el
+      // email de cuenta desde acá, sin reautenticación, es una superficie de seguridad que no
+      // hace falta para este flujo. `payer_email` es un dato exclusivo de ESTE pago — Mercado
+      // Pago nunca necesita que coincida con el email de cuenta, así que no se persiste.
       const externalReference = generateExternalReference(req.consultantId);
       const preapproval = await createSubscriptionPreapproval({
         externalReference,

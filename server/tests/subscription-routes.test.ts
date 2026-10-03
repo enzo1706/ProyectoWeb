@@ -161,6 +161,33 @@ describe("POST /api/subscription/start", () => {
     const sub = await storage.getSubscriptionByConsultantId(consultantId);
     expect(sub!.mpPreapprovalId).toBe("PA-guardado-123");
   });
+
+  it("11. (hallazgo R3, reproducido en producción 2026-10-03) un payer_email ya usado por OTRA consultora no rompe el alta — nunca se pisa consultants.email", async () => {
+    const taken = `ya.usado.${Date.now()}@example.com`;
+    const owner = await createConsultant(`vitest_sub_email_owner_${Date.now()}`);
+    await storage.setConsultantEmail(owner.consultantId, taken);
+
+    const { consultantId, cookie } = await createConsultant(`vitest_sub_email_collision_${Date.now()}`);
+    const before = await storage.getBusinessSettings(consultantId);
+    expect(before!.email ?? null).toBeNull();
+
+    const res = await fetch(`${baseUrl}/api/subscription/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ email: taken }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.initPoint).toBeTruthy();
+    // payer_email le llega a MP tal cual, aunque ya pertenezca a otra consultora...
+    expect(createSubscriptionPreapprovalMock).toHaveBeenCalledWith(
+      expect.objectContaining({ payerEmail: taken }),
+    );
+    // ...pero nunca se persiste como email de ESTA cuenta.
+    const after = await storage.getBusinessSettings(consultantId);
+    expect(after!.email ?? null).toBeNull();
+  });
 });
 
 describe("Idempotencia de pagos aprobados (storage.applyApprovedPayment)", () => {
