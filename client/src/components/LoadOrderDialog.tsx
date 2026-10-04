@@ -312,7 +312,10 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
                         </div>
                       )}
                       <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-semibold">{product.producto}</p>
+                        <p className="truncate text-sm font-semibold">
+                          {product.producto}
+                          {product.variante !== "Estándar" && <span className="font-normal text-muted-foreground"> {product.variante}</span>}
+                        </p>
                         <p className="text-xs text-muted-foreground">{format(product.precio)}</p>
                       </div>
                       <div className="flex shrink-0 items-center gap-1.5">
