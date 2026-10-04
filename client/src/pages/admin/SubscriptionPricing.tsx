@@ -48,6 +48,7 @@ interface PriceHistoryEntry {
   appliedAt: string | null;
   changedAt: string;
   changedByAdminId: number | null;
+  changedByUsername: string | null;
 }
 
 interface PriceResponse {
@@ -246,6 +247,7 @@ function PriceTab() {
               <TableHeader>
                 <TableRow>
                   <TableHead>Fecha</TableHead>
+                  <TableHead>Cambiado por</TableHead>
                   <TableHead>Precio anterior</TableHead>
                   <TableHead>Precio nuevo</TableHead>
                   <TableHead>A quiénes</TableHead>
@@ -255,6 +257,7 @@ function PriceTab() {
                 {data.history.map((entry) => (
                   <TableRow key={entry.id}>
                     <TableCell>{formatDate(entry.changedAt)}</TableCell>
+                    <TableCell>{entry.changedByUsername ?? "—"}</TableCell>
                     <TableCell>{entry.oldPriceArs !== null ? formatPrice(entry.oldPriceArs) : "—"}</TableCell>
                     <TableCell className="font-medium">{formatPrice(entry.newPriceArs)}</TableCell>
                     <TableCell>

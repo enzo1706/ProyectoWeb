@@ -1646,7 +1646,16 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.get("/api/admin/subscription-price", async (_req: Request, res: Response) => {
     try {
       const [currentPriceArs, history] = await Promise.all([getCurrentSubscriptionPriceArs(), storage.listSubscriptionPriceHistory()]);
-      res.json({ currentPriceArs, history });
+      // Quién hizo cada cambio, para el historial del admin — se resuelve acá (no se guarda
+      // desnormalizado) porque la cantidad de cambios de precio es chica, nunca justifica un
+      // join dedicado en el storage.
+      const enriched = await Promise.all(
+        history.map(async (entry) => ({
+          ...entry,
+          changedByUsername: entry.changedByAdminId ? ((await storage.getUser(entry.changedByAdminId))?.username ?? null) : null,
+        })),
+      );
+      res.json({ currentPriceArs, history: enriched });
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al consultar el precio de la suscripción" });
