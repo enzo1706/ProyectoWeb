@@ -10,6 +10,9 @@ import {
   consultants,
   subscriptions,
   payments,
+  subscriptionPriceHistory,
+  coupons,
+  couponRedemptions,
   passwordResetCodes,
   createSaleSchema,
   updateSaleSchema,
@@ -38,6 +41,13 @@ import {
   type Payment,
   type PaymentStatus,
   type PasswordResetCode,
+  type SubscriptionPriceHistoryEntry,
+  type PriceChangeScope,
+  type Coupon,
+  type CouponDiscountType,
+  type CouponDuration,
+  type CouponRedemption,
+  type CouponRedemptionStatus,
 } from "@shared/schema";
 import { normalizeEmail } from "@shared/email";
 import {
@@ -65,6 +75,18 @@ import { resolveStorageMode } from "./storage-mode";
 import { slugify } from "@shared/slug";
 import bcrypt from "bcryptjs";
 import { TRIAL_DAYS, PERIOD_DAYS } from "./config/subscription";
+
+/** Misma fórmula que `computeDiscountEndsAt` de server/subscription.ts, duplicada acá adentro
+ * (sin import) para no crear una dependencia circular storage.ts ↔ subscription.ts
+ * (subscription.ts ya importa `storage` de acá). Pura, sin acceso a datos — null para
+ * "forever" y "first_payment" (sin fecha futura: se revierte apenas se confirma este pago). */
+function computeDiscountEndsAtInline(
+  redemption: { duration: string; durationMonths: number | null },
+  confirmedAt: Date,
+): Date | null {
+  if (redemption.duration !== "months" || !redemption.durationMonths) return null;
+  return new Date(confirmedAt.getTime() + redemption.durationMonths * 30 * 24 * 60 * 60 * 1000);
+}
 
 export class SaleValidationError extends Error {}
 export class AppointmentValidationError extends Error {}
@@ -205,7 +227,14 @@ export type UpdateProductInput = z.infer<typeof updateProductSchema>;
 export type SubscriptionUpdate = Partial<
   Pick<
     Subscription,
-    "status" | "currentPeriodStart" | "currentPeriodEnd" | "lastPaymentId" | "mpPreapprovalId" | "mpPreapprovalCreatedAt" | "canceledAt"
+    | "status"
+    | "currentPeriodStart"
+    | "currentPeriodEnd"
+    | "lastPaymentId"
+    | "mpPreapprovalId"
+    | "mpPreapprovalCreatedAt"
+    | "canceledAt"
+    | "priceHistoryAppliedId"
   >
 >;
 /** Todos los campos van explícitos a propósito (nada de defaults acá): el precio/moneda/
@@ -231,6 +260,51 @@ export type ApplyApprovedPaymentResult =
   | { outcome: "applied"; payment: Payment }
   | { outcome: "already_processed"; payment: Payment }
   | { outcome: "preapproval_mismatch" };
+
+// ---------------------------------------------------------------------------
+// Prompt U — precio editable + cupones.
+// ---------------------------------------------------------------------------
+
+export interface CreatePriceChangeInput {
+  oldPriceArs: number | null;
+  newPriceArs: number;
+  appliesTo: PriceChangeScope;
+  effectiveAt: Date | null;
+  changedByAdminId: number | null;
+}
+
+export interface CreateCouponInput {
+  code: string;
+  discountType: CouponDiscountType;
+  discountValue: number;
+  duration: CouponDuration;
+  durationMonths: number | null;
+  maxUses: number | null;
+  expiresAt: Date | null;
+  createdByAdminId: number | null;
+}
+export type CouponUpdate = Partial<
+  Pick<Coupon, "discountType" | "discountValue" | "duration" | "durationMonths" | "maxUses" | "expiresAt" | "active">
+>;
+
+export interface ReserveCouponInput {
+  discountType: CouponDiscountType;
+  discountValue: number;
+  duration: CouponDuration;
+  durationMonths: number | null;
+}
+export type ReserveCouponResult =
+  | { outcome: "reserved"; redemption: CouponRedemption }
+  | { outcome: "already_used" }
+  | { outcome: "limit_reached" };
+
+/** Fila de detalle para el panel admin: una redención + los datos de la consultora que la usó. */
+export interface CouponRedemptionDetailRow {
+  redemption: CouponRedemption;
+  consultantId: number;
+  businessName: string;
+  username: string;
+}
 
 /** Etapa de hardening post-I-B.8-F: `PATCH /api/admin/users/:id/toggle-status` es exclusivo
  * para administrar cuentas de CONSULTORA — nunca cuentas admin. `"forbidden"` cubre tanto "un
@@ -538,6 +612,8 @@ export interface IStorage {
   updateSubscription(consultantId: number, patch: SubscriptionUpdate): Promise<Subscription | undefined>;
   /** Ledger de pagos de Mercado Pago — append-only, nunca se borra ni se reutiliza una fila. */
   createPendingPayment(consultantId: number, input: CreatePendingPaymentInput): Promise<Payment>;
+  /** `externalReference` NO es unique (varios cobros de una suscripción la comparten): devuelve
+   * el payment más reciente con esa referencia. La identidad de un cobro es `mpPaymentId`. */
   getPaymentByExternalReference(externalReference: string): Promise<Payment | undefined>;
   getPaymentByMpPaymentId(mpPaymentId: string): Promise<Payment | undefined>;
   updatePayment(id: number, patch: PaymentUpdate): Promise<Payment | undefined>;
@@ -547,6 +623,51 @@ export interface IStorage {
    * veces). Nunca se llama con datos del frontend: solo tras reconsultar el pago real contra
    * la API de Mercado Pago (ver server/mercadopago.ts). */
   applyApprovedPayment(consultantId: number, input: ApplyApprovedPaymentInput): Promise<ApplyApprovedPaymentResult>;
+  /** Confirma la redención de cupón "reserved" más reciente de esta consultora (si hay alguna)
+   * — se llama SIEMPRE que se acredita un pago aprobado, nunca antes. undefined si no había
+   * ninguna reserva pendiente (alta sin cupón). */
+  confirmCouponRedemption(consultantId: number, confirmedAt: Date): Promise<CouponRedemption | undefined>;
+  /** Activa una suscripción SIN pasar por Mercado Pago — solo cuando un cupón deja el precio en
+   * $0. Crea igual un registro en `payments` (amount 0, approved) para que el historial de la
+   * consultora quede completo y auditable. */
+  activateFreeSubscription(consultantId: number, input: { couponRedemptionId: number; periodDays: number }): Promise<Payment>;
+
+  // --- Prompt U: historial de precio ---
+  getLatestSubscriptionPriceChange(): Promise<SubscriptionPriceHistoryEntry | undefined>;
+  /** La entrada "all" más reciente cuya `effectiveAt` ya pasó — para el mecanismo perezoso de
+   * `reconcileSubscriptionPricing`. undefined si no hay ninguna pendiente. */
+  getLatestDuePriceChange(now: Date): Promise<SubscriptionPriceHistoryEntry | undefined>;
+  listSubscriptionPriceHistory(): Promise<SubscriptionPriceHistoryEntry[]>;
+  createSubscriptionPriceChange(input: CreatePriceChangeInput): Promise<SubscriptionPriceHistoryEntry>;
+
+  // --- Prompt U: cupones ---
+  getCouponByCode(normalizedCode: string): Promise<Coupon | undefined>;
+  getCouponById(id: number): Promise<Coupon | undefined>;
+  listCoupons(): Promise<Coupon[]>;
+  createCoupon(input: CreateCouponInput): Promise<Coupon>;
+  updateCoupon(id: number, patch: CouponUpdate): Promise<Coupon | undefined>;
+  getCouponRedemption(couponId: number, consultantId: number): Promise<CouponRedemption | undefined>;
+  /** La reserva "reserved" más reciente de esta consultora, sin importar el cupón — para saber
+   * qué monto se cotizó en el preapproval que se está por confirmar (ver handleApprovedPaymentTopic
+   * en server/routes.ts). undefined si no hay ninguna reserva pendiente (alta sin cupón). */
+  getReservedCouponRedemption(consultantId: number): Promise<CouponRedemption | undefined>;
+  /** Filas "confirmed" + "reserved" dentro de `reservationTtlMs` — lo que de verdad cuenta
+   * contra `maxUses` ahora mismo. */
+  countActiveCouponUses(couponId: number, reservationTtlMs: number): Promise<number>;
+  /** Único punto de escritura de una reserva — transaccional (lock del cupón + chequeo de
+   * límite + insert), nunca una verificación de límite separada del insert. */
+  reserveCouponForConsultant(couponId: number, consultantId: number, input: ReserveCouponInput, reservationTtlMs: number): Promise<ReserveCouponResult>;
+  /** La redención CONFIRMADA vigente de esta consultora ahora mismo (para mostrar "Tenés un
+   * X% de descuento hasta…" en /api/subscription/status) — undefined si no tiene ninguna o ya
+   * venció. */
+  getActiveCouponRedemptionForConsultant(consultantId: number): Promise<(CouponRedemption & { couponCode: string }) | undefined>;
+  /** Redención confirmada cuyo `discountEndsAt` ya pasó y todavía no se revirtió en Mercado
+   * Pago (`priceRevertedAt` null) — para `reconcileSubscriptionPricing`. */
+  getActiveExpiredCouponRedemption(consultantId: number, now: Date): Promise<CouponRedemption | undefined>;
+  markCouponRedemptionReverted(id: number): Promise<void>;
+  /** Admin-only: detalle de un cupón — quiénes lo usaron y cuándo. */
+  listCouponRedemptionsByCoupon(couponId: number): Promise<CouponRedemptionDetailRow[]>;
+
   /** Admin-only: una fila por consultora (con su subscription y su último payment, si los
    * tiene) para el panel de administración de Suscripciones — nunca llama a la API de
    * Mercado Pago, solo lee lo que ya tenemos guardado. */
@@ -939,7 +1060,14 @@ export class DatabaseStorage implements IStorage {
 
   async getPaymentByExternalReference(externalReference: string): Promise<Payment | undefined> {
     const db = await this.getDb();
-    const [payment] = await db.select().from(payments).where(eq(payments.externalReference, externalReference));
+    // externalReference ya no es unique (MP-1): puede haber varios cobros con la misma —
+    // se devuelve el más reciente, de forma determinista.
+    const [payment] = await db
+      .select()
+      .from(payments)
+      .where(eq(payments.externalReference, externalReference))
+      .orderBy(desc(payments.id))
+      .limit(1);
     return payment;
   }
 
@@ -963,19 +1091,27 @@ export class DatabaseStorage implements IStorage {
   async applyApprovedPayment(consultantId: number, input: ApplyApprovedPaymentInput): Promise<ApplyApprovedPaymentResult> {
     const db = await this.getDb();
     return db.transaction(async (tx) => {
+      // FOR UPDATE: bloquea la fila hasta el commit, igual que createSale con el stock —
+      // dos notificaciones casi simultáneas para la misma consultora no pueden pisarse. Va
+      // ANTES del chequeo de idempotencia (MP-1): si el chequeo corriera antes del lock, dos
+      // notificaciones idénticas podrían pasarlo a la vez y la segunda reventaría con un
+      // unique violation en vez de reconocerse como duplicada.
+      const [sub] = await tx.select().from(subscriptions).where(eq(subscriptions.consultantId, consultantId)).for("update");
+
       // Idempotencia: si esta notificación ya se procesó antes (webhook duplicado), no
       // extender el período una segunda vez — mpPaymentId es único por diseño.
       const [existing] = await tx.select().from(payments).where(eq(payments.mpPaymentId, input.mpPaymentId));
       if (existing) return { outcome: "already_processed", payment: existing };
 
-      // FOR UPDATE: bloquea la fila hasta el commit, igual que createSale con el stock —
-      // dos notificaciones casi simultáneas para la misma consultora no pueden pisarse.
-      const [sub] = await tx.select().from(subscriptions).where(eq(subscriptions.consultantId, consultantId)).for("update");
       if (!sub || sub.mpPreapprovalId !== input.mpPreapprovalId) {
         return { outcome: "preapproval_mismatch" };
       }
 
       const now = new Date();
+      // ON CONFLICT (mp_payment_id): el lock de arriba es por consultora, así que no cubre el
+      // mismo mpPaymentId llegando a la vez para dos consultoras distintas — ahí la única
+      // defensa es el unique global. Se traduce a "ya procesado" en vez de una excepción.
+      // `externalReference` NO participa: varios cobros de una suscripción pueden compartirlo.
       const [payment] = await tx
         .insert(payments)
         .values({
@@ -991,7 +1127,13 @@ export class DatabaseStorage implements IStorage {
           rawPayload: input.rawPayload as any,
           paidAt: now,
         })
+        .onConflictDoNothing({ target: payments.mpPaymentId })
         .returning();
+
+      if (!payment) {
+        const [duplicate] = await tx.select().from(payments).where(eq(payments.mpPaymentId, input.mpPaymentId));
+        return { outcome: "already_processed", payment: duplicate };
+      }
 
       // Sin lógica de "renovación anticipada": cada pago aprobado otorga PERIOD_DAYS desde
       // el momento de la confirmación, sin arrastrar días de un período anterior. El cobro
@@ -1011,6 +1153,249 @@ export class DatabaseStorage implements IStorage {
 
       return { outcome: "applied", payment };
     });
+  }
+
+  async confirmCouponRedemption(consultantId: number, confirmedAt: Date): Promise<CouponRedemption | undefined> {
+    const db = await this.getDb();
+    const [reserved] = await db
+      .select()
+      .from(couponRedemptions)
+      .where(and(eq(couponRedemptions.consultantId, consultantId), eq(couponRedemptions.status, "reserved")))
+      .orderBy(desc(couponRedemptions.reservedAt))
+      .limit(1);
+    if (!reserved) return undefined;
+    const [confirmed] = await db
+      .update(couponRedemptions)
+      .set({ status: "confirmed", confirmedAt, discountEndsAt: computeDiscountEndsAtInline(reserved, confirmedAt) })
+      .where(eq(couponRedemptions.id, reserved.id))
+      .returning();
+    return confirmed;
+  }
+
+  async activateFreeSubscription(consultantId: number, input: { couponRedemptionId: number; periodDays: number }): Promise<Payment> {
+    const db = await this.getDb();
+    return db.transaction(async (tx) => {
+      const now = new Date();
+      const [payment] = await tx
+        .insert(payments)
+        .values({
+          consultantId,
+          externalReference: `coupon-${input.couponRedemptionId}`,
+          mpPreapprovalId: null,
+          // Sintético y estable — nunca choca con un mpPaymentId real de Mercado Pago (siempre
+          // numérico) y deja una identidad clara en el ledger para auditar.
+          mpPaymentId: `coupon-free-${input.couponRedemptionId}`,
+          status: "approved",
+          amount: 0,
+          currency: "ARS",
+          periodDaysGranted: input.periodDays,
+          mpStatusDetail: "coupon_100_percent_off",
+          rawPayload: null,
+          paidAt: now,
+        })
+        .returning();
+
+      await tx
+        .update(subscriptions)
+        .set({
+          status: "active",
+          currentPeriodStart: now,
+          currentPeriodEnd: new Date(now.getTime() + input.periodDays * 24 * 60 * 60 * 1000),
+          lastPaymentId: payment.id,
+        })
+        .where(eq(subscriptions.consultantId, consultantId));
+
+      return payment;
+    });
+  }
+
+  async getLatestSubscriptionPriceChange(): Promise<SubscriptionPriceHistoryEntry | undefined> {
+    const db = await this.getDb();
+    const [latest] = await db.select().from(subscriptionPriceHistory).orderBy(desc(subscriptionPriceHistory.changedAt)).limit(1);
+    return latest;
+  }
+
+  async getLatestDuePriceChange(now: Date): Promise<SubscriptionPriceHistoryEntry | undefined> {
+    const db = await this.getDb();
+    const [due] = await db
+      .select()
+      .from(subscriptionPriceHistory)
+      .where(and(eq(subscriptionPriceHistory.appliesTo, "all"), lt(subscriptionPriceHistory.effectiveAt, now)))
+      .orderBy(desc(subscriptionPriceHistory.changedAt))
+      .limit(1);
+    return due;
+  }
+
+  async listSubscriptionPriceHistory(): Promise<SubscriptionPriceHistoryEntry[]> {
+    const db = await this.getDb();
+    return db.select().from(subscriptionPriceHistory).orderBy(desc(subscriptionPriceHistory.changedAt));
+  }
+
+  async createSubscriptionPriceChange(input: CreatePriceChangeInput): Promise<SubscriptionPriceHistoryEntry> {
+    const db = await this.getDb();
+    const [entry] = await db.insert(subscriptionPriceHistory).values(input).returning();
+    return entry;
+  }
+
+  async getCouponByCode(normalizedCode: string): Promise<Coupon | undefined> {
+    const db = await this.getDb();
+    const [coupon] = await db.select().from(coupons).where(eq(coupons.code, normalizedCode));
+    return coupon;
+  }
+
+  async getCouponById(id: number): Promise<Coupon | undefined> {
+    const db = await this.getDb();
+    const [coupon] = await db.select().from(coupons).where(eq(coupons.id, id));
+    return coupon;
+  }
+
+  async listCoupons(): Promise<Coupon[]> {
+    const db = await this.getDb();
+    return db.select().from(coupons).orderBy(desc(coupons.createdAt));
+  }
+
+  async createCoupon(input: CreateCouponInput): Promise<Coupon> {
+    const db = await this.getDb();
+    const [coupon] = await db.insert(coupons).values(input).returning();
+    return coupon;
+  }
+
+  async updateCoupon(id: number, patch: CouponUpdate): Promise<Coupon | undefined> {
+    const db = await this.getDb();
+    const [coupon] = await db.update(coupons).set(patch).where(eq(coupons.id, id)).returning();
+    return coupon;
+  }
+
+  async getCouponRedemption(couponId: number, consultantId: number): Promise<CouponRedemption | undefined> {
+    const db = await this.getDb();
+    const [redemption] = await db
+      .select()
+      .from(couponRedemptions)
+      .where(and(eq(couponRedemptions.couponId, couponId), eq(couponRedemptions.consultantId, consultantId)));
+    return redemption;
+  }
+
+  async getReservedCouponRedemption(consultantId: number): Promise<CouponRedemption | undefined> {
+    const db = await this.getDb();
+    const [redemption] = await db
+      .select()
+      .from(couponRedemptions)
+      .where(and(eq(couponRedemptions.consultantId, consultantId), eq(couponRedemptions.status, "reserved")))
+      .orderBy(desc(couponRedemptions.reservedAt))
+      .limit(1);
+    return redemption;
+  }
+
+  async countActiveCouponUses(couponId: number, reservationTtlMs: number): Promise<number> {
+    const db = await this.getDb();
+    const reservationCutoff = new Date(Date.now() - reservationTtlMs);
+    const [row] = await db
+      .select({ total: count() })
+      .from(couponRedemptions)
+      .where(
+        and(
+          eq(couponRedemptions.couponId, couponId),
+          or(eq(couponRedemptions.status, "confirmed"), and(eq(couponRedemptions.status, "reserved"), gt(couponRedemptions.reservedAt, reservationCutoff))),
+        ),
+      );
+    return row?.total ?? 0;
+  }
+
+  async reserveCouponForConsultant(
+    couponId: number,
+    consultantId: number,
+    input: ReserveCouponInput,
+    reservationTtlMs: number,
+  ): Promise<ReserveCouponResult> {
+    const db = await this.getDb();
+    return db.transaction(async (tx) => {
+      // Lock de la fila del cupón: serializa reservas concurrentes del MISMO cupón — dos
+      // consultoras tocando "Aplicar" al mismo tiempo para el último cupo nunca pasan las dos.
+      const [coupon] = await tx.select().from(coupons).where(eq(coupons.id, couponId)).for("update");
+      if (coupon?.maxUses != null) {
+        const reservationCutoff = new Date(Date.now() - reservationTtlMs);
+        const [row] = await tx
+          .select({ total: count() })
+          .from(couponRedemptions)
+          .where(
+            and(
+              eq(couponRedemptions.couponId, couponId),
+              or(eq(couponRedemptions.status, "confirmed"), and(eq(couponRedemptions.status, "reserved"), gt(couponRedemptions.reservedAt, reservationCutoff))),
+            ),
+          );
+        if ((row?.total ?? 0) >= coupon.maxUses) return { outcome: "limit_reached" };
+      }
+
+      const [redemption] = await tx
+        .insert(couponRedemptions)
+        .values({
+          couponId,
+          consultantId,
+          status: "reserved",
+          discountType: input.discountType,
+          discountValue: input.discountValue,
+          duration: input.duration,
+          durationMonths: input.durationMonths,
+        })
+        .onConflictDoNothing({ target: [couponRedemptions.couponId, couponRedemptions.consultantId] })
+        .returning();
+
+      if (!redemption) return { outcome: "already_used" };
+      return { outcome: "reserved", redemption };
+    });
+  }
+
+  async getActiveCouponRedemptionForConsultant(consultantId: number): Promise<(CouponRedemption & { couponCode: string }) | undefined> {
+    const db = await this.getDb();
+    const now = new Date();
+    const [row] = await db
+      .select({ redemption: couponRedemptions, couponCode: coupons.code })
+      .from(couponRedemptions)
+      .innerJoin(coupons, eq(couponRedemptions.couponId, coupons.id))
+      .where(
+        and(
+          eq(couponRedemptions.consultantId, consultantId),
+          eq(couponRedemptions.status, "confirmed"),
+          or(isNull(couponRedemptions.discountEndsAt), gt(couponRedemptions.discountEndsAt, now)),
+        ),
+      )
+      .orderBy(desc(couponRedemptions.confirmedAt))
+      .limit(1);
+    return row ? { ...row.redemption, couponCode: row.couponCode } : undefined;
+  }
+
+  async getActiveExpiredCouponRedemption(consultantId: number, now: Date): Promise<CouponRedemption | undefined> {
+    const db = await this.getDb();
+    const [redemption] = await db
+      .select()
+      .from(couponRedemptions)
+      .where(
+        and(
+          eq(couponRedemptions.consultantId, consultantId),
+          eq(couponRedemptions.status, "confirmed"),
+          isNotNull(couponRedemptions.discountEndsAt),
+          lt(couponRedemptions.discountEndsAt, now),
+          isNull(couponRedemptions.priceRevertedAt),
+        ),
+      );
+    return redemption;
+  }
+
+  async markCouponRedemptionReverted(id: number): Promise<void> {
+    const db = await this.getDb();
+    await db.update(couponRedemptions).set({ priceRevertedAt: new Date() }).where(eq(couponRedemptions.id, id));
+  }
+
+  async listCouponRedemptionsByCoupon(couponId: number): Promise<CouponRedemptionDetailRow[]> {
+    const db = await this.getDb();
+    const rows = await db
+      .select({ redemption: couponRedemptions, businessName: consultants.businessName, username: users.username })
+      .from(couponRedemptions)
+      .innerJoin(consultants, eq(couponRedemptions.consultantId, consultants.id))
+      .innerJoin(users, and(eq(users.consultantId, consultants.id), eq(users.role, "consultant")))
+      .where(eq(couponRedemptions.couponId, couponId))
+      .orderBy(desc(couponRedemptions.reservedAt));
+    return rows.map((r) => ({ redemption: r.redemption, consultantId: r.redemption.consultantId, businessName: r.businessName, username: r.username }));
   }
 
   async listAdminSubscriptions(): Promise<AdminSubscriptionRow[]> {
@@ -2919,6 +3304,9 @@ export class MemoryStorage implements IStorage {
   private subscriptions: Subscription[] = [];
   private payments: Payment[] = [];
   private passwordResetCodes: PasswordResetCode[] = [];
+  private subscriptionPriceHistory: SubscriptionPriceHistoryEntry[] = [];
+  private coupons: Coupon[] = [];
+  private couponRedemptions: CouponRedemption[] = [];
   private nextUserId = 1;
   private nextConsultantId = 1;
   private nextProductId = 1;
@@ -2931,6 +3319,9 @@ export class MemoryStorage implements IStorage {
   private nextSubscriptionId = 1;
   private nextPaymentId = 1;
   private nextPasswordResetCodeId = 1;
+  private nextPriceHistoryId = 1;
+  private nextCouponId = 1;
+  private nextCouponRedemptionId = 1;
 
   /** Fila de stock de la consultora sobre un producto, creándola con defaults si no existe. */
   private getOrCreateStock(consultantId: number, productId: number): ProductStock {
@@ -3151,6 +3542,7 @@ export class MemoryStorage implements IStorage {
       mpPreapprovalId: null,
       mpPreapprovalCreatedAt: null,
       canceledAt: null,
+      priceHistoryAppliedId: null,
     };
     this.subscriptions.push(sub);
     return sub;
@@ -3164,9 +3556,8 @@ export class MemoryStorage implements IStorage {
   }
 
   async createPendingPayment(consultantId: number, input: CreatePendingPaymentInput): Promise<Payment> {
-    if (this.payments.some((p) => p.externalReference === input.externalReference)) {
-      throw new Error(`Ya existe un payment con externalReference ${input.externalReference}`);
-    }
+    // Sin chequeo de externalReference duplicada: no es unique en Postgres (MP-1), y
+    // MemoryStorage no puede imponer una restricción que la base real no tiene.
     const payment: Payment = {
       id: this.nextPaymentId++,
       consultantId,
@@ -3187,7 +3578,10 @@ export class MemoryStorage implements IStorage {
   }
 
   async getPaymentByExternalReference(externalReference: string): Promise<Payment | undefined> {
-    return this.payments.find((p) => p.externalReference === externalReference);
+    // Más reciente primero (mismo criterio que DatabaseStorage): la referencia puede repetirse.
+    return this.payments
+      .filter((p) => p.externalReference === externalReference)
+      .sort((a, b) => b.id - a.id)[0];
   }
 
   async getPaymentByMpPaymentId(mpPaymentId: string): Promise<Payment | undefined> {
@@ -3240,6 +3634,211 @@ export class MemoryStorage implements IStorage {
     sub.lastPaymentId = payment.id;
 
     return { outcome: "applied", payment };
+  }
+
+  async confirmCouponRedemption(consultantId: number, confirmedAt: Date): Promise<CouponRedemption | undefined> {
+    const reserved = this.couponRedemptions
+      .filter((r) => r.consultantId === consultantId && r.status === "reserved")
+      .sort((a, b) => b.reservedAt.getTime() - a.reservedAt.getTime())[0];
+    if (!reserved) return undefined;
+    reserved.status = "confirmed";
+    reserved.confirmedAt = confirmedAt;
+    reserved.discountEndsAt = computeDiscountEndsAtInline(reserved, confirmedAt);
+    return reserved;
+  }
+
+  async activateFreeSubscription(consultantId: number, input: { couponRedemptionId: number; periodDays: number }): Promise<Payment> {
+    const now = new Date();
+    const payment: Payment = {
+      id: this.nextPaymentId++,
+      consultantId,
+      externalReference: `coupon-${input.couponRedemptionId}`,
+      mpPreapprovalId: null,
+      mpPaymentId: `coupon-free-${input.couponRedemptionId}`,
+      status: "approved",
+      amount: 0,
+      currency: "ARS",
+      periodDaysGranted: input.periodDays,
+      mpStatusDetail: "coupon_100_percent_off",
+      rawPayload: null,
+      createdAt: now,
+      paidAt: now,
+    };
+    this.payments.push(payment);
+
+    const sub = this.subscriptions.find((s) => s.consultantId === consultantId);
+    if (sub) {
+      sub.status = "active";
+      sub.currentPeriodStart = now;
+      sub.currentPeriodEnd = new Date(now.getTime() + input.periodDays * 24 * 60 * 60 * 1000);
+      sub.lastPaymentId = payment.id;
+    }
+
+    return payment;
+  }
+
+  async getLatestSubscriptionPriceChange(): Promise<SubscriptionPriceHistoryEntry | undefined> {
+    return [...this.subscriptionPriceHistory].sort((a, b) => b.changedAt.getTime() - a.changedAt.getTime())[0];
+  }
+
+  async getLatestDuePriceChange(now: Date): Promise<SubscriptionPriceHistoryEntry | undefined> {
+    return this.subscriptionPriceHistory
+      .filter((e) => e.appliesTo === "all" && e.effectiveAt !== null && e.effectiveAt.getTime() < now.getTime())
+      .sort((a, b) => b.changedAt.getTime() - a.changedAt.getTime())[0];
+  }
+
+  async listSubscriptionPriceHistory(): Promise<SubscriptionPriceHistoryEntry[]> {
+    return [...this.subscriptionPriceHistory].sort((a, b) => b.changedAt.getTime() - a.changedAt.getTime());
+  }
+
+  async createSubscriptionPriceChange(input: CreatePriceChangeInput): Promise<SubscriptionPriceHistoryEntry> {
+    const entry: SubscriptionPriceHistoryEntry = {
+      id: this.nextPriceHistoryId++,
+      oldPriceArs: input.oldPriceArs,
+      newPriceArs: input.newPriceArs,
+      appliesTo: input.appliesTo,
+      effectiveAt: input.effectiveAt,
+      changedAt: new Date(),
+      changedByAdminId: input.changedByAdminId,
+    };
+    this.subscriptionPriceHistory.push(entry);
+    return entry;
+  }
+
+  async getCouponByCode(normalizedCode: string): Promise<Coupon | undefined> {
+    return this.coupons.find((c) => c.code === normalizedCode);
+  }
+
+  async getCouponById(id: number): Promise<Coupon | undefined> {
+    return this.coupons.find((c) => c.id === id);
+  }
+
+  async listCoupons(): Promise<Coupon[]> {
+    return [...this.coupons].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  }
+
+  async createCoupon(input: CreateCouponInput): Promise<Coupon> {
+    const coupon: Coupon = {
+      id: this.nextCouponId++,
+      code: input.code,
+      discountType: input.discountType,
+      discountValue: input.discountValue,
+      duration: input.duration,
+      durationMonths: input.durationMonths,
+      maxUses: input.maxUses,
+      expiresAt: input.expiresAt,
+      active: true,
+      createdAt: new Date(),
+      createdByAdminId: input.createdByAdminId,
+    };
+    this.coupons.push(coupon);
+    return coupon;
+  }
+
+  async updateCoupon(id: number, patch: CouponUpdate): Promise<Coupon | undefined> {
+    const coupon = this.coupons.find((c) => c.id === id);
+    if (!coupon) return undefined;
+    Object.assign(coupon, patch);
+    return coupon;
+  }
+
+  async getCouponRedemption(couponId: number, consultantId: number): Promise<CouponRedemption | undefined> {
+    return this.couponRedemptions.find((r) => r.couponId === couponId && r.consultantId === consultantId);
+  }
+
+  async getReservedCouponRedemption(consultantId: number): Promise<CouponRedemption | undefined> {
+    return this.couponRedemptions
+      .filter((r) => r.consultantId === consultantId && r.status === "reserved")
+      .sort((a, b) => b.reservedAt.getTime() - a.reservedAt.getTime())[0];
+  }
+
+  private countActiveCouponUsesSync(couponId: number, reservationTtlMs: number): number {
+    const cutoff = Date.now() - reservationTtlMs;
+    return this.couponRedemptions.filter(
+      (r) => r.couponId === couponId && (r.status === "confirmed" || (r.status === "reserved" && r.reservedAt.getTime() > cutoff)),
+    ).length;
+  }
+
+  async countActiveCouponUses(couponId: number, reservationTtlMs: number): Promise<number> {
+    return this.countActiveCouponUsesSync(couponId, reservationTtlMs);
+  }
+
+  async reserveCouponForConsultant(
+    couponId: number,
+    consultantId: number,
+    input: ReserveCouponInput,
+    reservationTtlMs: number,
+  ): Promise<ReserveCouponResult> {
+    if (this.couponRedemptions.some((r) => r.couponId === couponId && r.consultantId === consultantId)) {
+      return { outcome: "already_used" };
+    }
+    const coupon = this.coupons.find((c) => c.id === couponId);
+    if (coupon?.maxUses != null && this.countActiveCouponUsesSync(couponId, reservationTtlMs) >= coupon.maxUses) {
+      return { outcome: "limit_reached" };
+    }
+    const redemption: CouponRedemption = {
+      id: this.nextCouponRedemptionId++,
+      couponId,
+      consultantId,
+      status: "reserved",
+      discountType: input.discountType,
+      discountValue: input.discountValue,
+      duration: input.duration,
+      durationMonths: input.durationMonths,
+      reservedAt: new Date(),
+      confirmedAt: null,
+      discountEndsAt: null,
+      priceRevertedAt: null,
+    };
+    this.couponRedemptions.push(redemption);
+    return { outcome: "reserved", redemption };
+  }
+
+  async getActiveCouponRedemptionForConsultant(consultantId: number): Promise<(CouponRedemption & { couponCode: string }) | undefined> {
+    const now = Date.now();
+    const redemption = this.couponRedemptions
+      .filter(
+        (r) =>
+          r.consultantId === consultantId &&
+          r.status === "confirmed" &&
+          (r.discountEndsAt === null || r.discountEndsAt.getTime() > now),
+      )
+      .sort((a, b) => (b.confirmedAt?.getTime() ?? 0) - (a.confirmedAt?.getTime() ?? 0))[0];
+    if (!redemption) return undefined;
+    const coupon = this.coupons.find((c) => c.id === redemption.couponId);
+    return { ...redemption, couponCode: coupon?.code ?? "" };
+  }
+
+  async getActiveExpiredCouponRedemption(consultantId: number, now: Date): Promise<CouponRedemption | undefined> {
+    return this.couponRedemptions.find(
+      (r) =>
+        r.consultantId === consultantId &&
+        r.status === "confirmed" &&
+        r.discountEndsAt !== null &&
+        r.discountEndsAt.getTime() < now.getTime() &&
+        r.priceRevertedAt === null,
+    );
+  }
+
+  async markCouponRedemptionReverted(id: number): Promise<void> {
+    const redemption = this.couponRedemptions.find((r) => r.id === id);
+    if (redemption) redemption.priceRevertedAt = new Date();
+  }
+
+  async listCouponRedemptionsByCoupon(couponId: number): Promise<CouponRedemptionDetailRow[]> {
+    return this.couponRedemptions
+      .filter((r) => r.couponId === couponId)
+      .sort((a, b) => b.reservedAt.getTime() - a.reservedAt.getTime())
+      .map((redemption) => {
+        const consultant = this.consultants.find((c) => c.id === redemption.consultantId);
+        const user = this.users.find((u) => u.consultantId === redemption.consultantId && u.role === "consultant");
+        return {
+          redemption,
+          consultantId: redemption.consultantId,
+          businessName: consultant?.businessName ?? "",
+          username: user?.username ?? "",
+        };
+      });
   }
 
   async listAdminSubscriptions(): Promise<AdminSubscriptionRow[]> {

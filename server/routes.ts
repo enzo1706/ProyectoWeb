@@ -34,6 +34,10 @@ import {
   incrementProductStockBatchSchema,
   setProductStockReminderSchema,
   startSubscriptionSchema,
+  updateSubscriptionPriceSchema,
+  createCouponSchema,
+  updateCouponSchema,
+  validateCouponSchema,
   registerConsultantSchema,
   forgotPasswordSchema,
   verifyResetCodeSchema,
@@ -41,13 +45,26 @@ import {
   paymentStatuses,
   type InsertProduct,
   type PaymentStatus,
+  type CouponDiscountType,
+  type CouponDuration,
 } from "@shared/schema";
 import { requireAdmin } from "./middleware/requireAdmin";
 import { requireAuth } from "./middleware/requireAuth";
 import { requireActiveSubscription } from "./middleware/requireActiveSubscription";
 import { slugify } from "@shared/slug";
-import { SUBSCRIPTION_PRICE_ARS, PLAN_NAME } from "./config/subscription";
-import { getConsultantAccessStatus, generateExternalReference, parseConsultantIdFromExternalReference } from "./subscription";
+import { SUBSCRIPTION_PRICE_ARS, PLAN_NAME, PERIOD_DAYS } from "./config/subscription";
+import {
+  getConsultantAccessStatus,
+  generateExternalReference,
+  parseConsultantIdFromExternalReference,
+  getCurrentSubscriptionPriceArs,
+  normalizeCouponCode,
+  validateCouponForConsultant,
+  computeDiscountedPriceArs,
+  computeDiscountEndsAt,
+  COUPON_ERROR_MESSAGES,
+  COUPON_RESERVATION_TTL_MS,
+} from "./subscription";
 import { createSubscriptionPreapproval, getMercadoPagoPayment, verifyWebhookSignature, InvalidWebhookSignatureError } from "./mercadopago";
 
 // Etapa 7.6: hash bcrypt (10 rounds, mismo costo que BCRYPT_SALT_ROUNDS) de un valor fijo
@@ -164,14 +181,8 @@ async function handleApprovedPaymentTopic(paymentId: string | undefined): Promis
     return;
   }
 
-  // El payment ya viene de reconsultar la API real de MP (nunca del payload del webhook), pero
-  // igual puede no coincidir con lo que vendemos — un cambio de precio futuro, una moneda
-  // distinta, o un payment ajeno reutilizado con el mismo external_reference. Nunca se acredita
-  // un período completo por un monto/moneda que no sea exactamente el nuestro.
-  if (payment.transaction_amount !== SUBSCRIPTION_PRICE_ARS || payment.currency_id !== "ARS") {
-    console.error(
-      `Pago ${paymentId} aprobado pero con monto/moneda inesperados (${payment.transaction_amount} ${payment.currency_id}, esperado ${SUBSCRIPTION_PRICE_ARS} ARS) — ignorado`,
-    );
+  if (payment.currency_id !== "ARS") {
+    console.error(`Pago ${paymentId} aprobado pero en una moneda inesperada (${payment.currency_id}, esperado ARS) — ignorado`);
     return;
   }
 
@@ -179,6 +190,32 @@ async function handleApprovedPaymentTopic(paymentId: string | undefined): Promis
   const mpPreapprovalId = payment.point_of_interaction?.transaction_data?.subscription_id;
   if (!consultantId || !mpPreapprovalId) {
     console.error(`Pago ${paymentId} aprobado pero sin external_reference/subscription_id reconocibles — ignorado`);
+    return;
+  }
+
+  // Prompt U — el monto esperado YA NO es un único valor fijo (SUBSCRIPTION_PRICE_ARS):
+  // el precio pudo cambiar (admin) o estar descontado por un cupón reservado para esta
+  // consultora. Se calcula el monto esperado con el MISMO dato que se usó para cotizar el
+  // preapproval — el precio vigente y, si corresponde, el descuento de la reserva más
+  // reciente (confirmada o todavía reservada) de esta consultora.
+  // LIMITACIÓN CONOCIDA, no resuelta: si el admin cambia el precio general en la ventana entre
+  // que la consultora arranca el checkout y Mercado Pago confirma el pago, esta comparación
+  // puede quedar desalineada (no se guarda un snapshot del precio cotizado en ese momento).
+  // Documentado, no bloqueante para el Prompt U — ver informe.
+  const currentPriceArs = await getCurrentSubscriptionPriceArs();
+  let expectedAmount = currentPriceArs;
+  // Primero la reserva pendiente (alta nueva con cupón, todavía sin confirmar en este punto
+  // exacto del flujo) y, si no hay, la redención ya confirmada (renovación de una suscripción
+  // que en su momento tuvo cupón "forever"/"months" vigente).
+  const relevantRedemption =
+    (await storage.getReservedCouponRedemption(consultantId)) ?? (await storage.getActiveCouponRedemptionForConsultant(consultantId));
+  if (relevantRedemption) {
+    expectedAmount = computeDiscountedPriceArs(currentPriceArs, relevantRedemption.discountType as CouponDiscountType, relevantRedemption.discountValue);
+  }
+  if (payment.transaction_amount !== expectedAmount) {
+    console.error(
+      `Pago ${paymentId} aprobado pero con monto inesperado (${payment.transaction_amount}, esperado ${expectedAmount} ARS) — ignorado`,
+    );
     return;
   }
 
@@ -197,6 +234,13 @@ async function handleApprovedPaymentTopic(paymentId: string | undefined): Promis
     console.log(`Pago ${paymentId} ya había sido procesado — notificación duplicada, ignorada`);
   } else {
     console.log(`Pago ${paymentId} aprobado — suscripción activada/renovada para la consultora ${consultantId}`);
+    // Si había un cupón reservado para esta consultora, este es el primer y único momento en
+    // que se confirma (un cupón solo aplica al ALTA, nunca a una renovación — ver Prompt U).
+    try {
+      await storage.confirmCouponRedemption(consultantId, new Date());
+    } catch (error) {
+      console.error(`No se pudo confirmar la redención de cupón de la consultora ${consultantId}:`, error);
+    }
   }
 }
 
@@ -558,6 +602,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(404).json({ error: "El estado de suscripción no aplica para administradores" });
       }
       const access = await getConsultantAccessStatus(req.consultantId);
+      const priceArs = await getCurrentSubscriptionPriceArs();
+      const activeCoupon = await storage.getActiveCouponRedemptionForConsultant(req.consultantId);
       res.json({
         status: access.status,
         hasAccess: access.hasAccess,
@@ -565,11 +611,51 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         currentPeriodStart: access.currentPeriodStart,
         currentPeriodEnd: access.currentPeriodEnd,
         daysRemaining: access.daysRemaining,
-        plan: { name: PLAN_NAME, priceArs: SUBSCRIPTION_PRICE_ARS },
+        plan: { name: PLAN_NAME, priceArs },
+        activeCoupon: activeCoupon
+          ? { code: activeCoupon.couponCode, discountType: activeCoupon.discountType, discountValue: activeCoupon.discountValue, endsAt: activeCoupon.discountEndsAt }
+          : null,
       });
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al consultar el estado de la suscripción" });
+    }
+  });
+
+  /** Preview de solo lectura — no reserva nada. La reserva real pasa en POST /subscription/start. */
+  app.post("/api/subscription/coupon/validate", requireAuth, async (req: Request, res: Response) => {
+    try {
+      if (req.consultantId === null || req.consultantId === undefined) {
+        return res.status(404).json({ error: "Los cupones no aplican para administradores" });
+      }
+      const parsed = validateCouponSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+      const result = await validateCouponForConsultant(parsed.data.code, req.consultantId);
+      if (!result.valid) {
+        return res.status(400).json({ valid: false, error: COUPON_ERROR_MESSAGES[result.reason] });
+      }
+      res.json({
+        valid: true,
+        code: result.coupon.code,
+        discountType: result.coupon.discountType,
+        discountValue: result.coupon.discountValue,
+        duration: result.coupon.duration,
+        durationMonths: result.coupon.durationMonths,
+        originalPriceArs: result.originalPriceArs,
+        discountedPriceArs: result.discountedPriceArs,
+        // Estimado a partir de "ahora" — solo para mostrar "hasta el [fecha]" en el preview.
+        // La fecha real se fija recién cuando se confirma el pago (ver confirmCouponRedemption).
+        estimatedDiscountEndsAt: computeDiscountEndsAt(
+          result.coupon.duration as CouponDuration,
+          result.coupon.durationMonths,
+          new Date(),
+        ),
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al validar el cupón" });
     }
   });
 
@@ -601,6 +687,48 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(409).json({ error: "Ya se está procesando tu suscripción, esperá unos segundos" });
       }
 
+      // Prompt U — cupón opcional: se vuelve a validar Y RECIÉN ACÁ se reserva de verdad
+      // (atómico contra la condición de carrera de "varias pagando a la vez" — ver
+      // storage.reserveCouponForConsultant). El preview de /coupon/validate no reserva nada.
+      let priceArs = await getCurrentSubscriptionPriceArs();
+      if (parsed.data.couponCode) {
+        const validation = await validateCouponForConsultant(parsed.data.couponCode, req.consultantId);
+        if (!validation.valid) {
+          return res.status(400).json({ error: COUPON_ERROR_MESSAGES[validation.reason] });
+        }
+        const reserveResult = await storage.reserveCouponForConsultant(
+          validation.coupon.id,
+          req.consultantId,
+          {
+            discountType: validation.coupon.discountType as CouponDiscountType,
+            discountValue: validation.coupon.discountValue,
+            duration: validation.coupon.duration as CouponDuration,
+            durationMonths: validation.coupon.durationMonths,
+          },
+          COUPON_RESERVATION_TTL_MS,
+        );
+        if (reserveResult.outcome === "limit_reached") {
+          return res.status(400).json({ error: COUPON_ERROR_MESSAGES.limit_reached });
+        }
+        if (reserveResult.outcome === "already_used") {
+          return res.status(400).json({ error: COUPON_ERROR_MESSAGES.already_used });
+        }
+        priceArs = computeDiscountedPriceArs(priceArs, validation.coupon.discountType as CouponDiscountType, validation.coupon.discountValue);
+
+        // Cupón de 100%: se activa directo, sin pasar por Mercado Pago — nunca se crea un
+        // preapproval de $0 (MP no lo acepta de forma consistente y no tiene sentido).
+        if (priceArs === 0) {
+          await storage.activateFreeSubscription(req.consultantId, {
+            couponRedemptionId: reserveResult.redemption.id,
+            periodDays: PERIOD_DAYS,
+          });
+          // El pago de $0 no pasa por el webhook (nunca hubo Mercado Pago de por medio) — se
+          // confirma la redención acá mismo, en el mismo momento en que se activa el acceso.
+          await storage.confirmCouponRedemption(req.consultantId, new Date());
+          return res.json({ initPoint: null, activatedWithoutPayment: true });
+        }
+      }
+
       // Hallazgo R3 de la auditoría de Mercado Pago (confirmado en producción, Etapa post-MP-2):
       // acá ANTES se pisaba el email de cuenta/recuperación de la consultora con el
       // payer_email tipeado en el diálogo, antes siquiera de llamar a MP. Dos problemas reales:
@@ -615,6 +743,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         externalReference,
         payerEmail: parsed.data.email,
         backUrl: `${req.protocol}://${req.get("host")}/subscription/success`,
+        amount: priceArs,
       });
 
       await storage.updateSubscription(req.consultantId, {
@@ -1506,6 +1635,126 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al listar consultoras" });
+    }
+  });
+
+  // ---------------------------------------------------------------------------------------
+  // Prompt U — admin: precio de la suscripción y cupones. Toda esta sección ya está detrás de
+  // `app.use("/api/admin", requireAdmin)`, montado arriba — no hace falta repetir el guard acá.
+  // ---------------------------------------------------------------------------------------
+
+  app.get("/api/admin/subscription-price", async (_req: Request, res: Response) => {
+    try {
+      const [currentPriceArs, history] = await Promise.all([getCurrentSubscriptionPriceArs(), storage.listSubscriptionPriceHistory()]);
+      res.json({ currentPriceArs, history });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al consultar el precio de la suscripción" });
+    }
+  });
+
+  app.put("/api/admin/subscription-price", async (req: Request, res: Response) => {
+    try {
+      const parsed = updateSubscriptionPriceSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+      if (parsed.data.appliesTo === "all" && !parsed.data.effectiveAt) {
+        return res.status(400).json({ error: "Elegí desde cuándo aplica a las suscripciones actuales" });
+      }
+      const oldPriceArs = await getCurrentSubscriptionPriceArs();
+      const entry = await storage.createSubscriptionPriceChange({
+        oldPriceArs,
+        newPriceArs: parsed.data.newPriceArs,
+        appliesTo: parsed.data.appliesTo,
+        effectiveAt: parsed.data.appliesTo === "all" ? new Date(parsed.data.effectiveAt!) : null,
+        changedByAdminId: req.session.userId ?? null,
+      });
+      res.status(201).json(entry);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar el precio de la suscripción" });
+    }
+  });
+
+  app.get("/api/admin/coupons", async (_req: Request, res: Response) => {
+    try {
+      const list = await storage.listCoupons();
+      // activeUses: confirmados + reservados recientes — lo mismo que cuenta contra maxUses
+      // en el momento de aplicar un cupón, para que "Agotado" en la tabla sea consistente con
+      // el motivo real por el que una consultora puede recibir ese error.
+      const enriched = await Promise.all(
+        list.map(async (coupon) => ({ ...coupon, activeUses: await storage.countActiveCouponUses(coupon.id, COUPON_RESERVATION_TTL_MS) })),
+      );
+      res.json(enriched);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al listar cupones" });
+    }
+  });
+
+  app.post("/api/admin/coupons", async (req: Request, res: Response) => {
+    try {
+      const parsed = createCouponSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+      const code = normalizeCouponCode(parsed.data.code);
+      const existing = await storage.getCouponByCode(code);
+      if (existing) {
+        return res.status(409).json({ error: "Ya existe un cupón con ese código" });
+      }
+      const coupon = await storage.createCoupon({
+        code,
+        discountType: parsed.data.discountType,
+        discountValue: parsed.data.discountValue,
+        duration: parsed.data.duration,
+        durationMonths: parsed.data.durationMonths ?? null,
+        maxUses: parsed.data.maxUses ?? null,
+        expiresAt: parsed.data.expiresAt ? new Date(parsed.data.expiresAt) : null,
+        createdByAdminId: req.session.userId ?? null,
+      });
+      res.status(201).json(coupon);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al crear el cupón" });
+    }
+  });
+
+  /** Detalle de un cupón: datos + quiénes lo usaron (busca-usos del admin). */
+  app.get("/api/admin/coupons/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) return res.status(400).json({ error: "ID inválido" });
+      const coupon = await storage.getCouponById(id);
+      if (!coupon) return res.status(404).json({ error: "Cupón no encontrado" });
+      const [redemptions, activeUses] = await Promise.all([
+        storage.listCouponRedemptionsByCoupon(id),
+        storage.countActiveCouponUses(id, COUPON_RESERVATION_TTL_MS),
+      ]);
+      res.json({ coupon: { ...coupon, activeUses }, redemptions });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al consultar el cupón" });
+    }
+  });
+
+  app.patch("/api/admin/coupons/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) return res.status(400).json({ error: "ID inválido" });
+      const parsed = updateCouponSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+      const { expiresAt, ...rest } = parsed.data;
+      const patch = { ...rest, ...(expiresAt !== undefined ? { expiresAt: expiresAt ? new Date(expiresAt) : null } : {}) };
+      const updated = await storage.updateCoupon(id, patch);
+      if (!updated) return res.status(404).json({ error: "Cupón no encontrado" });
+      res.json(updated);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar el cupón" });
     }
   });
 

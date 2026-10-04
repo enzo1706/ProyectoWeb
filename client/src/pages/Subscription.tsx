@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
-import { apiRequest } from "@/lib/queryClient";
+import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import {
   Card,
@@ -22,7 +22,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { CreditCard, CheckCircle2, Clock, AlertTriangle } from "lucide-react";
+import { CreditCard, CheckCircle2, Clock, AlertTriangle, Tag, X } from "lucide-react";
 
 interface SubscriptionStatusResponse {
   status: "trial" | "active" | "expired" | "canceled";
@@ -32,6 +32,19 @@ interface SubscriptionStatusResponse {
   currentPeriodEnd: string | null;
   daysRemaining: number;
   plan: { name: string; priceArs: number };
+  activeCoupon: { code: string; discountType: "percentage" | "fixed"; discountValue: number; endsAt: string | null } | null;
+}
+
+interface CouponPreview {
+  valid: true;
+  code: string;
+  discountType: "percentage" | "fixed";
+  discountValue: number;
+  duration: "first_payment" | "months" | "forever";
+  durationMonths: number | null;
+  originalPriceArs: number;
+  discountedPriceArs: number;
+  estimatedDiscountEndsAt: string | null;
 }
 
 const FEATURES = [
@@ -54,27 +67,70 @@ function formatPrice(priceArs: number): string {
   return priceArs.toLocaleString("es-AR");
 }
 
+function couponExplanation(coupon: CouponPreview): string {
+  const discounted = `Pagás $${formatPrice(coupon.discountedPriceArs)} ARS`;
+  if (coupon.duration === "first_payment") return `¡Cupón aplicado! ${discounted} tu primer mes. Después, $${formatPrice(coupon.originalPriceArs)} ARS.`;
+  if (coupon.duration === "forever") return `¡Cupón aplicado! ${discounted} por mes, para siempre.`;
+  return `¡Cupón aplicado! ${discounted} por mes durante ${coupon.durationMonths} ${coupon.durationMonths === 1 ? "mes" : "meses"}. Después, $${formatPrice(coupon.originalPriceArs)} ARS.`;
+}
+
+function activeCouponExplanation(coupon: NonNullable<SubscriptionStatusResponse["activeCoupon"]>): string {
+  const value = coupon.discountType === "percentage" ? `${coupon.discountValue}%` : `$${formatPrice(coupon.discountValue)}`;
+  return coupon.endsAt ? `Tenés un ${value} de descuento hasta el ${formatDate(coupon.endsAt)}.` : `Tenés un ${value} de descuento para siempre.`;
+}
+
 export default function Subscription() {
   const { toast } = useToast();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [email, setEmail] = useState("");
+  const [couponFieldOpen, setCouponFieldOpen] = useState(false);
+  const [couponCode, setCouponCode] = useState("");
+  const [appliedCoupon, setAppliedCoupon] = useState<CouponPreview | null>(null);
+  const [couponError, setCouponError] = useState<string | null>(null);
 
   const { data: status, isLoading, isError, error } = useQuery<SubscriptionStatusResponse>({
     queryKey: ["/api/subscription/status"],
   });
 
-  const startMutation = useGuardedMutation({
+  const validateCouponMutation = useGuardedMutation({
     mutationFn: async () => {
-      const res = await apiRequest("POST", "/api/subscription/start", { email });
-      return res.json() as Promise<{ initPoint: string }>;
+      const res = await apiRequest("POST", "/api/subscription/coupon/validate", { code: couponCode });
+      return res.json() as Promise<CouponPreview>;
     },
     onSuccess: (data) => {
-      window.location.href = data.initPoint;
+      setAppliedCoupon(data);
+      setCouponError(null);
+    },
+    onError: (err: Error) => {
+      setAppliedCoupon(null);
+      setCouponError(err.message);
+    },
+  });
+
+  const startMutation = useGuardedMutation({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", "/api/subscription/start", {
+        email,
+        ...(appliedCoupon ? { couponCode: appliedCoupon.code } : {}),
+      });
+      return res.json() as Promise<{ initPoint: string | null; activatedWithoutPayment?: boolean }>;
+    },
+    onSuccess: (data) => {
+      if (data.activatedWithoutPayment) {
+        // Cupón de 100% off: no hay a dónde redirigir, el acceso ya está activo.
+        queryClient.invalidateQueries({ queryKey: ["/api/subscription/status"] });
+        setDialogOpen(false);
+        toast({ title: "¡Listo! Tu suscripción ya está activa", description: "Tu cupón cubrió el 100% del pago." });
+        return;
+      }
+      window.location.href = data.initPoint!;
     },
     onError: (err: Error) => {
       toast({ title: "No se pudo iniciar el pago", description: err.message, variant: "destructive" });
     },
   });
+
+  const displayPriceArs = appliedCoupon ? appliedCoupon.discountedPriceArs : status?.plan.priceArs ?? 0;
 
   return (
     <div className="p-4 sm:p-6 space-y-6 max-w-2xl" data-testid="page-subscription">
@@ -117,6 +173,11 @@ export default function Subscription() {
                       Próximo vencimiento: {formatDate(status.currentPeriodEnd)} ({status.daysRemaining}{" "}
                       {status.daysRemaining === 1 ? "día" : "días"} restantes).
                     </p>
+                    {status.activeCoupon && (
+                      <p className="text-sm text-primary mt-1" data-testid="text-active-coupon">
+                        {activeCouponExplanation(status.activeCoupon)}
+                      </p>
+                    )}
                   </div>
                 </div>
               )}
@@ -180,15 +241,85 @@ export default function Subscription() {
                 <span className="text-muted-foreground">Período</span>
                 <span className="font-medium">30 días</span>
               </div>
-              <div className="flex justify-between">
+              <div className="flex justify-between items-center">
                 <span className="text-muted-foreground">Total</span>
-                <span className="font-medium">${status ? formatPrice(status.plan.priceArs) : ""} ARS</span>
+                {appliedCoupon ? (
+                  <span className="font-medium flex items-center gap-2">
+                    <span className="line-through text-muted-foreground text-xs">${formatPrice(appliedCoupon.originalPriceArs)}</span>
+                    ${formatPrice(displayPriceArs)} ARS
+                  </span>
+                ) : (
+                  <span className="font-medium">${status ? formatPrice(displayPriceArs) : ""} ARS</span>
+                )}
               </div>
               <div className="flex justify-between">
                 <span className="text-muted-foreground">Método de pago</span>
-                <span className="font-medium">Mercado Pago</span>
+                <span className="font-medium">{displayPriceArs === 0 ? "Sin cargo (cupón 100%)" : "Mercado Pago"}</span>
               </div>
             </div>
+
+            {!appliedCoupon && !couponFieldOpen && (
+              <button
+                type="button"
+                onClick={() => setCouponFieldOpen(true)}
+                className="text-sm text-primary hover:underline flex items-center gap-1.5"
+                data-testid="link-tengo-cupon"
+              >
+                <Tag className="h-3.5 w-3.5" />
+                ¿Tenés un cupón de descuento?
+              </button>
+            )}
+
+            {!appliedCoupon && couponFieldOpen && (
+              <div className="space-y-2">
+                <Label htmlFor="input-coupon-code">Código de cupón</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="input-coupon-code"
+                    value={couponCode}
+                    onChange={(e) => {
+                      setCouponCode(e.target.value.toUpperCase());
+                      setCouponError(null);
+                    }}
+                    placeholder="CONSULTORA123"
+                    data-testid="input-coupon-code"
+                  />
+                  <Button
+                    variant="outline"
+                    onClick={() => validateCouponMutation.mutate()}
+                    disabled={!couponCode || validateCouponMutation.isPending}
+                    data-testid="button-aplicar-cupon"
+                  >
+                    Aplicar
+                  </Button>
+                </div>
+                {couponError && (
+                  <p className="text-sm text-destructive" data-testid="text-coupon-error">{couponError}</p>
+                )}
+              </div>
+            )}
+
+            {appliedCoupon && (
+              <div className="rounded-lg border border-primary/30 bg-primary/5 p-3 text-sm space-y-1" data-testid="card-applied-coupon">
+                <div className="flex items-start justify-between gap-2">
+                  <p className="font-medium text-primary">{couponExplanation(appliedCoupon)}</p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAppliedCoupon(null);
+                      setCouponCode("");
+                      setCouponFieldOpen(false);
+                    }}
+                    className="text-muted-foreground hover:text-foreground shrink-0"
+                    aria-label="Quitar cupón"
+                    data-testid="button-quitar-cupon"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+
             <div className="space-y-1.5">
               <Label htmlFor="input-subscription-email">Email para Mercado Pago</Label>
               <Input

@@ -276,13 +276,20 @@ export type PaymentStatus = (typeof paymentStatuses)[number];
  * cobro — es una entidad distinta de `mpPaymentId`, nunca se mezclan: un preapproval es la
  * suscripción recurrente en sí, un payment es cada cobro individual que genera.
  *
+ * `externalReference` es una referencia de CORRELACIÓN (`sub-{consultantId}-{uuid}`, la misma
+ * que se le manda a MP al crear el preapproval), NO una identidad del cobro: varios cobros de
+ * una misma suscripción pueden compartirla, así que NO es unique (MP-1). La relación
+ * payment → suscripción → consultora se apoya en `mpPreapprovalId` + `consultantId`,
+ * validados contra `subscriptions.mpPreapprovalId` dentro de la transacción de
+ * `applyApprovedPayment`.
+ *
  * Única excepción a la convención de fechas del resto del schema (texto "YYYY-MM-DD"): acá se
  * usa `timestamp` real porque el cálculo de vencimiento necesita hora exacta, no solo fecha.
  */
 export const payments = pgTable("payments", {
   id: serial("id").primaryKey(),
   consultantId: integer("consultant_id").notNull().references(() => consultants.id),
-  externalReference: text("external_reference").notNull().unique(),
+  externalReference: text("external_reference").notNull(),
   mpPreapprovalId: text("mp_preapproval_id"),
   mpPaymentId: text("mp_payment_id").unique(),
   status: text("status").notNull().default(paymentStatuses[0]),
@@ -323,9 +330,111 @@ export const subscriptions = pgTable("subscriptions", {
   mpPreapprovalId: text("mp_preapproval_id"),
   mpPreapprovalCreatedAt: timestamp("mp_preapproval_created_at", { withTimezone: true }),
   canceledAt: timestamp("canceled_at", { withTimezone: true }),
+  // Último `subscriptionPriceHistory.id` que ya se le aplicó de verdad a ESTA consultora (vía
+  // PUT al preapproval de Mercado Pago). Null = nunca se le aplicó ningún cambio "a las
+  // actuales". Mecanismo perezoso (ver server/subscription.ts applyPendingPriceChange): no hay
+  // scheduler en la infraestructura, así que un cambio de precio con fecha futura se aplica la
+  // próxima vez que se calcula el acceso de esta consultora, no exactamente en esa fecha.
+  priceHistoryAppliedId: integer("price_history_applied_id"),
 }, (table) => ({
   statusIdx: index("subscriptions_status_idx").on(table.status),
   currentPeriodEndIdx: index("subscriptions_current_period_end_idx").on(table.currentPeriodEnd),
+}));
+
+export const priceChangeScopes = ["new_only", "all"] as const;
+export type PriceChangeScope = (typeof priceChangeScopes)[number];
+
+/**
+ * Historial de precios de la suscripción (Prompt U) — también es la fuente del precio VIGENTE:
+ * la fila más reciente (`changedAt` más nuevo) define cuánto paga una consultora nueva, sin
+ * excepción. `appliesTo` decide además si las consultoras YA suscriptas también lo reciben:
+ * - "new_only": solo las altas nuevas ven este precio; las activas conservan el monto de su
+ *   propio preapproval en Mercado Pago (nunca se les toca nada).
+ * - "all": las activas también pasan a este precio desde `effectiveAt` — aplicado de forma
+ *   perezosa (ver `subscriptions.priceHistoryAppliedId`), nunca con un cron real.
+ */
+export const subscriptionPriceHistory = pgTable("subscription_price_history", {
+  id: serial("id").primaryKey(),
+  oldPriceArs: integer("old_price_ars"),
+  newPriceArs: integer("new_price_ars").notNull(),
+  appliesTo: text("applies_to").notNull().default(priceChangeScopes[0]),
+  // Solo relevante cuando appliesTo === "all" — desde cuándo rige para las ya suscriptas.
+  // Null cuando appliesTo === "new_only" (no hay fecha: nunca se les aplica).
+  effectiveAt: timestamp("effective_at", { withTimezone: true }),
+  changedAt: timestamp("changed_at", { withTimezone: true }).notNull().defaultNow(),
+  changedByAdminId: integer("changed_by_admin_id").references(() => users.id),
+}, (table) => ({
+  changedAtIdx: index("subscription_price_history_changed_at_idx").on(table.changedAt),
+}));
+
+export const couponDiscountTypes = ["percentage", "fixed"] as const;
+export type CouponDiscountType = (typeof couponDiscountTypes)[number];
+export const couponDurations = ["first_payment", "months", "forever"] as const;
+export type CouponDuration = (typeof couponDurations)[number];
+
+/**
+ * Cupones de descuento (Prompt U), administrados por el admin. `code` siempre se guarda en
+ * mayúsculas (ver server/subscription.ts normalizeCouponCode) — al usarlo no importan las
+ * mayúsculas/minúsculas que tipee la consultora. Editar un cupón nunca altera las condiciones
+ * de quien ya lo usó: eso vive congelado en `couponRedemptions` (snapshot al momento de uso).
+ */
+export const coupons = pgTable("coupons", {
+  id: serial("id").primaryKey(),
+  code: text("code").notNull().unique(),
+  discountType: text("discount_type").notNull(),
+  discountValue: integer("discount_value").notNull(),
+  duration: text("duration").notNull(),
+  // Solo cuando duration === "months".
+  durationMonths: integer("duration_months"),
+  // Null = sin límite de usos.
+  maxUses: integer("max_uses"),
+  expiresAt: timestamp("expires_at", { withTimezone: true }),
+  active: boolean("active").notNull().default(true),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  createdByAdminId: integer("created_by_admin_id").references(() => users.id),
+});
+
+export const couponRedemptionStatuses = ["reserved", "confirmed", "released"] as const;
+export type CouponRedemptionStatus = (typeof couponRedemptionStatuses)[number];
+
+/**
+ * Un uso de un cupón. `status` empieza en "reserved" al tocar "Aplicar" en el diálogo de pago
+ * (reserva el cupo mientras la consultora paga) y pasa a "confirmed" recién cuando se aprueba
+ * el pago real (ver applyApprovedPayment) — así un pago rechazado o abandonado nunca ocupa un
+ * cupo. El límite de usos de un cupón cuenta las filas "confirmed" MÁS las "reserved" recientes
+ * (ver COUPON_RESERVATION_TTL_MS) — sin esto, una reserva abandonada quedaría ocupando un cupo
+ * para siempre, y no hay scheduler para "liberarla" sola.
+ *
+ * `unique(couponId, consultantId)`: una consultora usa un cupón una sola vez — el choque de esa
+ * unique es justamente lo que impide reusarlo (no una verificación aparte con condición de
+ * carrera).
+ */
+export const couponRedemptions = pgTable("coupon_redemptions", {
+  id: serial("id").primaryKey(),
+  couponId: integer("coupon_id").notNull().references(() => coupons.id),
+  consultantId: integer("consultant_id").notNull().references(() => consultants.id),
+  status: text("status").notNull().default(couponRedemptionStatuses[0]),
+  // Snapshot de las condiciones del cupón al momento de usarlo — editar el cupón después nunca
+  // cambia lo que ya está acá.
+  discountType: text("discount_type").notNull(),
+  discountValue: integer("discount_value").notNull(),
+  duration: text("duration").notNull(),
+  durationMonths: integer("duration_months"),
+  reservedAt: timestamp("reserved_at", { withTimezone: true }).notNull().defaultNow(),
+  confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
+  // Hasta cuándo rige el descuento para ESTA consultora — null para "forever" (nunca vuelve al
+  // precio normal) y para "first_payment" sin vencimiento futuro (se revierte apenas se
+  // confirma ese primer pago, no hace falta una fecha).
+  discountEndsAt: timestamp("discount_ends_at", { withTimezone: true }),
+  // Cuándo se le mandó de verdad el PUT a Mercado Pago volviendo el preapproval al precio
+  // normal. Null = todavía no (o no hace falta, ej. "forever"). Mecanismo perezoso, mismo
+  // criterio que `subscriptions.priceHistoryAppliedId` — evita reintentar el PUT en cada
+  // request una vez que ya se aplicó.
+  priceRevertedAt: timestamp("price_reverted_at", { withTimezone: true }),
+}, (table) => ({
+  couponConsultantUnique: unique("coupon_redemptions_coupon_consultant_unique").on(table.couponId, table.consultantId),
+  consultantIdx: index("coupon_redemptions_consultant_id_idx").on(table.consultantId),
+  couponIdx: index("coupon_redemptions_coupon_id_idx").on(table.couponId),
 }));
 
 /**
@@ -390,6 +499,12 @@ export type Payment = typeof payments.$inferSelect;
 export type InsertPayment = typeof payments.$inferInsert;
 export type Subscription = typeof subscriptions.$inferSelect;
 export type InsertSubscription = typeof subscriptions.$inferInsert;
+export type SubscriptionPriceHistoryEntry = typeof subscriptionPriceHistory.$inferSelect;
+export type InsertSubscriptionPriceHistoryEntry = typeof subscriptionPriceHistory.$inferInsert;
+export type Coupon = typeof coupons.$inferSelect;
+export type InsertCoupon = typeof coupons.$inferInsert;
+export type CouponRedemption = typeof couponRedemptions.$inferSelect;
+export type InsertCouponRedemption = typeof couponRedemptions.$inferInsert;
 
 export const insertUserSchema = createInsertSchema(users).omit({ id: true });
 export const insertProductSchema = createInsertSchema(products);
@@ -655,9 +770,56 @@ export const loginSchema = z.object({
 });
 
 /** Autogestión: la consultora lo carga recién al iniciar su primera suscripción — Mercado
- * Pago exige payer_email para crear el preapproval. Ver POST /api/subscription/start. */
+ * Pago exige payer_email para crear el preapproval. Ver POST /api/subscription/start.
+ * `couponCode` opcional: si viene, ya tiene que haber sido validado antes con
+ * POST /api/subscription/coupon/validate (acá solo se vuelve a chequear server-side). */
 export const startSubscriptionSchema = z.object({
   email: z.string().trim().min(1, "El email es obligatorio").email("Ingresá un email válido"),
+  couponCode: z.string().trim().min(1).optional(),
+});
+
+/** Prompt U — admin: cambiar el precio vigente de la suscripción. */
+export const updateSubscriptionPriceSchema = z.object({
+  newPriceArs: z.number().int().positive("El precio tiene que ser mayor a 0"),
+  appliesTo: z.enum(priceChangeScopes),
+  // Obligatorio y futuro solo cuando appliesTo === "all" — se valida en el handler, no acá
+  // (zod no tiene fácil validación cruzada legible sin .refine anidado innecesario).
+  effectiveAt: z.string().datetime().optional(),
+});
+
+/** Prompt U — admin: alta de cupón. El código se normaliza a mayúsculas en el backend, nunca
+ * en el frontend (una sola fuente de la normalización). */
+export const createCouponSchema = z
+  .object({
+    code: z.string().trim().min(3, "El código tiene que tener al menos 3 caracteres").regex(/^\S+$/, "Sin espacios"),
+    discountType: z.enum(couponDiscountTypes),
+    discountValue: z.number().int().positive(),
+    duration: z.enum(couponDurations),
+    durationMonths: z.number().int().positive().optional(),
+    maxUses: z.number().int().positive().optional(),
+    expiresAt: z.string().datetime().optional(),
+  })
+  .refine((v) => v.discountType !== "percentage" || v.discountValue <= 100, {
+    message: "El porcentaje no puede superar 100",
+    path: ["discountValue"],
+  })
+  .refine((v) => v.duration !== "months" || v.durationMonths !== undefined, {
+    message: "Elegí la cantidad de meses",
+    path: ["durationMonths"],
+  });
+
+export const updateCouponSchema = z.object({
+  discountType: z.enum(couponDiscountTypes).optional(),
+  discountValue: z.number().int().positive().optional(),
+  duration: z.enum(couponDurations).optional(),
+  durationMonths: z.number().int().positive().optional(),
+  maxUses: z.number().int().positive().nullable().optional(),
+  expiresAt: z.string().datetime().nullable().optional(),
+  active: z.boolean().optional(),
+});
+
+export const validateCouponSchema = z.object({
+  code: z.string().trim().min(1, "Ingresá un código"),
 });
 
 // ---------------------------------------------------------------------------

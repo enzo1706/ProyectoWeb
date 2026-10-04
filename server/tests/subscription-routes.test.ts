@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from "vitest";
 import type { AddressInfo } from "net";
 import type { Server } from "http";
+import { SUBSCRIPTION_PRICE_ARS } from "../config/subscription";
 
 // Modo memoria, sin tocar Postgres/Supabase real.
 process.env.NODE_ENV = "test";
@@ -84,7 +85,7 @@ describe("POST /api/subscription/start", () => {
     expect(createSubscriptionPreapprovalMock).not.toHaveBeenCalled();
   });
 
-  it("4. un monto/precio enviado por el frontend se ignora silenciosamente (el schema no tiene ese campo)", async () => {
+  it("4. un monto/precio enviado por el frontend se ignora silenciosamente — el monto real siempre lo calcula el backend (Prompt U)", async () => {
     const { cookie } = await createConsultant(`vitest_sub_price_${Date.now()}`);
     const res = await fetch(`${baseUrl}/api/subscription/start`, {
       method: "POST",
@@ -93,7 +94,11 @@ describe("POST /api/subscription/start", () => {
     });
     expect(res.status).toBe(200);
     const sentBody = createSubscriptionPreapprovalMock.mock.calls[0][0];
-    expect(sentBody).not.toHaveProperty("amount");
+    // El campo `amount` SÍ existe (el backend lo calcula y lo manda siempre, desde Prompt U) —
+    // lo que se verifica es que NUNCA sea el valor inyectado por el cliente, sino el precio
+    // real vigente. `transaction_amount`/`precio` nunca fueron nombres de campo reales.
+    expect(sentBody.amount).not.toBe(1);
+    expect(sentBody.amount).toBe(SUBSCRIPTION_PRICE_ARS);
     expect(sentBody).not.toHaveProperty("transaction_amount");
     expect(sentBody).not.toHaveProperty("precio");
   });

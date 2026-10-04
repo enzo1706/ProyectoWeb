@@ -21,6 +21,10 @@ export interface CreateSubscriptionPreapprovalInput {
   externalReference: string;
   payerEmail: string;
   backUrl: string;
+  /** Monto a cobrar — nunca lo decide el frontend. Default: SUBSCRIPTION_PRICE_ARS (precio sin
+   * descuento). Lo pasa el caller cuando hay un cupón aplicado (Prompt U), ya calculado por
+   * server/subscription.ts, nunca a partir de un valor que mande el cliente. */
+  amount?: number;
 }
 
 export interface CreatedPreapproval {
@@ -65,7 +69,7 @@ export async function createSubscriptionPreapproval(input: CreateSubscriptionPre
         // por pago aprobado) — esto es únicamente el límite que Mercado Pago exige para su
         // propio cobro recurrente automático del lado de ellos.
         end_date: endDate.toISOString(),
-        transaction_amount: SUBSCRIPTION_PRICE_ARS,
+        transaction_amount: input.amount ?? SUBSCRIPTION_PRICE_ARS,
         currency_id: "ARS",
       },
     },
@@ -74,6 +78,21 @@ export async function createSubscriptionPreapproval(input: CreateSubscriptionPre
     throw new Error("Mercado Pago no devolvió id/init_point al crear el preapproval");
   }
   return { id: response.id, initPoint: response.init_point, status: response.status ?? "pending" };
+}
+
+/**
+ * Prompt U — cambia el monto de un preapproval YA autorizado, sin que la consultora tenga que
+ * volver a autorizar nada (campo documentado como editable en `PUT /preapproval/{id}`, ver
+ * https://www.mercadopago.com.ar/developers/en/reference/online-payments/subscriptions/update-preapproval/put).
+ * IMPORTANTE: la documentación oficial NO aclara desde qué cobro exacto rige el nuevo monto —
+ * no asumido, hay que confirmarlo con una prueba real contra una suscripción TEST antes de
+ * confiar en esto para cobros reales (ver informe del Prompt U). Se usa tanto para "cambio de
+ * precio a las suscripciones actuales" como para revertir el monto cuando vence un descuento
+ * de cupón con duración limitada.
+ */
+export async function updatePreapprovalAmount(id: string, amount: number): Promise<void> {
+  const preApproval = new PreApproval(getConfig());
+  await preApproval.update({ id, body: { auto_recurring: { transaction_amount: amount, currency_id: "ARS" } } });
 }
 
 /** Server-to-server: nunca se confía en el payload del webhook por sí solo, siempre se

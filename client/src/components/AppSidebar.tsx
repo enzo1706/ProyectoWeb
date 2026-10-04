@@ -9,6 +9,7 @@ import {
   BarChart3,
   Settings,
   CreditCard,
+  Tag,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import {
@@ -50,6 +51,7 @@ const adminMenuItems: MenuItem[] = [
   { title: "Consultoras", url: "/admin/usuarios", icon: Users },
   { title: "Catálogo", url: "/admin/productos", icon: Package },
   { title: "Suscripciones", url: "/admin/suscripciones", icon: CreditCard },
+  { title: "Precio y cupones", url: "/admin/suscripcion-precio", icon: Tag },
 ];
 
 function isItemActive(location: string, url: string) {
