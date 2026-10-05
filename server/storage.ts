@@ -13,6 +13,7 @@ import {
   subscriptionPriceHistory,
   coupons,
   couponRedemptions,
+  orderDiscountLog,
   passwordResetCodes,
   createSaleSchema,
   updateSaleSchema,
@@ -48,6 +49,7 @@ import {
   type CouponDuration,
   type CouponRedemption,
   type CouponRedemptionStatus,
+  type OrderDiscountLogEntry,
 } from "@shared/schema";
 import { normalizeEmail } from "@shared/email";
 import {
@@ -581,6 +583,11 @@ export interface IStorage {
   listConsultantAccounts(): Promise<Consultant[]>;
   getBusinessSettings(consultantId: number): Promise<Consultant | undefined>;
   updateBusinessSettings(consultantId: number, input: UpdateBusinessSettingsInput): Promise<Consultant | undefined>;
+  /** Prompt 1/2 — una fila por pedido confirmado, para calcular el "descuento de compra
+   * habitual" (ver server/orderDiscount.ts). Append-only, nunca se edita ni se borra. */
+  createOrderDiscountLogEntry(consultantId: number, input: { discountPercent: number; publicValueArs: number }): Promise<OrderDiscountLogEntry>;
+  listOrderDiscountLogSince(consultantId: number, since: Date): Promise<OrderDiscountLogEntry[]>;
+  getLatestOrderDiscountLogEntry(consultantId: number): Promise<OrderDiscountLogEntry | undefined>;
   /** Autogestión: la consultora lo carga la primera vez que inicia una suscripción (Mercado
    * Pago exige payer_email) — no hay alta desde el admin. */
   setConsultantEmail(consultantId: number, email: string): Promise<Consultant | undefined>;
@@ -914,10 +921,41 @@ export class DatabaseStorage implements IStorage {
         currency: input.currency,
         monthlyGoal: input.monthlyGoal ?? null,
         defaultLowStockThreshold: input.defaultLowStockThreshold ?? null,
+        orderReminderDay1: input.orderReminderDay1 ?? null,
+        orderReminderDay2: input.orderReminderDay2 ?? null,
+        grossIncomeTaxPercentTenths: input.grossIncomeTaxPercentTenths ?? null,
       })
       .where(eq(consultants.id, consultantId))
       .returning();
     return updated;
+  }
+
+  async createOrderDiscountLogEntry(consultantId: number, input: { discountPercent: number; publicValueArs: number }): Promise<OrderDiscountLogEntry> {
+    const db = await this.getDb();
+    const [entry] = await db
+      .insert(orderDiscountLog)
+      .values({ consultantId, discountPercent: input.discountPercent, publicValueArs: input.publicValueArs })
+      .returning();
+    return entry;
+  }
+
+  async listOrderDiscountLogSince(consultantId: number, since: Date): Promise<OrderDiscountLogEntry[]> {
+    const db = await this.getDb();
+    return db
+      .select()
+      .from(orderDiscountLog)
+      .where(and(eq(orderDiscountLog.consultantId, consultantId), gte(orderDiscountLog.confirmedAt, since)));
+  }
+
+  async getLatestOrderDiscountLogEntry(consultantId: number): Promise<OrderDiscountLogEntry | undefined> {
+    const db = await this.getDb();
+    const [entry] = await db
+      .select()
+      .from(orderDiscountLog)
+      .where(eq(orderDiscountLog.consultantId, consultantId))
+      .orderBy(desc(orderDiscountLog.confirmedAt))
+      .limit(1);
+    return entry;
   }
 
   async setConsultantEmail(consultantId: number, email: string): Promise<Consultant | undefined> {
@@ -3307,6 +3345,8 @@ export class MemoryStorage implements IStorage {
   private subscriptionPriceHistory: SubscriptionPriceHistoryEntry[] = [];
   private coupons: Coupon[] = [];
   private couponRedemptions: CouponRedemption[] = [];
+  private orderDiscountLog: OrderDiscountLogEntry[] = [];
+  private nextOrderDiscountLogId = 1;
   private nextUserId = 1;
   private nextConsultantId = 1;
   private nextProductId = 1;
@@ -3369,6 +3409,9 @@ export class MemoryStorage implements IStorage {
         monthlyGoal: null,
         defaultLowStockThreshold: null,
         email: null,
+        orderReminderDay1: null,
+        orderReminderDay2: null,
+        grossIncomeTaxPercentTenths: null,
       };
       this.consultants.push(consultant);
       consultantId = consultant.id;
@@ -3431,7 +3474,32 @@ export class MemoryStorage implements IStorage {
     consultant.currency = input.currency;
     consultant.monthlyGoal = input.monthlyGoal ?? null;
     consultant.defaultLowStockThreshold = input.defaultLowStockThreshold ?? null;
+    consultant.orderReminderDay1 = input.orderReminderDay1 ?? null;
+    consultant.orderReminderDay2 = input.orderReminderDay2 ?? null;
+    consultant.grossIncomeTaxPercentTenths = input.grossIncomeTaxPercentTenths ?? null;
     return consultant;
+  }
+
+  async createOrderDiscountLogEntry(consultantId: number, input: { discountPercent: number; publicValueArs: number }): Promise<OrderDiscountLogEntry> {
+    const entry: OrderDiscountLogEntry = {
+      id: this.nextOrderDiscountLogId++,
+      consultantId,
+      discountPercent: input.discountPercent,
+      publicValueArs: input.publicValueArs,
+      confirmedAt: new Date(),
+    };
+    this.orderDiscountLog.push(entry);
+    return entry;
+  }
+
+  async listOrderDiscountLogSince(consultantId: number, since: Date): Promise<OrderDiscountLogEntry[]> {
+    return this.orderDiscountLog.filter((e) => e.consultantId === consultantId && e.confirmedAt.getTime() >= since.getTime());
+  }
+
+  async getLatestOrderDiscountLogEntry(consultantId: number): Promise<OrderDiscountLogEntry | undefined> {
+    return this.orderDiscountLog
+      .filter((e) => e.consultantId === consultantId)
+      .sort((a, b) => b.confirmedAt.getTime() - a.confirmedAt.getTime())[0];
   }
 
   async setConsultantEmail(consultantId: number, email: string): Promise<Consultant | undefined> {
@@ -3459,6 +3527,9 @@ export class MemoryStorage implements IStorage {
       monthlyGoal: null,
       defaultLowStockThreshold: null,
       email: normalizedEmail,
+      orderReminderDay1: null,
+      orderReminderDay2: null,
+      grossIncomeTaxPercentTenths: null,
     };
     this.consultants.push(consultant);
 

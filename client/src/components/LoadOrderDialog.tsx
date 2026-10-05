@@ -151,6 +151,17 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
           discountFailed.push(line.productName);
         }
       }
+
+      // Prompt 1/2 — registro del pedido para el "descuento de compra habitual" (Configuración).
+      // `subtotal` ya es el valor al público ANTES del descuento, justo lo que pide el log. Best
+      // effort, igual que el loop de arriba: el pedido ya quedó cargado (stock actualizado), que
+      // esto falle nunca debe mostrarse como un error del pedido en sí.
+      try {
+        await apiRequest("POST", "/api/products/order-discount-log", { discountPercent: chosenDiscount, publicValueArs: subtotal });
+      } catch {
+        // silencioso a propósito — ver comentario de arriba.
+      }
+
       return { discountFailed };
     },
     onSuccess: ({ discountFailed }) => {

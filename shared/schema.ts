@@ -23,6 +23,16 @@ export const consultants = pgTable("consultants", {
   // SIEMPRE normalizado (ver shared/email.ts normalizeEmail, storage.setConsultantEmail) antes
   // de guardarse, nunca tal cual lo tipeó la consultora.
   email: text("email"),
+  // Prompt 1 — "¿Qué día del mes hacés tu pedido?". Hasta 2 días (1-31), ambos opcionales e
+  // independientes entre sí — nunca un array, para no andar validando duplicados/orden adentro
+  // de un tipo compuesto. day2 solo tiene sentido si day1 también está cargado (se valida en
+  // updateBusinessSettingsSchema, no acá).
+  orderReminderDay1: integer("order_reminder_day1"),
+  orderReminderDay2: integer("order_reminder_day2"),
+  // Prompt 1 — "Ingresos Brutos (%)", en DÉCIMAS de punto porcentual (35 = 3,5%) para seguir
+  // la convención de todo el schema de nunca guardar decimales como float/numeric — mismo
+  // criterio que amount/precio en pesos enteros. Nullable: no todas pagan IIBB.
+  grossIncomeTaxPercentTenths: integer("gross_income_tax_percent_tenths"),
 }, (table) => ({
   // Etapa 3: único (parcial — Postgres nunca considera dos NULL "iguales" para UNIQUE, así
   // que las consultoras sin email todavía, la mayoría histórica, no chocan entre sí) — evita
@@ -576,6 +586,37 @@ export const applyDiscountSchema = z.object({
   }),
 });
 
+/**
+ * Prompt 1/2 — una fila por pedido CONFIRMADO desde "Cargar pedido" (LoadOrderDialog.tsx). No
+ * existía ningún registro histórico de pedidos antes de esto: `productStock.selectedDiscount`
+ * es un solo valor por producto que se pisa en cada pedido nuevo, sin fecha. Esta tabla es la
+ * única fuente del "descuento de compra habitual" (promedio ponderado por `publicValueArs` de
+ * los últimos 3 meses, ver server/orderDiscount.ts) — nace vacía para toda consultora existente,
+ * no hay forma de reconstruir pedidos pasados que nunca se guardaron.
+ */
+export const orderDiscountLog = pgTable("order_discount_log", {
+  id: serial("id").primaryKey(),
+  consultantId: integer("consultant_id").notNull().references(() => consultants.id),
+  discountPercent: integer("discount_percent").notNull(),
+  // Suma del valor al público del pedido (precio de catálogo × cantidad), ANTES del descuento —
+  // es el denominador de la fórmula del promedio ponderado.
+  publicValueArs: integer("public_value_ars").notNull(),
+  confirmedAt: timestamp("confirmed_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+  consultantConfirmedIdx: index("order_discount_log_consultant_confirmed_idx").on(table.consultantId, table.confirmedAt),
+}));
+export type OrderDiscountLogEntry = typeof orderDiscountLog.$inferSelect;
+export type InsertOrderDiscountLogEntry = typeof orderDiscountLog.$inferInsert;
+
+/** Lo que LoadOrderDialog.tsx manda al confirmar un pedido — además (no en reemplazo) del
+ * increment-batch de stock y los PATCH de descuento por producto que ya existían. */
+export const createOrderDiscountLogSchema = z.object({
+  discountPercent: z.number().int().refine((v) => (discountOptions as readonly number[]).includes(v), {
+    message: "El descuento debe ser uno de los valores permitidos",
+  }),
+  publicValueArs: z.number().int().positive(),
+});
+
 // Alta manual de un producto suelto desde Productos (fuera de la carga masiva por Excel/CSV).
 // consultantId, source y discontinued los pone el servidor, nunca el cliente.
 export const createProductSchema = z.object({
@@ -742,6 +783,16 @@ export const updateBusinessSettingsSchema = z.object({
     ),
   monthlyGoal: z.number().int().nonnegative().nullable().optional(),
   defaultLowStockThreshold: z.number().int().positive().nullable().optional(),
+  orderReminderDay1: z.number().int().min(1).max(31).nullable().optional(),
+  orderReminderDay2: z.number().int().min(1).max(31).nullable().optional(),
+  // Enteros en décimas de punto porcentual: 0 a 200 = 0% a 20%.
+  grossIncomeTaxPercentTenths: z.number().int().min(0).max(200).nullable().optional(),
+}).refine((v) => v.orderReminderDay2 == null || v.orderReminderDay1 != null, {
+  message: "Para elegir un segundo día, primero elegí el primero",
+  path: ["orderReminderDay2"],
+}).refine((v) => v.orderReminderDay1 == null || v.orderReminderDay2 == null || v.orderReminderDay1 !== v.orderReminderDay2, {
+  message: "No podés elegir el mismo día dos veces",
+  path: ["orderReminderDay2"],
 });
 
 // Carga masiva de catálogo global — admin-only. No lleva consultantId: el producto queda

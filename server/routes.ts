@@ -38,6 +38,7 @@ import {
   createCouponSchema,
   updateCouponSchema,
   validateCouponSchema,
+  createOrderDiscountLogSchema,
   registerConsultantSchema,
   forgotPasswordSchema,
   verifyResetCodeSchema,
@@ -66,6 +67,7 @@ import {
   COUPON_RESERVATION_TTL_MS,
 } from "./subscription";
 import { createSubscriptionPreapproval, getMercadoPagoPayment, verifyWebhookSignature, InvalidWebhookSignatureError } from "./mercadopago";
+import { computeHabitualDiscountPercent } from "./orderDiscount";
 
 // Etapa 7.6: hash bcrypt (10 rounds, mismo costo que BCRYPT_SALT_ROUNDS) de un valor fijo
 // arbitrario — NUNCA corresponde a ninguna cuenta real, existe solo para que bcrypt.compare()
@@ -567,7 +569,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (!settings) {
         return res.status(404).json({ error: "Configuración no encontrada" });
       }
-      res.json(settings);
+      // Prompt 1 — solo lectura, no se guarda en consultants: se recalcula siempre desde
+      // order_discount_log, nunca queda desactualizado.
+      const habitualDiscountPercent = await computeHabitualDiscountPercent(req.consultantId);
+      res.json({ ...settings, habitualDiscountPercent });
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al obtener la configuración" });
@@ -1464,6 +1469,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       console.error(error);
       res.status(500).json({ error: "Error al actualizar el stock" });
+    }
+  });
+
+  /**
+   * Prompt 1/2 — registra UN pedido confirmado para el cálculo del "descuento de compra
+   * habitual" (ver server/orderDiscount.ts). Se llama junto con increment-batch al confirmar
+   * un pedido en LoadOrderDialog.tsx — no reemplaza nada de lo que ya hacía ese flujo, es
+   * aditivo. Si falla, nunca bloquea el pedido en sí (el stock ya se actualizó): se loguea y
+   * se responde 200 igual, mismo criterio que el PATCH de descuento por línea en ese diálogo.
+   */
+  app.post("/api/products/order-discount-log", async (req: Request, res: Response) => {
+    try {
+      const parsed = createOrderDiscountLogSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+      const entry = await storage.createOrderDiscountLogEntry(req.consultantId!, parsed.data);
+      res.status(201).json(entry);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al registrar el pedido" });
     }
   });
 
