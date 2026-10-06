@@ -193,13 +193,28 @@ FROM appointments
 WHERE status != 'cancelada'
 GROUP BY consultant_id, date, time
 HAVING count(*) > 1;
+
+-- 3) Informativo, NO bloquea esta migración (no hay ningún índice/constraint nuevo sobre
+--    products en este paquete) — viene del diagnóstico del Prompt 3: ¿hay en el catálogo
+--    global el mismo producto con el mismo tono cargado dos veces como filas separadas? El
+--    Prompt 5 agrupa por seccion+linea+producto (toneFamilyKey) y por variante dentro de cada
+--    familia; un duplicado real acá se vería como dos filas con el mismo nombre de tono dentro
+--    de la misma familia, en vez de fundirse en una. Si da filas, mandenme la lista — es una
+--    limpieza de datos a resolver cuando puedan, no frena ni este deploy ni los anteriores.
+SELECT seccion, linea, producto, variante, count(*), array_agg(id) AS product_ids
+FROM products
+WHERE consultant_id IS NULL
+GROUP BY seccion, linea, producto, variante
+HAVING count(*) > 1;
 ```
 
 **Si CUALQUIERA de las consultas 1 o 2 devuelve filas: frenar TODO — ni el resto de la
 migración, ni el deploy del código — y mandarme el resultado antes de seguir con cualquier otra
 cosa.** (Técnicamente probé que el resto del SQL se puede aplicar igual, porque son bloques
 independientes entre sí — pero la regla acá es pararlo todo de una, no ir decidiendo parte por
-parte el mismo día del deploy. Más simple, menos margen de error humano.)
+parte el mismo día del deploy. Más simple, menos margen de error humano.) La consulta 3 queda
+afuera de esta regla a propósito: es solo informativa, no hay ninguna migración de esquema que
+dependa de que no haya duplicados en `products`.
 
 ### ¿El código nuevo depende de que estos índices únicos existan?
 
