@@ -110,6 +110,11 @@ export class SaleRequestConflictError extends Error {}
 /** Etapa I-B.8-C: violación del unique `(consultantId, codigo)` al editar un producto — mapea
  * a 409 (conflicto de estado), no a 400 (el payload en sí era válido). */
 export class ProductConflictError extends Error {}
+/** Prompt 4: `priceOverride` solo tiene sentido en un producto del CATÁLOGO (consultantId
+ * null) — un producto cargado a mano ya tiene su propio `products.precio` editable directo, no
+ * necesita (ni debe tener) un override separado. Mapea a 400: el payload en sí no es inválido
+ * en el vacío, pero no aplica a este producto puntual. */
+export class ProductValidationError extends Error {}
 /** Etapa 3 (registro): ya existe una cuenta con ese email normalizado — mapea a 409. */
 export class DuplicateEmailError extends Error {}
 /** Etapa 3 (registro): ya existe una cuenta con ese username — mapea a 409. */
@@ -348,7 +353,7 @@ export interface AdminPaymentFilters {
 type ProductRow = typeof products.$inferSelect;
 type StockFields = Pick<
   ProductStock,
-  "unidades" | "stockMinimo" | "costPrice" | "selectedDiscount" | "discontinued" | "remindStockAt"
+  "unidades" | "stockMinimo" | "costPrice" | "selectedDiscount" | "discontinued" | "remindStockAt" | "priceOverride"
 >;
 
 /** `previousImage` es el valor que tenía la fila justo antes de este cambio, leído bajo lock
@@ -369,6 +374,7 @@ function withStockDefaults(
   consultantDefaultThreshold?: number | null,
 ): Product {
   const stockMinimo = stock?.stockMinimo ?? null;
+  const priceOverride = stock?.priceOverride ?? null;
   return {
     ...product,
     unidades: stock?.unidades ?? 0,
@@ -377,7 +383,9 @@ function withStockDefaults(
     selectedDiscount: stock?.selectedDiscount ?? null,
     discontinued: stock?.discontinued ?? false,
     remindStockAt: stock?.remindStockAt ?? null,
+    priceOverride,
     effectiveStockMinimo: resolveLowStockThreshold(stockMinimo, consultantDefaultThreshold),
+    effectivePrecio: priceOverride ?? product.precio,
   };
 }
 
@@ -720,6 +728,21 @@ export interface IStorage {
    */
   deleteProduct(consultantId: number, id: number): Promise<"deleted" | "not_found" | "has_relations">;
   setProductDiscontinued(consultantId: number, productId: number, discontinued: boolean): Promise<Product | undefined>;
+  /** Prompt 4 — precio propio de la consultora sobre un producto del CATÁLOGO. Tira
+   * `ProductValidationError` si el producto es manual (ahí el precio se edita con
+   * `updateProduct`, en `products.precio` directo). Si `priceOverride` coincide exactamente con
+   * `products.precio`, se guarda `null` igual (nunca un override "de casualidad" idéntico) —
+   * así las subas futuras del precio de catálogo le llegan solas. `undefined` si el producto no
+   * existe o no es visible para esta consultora. */
+  setProductPriceOverride(consultantId: number, productId: number, priceOverride: number | null): Promise<Product | undefined>;
+  /** Prompt 4 — "¿Cuánto te costó?" cuando se escribe el costo directo en pesos (en vez de
+   * elegir uno de los 3 descuentos fijos de `applyProductDiscount`). Funciona para cualquier
+   * producto visible (catálogo o manual) — el costo siempre vive en `product_stock`, sin
+   * importar el tipo de producto. Si el costo pasa de null a un valor por primera vez,
+   * dispara `recalculateEstimatedSalesForProduct` (mismo criterio que la carga de un pedido:
+   * acá SÍ corresponde recalcular, porque es justo el caso previsto — "Editar producto" que
+   * menciona el Prompt 2, a diferencia de un pedido nuevo). */
+  setProductCost(consultantId: number, productId: number, costPrice: number): Promise<Product | undefined>;
   /** La consultora fija su propio stock sobre un producto (global o manual propio). `stockMinimo`
    * es opcional: si viene, actualiza también el umbral propio del producto (null lo borra). */
   setProductStock(
@@ -1818,6 +1841,62 @@ export class DatabaseStorage implements IStorage {
     return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
   }
 
+  async setProductPriceOverride(consultantId: number, productId: number, priceOverride: number | null): Promise<Product | undefined> {
+    const db = await this.getDb();
+    const product = await this.findVisibleProduct(db, consultantId, productId);
+    if (!product) return undefined;
+    if (product.consultantId !== null) {
+      throw new ProductValidationError("El precio de un producto cargado a mano se edita en el producto, no con un precio propio");
+    }
+
+    // Igual al precio de catálogo "de casualidad" -> se guarda null, no un override idéntico
+    // (así una suba futura del precio de catálogo le llega sola, sin quedar pisada).
+    const effectiveOverride = priceOverride === product.precio ? null : priceOverride;
+
+    const [stock] = await db
+      .insert(productStock)
+      .values({ consultantId, productId, priceOverride: effectiveOverride })
+      .onConflictDoUpdate({
+        target: [productStock.consultantId, productStock.productId],
+        set: { priceOverride: effectiveOverride },
+      })
+      .returning();
+    return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
+  }
+
+  async setProductCost(consultantId: number, productId: number, costPrice: number): Promise<Product | undefined> {
+    const db = await this.getDb();
+    const product = await this.findVisibleProduct(db, consultantId, productId);
+    if (!product) return undefined;
+
+    // Antes del UPSERT, para saber si corresponde recalcular ventas estimadas (ver abajo) —
+    // mismo criterio de "lectura previa solo informativa" que incrementProductStockBatch.
+    const [existing] = await db
+      .select({ costPrice: productStock.costPrice })
+      .from(productStock)
+      .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, productId)));
+    const hadNoRealCost = !existing || existing.costPrice === null;
+
+    // selectedDiscount queda en null: ya no representa un % real, la consultora escribió el
+    // costo directo en pesos.
+    const [stock] = await db
+      .insert(productStock)
+      .values({ consultantId, productId, costPrice, selectedDiscount: null })
+      .onConflictDoUpdate({
+        target: [productStock.consultantId, productStock.productId],
+        set: { costPrice, selectedDiscount: null },
+      })
+      .returning();
+
+    // Prompt 2: acá SÍ corresponde recalcular — es justo el caso previsto ("Editar producto"
+    // carga el costo a mano), a diferencia de un pedido nuevo (que nunca recalcula).
+    if (hadNoRealCost) {
+      await this.recalculateEstimatedSalesForProduct(consultantId, productId, costPrice);
+    }
+
+    return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
+  }
+
   async setProductStock(
     consultantId: number,
     productId: number,
@@ -2772,7 +2851,9 @@ export class DatabaseStorage implements IStorage {
     const [row] = await db
       .select({
         valueAtCost: sql<number>`coalesce(sum(${productStock.unidades} * coalesce(${productStock.costPrice}, round(${products.precio} * (1 - ${habitualDiscountPercent} / 100.0)))), 0)`,
-        valueAtPrice: sql<number>`coalesce(sum(${productStock.unidades} * ${products.precio}), 0)`,
+        // Prompt 4: "A precio de venta" respeta el precio propio de la consultora cuando existe
+        // (nunca el costo, que siempre parte de products.precio — ver valueAtCost arriba).
+        valueAtPrice: sql<number>`coalesce(sum(${productStock.unidades} * coalesce(${productStock.priceOverride}, ${products.precio})), 0)`,
         productCount: count(products.id),
         unitCount: sql<number>`coalesce(sum(${productStock.unidades}), 0)`,
         hasEstimatedCost: sql<boolean>`coalesce(bool_or(${productStock.costPrice} is null and ${productStock.unidades} > 0), false)`,
@@ -3573,6 +3654,7 @@ export class MemoryStorage implements IStorage {
         selectedDiscount: null,
         discontinued: false,
         remindStockAt: null,
+        priceOverride: null,
       };
       this.productStock.push(stock);
     }
@@ -4337,6 +4419,31 @@ export class MemoryStorage implements IStorage {
     return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
+  async setProductPriceOverride(consultantId: number, productId: number, priceOverride: number | null): Promise<Product | undefined> {
+    const product = this.findVisibleProduct(consultantId, productId);
+    if (!product) return undefined;
+    if (product.consultantId !== null) {
+      throw new ProductValidationError("El precio de un producto cargado a mano se edita en el producto, no con un precio propio");
+    }
+    const effectiveOverride = priceOverride === product.precio ? null : priceOverride;
+    const stock = this.getOrCreateStock(consultantId, productId);
+    stock.priceOverride = effectiveOverride;
+    return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
+  }
+
+  async setProductCost(consultantId: number, productId: number, costPrice: number): Promise<Product | undefined> {
+    const product = this.findVisibleProduct(consultantId, productId);
+    if (!product) return undefined;
+    const stock = this.getOrCreateStock(consultantId, productId);
+    const hadNoRealCost = stock.costPrice === null;
+    stock.costPrice = costPrice;
+    stock.selectedDiscount = null;
+    if (hadNoRealCost) {
+      await this.recalculateEstimatedSalesForProduct(consultantId, productId, costPrice);
+    }
+    return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
+  }
+
   async setProductStock(
     consultantId: number,
     productId: number,
@@ -4980,7 +5087,8 @@ export class MemoryStorage implements IStorage {
       const resolved = resolveLineCost({ costPrice: stock.costPrice, publicPrice: product.precio, habitualDiscountPercent });
       if (resolved.isEstimated && stock.unidades > 0) hasEstimatedCost = true;
       valueAtCost += stock.unidades * resolved.costPrice;
-      valueAtPrice += stock.unidades * product.precio;
+      // Prompt 4: respeta el precio propio de la consultora, nunca para el costo (arriba).
+      valueAtPrice += stock.unidades * (stock.priceOverride ?? product.precio);
       unitCount += stock.unidades;
       productCount++;
     }
