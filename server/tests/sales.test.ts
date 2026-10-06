@@ -669,7 +669,7 @@ describe("Ingresos Brutos — Etapa 4", () => {
     }
   });
 
-  it("9. una venta con cuota pagada rechaza el PATCH aunque solo se intente cambiar Ingresos Brutos", async () => {
+  it("9. una venta con cuota pagada: ingresosBrutos no es un campo editable (se ignora), y el saldo pendiente real ya es $0", async () => {
     const createRes = await api(
       "POST",
       "/api/sales",
@@ -682,7 +682,9 @@ describe("Ingresos Brutos — Etapa 4", () => {
     const markPaidRes = await api("PATCH", `/api/sales/${sale.id}/installments/${installmentId}`, { status: "pagado" });
     expect(markPaidRes.status).toBe(200);
 
-    const patchRes = await api("PATCH", `/api/sales/${sale.id}`, {
+    // Mandar el total completo (1000) como saldo pendiente ya no coincide con la realidad
+    // (ya se cobró todo, el saldo pendiente es $0) — Prompt 6, "edición inteligente".
+    const wrongRes = await api("PATCH", `/api/sales/${sale.id}`, {
       items: [{ productId, quantity: 1 }],
       orderDiscount: null,
       orderSurcharge: null,
@@ -690,11 +692,25 @@ describe("Ingresos Brutos — Etapa 4", () => {
       paymentMethod: "efectivo",
       installments: [{ amount: 1000 }],
     });
-    expect(patchRes.status).toBe(400);
-    expect((await patchRes.json()).error).toMatch(/cuotas pagadas/i);
+    expect(wrongRes.status).toBe(400);
+    expect((await wrongRes.json()).error).toMatch(/saldo pendiente/i);
+
+    // Con el saldo pendiente correcto ($0), la edición se permite y la cuota pagada no se toca.
+    const okRes = await api("PATCH", `/api/sales/${sale.id}`, {
+      items: [{ productId, quantity: 1 }],
+      orderDiscount: null,
+      orderSurcharge: null,
+      ingresosBrutos: 999,
+      paymentMethod: "efectivo",
+      installments: [{ amount: 0 }],
+    });
+    expect(okRes.status).toBe(200);
 
     const after = await (await api("GET", `/api/sales/${sale.id}`)).json();
-    expect(after.ingresosBrutos).toBeNull(); // no se coló el intento de cambio
+    expect(after.ingresosBrutos).toBeNull(); // no es un campo editable por esta vía, se ignora
+    expect(after.installments).toHaveLength(1);
+    expect(after.installments[0].id).toBe(installmentId);
+    expect(after.installments[0].status).toBe("pagado");
   });
 
   it("7. venta cancelada con Ingresos Brutos queda excluida de los totales financieros del período", async () => {
@@ -940,7 +956,14 @@ describe("PATCH /api/sales/:id — edición", () => {
   });
 });
 
-describe("PATCH /api/sales/:id — protección de cuotas pagadas (Etapa I-B.7-B)", () => {
+// Prompt 6 — "edición inteligente": antes de esta etapa (I-B.7-B), CUALQUIER cuota pagada
+// bloqueaba la edición entera. Eso dejó de ser viable en la práctica: con "paga en el
+// momento" (Prompt 6), la mayoría de las ventas nuevas en efectivo/transferencia y TODAS las
+// de tarjeta tienen su primera cuota pagada desde el instante de la creación — bloquear la
+// edición en ese caso haría "Editar" inusable para casi toda venta real. De acá en más: una
+// cuota ya cobrada se preserva tal cual (mismo id, status "pagado", misma dueDate — su fecha
+// de pago), y solo se recalculan las cuotas que seguían pendientes, sobre el saldo que falta.
+describe("PATCH /api/sales/:id — edición con cuotas ya pagadas (Prompt 6)", () => {
   // Este archivo comparte un único producto (20 unidades iniciales) entre TODOS los tests, en
   // orden — para cuando se llega acá, el remanente real depende de cuánto consumieron los
   // bloques anteriores y es frágil de calcular a mano. En vez de asumirlo, se resetea el
@@ -952,7 +975,7 @@ describe("PATCH /api/sales/:id — protección de cuotas pagadas (Etapa I-B.7-B)
     expect(res.status).toBe(200);
   });
 
-  it("una cuota pagada de dos -> PATCH rechazado (400), sales/items/installments/stock sin cambios", async () => {
+  it("una cuota pagada de dos: el PATCH se permite, la cuota pagada no se toca (mismo id, status y fecha de pago)", async () => {
     const createRes = await api(
       "POST",
       "/api/sales",
@@ -963,67 +986,61 @@ describe("PATCH /api/sales/:id — protección de cuotas pagadas (Etapa I-B.7-B)
 
     const detailBefore = await (await api("GET", `/api/sales/${sale.id}`)).json();
     const firstInstallmentId = detailBefore.installments[0].id;
+    const paidDueDate = detailBefore.installments[0].dueDate;
 
     const markPaidRes = await api("PATCH", `/api/sales/${sale.id}/installments/${firstInstallmentId}`, { status: "pagado" });
     expect(markPaidRes.status).toBe(200);
 
-    const stockBefore = (await (await api("GET", "/api/products")).json()).find((p: any) => p.id === productId).unidades;
-
+    // Edita de verdad: sube la cantidad de 2 a 3 (el total pasa de 2000 a 3000). El saldo que
+    // falta después de lo ya cobrado (1000) es 2000 — eso es lo que describe `installments` acá,
+    // no el total de la venta.
     const patchRes = await api("PATCH", `/api/sales/${sale.id}`, {
-      items: [{ productId, quantity: 1 }],
+      items: [{ productId, quantity: 3 }],
       orderDiscount: null,
       orderSurcharge: null,
       paymentMethod: "efectivo",
-      installments: [{ amount: 1000 }],
+      installments: [{ amount: 2000 }],
     });
-    expect(patchRes.status).toBe(400);
-    expect((await patchRes.json()).error).toMatch(/cuotas pagadas/i);
+    expect(patchRes.status).toBe(200);
+    const updated = await patchRes.json();
+    expect(updated.total).toBe(3000); // la edición se aplicó de verdad
 
     const detailAfter = await (await api("GET", `/api/sales/${sale.id}`)).json();
-    expect(detailAfter.total).toBe(detailBefore.total); // sales no cambió
-    expect(detailAfter.items).toEqual(detailBefore.items); // sale_items no cambió
-    expect(detailAfter.installments).toHaveLength(2); // installments no se recrearon
-    expect(detailAfter.installments[0].id).toBe(firstInstallmentId); // misma fila, no una nueva
-    expect(detailAfter.installments[0].status).toBe("pagado"); // el pago no se resetea
-    expect(detailAfter.installments[1].status).toBe("pendiente");
-
-    const stockAfter = (await (await api("GET", "/api/products")).json()).find((p: any) => p.id === productId).unidades;
-    expect(stockAfter).toBe(stockBefore); // stock no cambió
+    expect(detailAfter.installments).toHaveLength(2);
+    const paidAfter = detailAfter.installments.find((i: any) => i.id === firstInstallmentId);
+    expect(paidAfter).toBeDefined();
+    expect(paidAfter.status).toBe("pagado"); // el pago no se resetea
+    expect(paidAfter.dueDate).toBe(paidDueDate); // su fecha de pago no cambia
+    expect(paidAfter.amount).toBe(1000); // su monto tampoco
+    const pending = detailAfter.installments.find((i: any) => i.id !== firstInstallmentId);
+    expect(pending.status).toBe("pendiente");
+    expect(pending.amount).toBe(2000); // el saldo que falta, no el total
   });
 
-  it("varias cuotas con una sola pagada -> igual se rechaza (alcanza con UNA cuota pagada)", async () => {
-    // quantity:1 a propósito — este archivo comparte un único producto (20 unidades) entre
-    // TODOS los tests, en orden; usar cantidades chicas evita agotar el stock disponible en
-    // este punto de la suite (ver los otros tests del archivo, mismo patrón).
+  it("rechaza bajar el total por debajo de lo que ya se cobró", async () => {
     const createRes = await api(
       "POST",
       "/api/sales",
-      baseSale({
-        items: [{ productId, quantity: 1 }],
-        installments: [{ amount: 400 }, { amount: 300 }, { amount: 300 }],
-      }),
+      baseSale({ items: [{ productId, quantity: 2 }], installments: [{ amount: 1000 }, { amount: 1000 }] }),
     );
     expect(createRes.status).toBe(201);
     const sale = await createRes.json();
     const detail = await (await api("GET", `/api/sales/${sale.id}`)).json();
+    await api("PATCH", `/api/sales/${sale.id}/installments/${detail.installments[0].id}`, { status: "pagado" });
 
-    // Solo la última de las 3 cuotas se marca pagada — no la primera, para confirmar que la
-    // regla no depende de qué posición ocupa la cuota pagada.
-    const lastInstallmentId = detail.installments[2].id;
-    await api("PATCH", `/api/sales/${sale.id}/installments/${lastInstallmentId}`, { status: "pagado" });
-
+    // unitPrice manual a propósito: deja el total en 400, muy por debajo de los 1000 ya cobrados.
     const patchRes = await api("PATCH", `/api/sales/${sale.id}`, {
-      items: [{ productId, quantity: 1 }],
+      items: [{ productId, quantity: 1, unitPrice: 400 }],
       orderDiscount: null,
       orderSurcharge: null,
       paymentMethod: "efectivo",
-      installments: [{ amount: 1000 }],
+      installments: [{ amount: 0 }],
     });
     expect(patchRes.status).toBe(400);
-    expect((await patchRes.json()).error).toMatch(/cuotas pagadas/i);
+    expect((await patchRes.json()).error).toMatch(/no puede ser menor que lo que ya se cobró/i);
   });
 
-  it("todas las cuotas pendientes -> PATCH permitido (contraste directo con los dos casos de arriba)", async () => {
+  it("todas las cuotas pendientes -> PATCH permitido (sin cuotas pagadas, caso simple de siempre)", async () => {
     const createRes = await api(
       "POST",
       "/api/sales",

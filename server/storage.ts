@@ -3362,24 +3362,23 @@ export class DatabaseStorage implements IStorage {
         throw new SaleValidationError("No se puede editar una venta cancelada");
       }
 
-      // Etapa I-B.7-B: una venta con al menos una cuota ya cobrada no puede editarse — el
-      // flujo de abajo borra y recrea TODAS las cuotas como "pendiente", así que editar sin
-      // este chequeo resetearía en silencio dinero que ya se registró como cobrado (hallazgo
-      // P0 de la auditoría I-B.7-A). `FOR UPDATE` acá, no un SELECT simple: cierra la ventana
-      // donde `updateInstallmentStatus` marca una cuota "pagado" justo en el medio de esta
-      // transacción — esa marca, al no tener transacción propia, queda bloqueada por este
-      // lock hasta que esta transacción termine; si terminamos viendo 0 cuotas pagadas y
-      // seguimos, el UPDATE de esa marca (cuando se desbloquea) ya no encuentra la fila vieja
-      // (fue borrada y reemplazada) y no tiene efecto — nunca un "pagado" que se pierde en
-      // silencio con una respuesta 200 exitosa, que es lo que pasa hoy sin este lock.
+      // Prompt 6 — "edición inteligente": una cuota ya cobrada se preserva tal cual (nunca se
+      // borra ni se re-crea, nunca pierde su estado ni su fecha de pago). Solo se recalculan
+      // las cuotas que seguían pendientes, sobre el saldo que falta después de lo ya cobrado.
+      // Antes de esta etapa, cualquier cuota pagada bloqueaba la edición ENTERA (Etapa
+      // I-B.7-B) — eso dejó de ser viable en la práctica: con "paga en el momento" (Prompt 6),
+      // la mayoría de las ventas nuevas tienen su primera cuota pagada desde el instante de la
+      // creación. `FOR UPDATE` acá, no un SELECT simple: cierra la ventana donde
+      // `updateInstallmentStatus` marca una cuota "pagado" justo en el medio de esta
+      // transacción — ver Etapa I-B.7-B para el detalle de esa carrera, que sigue protegida
+      // igual: las cuotas pagadas (bajo este lock) nunca se tocan más abajo.
       const existingInstallments = await tx
         .select()
         .from(saleInstallments)
         .where(eq(saleInstallments.saleId, id))
         .for("update");
-      if (existingInstallments.some((i) => i.status === "pagado")) {
-        throw new SaleValidationError("No se puede editar una venta que tiene cuotas pagadas.");
-      }
+      const paidInstallments = existingInstallments.filter((i) => i.status === "pagado");
+      const alreadyPaidAmount = paidInstallments.reduce((sum, i) => sum + i.amount, 0);
 
       const existingItems = await tx.select().from(saleItems).where(eq(saleItems.saleId, id));
 
@@ -3463,23 +3462,29 @@ export class DatabaseStorage implements IStorage {
         shippingCharged: input.shippingCharged ?? null,
       });
 
+      // Prompt 6: `input.installments` describe el SALDO que falta — no el total de la venta
+      // — cuando ya se cobró algo antes de esta edición. El total nuevo nunca puede quedar
+      // por debajo de lo ya cobrado (bajarlo ahí sería borrar un cobro real).
       const installmentAmounts = input.installments.map((i) => i.amount);
-      if (!installmentsSumMatches(installmentAmounts, totals.total)) {
-        throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
+      const remainingTotal = totals.total - alreadyPaidAmount;
+      if (remainingTotal < 0) {
+        throw new SaleValidationError(`El nuevo total no puede ser menor que lo que ya se cobró (${alreadyPaidAmount})`);
+      }
+      if (!installmentsSumMatches(installmentAmounts, remainingTotal)) {
+        throw new SaleValidationError("La suma de las cuotas no coincide con el saldo pendiente de la venta");
       }
 
-      // Prompt 6: mismo criterio que createSale. Como esta venta nunca llega acá con una
-      // cuota ya pagada (chequeo de arriba), regenerar todas como "pendiente" nunca pisa
-      // dinero cobrado.
       const paidNow = input.paidNow ?? false;
       const firstDueDate = paidNow ? null : input.firstDueDate ?? existingSale.date;
+      // Solo describe las cuotas NUEVAS (el saldo pendiente) — las ya cobradas, arriba, no
+      // pasan por acá nunca.
       const installmentPlans = buildInstallmentPlans({
         amounts: installmentAmounts,
         saleDate: existingSale.date,
         paymentMethod: input.paymentMethod,
         paidNow,
         firstDueDate,
-      });
+      }).filter((plan) => plan.amount > 0); // saldo pendiente en $0: no hay cuota nueva que crear
       if (existingSale.clientId === null && installmentPlans.some((p) => p.status === "pendiente")) {
         throw new SaleValidationError("Para dejar una venta pendiente de cobro tenés que elegir la clienta");
       }
@@ -3505,7 +3510,9 @@ export class DatabaseStorage implements IStorage {
       }
 
       await tx.delete(saleItems).where(eq(saleItems.saleId, id));
-      await tx.delete(saleInstallments).where(eq(saleInstallments.saleId, id));
+      // Prompt 6: solo se borran las cuotas que seguían PENDIENTES — las ya cobradas (arriba)
+      // quedan intactas, con su mismo id, status y dueDate (su fecha de pago).
+      await tx.delete(saleInstallments).where(and(eq(saleInstallments.saleId, id), eq(saleInstallments.status, "pendiente")));
 
       await tx.insert(saleItems).values(
         lines.map((l) => ({
@@ -3525,15 +3532,22 @@ export class DatabaseStorage implements IStorage {
         })),
       );
 
-      await tx.insert(saleInstallments).values(
-        installmentPlans.map((plan, index) => ({
-          saleId: id,
-          installmentNumber: index + 1,
-          amount: plan.amount,
-          dueDate: plan.dueDate,
-          status: plan.status,
-        })),
-      );
+      if (installmentPlans.length > 0) {
+        await tx.insert(saleInstallments).values(
+          // El número sigue después de las cuotas ya cobradas (que conservan el suyo).
+          installmentPlans.map((plan, index) => ({
+            saleId: id,
+            installmentNumber: paidInstallments.length + index + 1,
+            amount: plan.amount,
+            dueDate: plan.dueDate,
+            status: plan.status,
+          })),
+        );
+      }
+
+      // Prompt 6: cuántas cuotas tiene la venta en total (ya cobradas + nuevas) — con tarjeta
+      // esto es solo informativo, igual que en createSale (una sola fila real se crea arriba).
+      const installmentsCount = paidInstallments.length + installmentAmounts.filter((a) => a > 0).length;
 
       const [updated] = await tx
         .update(sales)
@@ -3550,8 +3564,8 @@ export class DatabaseStorage implements IStorage {
           total: totals.total,
           profit,
           paymentMethod: input.paymentMethod,
-          installmentsCount: installmentAmounts.length,
-          installmentFrequency: installmentAmounts.length > 1 ? input.installmentFrequency ?? null : null,
+          installmentsCount,
+          installmentFrequency: installmentsCount > 1 ? input.installmentFrequency ?? null : null,
           notes: input.notes ?? null,
         })
         .where(and(eq(sales.id, id), eq(sales.consultantId, consultantId)))
@@ -5477,16 +5491,13 @@ export class MemoryStorage implements IStorage {
       throw new SaleValidationError("No se puede editar una venta cancelada");
     }
 
-    // Etapa I-B.7-B: misma regla que DatabaseStorage — una venta con al menos una cuota ya
-    // cobrada no puede editarse (el flujo de abajo reemplaza todas las cuotas por
-    // "pendiente"). Sin lock especial: no hay ningún `await` entre este chequeo y las
-    // mutaciones de más abajo, así que no existe ventana de interleaving posible (Node es
-    // single-threaded) — el mismo motivo por el que `createSale`/`cancelSale` en memoria
-    // tampoco necesitan uno.
+    // Prompt 6 — "edición inteligente": mismo criterio que DatabaseStorage.updateSale. Una
+    // cuota ya cobrada se preserva tal cual; solo se recalculan las que seguían pendientes,
+    // sobre el saldo que falta después de lo ya cobrado. Sin lock especial: no hay ningún
+    // `await` entre este chequeo y las mutaciones de más abajo (Node es single-threaded).
     const existingInstallments = this.saleInstallments.filter((i) => i.saleId === id);
-    if (existingInstallments.some((i) => i.status === "pagado")) {
-      throw new SaleValidationError("No se puede editar una venta que tiene cuotas pagadas.");
-    }
+    const paidInstallments = existingInstallments.filter((i) => i.status === "pagado");
+    const alreadyPaidAmount = paidInstallments.reduce((sum, i) => sum + i.amount, 0);
 
     const existingItems = this.saleItems.filter((i) => i.saleId === id);
 
@@ -5545,13 +5556,17 @@ export class MemoryStorage implements IStorage {
       shippingCharged: input.shippingCharged ?? null,
     });
 
+    // Prompt 6: `input.installments` describe el SALDO que falta, no el total de la venta,
+    // cuando ya se cobró algo antes de esta edición.
     const installmentAmounts = input.installments.map((i) => i.amount);
-    if (!installmentsSumMatches(installmentAmounts, totals.total)) {
-      throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
+    const remainingTotal = totals.total - alreadyPaidAmount;
+    if (remainingTotal < 0) {
+      throw new SaleValidationError(`El nuevo total no puede ser menor que lo que ya se cobró (${alreadyPaidAmount})`);
+    }
+    if (!installmentsSumMatches(installmentAmounts, remainingTotal)) {
+      throw new SaleValidationError("La suma de las cuotas no coincide con el saldo pendiente de la venta");
     }
 
-    // Prompt 6: mismo criterio que DatabaseStorage.updateSale — nunca llega acá con una cuota
-    // ya pagada (chequeo de arriba), así que regenerar como "pendiente" no pisa nada cobrado.
     const paidNow = input.paidNow ?? false;
     const firstDueDate = paidNow ? null : input.firstDueDate ?? existingSale.date;
     const installmentPlans = buildInstallmentPlans({
@@ -5560,7 +5575,7 @@ export class MemoryStorage implements IStorage {
       paymentMethod: input.paymentMethod,
       paidNow,
       firstDueDate,
-    });
+    }).filter((plan) => plan.amount > 0);
     if (existingSale.clientId === null && installmentPlans.some((p) => p.status === "pendiente")) {
       throw new SaleValidationError("Para dejar una venta pendiente de cobro tenés que elegir la clienta");
     }
@@ -5584,7 +5599,8 @@ export class MemoryStorage implements IStorage {
     });
 
     this.saleItems = this.saleItems.filter((i) => i.saleId !== id);
-    this.saleInstallments = this.saleInstallments.filter((i) => i.saleId !== id);
+    // Prompt 6: solo se borran las cuotas PENDIENTES — las ya cobradas quedan intactas.
+    this.saleInstallments = this.saleInstallments.filter((i) => i.saleId !== id || i.status === "pagado");
 
     for (const line of lines) {
       this.saleItems.push({
@@ -5607,7 +5623,7 @@ export class MemoryStorage implements IStorage {
       this.saleInstallments.push({
         id: this.nextSaleInstallmentId++,
         saleId: id,
-        installmentNumber: index + 1,
+        installmentNumber: paidInstallments.length + index + 1,
         amount: plan.amount,
         dueDate: plan.dueDate,
         status: plan.status,
@@ -5626,8 +5642,10 @@ export class MemoryStorage implements IStorage {
     existingSale.total = totals.total;
     existingSale.profit = profit;
     existingSale.paymentMethod = input.paymentMethod;
-    existingSale.installmentsCount = installmentAmounts.length;
-    existingSale.installmentFrequency = installmentAmounts.length > 1 ? input.installmentFrequency ?? null : null;
+    // Prompt 6: ya cobradas + nuevas — mismo criterio que DatabaseStorage.updateSale.
+    const installmentsCount = paidInstallments.length + installmentAmounts.filter((a) => a > 0).length;
+    existingSale.installmentsCount = installmentsCount;
+    existingSale.installmentFrequency = installmentsCount > 1 ? input.installmentFrequency ?? null : null;
     existingSale.notes = input.notes ?? null;
 
     return existingSale;
