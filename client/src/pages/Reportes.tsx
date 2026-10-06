@@ -771,7 +771,13 @@ export default function Reportes() {
                   )}
                 </div>
                 <div>
-                  <MetricCard title="Ganancia Total" value={format(kpis.totalProfit)} icon={TrendingUp} />
+                  {/* Prompt 2: mismo flag que "Costo de Mercadería" (misma consulta, mismo
+                      período) — si el costo de alguna venta es estimado, la ganancia también lo es. */}
+                  <MetricCard
+                    title="Ganancia Total"
+                    value={`${productCostQuery.data?.hasIncompleteCostData ? "≈ " : ""}${format(kpis.totalProfit)}`}
+                    icon={TrendingUp}
+                  />
                   {comparePeriod && previousKpis && (
                     <TrendDelta current={kpis.totalProfit} previous={previousKpis.totalProfit} format={format} />
                   )}

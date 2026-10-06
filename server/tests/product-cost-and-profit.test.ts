@@ -186,8 +186,8 @@ describe("Prompt 2 — Ingresos Brutos por porcentaje", () => {
   });
 });
 
-describe("Prompt 2 — nunca más 'Ganancia $0' por falta de costo, y se corrige cuando el costo llega", () => {
-  it("vender sin costo nunca da ganancia $0, y un pedido posterior con costo real corrige la venta vieja estimada", async () => {
+describe("Prompt 2 — nunca más 'Ganancia $0' por falta de costo, y un pedido NUNCA recalcula ventas viejas", () => {
+  it("vender sin costo nunca da ganancia $0, y un pedido posterior con costo real NO toca la venta vieja estimada", async () => {
     const { api } = await createConsultant(`vitest_recalc_${Date.now()}`);
     const productRes = await api("POST", "/api/products", { seccion: "VITEST", producto: "Sin costo", precio: 10000, unidades: 5 });
     const productId = (await productRes.json()).id;
@@ -216,14 +216,49 @@ describe("Prompt 2 — nunca más 'Ganancia $0' por falta de costo, y se corrige
     expect(beforeDetail.items[0].costIsEstimated).toBe(true);
     expect(beforeDetail.items[0].costPrice).toBe(6500);
 
-    // Llega el primer pedido real de este producto: costo real = 10000*0.55 = 5500 (45%).
+    // Llega el primer pedido real de este producto: el producto toma el costo promedio
+    // ponderado (10000*0.55 = 5500 al 45%)...
     const orderRes = await api("PATCH", "/api/products/stock/increment-batch", {
       lines: [{ productId, delta: 10 }],
       discountPercent: 45,
     });
     expect(orderRes.status).toBe(200);
+    const products = await (await api("GET", "/api/products")).json();
+    expect(products.find((p: any) => p.id === productId).costPrice).toBe(5500);
 
-    // La venta vieja se corrige sola: deja de ser estimada y pasa a usar el costo real.
+    // ...pero la venta vieja queda EXACTAMENTE igual: por acuerdo del Prompt 2, un pedido nunca
+    // cambia la ganancia de una venta vieja. Sigue estimada, con su "≈".
+    const afterDetail = await (await api("GET", `/api/sales/${sale.id}`)).json();
+    expect(afterDetail.items[0].costIsEstimated).toBe(true);
+    expect(afterDetail.items[0].costPrice).toBe(6500);
+    expect(afterDetail.profit).toBe(3500);
+  });
+
+  it("recalculateEstimatedSalesForProduct (llamada directa, simulando 'Editar producto' del Prompt 4) sí corrige la venta vieja", async () => {
+    const { api, consultantId } = await createConsultant(`vitest_manual_recalc_${Date.now()}`);
+    const productRes = await api("POST", "/api/products", { seccion: "VITEST", producto: "Sin costo", precio: 10000, unidades: 5 });
+    const productId = (await productRes.json()).id;
+
+    const clientRes = await api("POST", "/api/clients", { name: "Clienta manual recalc", phone: "9990003344" });
+    const clientId = (await clientRes.json()).id;
+
+    const saleRes = await api("POST", "/api/sales", {
+      clientId,
+      date: "2026-10-06",
+      items: [{ productId, quantity: 1 }],
+      orderDiscount: null,
+      orderSurcharge: null,
+      paymentMethod: "efectivo",
+      installments: [{ amount: 10000 }],
+      status: "pendiente",
+    });
+    const sale = await saleRes.json();
+    expect(sale.profit).toBe(3500); // estimado, 35% default
+
+    // Simula la carga manual de costo desde "Editar producto" (Prompt 4, todavía sin UI).
+    const { storage } = await import("../storage");
+    await storage.recalculateEstimatedSalesForProduct(consultantId, productId, 5500);
+
     const afterDetail = await (await api("GET", `/api/sales/${sale.id}`)).json();
     expect(afterDetail.items[0].costIsEstimated).toBe(false);
     expect(afterDetail.items[0].costPrice).toBe(5500);

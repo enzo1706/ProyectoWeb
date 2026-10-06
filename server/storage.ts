@@ -754,11 +754,13 @@ export interface IStorage {
     lines: { productId: number; delta: number }[],
     discountPercent?: number,
   ): Promise<{ updated: number }>;
-  /** Prompt 2 — cuando una línea de venta se marcó estimada (producto sin costo al momento de
-   * vender) y después el producto consigue un costo real por primera vez (un pedido, o una
-   * edición manual futura), corrige esas líneas viejas con el costo recién conocido y las deja
-   * de marcar estimadas. También recalcula el `profit` cacheado de cada venta afectada. No
-   * toca líneas ya reales (costIsEstimated = false) ni las de otros productos. */
+  /** Prompt 2 — corrige las líneas de venta estimadas (producto sin costo al momento de
+   * vender) de un producto con el costo recién conocido, y recalcula el `profit` cacheado de
+   * cada venta afectada. NO se llama desde `incrementProductStockBatch`: un pedido nunca
+   * cambia la ganancia de una venta vieja, por acuerdo explícito del Prompt 2. El único
+   * llamador previsto es la edición manual de costo de un producto sin costo ("Editar
+   * producto", Prompt 4) — esta función queda lista y testeada para engancharse ahí. No toca
+   * líneas ya reales (costIsEstimated = false) ni las de otros productos. */
   recalculateEstimatedSalesForProduct(consultantId: number, productId: number, newCostPrice: number): Promise<void>;
   /** Prompt 2 — dato para el aviso de Inicio "Tenés N productos sin costo cargado" (el diseño
    * del aviso en sí es otra tarea). Solo cuenta productos con unidades en stock: uno agotado y
@@ -1923,16 +1925,17 @@ export class DatabaseStorage implements IStorage {
       }
     }
 
-    // Prompt 2: productos cuyo costo pasó de "sin costo" a "con costo" en este mismo batch —
-    // sus ventas viejas estimadas se corrigen DESPUÉS de comitear el batch (ver llamado al
-    // final), nunca dentro de la misma transacción de stock (son dos preocupaciones distintas:
-    // "todo o nada" es solo sobre el stock/costo del producto, no sobre recalcular ventas).
-    const newlyCostedProducts: { productId: number; newCostPrice: number }[] = [];
-
     // TODO o NADA: las N líneas comparten una única transacción. Si cualquiera tira
     // SaleValidationError (stock insuficiente), Postgres revierte TODAS las escrituras ya
     // hechas por líneas anteriores de este mismo batch — nunca queda una importación aplicada
     // a medias (hallazgo P2, Etapa 6).
+    //
+    // Prompt 2: un pedido NUNCA dispara `recalculateEstimatedSalesForProduct` — lo acordado es
+    // que la ganancia de una venta vieja no cambia cuando entra un pedido nuevo, sin excepción.
+    // El producto toma el costo promedio ponderado de esta compra; las ventas viejas siguen
+    // "estimadas" con su "≈". La única puerta para recalcularlas es que la consultora cargue el
+    // costo a mano desde "Editar producto" (Prompt 4) — esa función ya existe y está testeada,
+    // lista para engancharse ahí.
     await db.transaction(async (tx) => {
       for (const productId of orderedProductIds) {
         const delta = deltaByProductId.get(productId)!;
@@ -1953,17 +1956,6 @@ export class DatabaseStorage implements IStorage {
           }
           continue;
         }
-
-        // Lectura previa SOLO para saber si corresponde recalcular ventas viejas estimadas de
-        // este producto (ver newlyCostedProducts más abajo) — el costo nuevo en sí NUNCA sale
-        // de esta lectura, sale siempre del UPDATE atómico de abajo. Una carrera acá, en el
-        // peor caso, dispara (o se salta) una recalculación de más/de menos — nunca corrompe
-        // el costo real, que sigue siendo 100% calculado por Postgres en una sola sentencia.
-        const [existing] = await tx
-          .select({ costPrice: productStock.costPrice, unidades: productStock.unidades })
-          .from(productStock)
-          .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, productId)));
-        const hadNoRealCost = !existing || existing.costPrice === null || existing.unidades <= 0;
 
         // Prompt 2 — costo promedio ponderado por unidades, calculado en una ÚNICA sentencia
         // atómica junto con el incremento de stock: Postgres evalúa todo el SET contra la fila
@@ -1991,16 +1983,8 @@ export class DatabaseStorage implements IStorage {
         if (stock.unidades < 0) {
           throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${stock.unidades} unidades`);
         }
-
-        if (hadNoRealCost) {
-          newlyCostedProducts.push({ productId, newCostPrice: lineCost });
-        }
       }
     });
-
-    for (const { productId, newCostPrice } of newlyCostedProducts) {
-      await this.recalculateEstimatedSalesForProduct(consultantId, productId, newCostPrice);
-    }
 
     return { updated: orderedProductIds.length };
   }
@@ -4409,12 +4393,11 @@ export class MemoryStorage implements IStorage {
     // pasan, la segunda pasada aplica todas. Si cualquiera falla en la primera pasada, no se
     // mutó ni una sola fila — nunca queda "línea por línea, aborta a la mitad" (Etapa 7.2,
     // sección 17).
-    const planned: {
-      stock: ProductStock;
-      nextUnidades: number;
-      nextCostPrice?: number;
-      newlyCosted?: boolean;
-    }[] = [];
+    // Prompt 2: un pedido NUNCA dispara `recalculateEstimatedSalesForProduct` — la ganancia de
+    // una venta vieja no cambia cuando entra un pedido nuevo. El producto toma el costo
+    // promedio ponderado; las ventas viejas siguen "estimadas". La única puerta para
+    // recalcularlas es la carga manual de costo desde "Editar producto" (Prompt 4).
+    const planned: { stock: ProductStock; nextUnidades: number; nextCostPrice?: number }[] = [];
     for (const productId of orderedProductIds) {
       const product = this.findVisibleProduct(consultantId, productId);
       if (!product) {
@@ -4438,23 +4421,15 @@ export class MemoryStorage implements IStorage {
       const nextCostPrice = hadNoRealCost
         ? lineCost
         : Math.round((stock.unidades * stock.costPrice! + delta * lineCost) / (stock.unidades + delta));
-      planned.push({ stock, nextUnidades, nextCostPrice, newlyCosted: hadNoRealCost });
+      planned.push({ stock, nextUnidades, nextCostPrice });
     }
 
-    const newlyCostedProducts: { productId: number; newCostPrice: number }[] = [];
-    for (const { stock, nextUnidades, nextCostPrice, newlyCosted } of planned) {
+    for (const { stock, nextUnidades, nextCostPrice } of planned) {
       stock.unidades = nextUnidades;
       if (nextCostPrice !== undefined) {
         stock.costPrice = nextCostPrice;
         stock.selectedDiscount = discountPercent!;
-        if (newlyCosted) {
-          newlyCostedProducts.push({ productId: stock.productId, newCostPrice: nextCostPrice });
-        }
       }
-    }
-
-    for (const { productId, newCostPrice } of newlyCostedProducts) {
-      await this.recalculateEstimatedSalesForProduct(consultantId, productId, newCostPrice);
     }
 
     return { updated: orderedProductIds.length };

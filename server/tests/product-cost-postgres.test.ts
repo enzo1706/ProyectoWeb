@@ -82,8 +82,8 @@ describe("Prompt 2 — costo promedio ponderado sobre Postgres real", () => {
     expect(stock.costPrice).toBe(583); // round(1750/3) = round(583.33...) = 583
   });
 
-  it("recalculateEstimatedSalesForProduct corrige ventas viejas estimadas y recalcula el profit cacheado", async () => {
-    const consultantId = await fixtureConsultant("recalc");
+  it("un pedido NUNCA recalcula ventas viejas estimadas — la ganancia de una venta vieja no cambia (acuerdo del Prompt 2)", async () => {
+    const consultantId = await fixtureConsultant("no-auto-recalc");
     const product = await storage.createProduct(consultantId, { seccion: "VITEST", producto: "Sin costo", precio: 10000, unidades: 5 });
     const [client] = await db.insert(clients).values({ consultantId, name: "Clienta VITEST", phone: "9990009999" }).returning();
 
@@ -99,11 +99,39 @@ describe("Prompt 2 — costo promedio ponderado sobre Postgres real", () => {
     } as any);
     expect(sale.profit).not.toBe(0); // estimado con el 35% default, nunca "precio = costo"
 
+    // Llega un pedido real para este producto — el producto toma el costo promedio ponderado,
+    // pero la venta vieja queda EXACTAMENTE igual: sigue estimada, con su "≈".
     await storage.incrementProductStockBatch(consultantId, [{ productId: product.id, delta: 10 }], 45);
 
     const detail = await storage.getSaleDetails(consultantId, sale.id);
+    expect(detail!.items[0].costIsEstimated).toBe(true);
+    expect(detail!.profit).toBe(sale.profit);
+  });
+
+  it("recalculateEstimatedSalesForProduct (llamada directa, simulando 'Editar producto' del Prompt 4) corrige ventas viejas estimadas y recalcula el profit cacheado", async () => {
+    const consultantId = await fixtureConsultant("manual-recalc");
+    const product = await storage.createProduct(consultantId, { seccion: "VITEST", producto: "Sin costo", precio: 10000, unidades: 5 });
+    const [client] = await db.insert(clients).values({ consultantId, name: "Clienta VITEST", phone: "9990009998" }).returning();
+
+    const sale = await storage.createSale(consultantId, {
+      clientId: client.id,
+      date: "2026-10-06",
+      items: [{ productId: product.id, quantity: 1 }],
+      orderDiscount: null,
+      orderSurcharge: null,
+      paymentMethod: "efectivo",
+      installments: [{ amount: 10000 }],
+      status: "pendiente",
+    } as any);
+    expect(sale.profit).not.toBe(0);
+
+    // Simula la carga manual de costo desde "Editar producto" (Prompt 4, todavía no tiene UI):
+    // llamar a esta función es exactamente lo que ese endpoint futuro va a hacer.
+    await storage.recalculateEstimatedSalesForProduct(consultantId, product.id, 5500);
+
+    const detail = await storage.getSaleDetails(consultantId, sale.id);
     expect(detail!.items[0].costIsEstimated).toBe(false);
-    expect(detail!.items[0].costPrice).toBe(5500); // 10000 * 0.55
-    expect(detail!.profit).toBe(4500);
+    expect(detail!.items[0].costPrice).toBe(5500);
+    expect(detail!.profit).toBe(4500); // 10000 - 5500
   });
 });
