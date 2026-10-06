@@ -33,12 +33,53 @@ igual (usa `IF NOT EXISTS`/`IF EXISTS` en todo, así que lo que ya esté aplicad
 hace nada) — pero ya no es ciego, es verificable.
 
 **Commit real que está corriendo en producción ahora**: `20c8d83` (confirmado vía la API de
-Railway, no supuesto) — es un commit descendiente de `3b42003` (Etapa 7.1-7.9, 15/9) con dos
-arreglos puntuales después (el fix de email de suscripción, assets de marca) pero **sin ningún
-cambio de schema entre medio** — confirmé que el diff de `shared/schema.ts` entre `3b42003` y
-`20c8d83` está vacío. O sea: el código vivo espera exactamente el schema de la sección 1+2 de
+Railway, no supuesto, viendo el último deployment con estado SUCCESS del servicio) — es un
+commit descendiente de `3b42003` (Etapa 7.1-7.9, 15/9) con dos arreglos puntuales después (el fix
+de email de suscripción, assets de marca) pero **sin ningún cambio de schema entre medio**.
+
+Rehice la lista completa de la sección "Migraciones de schema" tomando como base `20c8d83`
+directamente (no `e569568` ni `3b42003` por transitividad) — `git diff 20c8d83 HEAD --
+shared/schema.ts` — y la comparé bit a bit contra la que ya tenía armada desde `3b42003`:
+**salen idénticas** (mismas 255 líneas de diferencia, mismo contenido exacto). No cambia nada de
+la lista de abajo. O sea: el código vivo espera exactamente el schema de la sección 1+2 de
 abajo, ni más ni menos. Las secciones 3, 4 y 5 (Prompt U, 1 y 2) nunca se desplegaron — están
 solo en los commits locales de esta máquina.
+
+## Arreglar "Recuperar contraseña" — se puede hacer HOY, sin esperar el deploy
+
+Esto no tiene nada que ver con la migración de la base — es nada más cargar dos variables en
+Railway. No hace falta backup, no hace falta tocar código, no hace falta coordinar con nada de
+lo de abajo. Pasos:
+
+1. **Crear una cuenta en Resend** (resend.com) si todavía no existe una para el proyecto.
+2. **Agregar el dominio `impulsaweb.ar`** desde el panel de Resend (Domains → Add Domain).
+   Resend va a mostrar 2 o 3 registros DNS para agregar (normalmente un `TXT` para SPF, uno o
+   más `CNAME` para DKIM, y a veces un `TXT` para DMARC) — son específicos de esa cuenta, Resend
+   los genera en el momento, no son valores fijos que yo pueda darles de antemano. Hay que
+   cargarlos en el panel de DNS de donde esté registrado `impulsaweb.ar` (el proveedor del
+   dominio, no Railway ni Supabase).
+3. **Esperar la verificación** (Resend la hace sola una vez que los registros DNS propagan —
+   puede tardar de minutos a un par de horas según el proveedor de DNS). El panel de Resend
+   muestra el dominio como "Verified" cuando está listo.
+4. **Crear una API key** en Resend (API Keys → Create API Key) con permiso de envío.
+5. **Cargar las dos variables en Railway** (proyecto `proud-spontaneity` → servicio
+   `marykaymanager` → Variables):
+   - `RESEND_API_KEY`: la que generó el paso 4.
+   - `EMAIL_FROM`: una dirección del dominio ya verificado, en formato
+     `Impulsa <no-reply@impulsaweb.ar>` (el código la manda tal cual al SDK de Resend como
+     remitente — ver `server/email.ts`). No hace falta que esa casilla reciba nada, es solo el
+     remitente.
+6. **Railway redeploya solo** al guardar las variables (no hace falta tocar código ni hacer un
+   deploy manual).
+7. **Probarlo**: desde `impulsaweb.ar/login` → "¿Olvidaste tu contraseña?" → pedirlo con un email
+   real de una cuenta que exista → confirmar que el correo llega (revisar spam la primera vez).
+   Si Resend rechaza el envío, el error queda en los logs de Railway con el mensaje real de
+   Resend (`server/email.ts` lo loguea sin exponer la API key) — fácil de diagnosticar desde ahí
+   si algo falla.
+
+Mientras esto no esté hecho, el request a "Olvidé mi contraseña" sigue respondiendo 200 (es
+a propósito, para no revelar qué emails existen) pero el código nunca llega — nadie puede
+recuperar su cuenta por esta vía hasta que se complete esto.
 
 ## Por qué esto es urgente, no solo prolijo
 
@@ -154,10 +195,32 @@ GROUP BY consultant_id, date, time
 HAVING count(*) > 1;
 ```
 
-**Si cualquiera de las consultas 1 o 2 devuelve filas: frenar ahí, no aplicar esa parte puntual
-del SQL de la sección siguiente, y mandarme el resultado antes de seguir.** El resto del SQL
-(todo lo que no depende de esos dos índices) se puede aplicar igual sin problema — son bloques
-independientes.
+**Si CUALQUIERA de las consultas 1 o 2 devuelve filas: frenar TODO — ni el resto de la
+migración, ni el deploy del código — y mandarme el resultado antes de seguir con cualquier otra
+cosa.** (Técnicamente probé que el resto del SQL se puede aplicar igual, porque son bloques
+independientes entre sí — pero la regla acá es pararlo todo de una, no ir decidiendo parte por
+parte el mismo día del deploy. Más simple, menos margen de error humano.)
+
+### ¿El código nuevo depende de que estos índices únicos existan?
+
+Sí, de dos formas distintas — reviso el código, no es una suposición:
+
+- **`coupon_redemptions_coupon_consultant_unique`** (Prompt U, tabla nueva): el código de
+  reserva de cupón usa literalmente `ON CONFLICT (coupon_id, consultant_id) DO NOTHING` (ver
+  `server/storage.ts`, reserva de cupón). Esto es más grave que "silenciosamente deja pasar un
+  duplicado": si ese índice único no existe, Postgres **rechaza la consulta entera** con el
+  error `there is no unique or exclusion constraint matching the ON CONFLICT specification` —
+  cualquier intento de aplicar un cupón al suscribirse rompería con un 500, no solo dejaría de
+  protegerse contra el duplicado. Ya está cubierto por la sección 3 de la migración (la tabla
+  completa, con esa constraint incluida) — lo marco para que quede explícito el motivo.
+- **`consultants_email_unique_idx`** y **`appointments_consultant_active_slot_unique_idx`**: acá
+  es distinto, el código NO usa `ON CONFLICT` — hace un `INSERT`/`UPDATE` normal y después
+  atrapa la excepción de Postgres (código `23505`) **por el nombre exacto de la constraint**
+  (`isUniqueViolationOn`, en `server/storage.ts`) para convertirla en un mensaje claro
+  ("Ya existe una cuenta con ese email" / "Ya existe un turno en ese horario"). Si el índice no
+  existiera, no habría ningún error que atrapar: el registro duplicado o el turno duplicado se
+  guardarían igual, sin aviso — un hueco de integridad silencioso, no un 500. (El de email ya
+  está confirmado presente en producción; el de turnos sigue sin confirmar, ver arriba.)
 
 ---
 
@@ -169,7 +232,9 @@ independientes.
 4. Contra esa base restaurada, en este orden:
    a. Correr las consultas de "Chequeos de datos" de arriba (incluida la de verdad de base, la
       primera). Guardar los resultados.
-   b. Si las consultas 1 o 2 dieron filas: PARAR, mandarme el resultado, resolver antes de seguir.
+   b. Si CUALQUIERA de las consultas 1 o 2 dio filas: PARAR TODO ACÁ — ni el resto de la
+      migración, ni el deploy del código — y mandarme el resultado. No seguir a 4c/4d hasta
+      resolverlo conmigo.
    c. Correr el SQL completo de "Migraciones de schema" de más abajo.
    d. Correr `npx tsx script/check-cost-equals-price.ts` y
       `npx tsx script/migrate-estimated-sale-costs.ts` (ver nota de conexión más abajo) — los
