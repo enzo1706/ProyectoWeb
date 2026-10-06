@@ -117,6 +117,68 @@ export function computeDiscountedCost(precio: number, discountPercent: number): 
   return Math.round(precio * (1 - discountPercent / 100));
 }
 
+/** El más bajo de los descuentos reales (discountOptions = [35, 40, 45] en shared/schema.ts) —
+ * deliberado: sin ningún pedido registrado, conviene subestimar la ganancia antes que
+ * exagerarla. Fuente única: server/orderDiscount.ts y server/storage.ts (costo estimado de
+ * venta) la reusan, en vez de declarar el mismo número dos veces. */
+export const DEFAULT_HABITUAL_DISCOUNT_PERCENT = 35;
+export const HABITUAL_DISCOUNT_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
+
+export interface OrderDiscountLogEntryLike {
+  discountPercent: number;
+  publicValueArs: number;
+}
+
+/** Promedio ponderado por monto de una lista de pedidos (ver computeHabitualDiscountPercent,
+ * server/orderDiscount.ts, para los fallbacks de "sin pedidos recientes"/"sin pedidos nunca").
+ * `null` cuando no hay nada que promediar — el caller decide el fallback. Función pura, sin
+ * acceso a storage, para poder usarla tanto desde server/orderDiscount.ts (que sí importa
+ * `storage`) como desde server/storage.ts (que `orderDiscount.ts` ya importa) sin crear un
+ * ciclo de imports entre los dos módulos. */
+export function computeWeightedDiscountPercent(entries: OrderDiscountLogEntryLike[]): number | null {
+  if (entries.length === 0) return null;
+  let totalPublic = 0;
+  let totalPaid = 0;
+  for (const entry of entries) {
+    totalPublic += entry.publicValueArs;
+    totalPaid += entry.publicValueArs * (1 - entry.discountPercent / 100);
+  }
+  if (totalPublic === 0) return null;
+  return ((totalPublic - totalPaid) / totalPublic) * 100;
+}
+
+export interface ResolvedLineCost {
+  costPrice: number;
+  isEstimated: boolean;
+}
+
+/** Costo real de una línea si está cargado (`productStock.costPrice`); si no, lo estima con el
+ * descuento de compra habitual de la consultora — NUNCA con el precio de venta (Prompt 2:
+ * "nunca uses el precio de venta como costo"). Reemplaza el fallback `costPrice ?? product.precio`
+ * que existía en ~9 lugares de server/storage.ts. */
+export function resolveLineCost(input: {
+  costPrice: number | null;
+  publicPrice: number;
+  habitualDiscountPercent: number;
+}): ResolvedLineCost {
+  if (input.costPrice !== null) {
+    return { costPrice: input.costPrice, isEstimated: false };
+  }
+  return {
+    costPrice: computeDiscountedCost(input.publicPrice, input.habitualDiscountPercent),
+    isEstimated: true,
+  };
+}
+
+/** Monto de Ingresos Brutos de una venta: el % (en décimas de punto porcentual, mismo formato
+ * que `consultants.grossIncomeTaxPercentTenths`) aplicado sobre el `total` que paga la clienta
+ * (ya incluye descuento, recargo y envío cobrado — nunca sobre el subtotal). `null` cuando la
+ * consultora no cargó el porcentaje en Configuración: no se inventa un valor. */
+export function computeGrossIncomeTax(total: number, percentTenths: number | null): number | null {
+  if (percentTenths === null) return null;
+  return Math.round((total * percentTenths) / 1000);
+}
+
 /** Precio final de una línea según el modo de ajuste elegido en EditSaleItemDialog. */
 export function computeItemFinalPrice(originalPrice: number, mode: ItemAdjustmentMode, value: number | null): number {
   switch (mode) {

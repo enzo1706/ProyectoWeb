@@ -130,52 +130,29 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
       }
       const chosenDiscount = discount;
 
-      // Etapa 7.2 — UNA sola llamada atómica para el stock: todo o nada. Reemplaza el loop de
-      // PATCH /stock/increment por línea (hallazgo P2, Etapa 6) — si cualquier línea fuera
-      // inválida, el backend revierte la transacción completa y acá no se aplica NADA, ni las
-      // líneas que "hubieran pasado" antes en el loop viejo.
+      // Etapa 7.2, extendido en el Prompt 2 — UNA sola llamada atómica para stock Y costo: todo
+      // o nada. `discountPercent` hace que el backend calcule el costo promedio ponderado por
+      // unidades de cada línea en la MISMA sentencia que suma el stock (nunca una llamada
+      // separada por producto, que ya no sabría cuántas unidades había ANTES de este pedido).
       await apiRequest("PATCH", "/api/products/stock/increment-batch", {
         lines: lines.map((l) => ({ productId: l.productId, delta: l.quantity })),
+        discountPercent: chosenDiscount,
       });
-
-      // El descuento es un SET idempotente por producto (costPrice se recalcula siempre desde
-      // el mismo discountPercent, nunca un delta) — a diferencia del stock, reintentar una
-      // línea de descuento no duplica ni corrompe nada, así que una falla acá no forma parte
-      // del "todo o nada" de esta etapa (que es específicamente sobre stock, ver Etapa 7.2,
-      // sección 20) y no debe bloquear que el pedido quede cargado.
-      const discountFailed: string[] = [];
-      for (const line of lines) {
-        try {
-          await apiRequest("PATCH", `/api/products/${line.productId}/discount`, { discountPercent: chosenDiscount });
-        } catch {
-          discountFailed.push(line.productName);
-        }
-      }
 
       // Prompt 1/2 — registro del pedido para el "descuento de compra habitual" (Configuración).
       // `subtotal` ya es el valor al público ANTES del descuento, justo lo que pide el log. Best
-      // effort, igual que el loop de arriba: el pedido ya quedó cargado (stock actualizado), que
-      // esto falle nunca debe mostrarse como un error del pedido en sí.
+      // effort: el pedido ya quedó cargado (stock y costo actualizados), que esto falle nunca
+      // debe mostrarse como un error del pedido en sí.
       try {
         await apiRequest("POST", "/api/products/order-discount-log", { discountPercent: chosenDiscount, publicValueArs: subtotal });
       } catch {
         // silencioso a propósito — ver comentario de arriba.
       }
-
-      return { discountFailed };
     },
-    onSuccess: ({ discountFailed }) => {
+    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/products"] });
       queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
-      if (discountFailed.length > 0) {
-        toast({
-          title: "Pedido cargado, con un detalle",
-          description: `El stock se actualizó correctamente. No se pudo aplicar el descuento a: ${discountFailed.join(", ")}.`,
-          variant: "destructive",
-        });
-      } else {
-        toast({ title: "Pedido cargado", description: "El stock se actualizó correctamente." });
-      }
+      toast({ title: "Pedido cargado", description: "El stock se actualizó correctamente." });
       resetAndClose();
     },
     onError: (err: Error) => {

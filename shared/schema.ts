@@ -213,6 +213,14 @@ export const sales = pgTable("sales", {
   // la decisión de diseño completa. NULL = no informado (ventas anteriores a esta etapa, o
   // ventas donde la consultora simplemente no lo cargó) — nunca se inventa un valor.
   ingresosBrutos: integer("ingresos_brutos"),
+  // Prompt 2: % de Ingresos Brutos vigente en Configuración al confirmar la venta, en décimas
+  // de punto porcentual (mismo formato que consultants.grossIncomeTaxPercentTenths — 3,5% =
+  // 35). Reemplaza el monto manual de arriba para ventas nuevas: `ingresosBrutos` ($) se sigue
+  // escribiendo con el monto ya calculado a partir de este %, así que nada que lea esa columna
+  // necesita enterarse de este cambio. null = la consultora no tenía el % cargado en ese
+  // momento (no paga IIBB, o todavía no lo configuró) — nunca se inventa un valor, y si
+  // después cambia el %, esta venta no se recalcula.
+  grossIncomeTaxPercentTenths: integer("gross_income_tax_percent_tenths"),
   total: integer("total").notNull(),
   profit: integer("profit").notNull(),
   paymentMethod: text("payment_method").notNull().default("efectivo"),
@@ -254,6 +262,11 @@ export const saleItems = pgTable("sale_items", {
   // producto específico. Nullable: líneas de ventas anteriores a esta etapa quedan en NULL —
   // ese costo histórico por ítem nunca fue registrado y no se inventa retroactivamente.
   costPrice: integer("cost_price"),
+  // Prompt 2 (Costos y ganancia): true/false cuando `costPrice` se resolvió sin un costo real
+  // cargado en product_stock (se estimó con el descuento de compra habitual) — null en líneas
+  // de antes de esta columna, donde no hay forma de saberlo con certeza (ver migración de
+  // datos de la Etapa correspondiente). Nunca se "completa" retroactivamente a partir de null.
+  costIsEstimated: boolean("cost_is_estimated"),
 }, (table) => ({
   saleIdIdx: index("sale_items_sale_id_idx").on(table.saleId),
   productIdIdx: index("sale_items_product_id_idx").on(table.productId),
@@ -682,6 +695,21 @@ export const incrementProductStockBatchSchema = z.object({
       }),
     )
     .min(1, "El lote no puede estar vacío"),
+  // Prompt 2 (Costos y ganancia): el descuento elegido para TODO el pedido (35/40/45%, un solo
+  // valor por batch — LoadOrderDialog.tsx solo permite elegir uno por pedido). Cuando viene
+  // presente, el costo de cada línea se actualiza atómicamente junto con el stock (promedio
+  // ponderado por unidades, ver DatabaseStorage.incrementProductStockBatch) en vez del viejo
+  // loop separado de PATCH /:id/discount por línea, que no tenía forma de saber cuántas
+  // unidades había en stock ANTES de este mismo pedido (ya las había sumado el batch).
+  // Ausente/undefined = batch sin contexto de costo (ej. una corrección manual de stock que no
+  // represente un pedido real): no toca costPrice/selectedDiscount de ningún producto.
+  discountPercent: z
+    .number()
+    .int()
+    .refine((v) => (discountOptions as readonly number[]).includes(v), {
+      message: "El descuento debe ser uno de los valores permitidos",
+    })
+    .optional(),
 });
 
 export const setProductStockReminderSchema = z.object({
@@ -727,9 +755,9 @@ export const createSaleSchema = z.object({
   // `null` se tratan igual (no informado, el cálculo de profit lo trata como 0 sin inventar
   // el dato). Nunca negativo cuando se informa.
   shippingCost: z.number().int().nonnegative().nullable().optional(),
-  // Etapa 4: Ingresos Brutos — mismo criterio que shippingCost (opcional Y nullable, nunca
-  // negativo, resta de profit sin afectar total). Ver shared/saleCalculations.ts.
-  ingresosBrutos: z.number().int().nonnegative().nullable().optional(),
+  // Prompt 2: Ingresos Brutos deja de ser un monto que manda el cliente — se calcula solo en
+  // el backend a partir del % cargado en Configuración (consultants.grossIncomeTaxPercentTenths)
+  // sobre el total de ESTA venta. Si el cliente igual lo manda, se ignora (ver storage.createSale).
   paymentMethod: z.enum(paymentMethods),
   installments: z.array(z.object({ amount: z.number().int().nonnegative() })).min(1),
   installmentFrequency: z.enum(installmentFrequencies).optional(),
@@ -748,7 +776,7 @@ export const updateSaleSchema = z.object({
   orderSurcharge: orderAdjustmentSchema,
   shippingCharged: z.number().int().nonnegative().optional(),
   shippingCost: z.number().int().nonnegative().nullable().optional(),
-  ingresosBrutos: z.number().int().nonnegative().nullable().optional(),
+  // Prompt 2: mismo criterio que createSaleSchema — se recalcula solo desde Configuración.
   paymentMethod: z.enum(paymentMethods),
   installments: z.array(z.object({ amount: z.number().int().nonnegative() })).min(1),
   installmentFrequency: z.enum(installmentFrequencies).optional(),

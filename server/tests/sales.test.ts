@@ -21,6 +21,19 @@ async function api(method: string, path: string, body?: unknown) {
   });
 }
 
+// Prompt 2: el % de Ingresos Brutos vive en Configuración, no en el payload de la venta — se
+// configura antes de cada test que lo necesita y se vuelve a null al final, para no contaminar
+// los tests siguientes que comparten el mismo consultor/sesión de este archivo.
+async function setGrossIncomeTaxPercentTenths(value: number | null) {
+  const current = await (await api("GET", "/api/business-settings")).json();
+  const res = await api("PATCH", "/api/business-settings", {
+    businessName: current.businessName,
+    currency: current.currency,
+    grossIncomeTaxPercentTenths: value,
+  });
+  expect(res.status).toBe(200);
+}
+
 function baseSale(overrides: Record<string, unknown> = {}) {
   return {
     clientId,
@@ -380,64 +393,74 @@ describe("Ingresos Brutos — Etapa 4", () => {
     expect(sale.profit).toBe(400); // 1000 - 600(costo), sin IIBB
   });
 
-  it("2. venta con Ingresos Brutos: se persiste, resta de profit, NUNCA se suma a total (a diferencia de shippingCharged)", async () => {
-    const res = await api(
-      "POST",
-      "/api/sales",
-      baseSale({ items: [{ productId, quantity: 1 }], ingresosBrutos: 80, installments: [{ amount: 1000 }] }),
-    );
-    expect(res.status).toBe(201);
-    const sale = await res.json();
-    expect(sale.ingresosBrutos).toBe(80);
-    expect(sale.total).toBe(1000); // IIBB no participa del total que paga la clienta
-    expect(sale.profit).toBe(320); // 1000 - 600(costo) - 80(IIBB)
+  it("2. venta con % de Ingresos Brutos cargado en Configuración: se calcula solo, resta de profit, NUNCA se suma a total", async () => {
+    await setGrossIncomeTaxPercentTenths(80); // 8%
+    try {
+      const res = await api("POST", "/api/sales", baseSale({ items: [{ productId, quantity: 1 }], installments: [{ amount: 1000 }] }));
+      expect(res.status).toBe(201);
+      const sale = await res.json();
+      expect(sale.grossIncomeTaxPercentTenths).toBe(80);
+      expect(sale.ingresosBrutos).toBe(80); // 1000 * 8%
+      expect(sale.total).toBe(1000); // IIBB no participa del total que paga la clienta
+      expect(sale.profit).toBe(320); // 1000 - 600(costo) - 80(IIBB)
+    } finally {
+      await setGrossIncomeTaxPercentTenths(null);
+    }
   });
 
-  it("5+6. venta con Ingresos Brutos + envío cobrado + costo real de envío distinto: profit descuenta ambos costos, total solo suma lo cobrado", async () => {
-    const res = await api(
-      "POST",
-      "/api/sales",
-      baseSale({
-        items: [{ productId, quantity: 1 }],
-        shippingCharged: 200,
-        shippingCost: 120,
-        ingresosBrutos: 50,
-        installments: [{ amount: 1200 }],
-      }),
-    );
-    expect(res.status).toBe(201);
-    const sale = await res.json();
-    expect(sale.total).toBe(1200); // 1000 + 200 (shippingCharged) -- shippingCost/IIBB no tocan total
-    expect(sale.shippingCharged).toBe(200);
-    expect(sale.shippingCost).toBe(120);
-    expect(sale.ingresosBrutos).toBe(50);
-    expect(sale.profit).toBe(430); // 1200 - 600(costo) - 120(envío real) - 50(IIBB)
+  it("5+6. venta con % de IIBB + envío cobrado + costo real de envío distinto: profit descuenta ambos costos, total solo suma lo cobrado", async () => {
+    await setGrossIncomeTaxPercentTenths(100); // 10%
+    try {
+      const res = await api(
+        "POST",
+        "/api/sales",
+        baseSale({
+          items: [{ productId, quantity: 1 }],
+          shippingCharged: 200,
+          shippingCost: 120,
+          installments: [{ amount: 1200 }],
+        }),
+      );
+      expect(res.status).toBe(201);
+      const sale = await res.json();
+      expect(sale.total).toBe(1200); // 1000 + 200 (shippingCharged) -- shippingCost/IIBB no tocan total
+      expect(sale.shippingCharged).toBe(200);
+      expect(sale.shippingCost).toBe(120);
+      expect(sale.ingresosBrutos).toBe(120); // 1200 * 10%
+      expect(sale.profit).toBe(360); // 1200 - 600(costo) - 120(envío real) - 120(IIBB)
+    } finally {
+      await setGrossIncomeTaxPercentTenths(null);
+    }
   });
 
-  it("8. edición de venta editable: Ingresos Brutos se puede agregar/cambiar y recalcula profit sin perder otros valores", async () => {
+  it("8. editar una venta recalcula el % de Ingresos Brutos vigente en Configuración, sin perder otros valores", async () => {
     const createRes = await api(
       "POST",
       "/api/sales",
       baseSale({ items: [{ productId, quantity: 1 }], shippingCharged: 100, installments: [{ amount: 1100 }] }),
     );
     const sale = await createRes.json();
-    expect(sale.ingresosBrutos).toBeNull();
+    expect(sale.ingresosBrutos).toBeNull(); // todavía sin % configurado
 
-    const patchRes = await api("PATCH", `/api/sales/${sale.id}`, {
-      items: [{ productId, quantity: 1 }],
-      orderDiscount: null,
-      orderSurcharge: null,
-      shippingCharged: 100,
-      ingresosBrutos: 40,
-      paymentMethod: "efectivo",
-      installments: [{ amount: 1100 }],
-    });
-    expect(patchRes.status).toBe(200);
-    const updated = await patchRes.json();
-    expect(updated.total).toBe(1100); // sin cambios (shippingCharged sigue igual)
-    expect(updated.shippingCharged).toBe(100); // no se perdió al editar solo IIBB
-    expect(updated.ingresosBrutos).toBe(40);
-    expect(updated.profit).toBe(460); // 1100 - 600 - 40(IIBB), shippingCost sigue null
+    await setGrossIncomeTaxPercentTenths(40); // 4%
+    try {
+      const patchRes = await api("PATCH", `/api/sales/${sale.id}`, {
+        items: [{ productId, quantity: 1 }],
+        orderDiscount: null,
+        orderSurcharge: null,
+        shippingCharged: 100,
+        paymentMethod: "efectivo",
+        installments: [{ amount: 1100 }],
+      });
+      expect(patchRes.status).toBe(200);
+      const updated = await patchRes.json();
+      expect(updated.total).toBe(1100); // sin cambios (shippingCharged sigue igual)
+      expect(updated.shippingCharged).toBe(100); // no se perdió al editar
+      expect(updated.ingresosBrutos).toBe(44); // 1100 * 4%, recién configurado al editar
+      expect(updated.profit).toBe(456); // 1100 - 600 - 0(shippingCost null) - 44(IIBB)
+    } finally {
+      await setGrossIncomeTaxPercentTenths(null);
+    }
   });
 
   it("9. una venta con cuota pagada rechaza el PATCH aunque solo se intente cambiar Ingresos Brutos", async () => {
@@ -546,33 +569,35 @@ describe("Ingresos Brutos — Etapa 4", () => {
     expect(stillB.ingresosBrutos).toBeNull();
   });
 
-  it("11. idempotencia de creación sigue funcionando con Ingresos Brutos en el payload", async () => {
-    const clientRequestId = randomUUID();
-    const payload = baseSale({
-      items: [{ productId, quantity: 1 }],
-      ingresosBrutos: 30,
-      installments: [{ amount: 1000 }],
-      clientRequestId,
-    });
+  it("11. idempotencia de creación sigue funcionando con el % de Ingresos Brutos vigente", async () => {
+    await setGrossIncomeTaxPercentTenths(30); // 3%
+    try {
+      const clientRequestId = randomUUID();
+      const payload = baseSale({ items: [{ productId, quantity: 1 }], installments: [{ amount: 1000 }], clientRequestId });
 
-    const first = await api("POST", "/api/sales", payload);
-    expect(first.status).toBe(201);
-    const firstSale = await first.json();
+      const first = await api("POST", "/api/sales", payload);
+      expect(first.status).toBe(201);
+      const firstSale = await first.json();
 
-    const second = await api("POST", "/api/sales", payload);
-    expect(second.status).toBe(201); // mismo criterio ya existente: reintento -> misma venta
-    const secondSale = await second.json();
-    expect(secondSale.id).toBe(firstSale.id);
-    expect(secondSale.ingresosBrutos).toBe(30);
+      const second = await api("POST", "/api/sales", payload);
+      expect(second.status).toBe(201); // mismo criterio ya existente: reintento -> misma venta
+      const secondSale = await second.json();
+      expect(secondSale.id).toBe(firstSale.id);
+      expect(secondSale.ingresosBrutos).toBe(30); // 1000 * 3%
+    } finally {
+      await setGrossIncomeTaxPercentTenths(null);
+    }
   });
 
-  it("12. Ingresos Brutos negativo es rechazado por el backend, no crea la venta", async () => {
+  it("12. mandar 'ingresosBrutos' en el payload ya no tiene efecto — lo reemplaza el % de Configuración", async () => {
     const res = await api(
       "POST",
       "/api/sales",
-      baseSale({ items: [{ productId, quantity: 1 }], ingresosBrutos: -1, installments: [{ amount: 1000 }] }),
+      baseSale({ items: [{ productId, quantity: 1 }], ingresosBrutos: 999, installments: [{ amount: 1000 }] }),
     );
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(201); // ya no es un campo validado: lo que venga ahí se ignora
+    const sale = await res.json();
+    expect(sale.ingresosBrutos).toBeNull(); // sin % configurado, nunca 999
   });
 });
 
@@ -932,7 +957,7 @@ describe("Snapshot histórico de costo por ítem (saleItem.costPrice) — Etapa 
     expect(detail.items[0].costPrice).toBe(600); // productCost = 2*600 = 1200
   });
 
-  it("Test B — fallback sin costPrice: snapshot = precio de catálogo", async () => {
+  it("Test B — sin costPrice cargado: se estima con el descuento habitual, NUNCA con el precio de venta (Prompt 2)", async () => {
     const res = await api(
       "POST",
       "/api/sales",
@@ -940,10 +965,13 @@ describe("Snapshot histórico de costo por ítem (saleItem.costPrice) — Etapa 
     );
     expect(res.status).toBe(201);
     const sale = await res.json();
-    expect(sale.profit).toBe(0); // sin costo cargado, cost=precio -> (1000-1000)*2
+    // Esta consultora nunca cargó un pedido -> descuento habitual = 35% (default más bajo) ->
+    // costo estimado = 1000 * 0.65 = 650 (nunca 1000, el precio de venta).
+    expect(sale.profit).toBe(700); // (1000-650)*2
 
     const detail = await (await api("GET", `/api/sales/${sale.id}`)).json();
-    expect(detail.items[0].costPrice).toBe(1000); // fallback: costPrice = product.precio
+    expect(detail.items[0].costPrice).toBe(650);
+    expect(detail.items[0].costIsEstimated).toBe(true);
   });
 
   it("Test C — múltiples productos: cada línea guarda SU propio snapshot (resuelve F4)", async () => {

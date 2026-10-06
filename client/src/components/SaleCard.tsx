@@ -9,6 +9,8 @@ export type { SaleItem, SaleInstallment };
 
 export interface Sale extends BaseSale {
   itemCount: number;
+  // Prompt 2: true si alguna línea de esta venta tiene costo estimado — se muestra con "≈".
+  hasEstimatedCost: boolean;
 }
 
 /** Venta con el detalle completo (ítems + cuotas), tal como la devuelve GET /api/sales/:id. */
@@ -81,7 +83,7 @@ export function SaleCard({ sale, onClick }: SaleCardProps) {
           </div>
           <div className="text-right">
             <p className="text-sm font-medium text-green-600 dark:text-green-400">
-              +{format(sale.profit)}
+              +{sale.hasEstimatedCost ? "≈ " : ""}{format(sale.profit)}
             </p>
             <p className="text-xs text-muted-foreground">ganancia</p>
           </div>

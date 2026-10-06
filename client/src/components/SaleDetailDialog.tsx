@@ -130,6 +130,9 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
   // (nunca el costo actual del producto/productStock). Ver computeHistoricalProductCost para
   // el criterio de "no disponible" cuando falta el snapshot de algún ítem.
   const productCost = sale ? computeHistoricalProductCost(sale.items) : null;
+  // Prompt 2: "≈" cuando el costo de algún producto se estimó con el descuento habitual (no
+  // hay costo real cargado) — la ganancia mostrada no es exacta hasta que se cargue ese costo.
+  const hasEstimatedCost = sale ? sale.items.some((item) => item.costIsEstimated) : false;
 
   return (
     <>
@@ -206,7 +209,7 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                           {item.quantity} x {format(item.price)}
                         </p>
                         <p className="text-xs text-muted-foreground" data-testid={`text-item-cost-${item.id}`}>
-                          Costo:{" "}
+                          Costo{item.costIsEstimated ? " (estimado)" : ""}:{" "}
                           {item.costPrice !== null
                             ? `${item.quantity} x ${format(item.costPrice)} = ${format(item.quantity * item.costPrice)}`
                             : "No disponible"}
@@ -264,8 +267,13 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                   )}
                   <div className="flex justify-between text-green-600 dark:text-green-400">
                     <span>Ganancia</span>
-                    <span>{format(sale.profit)}</span>
+                    <span>{hasEstimatedCost ? "≈ " : ""}{format(sale.profit)}</span>
                   </div>
+                  {hasEstimatedCost && (
+                    <p className="text-xs text-muted-foreground -mt-1">
+                      Ganancia estimada: falta el costo de algún producto.
+                    </p>
+                  )}
                   <div className="flex justify-between text-muted-foreground">
                     <span>Método de pago</span>
                     <span className="capitalize">{sale.paymentMethod}</span>

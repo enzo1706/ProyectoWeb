@@ -14,6 +14,7 @@ const mockSale: Sale = {
   shippingCharged: null,
   shippingCost: null,
   ingresosBrutos: null,
+  grossIncomeTaxPercentTenths: null,
   total: 10100,
   profit: 4550,
   paymentMethod: "efectivo",
@@ -23,6 +24,7 @@ const mockSale: Sale = {
   notes: null,
   clientRequestId: null,
   itemCount: 3,
+  hasEstimatedCost: false,
 };
 
 export default function SaleCardExample() {

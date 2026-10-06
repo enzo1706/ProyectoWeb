@@ -932,6 +932,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  /** Prompt 2 — dato para el aviso de Inicio "Tenés N productos sin costo cargado" (el diseño
+   * del aviso es otra tarea). */
+  app.get("/api/products/without-cost-count", async (req: Request, res: Response) => {
+    try {
+      const count = await storage.countProductsWithoutCost(req.consultantId!);
+      res.json({ count });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener los productos sin costo" });
+    }
+  });
+
   app.get("/api/appointments/upcoming", async (req: Request, res: Response) => {
     try {
       const list = await storage.getUpcomingAppointments(req.consultantId!);
@@ -1461,7 +1473,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
 
-      const result = await storage.incrementProductStockBatch(req.consultantId!, parsed.data.lines);
+      const result = await storage.incrementProductStockBatch(req.consultantId!, parsed.data.lines, parsed.data.discountPercent);
       res.json(result);
     } catch (error) {
       if (error instanceof SaleValidationError) {

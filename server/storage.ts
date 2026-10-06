@@ -59,6 +59,12 @@ import {
   computeSaleProfit,
   installmentsSumMatches,
   computeInstallmentDueDate,
+  computeHistoricalProductCost,
+  computeWeightedDiscountPercent,
+  DEFAULT_HABITUAL_DISCOUNT_PERCENT,
+  HABITUAL_DISCOUNT_WINDOW_MS,
+  resolveLineCost,
+  computeGrossIncomeTax,
 } from "@shared/saleCalculations";
 import { resolveLowStockThreshold, DEFAULT_LOW_STOCK_THRESHOLD } from "@shared/stockAlerts";
 import {
@@ -412,6 +418,9 @@ export interface PaginatedClients {
 
 export interface SaleWithItemCount extends Sale {
   itemCount: number;
+  // Prompt 2: true si alguna línea de esta venta tiene costo estimado — Ventas/Reportes lo
+  // muestran con "≈" junto a la ganancia (otra tarea de UI).
+  hasEstimatedCost: boolean;
 }
 
 export interface SaleWithDetails extends Sale {
@@ -461,6 +470,10 @@ export interface StockValuation {
   potentialProfit: number;
   productCount: number;
   unitCount: number;
+  // Prompt 2: true si algún producto con unidades no tiene costo real cargado (valueAtCost
+  // incluye costos estimados con el descuento habitual para esos casos) — la UI de Stock
+  // (otra tarea) lo muestra con "≈".
+  hasEstimatedCost: boolean;
 }
 
 export interface InactiveClient {
@@ -736,7 +749,21 @@ export interface IStorage {
    * transacción. Si cualquier línea es inválida (producto no visible para este consultantId,
    * o el resultado quedaría negativo), tira `SaleValidationError` y NINGUNA línea queda
    * aplicada — ni las que "ya habían pasado" antes en el loop. */
-  incrementProductStockBatch(consultantId: number, lines: { productId: number; delta: number }[]): Promise<{ updated: number }>;
+  incrementProductStockBatch(
+    consultantId: number,
+    lines: { productId: number; delta: number }[],
+    discountPercent?: number,
+  ): Promise<{ updated: number }>;
+  /** Prompt 2 — cuando una línea de venta se marcó estimada (producto sin costo al momento de
+   * vender) y después el producto consigue un costo real por primera vez (un pedido, o una
+   * edición manual futura), corrige esas líneas viejas con el costo recién conocido y las deja
+   * de marcar estimadas. También recalcula el `profit` cacheado de cada venta afectada. No
+   * toca líneas ya reales (costIsEstimated = false) ni las de otros productos. */
+  recalculateEstimatedSalesForProduct(consultantId: number, productId: number, newCostPrice: number): Promise<void>;
+  /** Prompt 2 — dato para el aviso de Inicio "Tenés N productos sin costo cargado" (el diseño
+   * del aviso en sí es otra tarea). Solo cuenta productos con unidades en stock: uno agotado y
+   * sin costo no tiene ninguna urgencia de completarse. */
+  countProductsWithoutCost(consultantId: number): Promise<number>;
   /** Admin-only: catálogo global completo (sin stock, eso es por consultora) para la pantalla de imágenes. */
   listGlobalProducts(): Promise<ProductRow[]>;
   /** Admin-only: solo aplica a productos globales — las imágenes de productos manuales las
@@ -807,6 +834,20 @@ export class DatabaseStorage implements IStorage {
       ? import("./test-db").then((module) => module.testDb)
       : import("./db").then((module) => module.db);
     return this.dbPromise;
+  }
+
+  /** Mismo cálculo que computeHabitualDiscountPercent (server/orderDiscount.ts), reimplementado
+   * acá en vez de importado: ese módulo importa `storage` desde este archivo, así que
+   * importarlo de vuelta crearía un ciclo. Ambos usan la misma función pura de
+   * shared/saleCalculations.ts — solo el "pegamento" de fetch+fallback está duplicado. */
+  private async resolveHabitualDiscountPercent(consultantId: number): Promise<number> {
+    const since = new Date(Date.now() - HABITUAL_DISCOUNT_WINDOW_MS);
+    const recent = await this.listOrderDiscountLogSince(consultantId, since);
+    const weighted = computeWeightedDiscountPercent(recent);
+    if (weighted !== null) return weighted;
+    const latestEver = await this.getLatestOrderDiscountLogEntry(consultantId);
+    if (latestEver) return latestEver.discountPercent;
+    return DEFAULT_HABITUAL_DISCOUNT_PERCENT;
   }
 
   async getUser(id: number): Promise<User | undefined> {
@@ -1835,7 +1876,11 @@ export class DatabaseStorage implements IStorage {
     return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
   }
 
-  async incrementProductStockBatch(consultantId: number, lines: { productId: number; delta: number }[]): Promise<{ updated: number }> {
+  async incrementProductStockBatch(
+    consultantId: number,
+    lines: { productId: number; delta: number }[],
+    discountPercent?: number,
+  ): Promise<{ updated: number }> {
     if (lines.length === 0) {
       throw new SaleValidationError("El lote no puede estar vacío");
     }
@@ -1865,16 +1910,24 @@ export class DatabaseStorage implements IStorage {
     // que createSale: el catálogo no lo modifica ninguna venta/import concurrente, no hace
     // falta bloquearlo. Un producto de OTRO consultantId (privado, no global) da exactamente
     // el mismo error que uno inexistente — nunca se distingue, para no filtrar si existe.
+    // Prompt 2: también trae `precio`, necesario para el costo de esta compra cuando viene
+    // discountPercent.
     const catalogRows = await db
-      .select({ id: products.id })
+      .select({ id: products.id, precio: products.precio })
       .from(products)
       .where(and(inArray(products.id, orderedProductIds), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
-    const visibleIds = new Set(catalogRows.map((p) => p.id));
+    const precioById = new Map(catalogRows.map((p) => [p.id, p.precio]));
     for (const productId of orderedProductIds) {
-      if (!visibleIds.has(productId)) {
+      if (!precioById.has(productId)) {
         throw new SaleValidationError(`Producto ${productId} no encontrado`);
       }
     }
+
+    // Prompt 2: productos cuyo costo pasó de "sin costo" a "con costo" en este mismo batch —
+    // sus ventas viejas estimadas se corrigen DESPUÉS de comitear el batch (ver llamado al
+    // final), nunca dentro de la misma transacción de stock (son dos preocupaciones distintas:
+    // "todo o nada" es solo sobre el stock/costo del producto, no sobre recalcular ventas).
+    const newlyCostedProducts: { productId: number; newCostPrice: number }[] = [];
 
     // TODO o NADA: las N líneas comparten una única transacción. Si cualquiera tira
     // SaleValidationError (stock insuficiente), Postgres revierte TODAS las escrituras ya
@@ -1883,21 +1936,128 @@ export class DatabaseStorage implements IStorage {
     await db.transaction(async (tx) => {
       for (const productId of orderedProductIds) {
         const delta = deltaByProductId.get(productId)!;
+
+        if (discountPercent === undefined) {
+          // Camino de siempre: solo cantidad, no toca costo (correcciones manuales de stock
+          // sin contexto de pedido/costo).
+          const [stock] = await tx
+            .insert(productStock)
+            .values({ consultantId, productId, unidades: delta })
+            .onConflictDoUpdate({
+              target: [productStock.consultantId, productStock.productId],
+              set: { unidades: sql`${productStock.unidades} + ${delta}` },
+            })
+            .returning();
+          if (stock.unidades < 0) {
+            throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${stock.unidades} unidades`);
+          }
+          continue;
+        }
+
+        // Lectura previa SOLO para saber si corresponde recalcular ventas viejas estimadas de
+        // este producto (ver newlyCostedProducts más abajo) — el costo nuevo en sí NUNCA sale
+        // de esta lectura, sale siempre del UPDATE atómico de abajo. Una carrera acá, en el
+        // peor caso, dispara (o se salta) una recalculación de más/de menos — nunca corrompe
+        // el costo real, que sigue siendo 100% calculado por Postgres en una sola sentencia.
+        const [existing] = await tx
+          .select({ costPrice: productStock.costPrice, unidades: productStock.unidades })
+          .from(productStock)
+          .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, productId)));
+        const hadNoRealCost = !existing || existing.costPrice === null || existing.unidades <= 0;
+
+        // Prompt 2 — costo promedio ponderado por unidades, calculado en una ÚNICA sentencia
+        // atómica junto con el incremento de stock: Postgres evalúa todo el SET contra la fila
+        // VIEJA (antes de este UPDATE), así que `unidades`/`cost_price` de la derecha son
+        // siempre los valores previos a este pedido, sin necesidad de FOR UPDATE explícito (el
+        // propio UPSERT ya toma el lock de fila al ejecutarse). Si no había costo o el stock
+        // estaba en 0 (o menos), el costo nuevo es directamente el de esta compra — nunca se
+        // promedia contra "nada".
+        const lineCost = Math.round(precioById.get(productId)! * (1 - discountPercent / 100));
         const [stock] = await tx
           .insert(productStock)
-          .values({ consultantId, productId, unidades: delta })
+          .values({ consultantId, productId, unidades: delta, costPrice: lineCost, selectedDiscount: discountPercent })
           .onConflictDoUpdate({
             target: [productStock.consultantId, productStock.productId],
-            set: { unidades: sql`${productStock.unidades} + ${delta}` },
+            set: {
+              unidades: sql`${productStock.unidades} + ${delta}`,
+              costPrice: sql`CASE
+                WHEN ${productStock.costPrice} IS NULL OR ${productStock.unidades} <= 0 THEN ${lineCost}
+                ELSE ROUND((${productStock.unidades} * ${productStock.costPrice} + ${delta}::integer * ${lineCost}::integer)::numeric / (${productStock.unidades} + ${delta}))
+              END`,
+              selectedDiscount: discountPercent,
+            },
           })
-          .returning();
+          .returning({ unidades: productStock.unidades });
         if (stock.unidades < 0) {
           throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${stock.unidades} unidades`);
+        }
+
+        if (hadNoRealCost) {
+          newlyCostedProducts.push({ productId, newCostPrice: lineCost });
         }
       }
     });
 
+    for (const { productId, newCostPrice } of newlyCostedProducts) {
+      await this.recalculateEstimatedSalesForProduct(consultantId, productId, newCostPrice);
+    }
+
     return { updated: orderedProductIds.length };
+  }
+
+  async recalculateEstimatedSalesForProduct(consultantId: number, productId: number, newCostPrice: number): Promise<void> {
+    const db = await this.getDb();
+    await db.transaction(async (tx) => {
+      const estimatedItems = await tx
+        .select({ id: saleItems.id, saleId: saleItems.saleId })
+        .from(saleItems)
+        .innerJoin(sales, eq(saleItems.saleId, sales.id))
+        .where(and(eq(sales.consultantId, consultantId), eq(saleItems.productId, productId), eq(saleItems.costIsEstimated, true)));
+      if (estimatedItems.length === 0) return;
+
+      await tx
+        .update(saleItems)
+        .set({ costPrice: newCostPrice, costIsEstimated: false })
+        .where(
+          inArray(
+            saleItems.id,
+            estimatedItems.map((i) => i.id),
+          ),
+        );
+
+      // Una venta puede tener más de un producto — el profit se recalcula con TODAS sus
+      // líneas, no solo las que se acaban de corregir.
+      const affectedSaleIds = Array.from(new Set(estimatedItems.map((i) => i.saleId)));
+      for (const saleId of affectedSaleIds) {
+        const [sale] = await tx.select().from(sales).where(eq(sales.id, saleId));
+        if (!sale) continue;
+        const items = await tx
+          .select({ quantity: saleItems.quantity, costPrice: saleItems.costPrice })
+          .from(saleItems)
+          .where(eq(saleItems.saleId, saleId));
+        // Si alguna OTRA línea de esta venta es tan vieja que nunca tuvo costPrice (de antes
+        // de que esa columna existiera), no se inventa un valor para poder recalcular el
+        // profit — se deja la venta como estaba (mismo criterio que computeHistoricalProductCost).
+        const productCost = computeHistoricalProductCost(items);
+        if (productCost === null) continue;
+        const profit = computeSaleProfit({
+          total: sale.total,
+          productCost,
+          shippingCost: sale.shippingCost,
+          ingresosBrutos: sale.ingresosBrutos,
+        });
+        await tx.update(sales).set({ profit }).where(eq(sales.id, saleId));
+      }
+    });
+  }
+
+  async countProductsWithoutCost(consultantId: number): Promise<number> {
+    const db = await this.getDb();
+    const [row] = await db
+      .select({ value: count() })
+      .from(productStock)
+      .where(and(eq(productStock.consultantId, consultantId), isNull(productStock.costPrice), gt(productStock.unidades, 0)));
+    return row?.value ?? 0;
   }
 
   async setProductStockReminder(consultantId: number, productId: number, remindAt: string | null): Promise<Product | undefined> {
@@ -2622,12 +2782,16 @@ export class DatabaseStorage implements IStorage {
 
   async getStockValuation(consultantId: number): Promise<StockValuation> {
     const db = await this.getDb();
+    // Prompt 2: nunca el precio de venta como costo — un producto sin costPrice se estima con
+    // el descuento de compra habitual, igual que al vender (ver resolveLineCost).
+    const habitualDiscountPercent = await this.resolveHabitualDiscountPercent(consultantId);
     const [row] = await db
       .select({
-        valueAtCost: sql<number>`coalesce(sum(${productStock.unidades} * coalesce(${productStock.costPrice}, ${products.precio})), 0)`,
+        valueAtCost: sql<number>`coalesce(sum(${productStock.unidades} * coalesce(${productStock.costPrice}, round(${products.precio} * (1 - ${habitualDiscountPercent} / 100.0)))), 0)`,
         valueAtPrice: sql<number>`coalesce(sum(${productStock.unidades} * ${products.precio}), 0)`,
         productCount: count(products.id),
         unitCount: sql<number>`coalesce(sum(${productStock.unidades}), 0)`,
+        hasEstimatedCost: sql<boolean>`coalesce(bool_or(${productStock.costPrice} is null and ${productStock.unidades} > 0), false)`,
       })
       .from(productStock)
       .innerJoin(products, eq(products.id, productStock.productId))
@@ -2641,6 +2805,7 @@ export class DatabaseStorage implements IStorage {
       potentialProfit: valueAtPrice - valueAtCost,
       productCount: Number(row?.productCount ?? 0),
       unitCount: Number(row?.unitCount ?? 0),
+      hasEstimatedCost: row?.hasEstimatedCost ?? false,
     };
   }
 
@@ -2745,7 +2910,10 @@ export class DatabaseStorage implements IStorage {
     const [row] = await db
       .select({
         productCost: sql<number>`coalesce(sum(${saleItems.quantity} * ${saleItems.costPrice}), 0)`,
-        unknownCostLines: sql<number>`count(*) filter (where ${saleItems.costPrice} is null)`,
+        // Prompt 2: desde que costPrice nunca más queda null en ventas nuevas (siempre real o
+        // estimado), "costo incompleto" pasa a incluir también las líneas marcadas estimadas
+        // — no solo las legacy sin costPrice. Ambas producen el mismo "≈" en pantalla.
+        incompleteCostLines: sql<number>`count(*) filter (where ${saleItems.costPrice} is null or ${saleItems.costIsEstimated} = true)`,
       })
       .from(saleItems)
       .innerJoin(sales, eq(saleItems.saleId, sales.id))
@@ -2753,7 +2921,7 @@ export class DatabaseStorage implements IStorage {
 
     return {
       productCost: Number(row?.productCost ?? 0),
-      hasIncompleteCostData: Number(row?.unknownCostLines ?? 0) > 0,
+      hasIncompleteCostData: Number(row?.incompleteCostLines ?? 0) > 0,
     };
   }
 
@@ -2800,13 +2968,23 @@ export class DatabaseStorage implements IStorage {
 
     const saleIds = salesRows.map((s) => s.id);
     const counts = await db
-      .select({ saleId: saleItems.saleId, itemCount: sql<number>`coalesce(sum(${saleItems.quantity}), 0)` })
+      .select({
+        saleId: saleItems.saleId,
+        itemCount: sql<number>`coalesce(sum(${saleItems.quantity}), 0)`,
+        // Prompt 2: "≈" en la lista cuando alguna línea es estimada, o cuando es tan vieja que
+        // ni siquiera tiene costPrice (misma incertidumbre, mismo símbolo).
+        hasEstimatedCost: sql<boolean>`coalesce(bool_or(${saleItems.costIsEstimated} = true or ${saleItems.costPrice} is null), false)`,
+      })
       .from(saleItems)
       .where(inArray(saleItems.saleId, saleIds))
       .groupBy(saleItems.saleId);
-    const countBySale = new Map(counts.map((c) => [c.saleId, Number(c.itemCount)]));
+    const countsBySale = new Map(counts.map((c) => [c.saleId, c]));
 
-    return salesRows.map((s) => ({ ...s, itemCount: countBySale.get(s.id) ?? 0 }));
+    return salesRows.map((s) => ({
+      ...s,
+      itemCount: countsBySale.get(s.id)?.itemCount ?? 0,
+      hasEstimatedCost: countsBySale.get(s.id)?.hasEstimatedCost ?? false,
+    }));
   }
 
   async getSaleDetails(consultantId: number, id: number): Promise<SaleWithDetails | undefined> {
@@ -2878,6 +3056,16 @@ export class DatabaseStorage implements IStorage {
     if (!client) throw new SaleValidationError("Clienta no encontrada");
     const clientName = client.name ?? client.phone;
 
+    // Prompt 2: costo estimado (cuando el producto no tiene costPrice) y el % de IIBB vigente
+    // se resuelven ANTES de la transacción — son lecturas de otras tablas, no de productStock,
+    // así que no necesitan el mismo lock que el stock.
+    const habitualDiscountPercent = await this.resolveHabitualDiscountPercent(consultantId);
+    const [consultantRow] = await db
+      .select({ grossIncomeTaxPercentTenths: consultants.grossIncomeTaxPercentTenths })
+      .from(consultants)
+      .where(eq(consultants.id, consultantId));
+    const grossIncomeTaxPercentTenths = consultantRow?.grossIncomeTaxPercentTenths ?? null;
+
     try {
       return await db.transaction(async (tx) => {
       // SELECT ... FOR UPDATE: bloquea las filas de stock involucradas hasta el commit. Si
@@ -2908,11 +3096,17 @@ export class DatabaseStorage implements IStorage {
         if (available < item.quantity) {
           throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);
         }
+        const resolvedCost = resolveLineCost({
+          costPrice: stock?.costPrice ?? null,
+          publicPrice: product.precio,
+          habitualDiscountPercent,
+        });
         return {
           product,
           quantity: item.quantity,
           unitPrice: item.unitPrice ?? product.precio,
-          costPrice: stock?.costPrice ?? null,
+          costPrice: resolvedCost.costPrice,
+          costIsEstimated: resolvedCost.isEstimated,
           remainingAfterSale: available - item.quantity,
         };
       });
@@ -2930,18 +3124,15 @@ export class DatabaseStorage implements IStorage {
         throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
       }
 
-      // Etapa I-B.7-D-C: profit real — total autoritativo (ya incluye descuento/recargo/envío
-      // cobrado) menos el costo real de mercadería y el costo real de envío. Mismo fallback de
-      // costo por línea que ya existía (`costPrice ?? product.precio`), ahora usado para COGS
-      // en vez de para un cálculo de profit por línea que ignoraba el resto de la orden.
-      const productCost = computeProductCost(
-        lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice ?? l.product.precio })),
-      );
+      // Prompt 2: costo de mercadería SIEMPRE real o explícitamente estimado — nunca más el
+      // precio de venta como sustituto (costPrice ya viene resuelto de arriba, nunca null).
+      const productCost = computeProductCost(lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice })));
+      const ingresosBrutosAmount = computeGrossIncomeTax(totals.total, grossIncomeTaxPercentTenths);
       const profit = computeSaleProfit({
         total: totals.total,
         productCost,
         shippingCost: input.shippingCost ?? null,
-        ingresosBrutos: input.ingresosBrutos ?? null,
+        ingresosBrutos: ingresosBrutosAmount,
       });
 
       // Última línea de defensa contra una carrera real (dos requests concurrentes con el
@@ -2968,7 +3159,8 @@ export class DatabaseStorage implements IStorage {
             orderSurchargeValue: input.orderSurcharge?.value ?? null,
             shippingCharged: input.shippingCharged ?? null,
             shippingCost: input.shippingCost ?? null,
-            ingresosBrutos: input.ingresosBrutos ?? null,
+            ingresosBrutos: ingresosBrutosAmount,
+            grossIncomeTaxPercentTenths,
             total: totals.total,
             profit,
             paymentMethod: input.paymentMethod,
@@ -2995,10 +3187,10 @@ export class DatabaseStorage implements IStorage {
           quantity: l.quantity,
           originalPrice: l.product.precio,
           price: l.unitPrice,
-          // Etapa I-B.7-D-D: mismo costo, misma expresión, que ya usa `computeProductCost`
-          // más arriba — nunca una fuente distinta para lo que se persiste vs. lo que se
-          // calculó.
-          costPrice: l.costPrice ?? l.product.precio,
+          // Mismo costo, misma expresión, que ya usa `computeProductCost` más arriba — nunca
+          // una fuente distinta para lo que se persiste vs. lo que se calculó.
+          costPrice: l.costPrice,
+          costIsEstimated: l.costIsEstimated,
         })),
       );
 
@@ -3043,6 +3235,15 @@ export class DatabaseStorage implements IStorage {
    */
   async updateSale(consultantId: number, id: number, input: UpdateSaleInput): Promise<Sale | undefined> {
     const db = await this.getDb();
+
+    // Prompt 2: mismo criterio que createSale — se resuelven antes de la transacción, no
+    // dependen del lock de stock.
+    const habitualDiscountPercent = await this.resolveHabitualDiscountPercent(consultantId);
+    const [consultantRow] = await db
+      .select({ grossIncomeTaxPercentTenths: consultants.grossIncomeTaxPercentTenths })
+      .from(consultants)
+      .where(eq(consultants.id, consultantId));
+    const grossIncomeTaxPercentTenths = consultantRow?.grossIncomeTaxPercentTenths ?? null;
 
     return db.transaction(async (tx) => {
       // Etapa I-B.7-C: `FOR UPDATE` acá también — mismo orden global de locks que
@@ -3140,8 +3341,18 @@ export class DatabaseStorage implements IStorage {
           throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);
         }
         stockById.set(item.productId, available - item.quantity);
-        const costPrice = stockRowById.get(item.productId)?.costPrice ?? null;
-        return { product, quantity: item.quantity, unitPrice: item.unitPrice ?? product.precio, costPrice };
+        const resolvedCost = resolveLineCost({
+          costPrice: stockRowById.get(item.productId)?.costPrice ?? null,
+          publicPrice: product.precio,
+          habitualDiscountPercent,
+        });
+        return {
+          product,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice ?? product.precio,
+          costPrice: resolvedCost.costPrice,
+          costIsEstimated: resolvedCost.isEstimated,
+        };
       });
 
       const subtotal = computeSubtotal(lines.map((l) => ({ quantity: l.quantity, unitPrice: l.unitPrice })));
@@ -3157,17 +3368,16 @@ export class DatabaseStorage implements IStorage {
         throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
       }
 
-      // Etapa I-B.7-D-C: misma fórmula que createSale — total autoritativo menos costo real
+      // Prompt 2: misma fórmula que createSale — total autoritativo menos costo real/estimado
       // de mercadería (con costos ACTUALES de productStock, ya releídos arriba bajo el lock)
-      // menos costo real de envío informado en esta edición.
-      const productCost = computeProductCost(
-        lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice ?? l.product.precio })),
-      );
+      // menos costo real de envío e Ingresos Brutos de esta edición.
+      const productCost = computeProductCost(lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice })));
+      const ingresosBrutosAmount = computeGrossIncomeTax(totals.total, grossIncomeTaxPercentTenths);
       const profit = computeSaleProfit({
         total: totals.total,
         productCost,
         shippingCost: input.shippingCost ?? null,
-        ingresosBrutos: input.ingresosBrutos ?? null,
+        ingresosBrutos: ingresosBrutosAmount,
       });
 
       // A partir de acá ya está todo validado: recién ahora se escribe.
@@ -3190,11 +3400,12 @@ export class DatabaseStorage implements IStorage {
           quantity: l.quantity,
           originalPrice: l.product.precio,
           price: l.unitPrice,
-          // Etapa I-B.7-D-D: costo vigente al momento de esta edición (releído de
-          // productStock bajo el mismo lock, arriba) — misma fuente que computeProductCost.
-          // Una edición reemplaza la composición completa, así que el snapshot viejo de la
-          // línea anterior no se conserva (mismo criterio ya vigente para el resto de la fila).
-          costPrice: l.costPrice ?? l.product.precio,
+          // Costo vigente al momento de esta edición (releído de productStock bajo el mismo
+          // lock, arriba) — misma fuente que computeProductCost. Una edición reemplaza la
+          // composición completa, así que el snapshot viejo de la línea anterior no se
+          // conserva (mismo criterio ya vigente para el resto de la fila).
+          costPrice: l.costPrice,
+          costIsEstimated: l.costIsEstimated,
         })),
       );
 
@@ -3218,7 +3429,8 @@ export class DatabaseStorage implements IStorage {
           orderSurchargeValue: input.orderSurcharge?.value ?? null,
           shippingCharged: input.shippingCharged ?? null,
           shippingCost: input.shippingCost ?? null,
-          ingresosBrutos: input.ingresosBrutos ?? null,
+          ingresosBrutos: ingresosBrutosAmount,
+          grossIncomeTaxPercentTenths,
           total: totals.total,
           profit,
           paymentMethod: input.paymentMethod,
@@ -3386,6 +3598,19 @@ export class MemoryStorage implements IStorage {
   /** Producto visible para la consultora (global o manual propio) o undefined si no aplica. */
   private findVisibleProduct(consultantId: number, productId: number): ProductRow | undefined {
     return this.products.find((p) => p.id === productId && (p.consultantId === null || p.consultantId === consultantId));
+  }
+
+  /** Espejo de DatabaseStorage.resolveHabitualDiscountPercent. */
+  private resolveHabitualDiscountPercentMem(consultantId: number): number {
+    const since = new Date(Date.now() - HABITUAL_DISCOUNT_WINDOW_MS);
+    const recent = this.orderDiscountLog.filter((e) => e.consultantId === consultantId && e.confirmedAt.getTime() >= since.getTime());
+    const weighted = computeWeightedDiscountPercent(recent);
+    if (weighted !== null) return weighted;
+    const latestEver = this.orderDiscountLog
+      .filter((e) => e.consultantId === consultantId)
+      .sort((a, b) => b.confirmedAt.getTime() - a.confirmedAt.getTime())[0];
+    if (latestEver) return latestEver.discountPercent;
+    return DEFAULT_HABITUAL_DISCOUNT_PERCENT;
   }
 
   async getUser(id: number): Promise<User | undefined> {
@@ -4160,7 +4385,11 @@ export class MemoryStorage implements IStorage {
     return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
-  async incrementProductStockBatch(consultantId: number, lines: { productId: number; delta: number }[]): Promise<{ updated: number }> {
+  async incrementProductStockBatch(
+    consultantId: number,
+    lines: { productId: number; delta: number }[],
+    discountPercent?: number,
+  ): Promise<{ updated: number }> {
     if (lines.length === 0) {
       throw new SaleValidationError("El lote no puede estar vacío");
     }
@@ -4180,7 +4409,12 @@ export class MemoryStorage implements IStorage {
     // pasan, la segunda pasada aplica todas. Si cualquiera falla en la primera pasada, no se
     // mutó ni una sola fila — nunca queda "línea por línea, aborta a la mitad" (Etapa 7.2,
     // sección 17).
-    const planned: { stock: ProductStock; nextUnidades: number }[] = [];
+    const planned: {
+      stock: ProductStock;
+      nextUnidades: number;
+      nextCostPrice?: number;
+      newlyCosted?: boolean;
+    }[] = [];
     for (const productId of orderedProductIds) {
       const product = this.findVisibleProduct(consultantId, productId);
       if (!product) {
@@ -4192,14 +4426,70 @@ export class MemoryStorage implements IStorage {
       if (nextUnidades < 0) {
         throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${nextUnidades} unidades`);
       }
-      planned.push({ stock, nextUnidades });
+      if (discountPercent === undefined) {
+        planned.push({ stock, nextUnidades });
+        continue;
+      }
+      // Prompt 2 — mismo criterio que DatabaseStorage: promedio ponderado por unidades,
+      // redondeado a pesos enteros; sin costo previo o con 0 unidades, el costo nuevo es
+      // directamente el de esta compra.
+      const lineCost = Math.round(product.precio * (1 - discountPercent / 100));
+      const hadNoRealCost = stock.costPrice === null || stock.unidades <= 0;
+      const nextCostPrice = hadNoRealCost
+        ? lineCost
+        : Math.round((stock.unidades * stock.costPrice! + delta * lineCost) / (stock.unidades + delta));
+      planned.push({ stock, nextUnidades, nextCostPrice, newlyCosted: hadNoRealCost });
     }
 
-    for (const { stock, nextUnidades } of planned) {
+    const newlyCostedProducts: { productId: number; newCostPrice: number }[] = [];
+    for (const { stock, nextUnidades, nextCostPrice, newlyCosted } of planned) {
       stock.unidades = nextUnidades;
+      if (nextCostPrice !== undefined) {
+        stock.costPrice = nextCostPrice;
+        stock.selectedDiscount = discountPercent!;
+        if (newlyCosted) {
+          newlyCostedProducts.push({ productId: stock.productId, newCostPrice: nextCostPrice });
+        }
+      }
+    }
+
+    for (const { productId, newCostPrice } of newlyCostedProducts) {
+      await this.recalculateEstimatedSalesForProduct(consultantId, productId, newCostPrice);
     }
 
     return { updated: orderedProductIds.length };
+  }
+
+  async recalculateEstimatedSalesForProduct(consultantId: number, productId: number, newCostPrice: number): Promise<void> {
+    const saleIdsByConsultant = new Set(this.sales.filter((s) => s.consultantId === consultantId).map((s) => s.id));
+    const estimatedItems = this.saleItems.filter(
+      (i) => saleIdsByConsultant.has(i.saleId) && i.productId === productId && i.costIsEstimated === true,
+    );
+    if (estimatedItems.length === 0) return;
+
+    for (const item of estimatedItems) {
+      item.costPrice = newCostPrice;
+      item.costIsEstimated = false;
+    }
+
+    const affectedSaleIds = Array.from(new Set(estimatedItems.map((i) => i.saleId)));
+    for (const saleId of affectedSaleIds) {
+      const sale = this.sales.find((s) => s.id === saleId);
+      if (!sale) continue;
+      const items = this.saleItems.filter((i) => i.saleId === saleId);
+      const productCost = computeHistoricalProductCost(items.map((i) => ({ quantity: i.quantity, costPrice: i.costPrice })));
+      if (productCost === null) continue;
+      sale.profit = computeSaleProfit({
+        total: sale.total,
+        productCost,
+        shippingCost: sale.shippingCost,
+        ingresosBrutos: sale.ingresosBrutos,
+      });
+    }
+  }
+
+  async countProductsWithoutCost(consultantId: number): Promise<number> {
+    return this.productStock.filter((s) => s.consultantId === consultantId && s.costPrice === null && s.unidades > 0).length;
   }
 
   async setProductStockReminder(consultantId: number, productId: number, remindAt: string | null): Promise<Product | undefined> {
@@ -4702,16 +4992,19 @@ export class MemoryStorage implements IStorage {
   }
 
   async getStockValuation(consultantId: number): Promise<StockValuation> {
+    const habitualDiscountPercent = this.resolveHabitualDiscountPercentMem(consultantId);
     let valueAtCost = 0;
     let valueAtPrice = 0;
     let unitCount = 0;
     let productCount = 0;
+    let hasEstimatedCost = false;
     for (const stock of this.productStock) {
       if (stock.consultantId !== consultantId) continue;
       const product = this.products.find((p) => p.id === stock.productId);
       if (!product) continue;
-      const cost = stock.costPrice ?? product.precio;
-      valueAtCost += stock.unidades * cost;
+      const resolved = resolveLineCost({ costPrice: stock.costPrice, publicPrice: product.precio, habitualDiscountPercent });
+      if (resolved.isEstimated && stock.unidades > 0) hasEstimatedCost = true;
+      valueAtCost += stock.unidades * resolved.costPrice;
       valueAtPrice += stock.unidades * product.precio;
       unitCount += stock.unidades;
       productCount++;
@@ -4722,6 +5015,7 @@ export class MemoryStorage implements IStorage {
       potentialProfit: valueAtPrice - valueAtCost,
       productCount,
       unitCount,
+      hasEstimatedCost,
     };
   }
 
@@ -4813,6 +5107,9 @@ export class MemoryStorage implements IStorage {
       if (!sale) continue;
       if (start && sale.date < start) continue;
       if (end && sale.date >= end) continue;
+      // Prompt 2: igual que DatabaseStorage — "incompleto" incluye las líneas estimadas, no
+      // solo las legacy sin costPrice.
+      if (item.costIsEstimated) hasIncompleteCostData = true;
       if (item.costPrice === null) {
         hasIncompleteCostData = true;
         continue;
@@ -4859,10 +5156,14 @@ export class MemoryStorage implements IStorage {
     return this.sales
       .filter((s) => s.consultantId === consultantId)
       .sort((a, b) => (a.date === b.date ? b.id - a.id : b.date.localeCompare(a.date)))
-      .map((s) => ({
-        ...s,
-        itemCount: this.saleItems.filter((i) => i.saleId === s.id).reduce((sum, i) => sum + i.quantity, 0),
-      }));
+      .map((s) => {
+        const items = this.saleItems.filter((i) => i.saleId === s.id);
+        return {
+          ...s,
+          itemCount: items.reduce((sum, i) => sum + i.quantity, 0),
+          hasEstimatedCost: items.some((i) => i.costIsEstimated === true || i.costPrice === null),
+        };
+      });
   }
 
   async getSaleDetails(consultantId: number, id: number): Promise<SaleWithDetails | undefined> {
@@ -4903,6 +5204,7 @@ export class MemoryStorage implements IStorage {
 
     const productIds = input.items.map((i) => i.productId);
     const productById = new Map((await this.getProductsByIds(consultantId, productIds)).map((p) => [p.id, p]));
+    const habitualDiscountPercent = this.resolveHabitualDiscountPercentMem(consultantId);
 
     const lines = input.items.map((item) => {
       const product = productById.get(item.productId);
@@ -4915,7 +5217,14 @@ export class MemoryStorage implements IStorage {
       if (product.unidades < item.quantity) {
         throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${product.unidades})`);
       }
-      return { product, quantity: item.quantity, unitPrice: item.unitPrice ?? product.precio };
+      const resolvedCost = resolveLineCost({ costPrice: product.costPrice, publicPrice: product.precio, habitualDiscountPercent });
+      return {
+        product,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice ?? product.precio,
+        costPrice: resolvedCost.costPrice,
+        costIsEstimated: resolvedCost.isEstimated,
+      };
     });
 
     const subtotal = computeSubtotal(lines.map((l) => ({ quantity: l.quantity, unitPrice: l.unitPrice })));
@@ -4935,15 +5244,16 @@ export class MemoryStorage implements IStorage {
     if (!client) throw new SaleValidationError("Clienta no encontrada");
     const clientName = client.name ?? client.phone;
 
-    // Etapa I-B.7-D-C: misma fórmula que DatabaseStorage — ver shared/saleCalculations.ts.
-    const productCost = computeProductCost(
-      lines.map((l) => ({ quantity: l.quantity, costPrice: l.product.costPrice ?? l.product.precio })),
-    );
+    // Prompt 2: costo siempre real o explícitamente estimado — ver shared/saleCalculations.ts.
+    const productCost = computeProductCost(lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice })));
+    const consultant = this.consultants.find((c) => c.id === consultantId);
+    const grossIncomeTaxPercentTenths = consultant?.grossIncomeTaxPercentTenths ?? null;
+    const ingresosBrutosAmount = computeGrossIncomeTax(totals.total, grossIncomeTaxPercentTenths);
     const profit = computeSaleProfit({
       total: totals.total,
       productCost,
       shippingCost: input.shippingCost ?? null,
-      ingresosBrutos: input.ingresosBrutos ?? null,
+      ingresosBrutos: ingresosBrutosAmount,
     });
 
     const sale: Sale = {
@@ -4959,7 +5269,8 @@ export class MemoryStorage implements IStorage {
       orderSurchargeValue: input.orderSurcharge?.value ?? null,
       shippingCharged: input.shippingCharged ?? null,
       shippingCost: input.shippingCost ?? null,
-      ingresosBrutos: input.ingresosBrutos ?? null,
+      ingresosBrutos: ingresosBrutosAmount,
+      grossIncomeTaxPercentTenths,
       total: totals.total,
       profit,
       paymentMethod: input.paymentMethod,
@@ -4981,8 +5292,9 @@ export class MemoryStorage implements IStorage {
         quantity: line.quantity,
         originalPrice: line.product.precio,
         price: line.unitPrice,
-        // Etapa I-B.7-D-D: misma fuente que computeProductCost más arriba.
-        costPrice: line.product.costPrice ?? line.product.precio,
+        // Misma fuente que computeProductCost más arriba.
+        costPrice: line.costPrice,
+        costIsEstimated: line.costIsEstimated,
       });
       const stock = this.getOrCreateStock(consultantId, line.product.id);
       stock.unidades -= line.quantity;
@@ -5047,6 +5359,7 @@ export class MemoryStorage implements IStorage {
     }
 
     // 2) Validar y reservar stock para la nueva composición, sobre el stock ya restaurado.
+    const habitualDiscountPercent = this.resolveHabitualDiscountPercentMem(consultantId);
     const lines = input.items.map((item) => {
       const product = productById.get(item.productId);
       if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
@@ -5058,7 +5371,14 @@ export class MemoryStorage implements IStorage {
         throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);
       }
       stockById.set(item.productId, available - item.quantity);
-      return { product, quantity: item.quantity, unitPrice: item.unitPrice ?? product.precio };
+      const resolvedCost = resolveLineCost({ costPrice: product.costPrice, publicPrice: product.precio, habitualDiscountPercent });
+      return {
+        product,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice ?? product.precio,
+        costPrice: resolvedCost.costPrice,
+        costIsEstimated: resolvedCost.isEstimated,
+      };
     });
 
     const subtotal = computeSubtotal(lines.map((l) => ({ quantity: l.quantity, unitPrice: l.unitPrice })));
@@ -5074,15 +5394,16 @@ export class MemoryStorage implements IStorage {
       throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
     }
 
-    // Etapa I-B.7-D-C: misma fórmula que DatabaseStorage.updateSale.
-    const productCost = computeProductCost(
-      lines.map((l) => ({ quantity: l.quantity, costPrice: l.product.costPrice ?? l.product.precio })),
-    );
+    // Prompt 2: misma fórmula que DatabaseStorage.updateSale.
+    const productCost = computeProductCost(lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice })));
+    const consultant = this.consultants.find((c) => c.id === consultantId);
+    const grossIncomeTaxPercentTenths = consultant?.grossIncomeTaxPercentTenths ?? null;
+    const ingresosBrutosAmount = computeGrossIncomeTax(totals.total, grossIncomeTaxPercentTenths);
     const profit = computeSaleProfit({
       total: totals.total,
       productCost,
       shippingCost: input.shippingCost ?? null,
-      ingresosBrutos: input.ingresosBrutos ?? null,
+      ingresosBrutos: ingresosBrutosAmount,
     });
 
     // A partir de acá ya está todo validado: recién ahora se muta estado.
@@ -5104,9 +5425,10 @@ export class MemoryStorage implements IStorage {
         quantity: line.quantity,
         originalPrice: line.product.precio,
         price: line.unitPrice,
-        // Etapa I-B.7-D-D: costo vigente al momento de esta edición — misma fuente que
-        // computeProductCost más arriba. La composición se reemplaza por completo.
-        costPrice: line.product.costPrice ?? line.product.precio,
+        // Costo vigente al momento de esta edición — misma fuente que computeProductCost más
+        // arriba. La composición se reemplaza por completo.
+        costPrice: line.costPrice,
+        costIsEstimated: line.costIsEstimated,
       });
     }
 
@@ -5128,7 +5450,8 @@ export class MemoryStorage implements IStorage {
     existingSale.orderSurchargeValue = input.orderSurcharge?.value ?? null;
     existingSale.shippingCharged = input.shippingCharged ?? null;
     existingSale.shippingCost = input.shippingCost ?? null;
-    existingSale.ingresosBrutos = input.ingresosBrutos ?? null;
+    existingSale.ingresosBrutos = ingresosBrutosAmount;
+    existingSale.grossIncomeTaxPercentTenths = grossIncomeTaxPercentTenths;
     existingSale.total = totals.total;
     existingSale.profit = profit;
     existingSale.paymentMethod = input.paymentMethod;
