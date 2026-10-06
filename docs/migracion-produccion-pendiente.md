@@ -1,8 +1,48 @@
 # Migraciones pendientes en producción (al 2026-10-06)
 
-## Antes que nada: por qué esto es urgente, no solo prolijo
+## Estado real de producción, verificado recién (no es la foto del 15/9)
 
-**El código nuevo (ya commiteado localmente, Prompts U, 1 y 2) rompe funcionalidad básica si se
+Antes de armar este documento asumí que nadie había tocado la base desde el 12/9 (último dato
+duro que tenía, de la Etapa 8.1). Para no pasarles una suposición vieja, revisé ahora mismo los
+logs y variables reales de Railway, y la foto cambió:
+
+**Confirmado roto, ahora mismo, sin relación con ninguna migración de abajo:**
+- **Recuperar contraseña no funciona de punta a punta.** `RESEND_API_KEY` y `EMAIL_FROM` siguen
+  sin estar configuradas en Railway (lo confirmé ahora, de nuevo). El request responde 200
+  (diseño anti-enumeración), pero el email nunca sale. **Esto no lo arregla ninguna migración —
+  hace falta cargar esas dos variables en Railway por separado.** Lo marco acá para que no se
+  pierda, pero es un pendiente aparte de este paquete.
+
+**Lo que YA NO está roto (corrige lo que decía la Etapa 8.1 del 15/9):**
+- `sales.ingresos_brutos` **ya existe** — confirmado con tráfico real: `GET /api/sales` responde
+  200/304 ahora mismo, no 500.
+- `consultants_email_unique_idx` **ya existe** — confirmado con un error real de los logs del
+  3/10 (`duplicate key value violates unique constraint "consultants_email_unique_idx"`, durante
+  el bug que después arregló el commit `20c8d83`). Si el índice no existiera, ese error no podría
+  haber pasado.
+
+**Sin confirmar en ningún sentido** (no encontré tráfico reciente que lo pruebe ni lo descarte):
+- Tabla `password_reset_codes`.
+- Índice `appointments_consultant_active_slot_unique_idx`.
+
+**Conclusión práctica: no confío en mi propia reconstrucción del estado de la base — ni ustedes
+deberían.** Por eso el primer paso real del proceso (más abajo) ya no es "aplicar el SQL a
+ciegas", es correr una consulta de solo lectura que diga, con certeza, qué existe y qué no, antes
+de tocar nada. El SQL completo de la sección de abajo sigue siendo correcto y seguro de correr
+igual (usa `IF NOT EXISTS`/`IF EXISTS` en todo, así que lo que ya esté aplicado simplemente no
+hace nada) — pero ya no es ciego, es verificable.
+
+**Commit real que está corriendo en producción ahora**: `20c8d83` (confirmado vía la API de
+Railway, no supuesto) — es un commit descendiente de `3b42003` (Etapa 7.1-7.9, 15/9) con dos
+arreglos puntuales después (el fix de email de suscripción, assets de marca) pero **sin ningún
+cambio de schema entre medio** — confirmé que el diff de `shared/schema.ts` entre `3b42003` y
+`20c8d83` está vacío. O sea: el código vivo espera exactamente el schema de la sección 1+2 de
+abajo, ni más ni menos. Las secciones 3, 4 y 5 (Prompt U, 1 y 2) nunca se desplegaron — están
+solo en los commits locales de esta máquina.
+
+## Por qué esto es urgente, no solo prolijo
+
+**El código nuevo (Prompts U, 1 y 2, ya commiteado localmente) rompe funcionalidad básica si se
 publica ANTES de correr estas migraciones — no es una degradación elegante, es un error 500.**
 
 La razón técnica: Drizzle (el ORM) arma el `SELECT`/`RETURNING` de cada consulta a partir de las
@@ -12,7 +52,7 @@ código ya conoce una columna que la base todavía no tiene, Postgres devuelve
 pasa en **cualquier consulta sin lista explícita de columnas sobre esa tabla**, aunque esa
 consulta no tenga nada que ver con lo nuevo.
 
-Ejemplos concretos de lo que se rompería, con la lista completa de abajo sin aplicar:
+Ejemplos concretos de lo que se rompería si se publica el código sin migrar antes:
 
 - **Vender** (`POST /api/sales`): el Prompt 2 agrega una consulta a `consultants` para leer el %
   de Ingresos Brutos — sin la columna `gross_income_tax_percent_tenths`, **toda venta nueva
@@ -30,35 +70,135 @@ Ejemplos concretos de lo que se rompería, con la lista completa de abajo sin ap
 **Conclusión: el deploy del código y la migración de la base tienen que ir juntos, migración
 primero (o en el mismo instante de mantenimiento) — nunca "subo el código y migro después".**
 
-## Supuesto de partida (verificar antes de confiar en esto)
+## Plan de vuelta atrás — ¿se puede volver al deploy anterior si algo sale mal?
 
-Esta lista asume que la última vez que alguien corrió una migración contra producción fue antes
-del commit `e569568` (12/9) — es lo último confirmado con evidencia real (Etapa 8.1, logs de
-Railway). Desde ahí hasta hoy nadie volvió a correr `drizzle-kit push`/`migrate` contra
-producción (no hay rastro de eso en este proyecto). Si alguien corrió algo manual que yo no sé,
-avisen antes de aplicar nada — las sentencias de abajo usan `IF NOT EXISTS`/`IF EXISTS` para que
-sea seguro re-correrlas igual, pero mejor confirmarlo.
+**Sí, con una sola salvedad.** Revisé cada cambio de la lista de abajo: todos son aditivos
+(columna nueva nullable, tabla nueva, índice nuevo) salvo uno:
 
-## Proceso (seguir en este orden, sin saltear pasos)
+- **`ALTER TABLE payments DROP CONSTRAINT payments_external_reference_unique`** es el único
+  cambio que no es "sumar algo". Igual es seguro para el código viejo (`20c8d83`, el que está
+  vivo hoy): sacar una restricción solo PERMITE más cosas, nunca puede hacer que una consulta que
+  antes andaba deje de andar. En el peor caso, el código viejo ya no tendría esa protección
+  puntual contra un `external_reference` duplicado — pero el código viejo tampoco dependía de
+  ella para funcionar (de hecho esa misma restricción es la que rompía los cobros recurrentes
+  reales, el motivo original del fix MP-1).
 
-1. **Backup de la base de producción** (Supabase → Database → Backups, o `pg_dump`). Esto lo
-   hace el equipo con acceso a Supabase — no yo.
-2. **Restaurar ese backup en una base de prueba** (un proyecto Supabase aparte, o un Postgres
-   local/Railway nuevo — cualquier cosa que NO sea producción).
-3. Contra esa base de prueba, en este orden:
-   a. Correr el SQL completo de la sección "Migraciones de schema" de más abajo.
-   b. Correr `npx tsx script/check-cost-equals-price.ts` apuntando `TEST_DATABASE_URL` a esa
-      base restaurada (ver nota de conexión más abajo) — es de solo lectura, no escribe nada.
-   c. Correr `npx tsx script/migrate-estimated-sale-costs.ts` de la misma forma — también de
-      solo lectura por defecto.
-   d. Revisar los dos resultados.
-4. **Pasame los resultados de 3b y 3c** (cuántas filas encontró cada uno, los ejemplos que
-   imprime). Los reviso con ustedes antes de decidir si aplicar las dos migraciones de datos
-   (que si hace falta, se aplican aparte, nunca junto con el dry-run).
-5. Recién ahí, con todo probado y revisado: aplicar el mismo SQL + las migraciones de datos (si
-   correspondía) contra producción, coordinado con el deploy del código nuevo.
+Con todo lo de arriba aplicado, **el código del commit `20c8d83` (el que está en producción hoy)
+sigue funcionando sin cambios contra la base ya migrada.** Si el deploy del código nuevo falla
+por cualquier motivo, pueden revertir el deploy en Railway al commit anterior sin tocar la base
+de nuevo — no hace falta deshacer ninguna migración.
 
-### Nota de conexión para los scripts
+## Nota aparte: cambio de precio sobre una suscripción ACTIVA, sin probar en real
+
+El cambio de precio "a las actuales" (`appliesTo: "all"`) del Prompt U nunca se probó de punta a
+punta contra una suscripción real y activa en Mercado Pago — solo en modo TEST. Hasta que se
+pruebe así, en producción usen solo la opción **"Solo a las nuevas suscripciones"** al cambiar el
+precio desde el admin. No es parte de la migración de base, pero va en este paquete porque es
+una restricción operativa que el programador/equipo tiene que conocer el mismo día del deploy.
+
+## Chequeos de datos antes de migrar (solo lectura, correr en la copia del backup)
+
+La prueba que yo hice (correr el SQL contra una base vacía) confirma que la SINTAXIS es correcta
+y que es idempotente — pero NO puede detectar un problema de DATOS reales, porque una base vacía
+no tiene datos que choquen con una restricción nueva. Antes de aplicar el SQL de la sección
+siguiente contra la copia del backup, corran esto:
+
+```sql
+-- 0) Verdad de base: qué existe HOY en esta copia, antes de tocar nada. Corran esto primero y
+--    guarden el resultado — es la foto real que reemplaza cualquier supuesto mío o de este doc.
+SELECT table_name, column_name, data_type
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name IN ('sales', 'sale_items', 'consultants', 'subscriptions', 'payments', 'appointments')
+ORDER BY table_name, column_name;
+
+SELECT table_name FROM information_schema.tables
+WHERE table_schema = 'public'
+  AND table_name IN ('password_reset_codes', 'subscription_price_history', 'coupons', 'coupon_redemptions', 'order_discount_log');
+
+SELECT indexname, tablename FROM pg_indexes
+WHERE schemaname = 'public'
+  AND indexname IN ('consultants_email_unique_idx', 'appointments_consultant_active_slot_unique_idx');
+
+SELECT conname FROM pg_constraint WHERE conname = 'payments_external_reference_unique';
+
+-- 1) ¿Hay emails EXACTAMENTE duplicados en consultants? Esto haría fallar la creación del
+--    índice único si no existiera todavía. Si da filas: PARAR, no aplicar el SQL de la sección
+--    1c/consultants_email_unique_idx, y mandarme la lista — hay que decidir a mano qué email es
+--    el correcto en cada caso antes de poder crear el índice.
+SELECT email, count(*), array_agg(id) AS consultant_ids
+FROM consultants
+WHERE email IS NOT NULL
+GROUP BY email
+HAVING count(*) > 1;
+
+-- 1b) Informativo, no bloquea nada: emails que son el mismo normalizando mayúsculas/minúsculas
+--     pero están guardados distinto (ej. "Maria@x.com" vs "maria@x.com"). No rompe el índice
+--     (que es case-sensitive), pero puede confundir a dos consultoras que creen tener cuentas
+--     separadas cuando en realidad "son" el mismo email para cualquier humano. Si da filas,
+--     avisen y lo revisamos — no es urgente para esta migración puntual.
+SELECT lower(email) AS email_normalizado, count(*), array_agg(id) AS consultant_ids
+FROM consultants
+WHERE email IS NOT NULL
+GROUP BY lower(email)
+HAVING count(*) > 1;
+
+-- 2) ¿Hay citas activas duplicadas en el mismo horario? Esto haría fallar la creación del
+--    índice único de appointments si no existiera todavía. Si da filas: PARAR, no aplicar el
+--    SQL de la sección 2a, y mandarme la lista — hay que decidir a mano cuál de las citas
+--    duplicadas cancelar antes de poder crear el índice.
+SELECT consultant_id, date, time, count(*), array_agg(id) AS appointment_ids
+FROM appointments
+WHERE status != 'cancelada'
+GROUP BY consultant_id, date, time
+HAVING count(*) > 1;
+```
+
+**Si cualquiera de las consultas 1 o 2 devuelve filas: frenar ahí, no aplicar esa parte puntual
+del SQL de la sección siguiente, y mandarme el resultado antes de seguir.** El resto del SQL
+(todo lo que no depende de esos dos índices) se puede aplicar igual sin problema — son bloques
+independientes.
+
+---
+
+## Orden del día del deploy (para el programador, paso a paso)
+
+1. Elegir un horario de poco uso (de madrugada, hora Argentina).
+2. **Backup de producción** (Supabase → Database → Backups, o `pg_dump`).
+3. **Restaurar el backup en una base de prueba** (nunca producción).
+4. Contra esa base restaurada, en este orden:
+   a. Correr las consultas de "Chequeos de datos" de arriba (incluida la de verdad de base, la
+      primera). Guardar los resultados.
+   b. Si las consultas 1 o 2 dieron filas: PARAR, mandarme el resultado, resolver antes de seguir.
+   c. Correr el SQL completo de "Migraciones de schema" de más abajo.
+   d. Correr `npx tsx script/check-cost-equals-price.ts` y
+      `npx tsx script/migrate-estimated-sale-costs.ts` (ver nota de conexión más abajo) — los
+      dos son de solo lectura por default.
+5. **Mandarme los resultados de 4a y 4d.** Los reviso con ustedes antes de decidir si aplicar las
+   dos migraciones de datos del Prompt 2 (que, si hace falta, se aplican aparte — nunca junto con
+   el dry-run).
+6. Con todo revisado y aprobado: aplicar el mismo SQL (más las migraciones de datos, si
+   correspondía) contra producción real.
+7. **Verificación rápida en producción** con las mismas consultas del punto 0 de "Chequeos de
+   datos" (la de `information_schema`) — confirmar que todo lo nuevo existe antes de publicar
+   código.
+8. Publicar (deploy) el código nuevo en Railway.
+9. **Probar en la app real, enseguida**, en este orden:
+   - Iniciar sesión con una cuenta de consultora real.
+   - Cargar una venta completa (con al menos un producto).
+   - Entrar a Configuración, guardar un cambio cualquiera.
+   - Entrar a Suscripción, aplicar un cupón de prueba (si hay uno cargado) y ver que el precio
+     con descuento se calcule bien — sin completar el pago real todavía.
+   - Recuperar contraseña: pedirlo con un email real y confirmar si el correo llega (depende
+     también de `RESEND_API_KEY`/`EMAIL_FROM`, ver nota arriba — puede seguir sin andar por eso,
+     aparte de esta migración).
+   - Ver la lista de Ventas y el detalle de una venta vieja (de antes del deploy) — confirmar que
+     se siguen viendo bien.
+10. Si algo falla: revertir el deploy del código en Railway al commit anterior (`20c8d83`) — la
+    base ya migrada sigue funcionando con ese código, según "Plan de vuelta atrás" arriba. No
+    hace falta deshacer la migración.
+
+### Nota de conexión para los scripts de datos
 
 Los dos scripts (`check-cost-equals-price.ts` y `migrate-estimated-sale-costs.ts`) están
 deliberadamente escritos para usar **solo** `TEST_DATABASE_URL` — nunca aceptan apuntar a otra
@@ -73,12 +213,16 @@ avisen y los adapto.
 ## Migraciones de schema (SQL completo, en orden)
 
 Cada bloque usa `IF NOT EXISTS`/`IF EXISTS` a propósito: no hace nada si esa parte puntual ya
-estaba aplicada, así que correr todo el archivo de una es seguro aunque alguna parte ya exista.
+estaba aplicada (confirmado: al menos las secciones 1a y 1c de abajo YA están aplicadas en
+producción — ver "Estado real" arriba), así que correr todo el archivo de una es seguro aunque
+partes ya existan. Probado dos veces contra una base Postgres en blanco: la primera corrida
+aplica todo limpio, la segunda no hace nada (confirma que es idempotente de verdad).
 
 ```sql
 -- ============================================================
--- 1. Etapa previa a e569568 (12/9) — confirmado faltante en
---    producción por logs reales de error (Etapa 8.1).
+-- 1. De antes del 15/9 — password_reset_codes sigue sin confirmar
+--    (ver "Estado real" arriba; ingresos_brutos y el índice de
+--    email de este mismo bloque YA están en producción).
 -- ============================================================
 
 -- 1a. Ingresos Brutos manual por venta (columna vieja, se sigue usando para ventas
@@ -104,6 +248,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS consultants_email_unique_idx ON consultants(em
 
 -- ============================================================
 -- 2. Etapa 7.1-7.9 (15/9, commit 3b42003) — hardening general.
+--    El código vivo HOY ya espera esto (ver "Estado real" arriba).
 -- ============================================================
 
 -- 2a. Dos citas de la misma consultora no pueden chocar en el mismo día+hora (una cita
@@ -113,6 +258,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS appointments_consultant_active_slot_unique_idx
 
 -- ============================================================
 -- 3. Prompt U (4/10) — precio de suscripción editable y cupones.
+--    Nada de acá está desplegado todavía.
 -- ============================================================
 
 -- 3a. MP-1: varios cobros recurrentes de una misma suscripción comparten
@@ -172,7 +318,7 @@ CREATE INDEX IF NOT EXISTS coupon_redemptions_coupon_id_idx ON coupon_redemption
 
 -- ============================================================
 -- 4. Prompt 1 (5/10) — Configuración: días de pedido, descuento
---    habitual, Ingresos Brutos (%).
+--    habitual, Ingresos Brutos (%). Nada de acá está desplegado.
 -- ============================================================
 
 -- 4a. Hasta 2 días del mes para el recordatorio de pedido (independientes entre sí).
@@ -195,7 +341,7 @@ CREATE INDEX IF NOT EXISTS order_discount_log_consultant_confirmed_idx
   ON order_discount_log(consultant_id, confirmed_at);
 
 -- ============================================================
--- 5. Prompt 2 (6/10) — Costos y ganancia.
+-- 5. Prompt 2 (6/10) — Costos y ganancia. Nada de acá está desplegado.
 -- ============================================================
 
 -- 5a. % de Ingresos Brutos vigente en Configuración al confirmar CADA venta (snapshot,
