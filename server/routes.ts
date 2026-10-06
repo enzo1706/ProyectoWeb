@@ -914,7 +914,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       if (result === "has_relations") {
         return res.status(409).json({
-          error: "No se puede eliminar: el producto tiene ventas asociadas. Usá 'Descontinuar' para dejar de venderlo sin perder el historial.",
+          error: "Este producto tiene ventas registradas, no se puede eliminar.",
         });
       }
       res.status(204).send();
