@@ -58,7 +58,7 @@ import {
   computeProductCost,
   computeSaleProfit,
   installmentsSumMatches,
-  computeInstallmentDueDate,
+  buildInstallmentPlans,
   computeHistoricalProductCost,
   computeWeightedDiscountPercent,
   DEFAULT_HABITUAL_DISCOUNT_PERCENT,
@@ -200,7 +200,11 @@ function saleRequestMatchesExisting(
   >,
   existingItems: { productId: number | null; quantity: number; price: number }[],
 ): boolean {
-  if (existing.clientId !== input.clientId) return false;
+  // Prompt 6: clientId ahora es opcional en el input ("Completar después") — se normaliza
+  // contra `null` (lo que queda persistido en la venta sin clienta) para no tratar
+  // `undefined !== null` como "es una operación distinta" cuando en realidad las dos
+  // representan "sin clienta".
+  if ((existing.clientId ?? null) !== (input.clientId ?? null)) return false;
   if (existing.date !== input.date) return false;
   if (existing.paymentMethod !== input.paymentMethod) return false;
   if ((existing.orderDiscountType ?? null) !== (input.orderDiscount?.type ?? null)) return false;
@@ -3114,12 +3118,21 @@ export class DatabaseStorage implements IStorage {
       .where(and(inArray(products.id, productIds), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
     const catalogById = new Map(catalogRows.map((p) => [p.id, p]));
 
-    const [client] = await db
-      .select()
-      .from(clients)
-      .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
-    if (!client) throw new SaleValidationError("Clienta no encontrada");
-    const clientName = client.name ?? client.phone;
+    // Prompt 6: clienta opcional ("Completar después") — sin input.clientId, la venta se
+    // guarda con client_id NULL (la columna ya lo permite) y un nombre fijo "Sin clienta". Si
+    // mandan un clientId, tiene que existir — mismo criterio que siempre.
+    let client: Client | undefined;
+    let clientName: string;
+    if (input.clientId !== undefined) {
+      [client] = await db
+        .select()
+        .from(clients)
+        .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
+      if (!client) throw new SaleValidationError("Clienta no encontrada");
+      clientName = client.name ?? client.phone;
+    } else {
+      clientName = "Sin clienta";
+    }
 
     // Prompt 2: costo estimado (cuando el producto no tiene costPrice) y el % de IIBB vigente
     // se resuelven ANTES de la transacción — son lecturas de otras tablas, no de productStock,
@@ -3189,6 +3202,23 @@ export class DatabaseStorage implements IStorage {
         throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
       }
 
+      // Prompt 6: sin `paidNow` (compatibilidad), se preserva el comportamiento de siempre —
+      // cuota pendiente con vencimiento en la fecha de la venta. Con tarjeta `firstDueDate` no
+      // se usa (buildInstallmentPlans cobra todo en una sola cuota igual).
+      const paidNow = input.paidNow ?? false;
+      const firstDueDate = paidNow ? null : input.firstDueDate ?? input.date;
+      const installmentPlans = buildInstallmentPlans({
+        amounts: installmentAmounts,
+        saleDate: input.date,
+        paymentMethod: input.paymentMethod,
+        paidNow,
+        firstDueDate,
+      });
+      // Prompt 6: una venta con algo pendiente de cobro necesita una clienta a quien reclamarle.
+      if (client === undefined && installmentPlans.some((p) => p.status === "pendiente")) {
+        throw new SaleValidationError("Para dejar una venta pendiente de cobro tenés que elegir la clienta");
+      }
+
       // Prompt 2: costo de mercadería SIEMPRE real o explícitamente estimado — nunca más el
       // precio de venta como sustituto (costPrice ya viene resuelto de arriba, nunca null).
       const productCost = computeProductCost(lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice })));
@@ -3214,7 +3244,7 @@ export class DatabaseStorage implements IStorage {
           .insert(sales)
           .values({
             consultantId,
-            clientId: client.id,
+            clientId: client?.id ?? null,
             clientName,
             date: input.date,
             subtotal,
@@ -3229,9 +3259,14 @@ export class DatabaseStorage implements IStorage {
             total: totals.total,
             profit,
             paymentMethod: input.paymentMethod,
+            // Prompt 6: con tarjeta esto es solo informativo (la cuenta real con el banco) —
+            // sale_installments siempre tiene una sola fila pagada en ese caso, ver abajo.
             installmentsCount: input.installments.length,
             installmentFrequency: input.installments.length > 1 ? input.installmentFrequency ?? null : null,
-            status: input.status,
+            // Prompt 6: único valor real que se escribe hoy en creación — "entregado"/"pagado"
+            // quedaron retirados (ver comentario en shared/schema.ts).
+            status: "pendiente",
+            deliveryStatus: "entregada",
             notes: input.notes ?? null,
             clientRequestId: input.clientRequestId ?? null,
           })
@@ -3260,12 +3295,12 @@ export class DatabaseStorage implements IStorage {
       );
 
       await tx.insert(saleInstallments).values(
-        installmentAmounts.map((amount, index) => ({
+        installmentPlans.map((plan, index) => ({
           saleId: sale.id,
           installmentNumber: index + 1,
-          amount,
-          dueDate: computeInstallmentDueDate(input.date, input.installmentFrequency, index),
-          status: "pendiente",
+          amount: plan.amount,
+          dueDate: plan.dueDate,
+          status: plan.status,
         })),
       );
 
@@ -3433,6 +3468,22 @@ export class DatabaseStorage implements IStorage {
         throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
       }
 
+      // Prompt 6: mismo criterio que createSale. Como esta venta nunca llega acá con una
+      // cuota ya pagada (chequeo de arriba), regenerar todas como "pendiente" nunca pisa
+      // dinero cobrado.
+      const paidNow = input.paidNow ?? false;
+      const firstDueDate = paidNow ? null : input.firstDueDate ?? existingSale.date;
+      const installmentPlans = buildInstallmentPlans({
+        amounts: installmentAmounts,
+        saleDate: existingSale.date,
+        paymentMethod: input.paymentMethod,
+        paidNow,
+        firstDueDate,
+      });
+      if (existingSale.clientId === null && installmentPlans.some((p) => p.status === "pendiente")) {
+        throw new SaleValidationError("Para dejar una venta pendiente de cobro tenés que elegir la clienta");
+      }
+
       // Prompt 2: misma fórmula que createSale — total autoritativo menos costo real/estimado
       // de mercadería (con costos ACTUALES de productStock, ya releídos arriba bajo el lock)
       // menos costo real de envío e Ingresos Brutos de esta edición.
@@ -3475,12 +3526,12 @@ export class DatabaseStorage implements IStorage {
       );
 
       await tx.insert(saleInstallments).values(
-        installmentAmounts.map((amount, index) => ({
+        installmentPlans.map((plan, index) => ({
           saleId: id,
           installmentNumber: index + 1,
-          amount,
-          dueDate: computeInstallmentDueDate(existingSale.date, input.installmentFrequency, index),
-          status: "pendiente",
+          amount: plan.amount,
+          dueDate: plan.dueDate,
+          status: plan.status,
         })),
       );
 
@@ -5323,9 +5374,30 @@ export class MemoryStorage implements IStorage {
       throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
     }
 
-    const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
-    if (!client) throw new SaleValidationError("Clienta no encontrada");
-    const clientName = client.name ?? client.phone;
+    // Prompt 6: clienta opcional ("Completar después") — mismo criterio que DatabaseStorage.
+    let client: Client | undefined;
+    let clientName: string;
+    if (input.clientId !== undefined) {
+      client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
+      if (!client) throw new SaleValidationError("Clienta no encontrada");
+      clientName = client.name ?? client.phone;
+    } else {
+      clientName = "Sin clienta";
+    }
+
+    // Prompt 6: mismo criterio que DatabaseStorage.createSale.
+    const paidNow = input.paidNow ?? false;
+    const firstDueDate = paidNow ? null : input.firstDueDate ?? input.date;
+    const installmentPlans = buildInstallmentPlans({
+      amounts: installmentAmounts,
+      saleDate: input.date,
+      paymentMethod: input.paymentMethod,
+      paidNow,
+      firstDueDate,
+    });
+    if (client === undefined && installmentPlans.some((p) => p.status === "pendiente")) {
+      throw new SaleValidationError("Para dejar una venta pendiente de cobro tenés que elegir la clienta");
+    }
 
     // Prompt 2: costo siempre real o explícitamente estimado — ver shared/saleCalculations.ts.
     const productCost = computeProductCost(lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice })));
@@ -5342,7 +5414,7 @@ export class MemoryStorage implements IStorage {
     const sale: Sale = {
       id: this.nextSaleId++,
       consultantId,
-      clientId: client.id,
+      clientId: client?.id ?? null,
       clientName,
       date: input.date,
       subtotal,
@@ -5359,7 +5431,8 @@ export class MemoryStorage implements IStorage {
       paymentMethod: input.paymentMethod,
       installmentsCount: input.installments.length,
       installmentFrequency: input.installments.length > 1 ? input.installmentFrequency ?? null : null,
-      status: input.status,
+      status: "pendiente",
+      deliveryStatus: "entregada",
       notes: input.notes ?? null,
       clientRequestId: input.clientRequestId ?? null,
     };
@@ -5383,14 +5456,14 @@ export class MemoryStorage implements IStorage {
       stock.unidades -= line.quantity;
     }
 
-    installmentAmounts.forEach((amount, index) => {
+    installmentPlans.forEach((plan, index) => {
       this.saleInstallments.push({
         id: this.nextSaleInstallmentId++,
         saleId: sale.id,
         installmentNumber: index + 1,
-        amount,
-        dueDate: computeInstallmentDueDate(input.date, input.installmentFrequency, index),
-        status: "pendiente",
+        amount: plan.amount,
+        dueDate: plan.dueDate,
+        status: plan.status,
       });
     });
 
@@ -5477,6 +5550,21 @@ export class MemoryStorage implements IStorage {
       throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
     }
 
+    // Prompt 6: mismo criterio que DatabaseStorage.updateSale — nunca llega acá con una cuota
+    // ya pagada (chequeo de arriba), así que regenerar como "pendiente" no pisa nada cobrado.
+    const paidNow = input.paidNow ?? false;
+    const firstDueDate = paidNow ? null : input.firstDueDate ?? existingSale.date;
+    const installmentPlans = buildInstallmentPlans({
+      amounts: installmentAmounts,
+      saleDate: existingSale.date,
+      paymentMethod: input.paymentMethod,
+      paidNow,
+      firstDueDate,
+    });
+    if (existingSale.clientId === null && installmentPlans.some((p) => p.status === "pendiente")) {
+      throw new SaleValidationError("Para dejar una venta pendiente de cobro tenés que elegir la clienta");
+    }
+
     // Prompt 2: misma fórmula que DatabaseStorage.updateSale.
     const productCost = computeProductCost(lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice })));
     const consultant = this.consultants.find((c) => c.id === consultantId);
@@ -5515,14 +5603,14 @@ export class MemoryStorage implements IStorage {
       });
     }
 
-    installmentAmounts.forEach((amount, index) => {
+    installmentPlans.forEach((plan, index) => {
       this.saleInstallments.push({
         id: this.nextSaleInstallmentId++,
         saleId: id,
         installmentNumber: index + 1,
-        amount,
-        dueDate: computeInstallmentDueDate(existingSale.date, input.installmentFrequency, index),
-        status: "pendiente",
+        amount: plan.amount,
+        dueDate: plan.dueDate,
+        status: plan.status,
       });
     });
 

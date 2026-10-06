@@ -228,3 +228,75 @@ export function computeInstallmentDueDate(
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${due.getFullYear()}-${pad(due.getMonth() + 1)}-${pad(due.getDate())}`;
 }
+
+/** Suma `days` días de calendario a una fecha `YYYY-MM-DD` — aritmética pura. Asume que
+ * `dateStr` ya representa el día correcto (el caller es responsable de que esté en hora de
+ * Argentina); esta función no mira la hora actual ni ningún huso horario. */
+export function addDays(dateStr: string, days: number): string {
+  const [year, month, day] = dateStr.split("-").map(Number);
+  const result = new Date(year, month - 1, day);
+  result.setDate(result.getDate() + days);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${result.getFullYear()}-${pad(result.getMonth() + 1)}-${pad(result.getDate())}`;
+}
+
+export interface InstallmentPlanEntry {
+  amount: number;
+  dueDate: string;
+  status: "pendiente" | "pagado";
+}
+
+export interface BuildInstallmentPlansInput {
+  /** Montos de cada cuota, en el orden en que se muestran — ya repartidos (ver
+   * `splitIntoInstallments`) o editados a mano por la consultora. Con tarjeta, la suma de
+   * estos montos es lo que se cobra en la única cuota real que se crea (ver abajo). */
+  amounts: number[];
+  /** Fecha de la venta (`YYYY-MM-DD`, ya en hora de Argentina). */
+  saleDate: string;
+  paymentMethod: "efectivo" | "transferencia" | "tarjeta";
+  /** "La clienta paga en el momento" — con tarjeta no se usa (la venta queda cobrada siempre). */
+  paidNow: boolean;
+  /** Vencimiento de la primera cuota cuando NO se paga en el momento (resultado de elegir "En
+   * 7/15/30 días" o una fecha puntual). Requerida en ese caso para efectivo/transferencia. */
+  firstDueDate?: string | null;
+}
+
+/**
+ * Prompt 6 — arma el plan de cuotas (monto, vencimiento, si queda cobrada o pendiente) según
+ * la forma de pago y si la clienta paga en el momento. Reemplaza la vieja lógica de
+ * `computeInstallmentDueDate` + frecuencia semanal/mensual elegible: de acá en más el
+ * espaciado entre cuotas pendientes es siempre de 30 días corridos.
+ *
+ * - Tarjeta (1 pago o en cuotas): las cuotas son con el banco, nunca con la consultora — se
+ *   crea UNA sola cuota ya cobrada por el total. La cantidad de cuotas elegida se guarda aparte
+ *   como dato (`sales.installmentsCount`), nunca como filas de `sale_installments`.
+ * - Efectivo/transferencia, tildada ("paga en el momento"): la primera cuota queda cobrada
+ *   con vencimiento en la fecha de la venta; las demás (si hay) quedan pendientes, cada una
+ *   30 días después de la fecha de venta (cuota N vence a los 30×N días).
+ * - Efectivo/transferencia, destildada: ninguna cuota queda cobrada. La primera vence en
+ *   `firstDueDate` (obligatoria en este caso) y las siguientes, 30 días después de esa fecha.
+ */
+export function buildInstallmentPlans(input: BuildInstallmentPlansInput): InstallmentPlanEntry[] {
+  if (input.paymentMethod === "tarjeta") {
+    const total = input.amounts.reduce((sum, a) => sum + a, 0);
+    return [{ amount: total, dueDate: input.saleDate, status: "pagado" }];
+  }
+
+  if (input.paidNow) {
+    return input.amounts.map((amount, index) => ({
+      amount,
+      dueDate: addDays(input.saleDate, 30 * index),
+      status: index === 0 ? "pagado" : "pendiente",
+    }));
+  }
+
+  if (!input.firstDueDate) {
+    throw new Error("Falta la fecha de vencimiento de la primera cuota");
+  }
+  const firstDueDate = input.firstDueDate;
+  return input.amounts.map((amount, index) => ({
+    amount,
+    dueDate: addDays(firstDueDate, 30 * index),
+    status: "pendiente",
+  }));
+}

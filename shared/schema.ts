@@ -195,6 +195,11 @@ export const installmentStatuses = ["pendiente", "pagado"] as const;
 export type InstallmentStatus = (typeof installmentStatuses)[number];
 export const adjustmentTypes = ["percent", "fixed"] as const;
 export type AdjustmentType = (typeof adjustmentTypes)[number];
+// Prompt 6: estado de entrega, separado del estado de pago (que ya vive en sale_installments).
+// "entregada" es el default porque hoy TODA venta se hace con stock (vender sin stock es el
+// Prompt 8, todavía no existe) — toda venta pasada fue, en los hechos, entregada al momento.
+export const deliveryStatuses = ["entregada", "pendiente_entrega"] as const;
+export type DeliveryStatus = (typeof deliveryStatuses)[number];
 
 export const sales = pgTable("sales", {
   id: serial("id").primaryKey(),
@@ -237,7 +242,17 @@ export const sales = pgTable("sales", {
   paymentMethod: text("payment_method").notNull().default("efectivo"),
   installmentsCount: integer("installments_count").notNull().default(1),
   installmentFrequency: text("installment_frequency"),
+  // Prompt 6: de acá en más solo "pendiente" | "cancelada" — "entregado"/"pagado" eran
+  // valores permitidos que el código nunca llegó a escribir (auditado, ver storage.createSale
+  // de antes de esta etapa); el pago se rastrea en sale_installments y la entrega en la
+  // columna nueva de abajo. No se migra ningún dato: esos dos valores nunca existieron en una
+  // fila real.
   status: text("status").notNull().default("pendiente"),
+  // Prompt 6 — separado del pago a propósito (ver deliveryStatuses arriba). Default
+  // "entregada": toda venta ya confirmada hasta ahora se hizo con stock, es decir que ya fue
+  // entregada en los hechos — Postgres completa esto solo en las filas existentes al agregar
+  // la columna con este default, sin ningún UPDATE manual.
+  deliveryStatus: text("delivery_status").notNull().default("entregada"),
   notes: text("notes"),
   // Nullable: ventas históricas y cualquier cliente que no lo mande siguen funcionando igual.
   // UUID generado por el frontend (un valor por intento lógico de venta, ver NewSaleDialog) —
@@ -777,7 +792,10 @@ export const createSaleItemSchema = z.object({
 });
 
 export const createSaleSchema = z.object({
-  clientId: z.number().int().positive(),
+  // Prompt 6: opcional ("Completar después") — sin clienta, una venta pendiente de cobro se
+  // rechaza en el servidor (ver storage.createSale); una venta ya cobrada entera sí se puede
+  // guardar sin clienta.
+  clientId: z.number().int().positive().optional(),
   date: z.string().min(1),
   items: z.array(createSaleItemSchema).min(1, "La venta debe tener al menos un producto"),
   orderDiscount: orderAdjustmentSchema,
@@ -795,8 +813,19 @@ export const createSaleSchema = z.object({
   // sobre el total de ESTA venta. Si el cliente igual lo manda, se ignora (ver storage.createSale).
   paymentMethod: z.enum(paymentMethods),
   installments: z.array(z.object({ amount: z.number().int().nonnegative() })).min(1),
+  // Prompt 6: reemplaza al viejo selector de frecuencia semanal/mensual — el espaciado entre
+  // cuotas pendientes pasa a ser siempre de 30 días (ver shared/saleCalculations.buildInstallmentPlans).
+  // Se deja `installmentFrequency` en el schema (no se borra la columna) pero ya no se lee acá.
   installmentFrequency: z.enum(installmentFrequencies).optional(),
-  status: z.enum(["pendiente", "entregado", "pagado"]).default("pendiente"),
+  // Prompt 6: "La clienta paga en el momento" — con tarjeta se ignora (la venta queda cobrada
+  // siempre). Opcional por compatibilidad con un cliente viejo que todavía no la manda: ausente
+  // se trata igual que hoy (cuota pendiente con vencimiento en la fecha de la venta), nunca
+  // rompe una integración que no se actualizó.
+  paidNow: z.boolean().optional(),
+  // Fecha de vencimiento de la primera cuota cuando NO se paga en el momento (resultado de
+  // elegir "En 7/15/30 días" o una fecha puntual del lado del cliente) — obligatoria en ese
+  // caso para pagos que no son con tarjeta (ver storage.createSale).
+  firstDueDate: z.string().min(1).optional(),
   notes: z.string().max(1000).optional(),
   // Opcional (compatibilidad con clientes viejos): clave de idempotencia generada por el
   // frontend — ver `sales.clientRequestId` en el schema de arriba y la Etapa I-B.6.
@@ -815,6 +844,11 @@ export const updateSaleSchema = z.object({
   paymentMethod: z.enum(paymentMethods),
   installments: z.array(z.object({ amount: z.number().int().nonnegative() })).min(1),
   installmentFrequency: z.enum(installmentFrequencies).optional(),
+  // Prompt 6: mismo criterio que createSaleSchema — una edición puede volver a definir cómo
+  // se cobra (la venta solo se puede editar si ninguna cuota está pagada todavía, ver
+  // storage.updateSale, así que esto nunca pisa dinero ya cobrado).
+  paidNow: z.boolean().optional(),
+  firstDueDate: z.string().min(1).optional(),
   notes: z.string().max(1000).optional(),
 });
 

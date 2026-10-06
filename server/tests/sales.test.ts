@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "net";
 import type { Server } from "http";
+import { addDays } from "@shared/saleCalculations";
 
 process.env.NODE_ENV = "test";
 process.env.DATABASE_MODE = "memory";
@@ -12,6 +13,7 @@ let baseUrl: string;
 let cookie: string;
 let clientId: number;
 let productId: number; // precio 1000, unidades 20
+let highStockProductId: number; // precio 1000, unidades 1000 — para los tests de Prompt 6 que no quieren competir por stock con el resto del archivo
 
 async function api(method: string, path: string, body?: unknown) {
   return fetch(`${baseUrl}${path}`, {
@@ -80,6 +82,12 @@ beforeAll(async () => {
   // ejemplos numéricos de la Etapa I-B.7-D-C, para poder reusarlos tal cual en los tests de
   // profit de más abajo.
   await api("PATCH", `/api/products/${productId}/discount`, { discountPercent: 40 });
+
+  // Prompt 6: producto aparte con stock de sobra — los tests de creación de cuotas usan
+  // cantidades de hasta 6 unidades por venta y no deben competir por el stock, ya ajustado,
+  // de `productId` con el resto de este archivo.
+  const highStockProductRes = await api("POST", "/api/products", { seccion: "VITEST", producto: "Producto stock alto", precio: 1000, unidades: 1000 });
+  highStockProductId = (await highStockProductRes.json()).id;
 });
 
 afterAll(async () => {
@@ -168,6 +176,204 @@ describe("POST /api/sales — creación", () => {
   it("rechaza sin persistir: body vacío", async () => {
     const res = await api("POST", "/api/sales", {});
     expect(res.status).toBe(400);
+  });
+});
+
+// Prompt 6: arma el plan de cuotas (monto, vencimiento, cobrada o no) según la forma de pago
+// y si la clienta paga en el momento — reemplaza la vieja lógica que siempre dejaba la cuota
+// "pendiente" con vencimiento el mismo día de la venta, el bug original de este prompt.
+// Usa `highStockProductId` (no el `productId` compartido con el resto del archivo) para no
+// competir por stock con tests que corren antes en el mismo archivo.
+describe("POST /api/sales — Prompt 6: creación de cuotas según forma de pago", () => {
+  it("efectivo, 1 pago, paga en el momento: la cuota queda cobrada con vencimiento en la fecha de la venta", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        paymentMethod: "efectivo",
+        items: [{ productId: highStockProductId, quantity: 2 }],
+        installments: [{ amount: 2000 }],
+        paidNow: true,
+      }),
+    );
+    expect(res.status).toBe(201);
+    const sale = await res.json();
+    const detail = await (await api("GET", `/api/sales/${sale.id}`)).json();
+    expect(detail.installments).toHaveLength(1);
+    expect(detail.installments[0].status).toBe("pagado");
+    expect(detail.installments[0].dueDate).toBe("2026-09-03");
+  });
+
+  it("efectivo, 1 pago, NO paga en el momento: la cuota queda pendiente con el vencimiento elegido", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        paymentMethod: "efectivo",
+        items: [{ productId: highStockProductId, quantity: 2 }],
+        installments: [{ amount: 2000 }],
+        paidNow: false,
+        firstDueDate: "2026-09-10",
+      }),
+    );
+    expect(res.status).toBe(201);
+    const sale = await res.json();
+    const detail = await (await api("GET", `/api/sales/${sale.id}`)).json();
+    expect(detail.installments).toHaveLength(1);
+    expect(detail.installments[0].status).toBe("pendiente");
+    expect(detail.installments[0].dueDate).toBe("2026-09-10");
+  });
+
+  it("transferencia, 3 pagos, paga en el momento: la primera cobrada, las demás pendientes cada 30 días desde la venta", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        paymentMethod: "transferencia",
+        items: [{ productId: highStockProductId, quantity: 3 }],
+        installments: [{ amount: 1000 }, { amount: 1000 }, { amount: 1000 }],
+        paidNow: true,
+      }),
+    );
+    expect(res.status).toBe(201);
+    const sale = await res.json();
+    const detail = await (await api("GET", `/api/sales/${sale.id}`)).json();
+    expect(detail.installments).toHaveLength(3);
+    expect(detail.installments[0].status).toBe("pagado");
+    expect(detail.installments[0].dueDate).toBe("2026-09-03");
+    expect(detail.installments[1].status).toBe("pendiente");
+    expect(detail.installments[1].dueDate).toBe(addDays("2026-09-03", 30));
+    expect(detail.installments[2].status).toBe("pendiente");
+    expect(detail.installments[2].dueDate).toBe(addDays("2026-09-03", 60));
+  });
+
+  it("efectivo, 3 pagos, NO paga en el momento: ninguna cobrada, la primera vence lo elegido y las demás cada 30 días después", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        paymentMethod: "efectivo",
+        items: [{ productId: highStockProductId, quantity: 3 }],
+        installments: [{ amount: 1000 }, { amount: 1000 }, { amount: 1000 }],
+        paidNow: false,
+        firstDueDate: "2026-09-10",
+      }),
+    );
+    expect(res.status).toBe(201);
+    const sale = await res.json();
+    const detail = await (await api("GET", `/api/sales/${sale.id}`)).json();
+    expect(detail.installments).toHaveLength(3);
+    expect(detail.installments.every((i: any) => i.status === "pendiente")).toBe(true);
+    expect(detail.installments[0].dueDate).toBe("2026-09-10");
+    expect(detail.installments[1].dueDate).toBe(addDays("2026-09-10", 30));
+    expect(detail.installments[2].dueDate).toBe(addDays("2026-09-10", 60));
+  });
+
+  it("tarjeta, 1 pago: la venta queda cobrada con una sola cuota por el total (paidNow se ignora)", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        paymentMethod: "tarjeta",
+        items: [{ productId: highStockProductId, quantity: 2 }],
+        installments: [{ amount: 2000 }],
+        paidNow: false,
+      }),
+    );
+    expect(res.status).toBe(201);
+    const sale = await res.json();
+    expect(sale.installmentsCount).toBe(1);
+    const detail = await (await api("GET", `/api/sales/${sale.id}`)).json();
+    expect(detail.installments).toHaveLength(1);
+    expect(detail.installments[0].amount).toBe(2000);
+    expect(detail.installments[0].status).toBe("pagado");
+    expect(detail.installments[0].dueDate).toBe("2026-09-03");
+  });
+
+  it("tarjeta, 6 cuotas: una sola cuota cobrada por el total; installmentsCount guarda las 6 solo como dato", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        paymentMethod: "tarjeta",
+        items: [{ productId: highStockProductId, quantity: 6 }],
+        installments: Array.from({ length: 6 }, () => ({ amount: 1000 })),
+      }),
+    );
+    expect(res.status).toBe(201);
+    const sale = await res.json();
+    expect(sale.installmentsCount).toBe(6);
+    const detail = await (await api("GET", `/api/sales/${sale.id}`)).json();
+    expect(detail.installments).toHaveLength(1);
+    expect(detail.installments[0].amount).toBe(6000);
+    expect(detail.installments[0].status).toBe("pagado");
+  });
+
+  it("toda venta nueva arranca con deliveryStatus 'entregada'", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({ paymentMethod: "tarjeta", items: [{ productId: highStockProductId, quantity: 2 }], installments: [{ amount: 2000 }] }),
+    );
+    expect(res.status).toBe(201);
+    const sale = await res.json();
+    expect(sale.deliveryStatus).toBe("entregada");
+  });
+});
+
+// Prompt 6, punto 1: "Completar después" — la clienta es opcional, salvo que la venta quede
+// con algo pendiente de cobro. Mismo motivo que arriba para usar `highStockProductId`.
+describe("POST /api/sales — Prompt 6: clienta opcional", () => {
+  it("se puede crear sin clienta una venta que queda cobrada completa (tarjeta)", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        clientId: undefined,
+        paymentMethod: "tarjeta",
+        items: [{ productId: highStockProductId, quantity: 2 }],
+        installments: [{ amount: 2000 }],
+      }),
+    );
+    expect(res.status).toBe(201);
+    const sale = await res.json();
+    expect(sale.clientId).toBeNull();
+    expect(sale.clientName).toBe("Sin clienta");
+  });
+
+  it("rechaza sin persistir una venta pendiente de cobro sin clienta", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        clientId: undefined,
+        paymentMethod: "efectivo",
+        items: [{ productId: highStockProductId, quantity: 2 }],
+        installments: [{ amount: 2000 }],
+        paidNow: false,
+        firstDueDate: "2026-09-10",
+      }),
+    );
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("Para dejar una venta pendiente de cobro tenés que elegir la clienta");
+  });
+
+  it("una venta cobrada en el momento tampoco necesita clienta (efectivo, paidNow true)", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        clientId: undefined,
+        paymentMethod: "efectivo",
+        items: [{ productId: highStockProductId, quantity: 2 }],
+        installments: [{ amount: 2000 }],
+        paidNow: true,
+      }),
+    );
+    expect(res.status).toBe(201);
+    const sale = await res.json();
+    expect(sale.clientId).toBeNull();
   });
 });
 
