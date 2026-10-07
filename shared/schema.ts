@@ -860,6 +860,10 @@ export const updateSaleDeliveryStatusSchema = z.object({
   deliveryStatus: z.enum(deliveryStatuses),
 });
 
+export const assignSaleClientSchema = z.object({
+  clientId: z.number().int().positive(),
+});
+
 export const createConsultantSchema = z.object({
   username: z.string().min(3),
   password: z.string().min(6),

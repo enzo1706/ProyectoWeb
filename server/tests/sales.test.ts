@@ -1168,6 +1168,68 @@ describe("PATCH /api/sales/:id/delivery-status", () => {
   });
 });
 
+// Prompt 6, punto 1 — "Asignar clienta" para una venta creada con "Completar después".
+describe("PATCH /api/sales/:id/client", () => {
+  it("asigna una clienta a una venta 'Sin clienta'", async () => {
+    const otherClientRes = await api("POST", "/api/clients", { name: "Clienta para asignar", phone: "9990000004" });
+    const otherClient = await otherClientRes.json();
+
+    const createRes = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        clientId: undefined,
+        paymentMethod: "tarjeta",
+        items: [{ productId: highStockProductId, quantity: 2 }],
+        installments: [{ amount: 2000 }],
+      }),
+    );
+    const sale = await createRes.json();
+    expect(sale.clientId).toBeNull();
+
+    const assignRes = await api("PATCH", `/api/sales/${sale.id}/client`, { clientId: otherClient.id });
+    expect(assignRes.status).toBe(200);
+    const assigned = await assignRes.json();
+    expect(assigned.clientId).toBe(otherClient.id);
+    expect(assigned.clientName).toBe(otherClient.name);
+  });
+
+  it("rechaza asignar clienta a una venta que ya tiene una", async () => {
+    const createRes = await api("POST", "/api/sales", baseSale());
+    const sale = await createRes.json();
+    const res = await api("PATCH", `/api/sales/${sale.id}/client`, { clientId });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/ya tiene una clienta asignada/i);
+  });
+
+  it("rechaza con una clienta que no existe (o es de otra consultora)", async () => {
+    const createRes = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        clientId: undefined,
+        paymentMethod: "tarjeta",
+        items: [{ productId: highStockProductId, quantity: 2 }],
+        installments: [{ amount: 2000 }],
+      }),
+    );
+    const sale = await createRes.json();
+    const res = await api("PATCH", `/api/sales/${sale.id}/client`, { clientId: 99999999 });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/clienta no encontrada/i);
+  });
+
+  it("404 sobre una venta inexistente", async () => {
+    const res = await api("PATCH", "/api/sales/99999999/client", { clientId });
+    expect(res.status).toBe(404);
+  });
+
+  it("404 sobre una venta inexistente", async () => {
+    const res = await api("PATCH", "/api/sales/99999999/delivery-status", { deliveryStatus: "pendiente_entrega" });
+    expect(res.status).toBe(404);
+  });
+});
+
 describe("POST /api/sales/:id/cancel", () => {
   let saleId: number;
 

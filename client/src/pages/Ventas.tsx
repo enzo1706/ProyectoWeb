@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { SaleCard, type Sale, type SaleDetails } from "@/components/SaleCard";
 import { NewSaleDialog } from "@/components/NewSaleDialog";
 import { SaleDetailDialog } from "@/components/SaleDetailDialog";
+import { AssignClientDialog } from "@/components/AssignClientDialog";
 import { ErrorBlock } from "@/components/ErrorBlock";
 import { Plus, Search, Filter } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -41,6 +42,7 @@ export default function Ventas() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [selectedSaleId, setSelectedSaleId] = useState<number | null>(null);
   const [editingSale, setEditingSale] = useState<SaleDetails | null>(null);
+  const [assigningClientSale, setAssigningClientSale] = useState<Sale | null>(null);
 
   // Si venimos de "Ir a Ventas" desde Productos con un carrito ya armado, abrir el diálogo
   // de venta nueva automáticamente en vez de dejar el carrito perdido en un botón sin apretar.
@@ -200,7 +202,12 @@ export default function Ventas() {
         <>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {filteredSales.map((sale) => (
-              <SaleCard key={sale.id} sale={sale} onClick={(s) => setSelectedSaleId(s.id)} />
+              <SaleCard
+                key={sale.id}
+                sale={sale}
+                onClick={(s) => setSelectedSaleId(s.id)}
+                onAssignClient={(s) => setAssigningClientSale(s)}
+              />
             ))}
           </div>
 
@@ -237,6 +244,11 @@ export default function Ventas() {
           setSelectedSaleId(null);
           setEditingSale(sale);
         }}
+      />
+
+      <AssignClientDialog
+        sale={assigningClientSale}
+        onOpenChange={(next) => !next && setAssigningClientSale(null)}
       />
     </div>
   );

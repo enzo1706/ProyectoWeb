@@ -847,6 +847,9 @@ export interface IStorage {
   /** Prompt 6, punto 6 — cambiar a mano entre "entregada" y "pendiente_entrega" desde el
    * detalle de la venta. Independiente del pago: no toca sale_installments ni status. */
   setSaleDeliveryStatus(consultantId: number, saleId: number, deliveryStatus: "entregada" | "pendiente_entrega"): Promise<Sale | undefined>;
+  /** Prompt 6, punto 1 — asigna una clienta a una venta creada sin una ("Sin clienta"). Solo
+   * de `null` a una clienta real. */
+  assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined>;
   getSalesSummary(consultantId: number, start: string, end: string, groupBy?: ReportGroupBy): Promise<SalesSummaryPoint[]>;
   getTopCategories(consultantId: number, start?: string, end?: string): Promise<TopCategory[]>;
   getSalesByPaymentMethod(consultantId: number, start?: string, end?: string): Promise<PaymentMethodBreakdown[]>;
@@ -3718,6 +3721,26 @@ export class DatabaseStorage implements IStorage {
     return updated;
   }
 
+  /** Prompt 6, punto 1 — "Completar después": asigna una clienta a una venta que se creó sin
+   * una ("Sin clienta"). Solo de `null` a una clienta real — nunca reemplaza una ya asignada
+   * (para eso no hace falta este endpoint, la clienta no es editable por otra vía a propósito). */
+  async assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined> {
+    const db = await this.getDb();
+    const [sale] = await db.select().from(sales).where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)));
+    if (!sale) return undefined;
+    if (sale.clientId !== null) {
+      throw new SaleValidationError("Esta venta ya tiene una clienta asignada");
+    }
+    const [client] = await db.select().from(clients).where(and(eq(clients.id, clientId), eq(clients.consultantId, consultantId)));
+    if (!client) throw new SaleValidationError("Clienta no encontrada");
+    const [updated] = await db
+      .update(sales)
+      .set({ clientId: client.id, clientName: client.name ?? client.phone })
+      .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+      .returning();
+    return updated;
+  }
+
 }
 
 export class MemoryStorage implements IStorage {
@@ -5749,6 +5772,19 @@ export class MemoryStorage implements IStorage {
       throw new SaleValidationError("No se puede cambiar la entrega de una venta cancelada");
     }
     sale.deliveryStatus = deliveryStatus;
+    return sale;
+  }
+
+  async assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined> {
+    const sale = this.sales.find((s) => s.id === saleId && s.consultantId === consultantId);
+    if (!sale) return undefined;
+    if (sale.clientId !== null) {
+      throw new SaleValidationError("Esta venta ya tiene una clienta asignada");
+    }
+    const client = this.clients.find((c) => c.id === clientId && c.consultantId === consultantId);
+    if (!client) throw new SaleValidationError("Clienta no encontrada");
+    sale.clientId = client.id;
+    sale.clientName = client.name ?? client.phone;
     return sale;
   }
 

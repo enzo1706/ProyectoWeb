@@ -1,5 +1,6 @@
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { User, Calendar, Package } from "lucide-react";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { onActivationKeyDown } from "@/lib/utils";
@@ -27,6 +28,9 @@ export interface SaleDetails extends BaseSale {
 interface SaleCardProps {
   sale: Sale;
   onClick?: (sale: Sale) => void;
+  // Prompt 6, punto 1 — solo tiene efecto visible cuando `sale.clientId` es `null` ("Sin
+  // clienta", venta creada con "Completar después").
+  onAssignClient?: (sale: Sale) => void;
 }
 
 // Prompt 6: dos etiquetas separadas (pago/entrega) en vez de un único "status" que mezclaba
@@ -43,10 +47,11 @@ function formatSaleDate(date: string): string {
   return new Date(year, month - 1, day).toLocaleDateString("es-MX", { day: "numeric", month: "short", year: "numeric" });
 }
 
-export function SaleCard({ sale, onClick }: SaleCardProps) {
+export function SaleCard({ sale, onClick, onAssignClient }: SaleCardProps) {
   const { format } = useHideMoney();
   const isCancelled = sale.status === "cancelada";
   const isPendingDelivery = !isCancelled && sale.deliveryStatus === "pendiente_entrega";
+  const hasNoClient = sale.clientId === null;
   return (
     <Card
       className={`hover-elevate cursor-pointer ${isCancelled ? "opacity-60" : ""}`}
@@ -59,9 +64,24 @@ export function SaleCard({ sale, onClick }: SaleCardProps) {
       <CardContent className="py-4">
         <div className="flex items-start justify-between gap-2">
           <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2">
-              <User className="h-4 w-4 text-muted-foreground" />
+            <div className="flex items-center gap-2 flex-wrap">
+              <User className="h-4 w-4 text-muted-foreground shrink-0" />
               <span className="font-medium truncate">{sale.clientName}</span>
+              {hasNoClient && !isCancelled && onAssignClient && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-auto p-0 text-xs underline"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onAssignClient(sale);
+                  }}
+                  data-testid={`button-assign-client-${sale.id}`}
+                >
+                  Asignar clienta
+                </Button>
+              )}
             </div>
             <div className="flex items-center gap-4 mt-2 text-sm text-muted-foreground">
               <div className="flex items-center gap-1">
