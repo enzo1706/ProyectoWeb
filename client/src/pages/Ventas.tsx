@@ -21,19 +21,23 @@ import { useHideMoney } from "@/hooks/use-hide-money";
 import type { Product } from "@shared/schema";
 import type { TopProductByCategory } from "@/components/CategoryProductsDialog";
 
+// Prompt 6, punto 8: reemplaza el filtro viejo, que filtraba por `sale.status` — ese campo ya
+// solo vale "pendiente"/"cancelada" (el pago y la entrega se separaron en sus propios
+// conceptos, ver SaleCard/SaleDetailDialog). "Pendientes"/"Entregados"/"Pagados" ya no
+// significaban nada real.
 const statusFilters = [
-  { value: "todos", label: "Todos" },
-  { value: "pendiente", label: "Pendientes" },
-  { value: "entregado", label: "Entregados" },
-  { value: "pagado", label: "Pagados" },
-  { value: "cancelada", label: "Canceladas" },
+  { value: "todas", label: "Todas" },
+  { value: "te_deben", label: "Te deben" },
+  { value: "pendientes_entrega", label: "Pendientes de entrega" },
+  { value: "cobradas", label: "Cobradas" },
+  { value: "canceladas", label: "Canceladas" },
 ];
 
 export default function Ventas() {
   const { format } = useHideMoney();
   const cart = useSaleCart();
   const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState("todos");
+  const [statusFilter, setStatusFilter] = useState("todas");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [selectedSaleId, setSelectedSaleId] = useState<number | null>(null);
   const [editingSale, setEditingSale] = useState<SaleDetails | null>(null);
@@ -63,7 +67,11 @@ export default function Ventas() {
 
   const filteredSales = sales.filter((s) => {
     const matchesSearch = s.clientName.toLowerCase().includes(search.toLowerCase());
-    const matchesStatus = statusFilter === "todos" || s.status === statusFilter;
+    let matchesStatus = true;
+    if (statusFilter === "canceladas") matchesStatus = s.status === "cancelada";
+    else if (statusFilter === "te_deben") matchesStatus = s.status !== "cancelada" && s.paymentStatus === "te_debe";
+    else if (statusFilter === "cobradas") matchesStatus = s.status !== "cancelada" && s.paymentStatus === "cobrada";
+    else if (statusFilter === "pendientes_entrega") matchesStatus = s.status !== "cancelada" && s.deliveryStatus === "pendiente_entrega";
     return matchesSearch && matchesStatus;
   });
 
@@ -74,7 +82,9 @@ export default function Ventas() {
   const nonCancelledSales = sales.filter((s) => s.status !== "cancelada");
   const totalSales = nonCancelledSales.reduce((sum, s) => sum + s.total, 0);
   const totalProfit = nonCancelledSales.reduce((sum, s) => sum + s.profit, 0);
-  const pendingCount = sales.filter((s) => s.status === "pendiente").length;
+  // Prompt 6: "pendientes" (sale.status) ya no distingue nada — todas las no canceladas valen
+  // "pendiente" ahora. Lo que importa mostrar es cuántas ventas todavía deben plata.
+  const owingCount = nonCancelledSales.filter((s) => s.paymentStatus === "te_debe").length;
 
   return (
     <div className="p-6 space-y-6" data-testid="page-ventas">
@@ -84,7 +94,7 @@ export default function Ventas() {
           <p className="text-muted-foreground">
             {errorSales
               ? "No pudimos calcular tus totales"
-              : `${sales.length} ventas registradas | ${pendingCount} pendientes`}
+              : `${sales.length} venta${sales.length !== 1 ? "s" : ""} registrada${sales.length !== 1 ? "s" : ""} · ${owingCount} te debe${owingCount !== 1 ? "n" : ""}`}
           </p>
         </div>
         <Button onClick={() => setDialogOpen(true)} data-testid="button-add-sale">

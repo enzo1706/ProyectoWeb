@@ -26,6 +26,9 @@ const mockSale: Sale = {
   clientRequestId: null,
   itemCount: 3,
   hasEstimatedCost: false,
+  paymentStatus: "te_debe",
+  pendingAmount: 10100,
+  nextDueDate: "2025-12-05",
 };
 
 export default function SaleCardExample() {
