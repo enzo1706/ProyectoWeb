@@ -19,14 +19,18 @@ import { useHideMoney } from "@/hooks/use-hide-money";
 import { cn, onActivationKeyDown } from "@/lib/utils";
 import { getProductCategories, toneFamilyKey } from "@/lib/productCategories";
 import { computeDiscountedCost } from "@shared/saleCalculations";
-import { discountOptions, type Product } from "@shared/schema";
+import { discountOptions, orderDraftPayloadSchema, type Product, type Draft, type OrderDraftPayload, type OrderDraftDiscountState } from "@shared/schema";
 import { ChevronDown, Minus, Package, Pencil, Plus, Search, Trash2, Upload } from "lucide-react";
 import { ImportProductsDialog, type ImportedOrderLine } from "./ImportProductsDialog";
+import { UnsavedDraftAlert } from "./UnsavedDraftAlert";
+import { useDraftAutosave } from "@/hooks/use-draft-autosave";
 
 interface LoadOrderDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   products: Product[];
+  /** Prompt 7 — borrador a retomar (desde "Pedidos sin terminar"). */
+  draftToResume?: Draft | null;
 }
 
 interface OrderLine {
@@ -221,7 +225,19 @@ function FamilyRow({
   );
 }
 
-export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialogProps) {
+function discountToDraftState(discount: number | null | undefined): OrderDraftDiscountState {
+  if (discount === undefined) return { kind: "unset" };
+  if (discount === null) return { kind: "later" };
+  return { kind: "chosen", value: discount };
+}
+
+function draftStateToDiscount(state: OrderDraftDiscountState): number | null | undefined {
+  if (state.kind === "unset") return undefined;
+  if (state.kind === "later") return null;
+  return state.value;
+}
+
+export function LoadOrderDialog({ open, onOpenChange, products, draftToResume }: LoadOrderDialogProps) {
   const { toast } = useToast();
   const { format } = useHideMoney();
   const [stepIndex, setStepIndex] = useState(0);
@@ -244,10 +260,15 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
   const [editQtyDraft, setEditQtyDraft] = useState(1);
   const [removingProductId, setRemovingProductId] = useState<number | null>(null);
 
+  // Prompt 7 — borradores: aviso de 3 botones al cerrar con algo cargado, y "este borrador no
+  // se pudo retomar" (formato viejo/incompatible).
+  const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
+  const [resumeFormatError, setResumeFormatError] = useState(false);
+
   const categories = useMemo(() => getProductCategories(products), [products]);
 
   useEffect(() => {
-    if (open) {
+    if (open && !draftToResume) {
       setStepIndex(0);
       setDiscount(undefined);
       setQtyByProduct({});
@@ -259,7 +280,7 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
       setEditingQtyProductId(null);
       setRemovingProductId(null);
     }
-  }, [open]);
+  }, [open, draftToResume]);
 
   const getQty = (productId: number) => qtyByProduct[productId] ?? 0;
 
@@ -341,6 +362,53 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
       }));
   }, [products, qtyByProduct]);
 
+  // Prompt 7 — borradores: "algo cargado" para un pedido es al menos un producto/cantidad
+  // elegido (el descuento solo no alcanza — no es "un producto ni una cantidad").
+  const hasDraftContent = lines.length > 0;
+  const orderDraftPayload: OrderDraftPayload = useMemo(
+    () => ({
+      formatVersion: 1,
+      step: currentStep,
+      discountState: discountToDraftState(discount),
+      lines: lines.map((l) => ({ productId: l.productId, productName: l.productName, quantity: l.quantity })),
+    }),
+    [currentStep, discount, lines],
+  );
+  const draftAutosave = useDraftAutosave({ type: "order", enabled: open && hasDraftContent, payload: orderDraftPayload, step: currentStep });
+
+  // Prompt 7, punto 4 — "Retomar" un pedido: abre en el paso donde quedó; un producto que ya
+  // no existe se saca con un aviso. A diferencia de una venta, el pedido SIEMPRE usa el precio
+  // actual del catálogo (por eso ni se guarda precio en el borrador) — no hay nada que
+  // "preservar" más allá de qué productos y cuántas unidades.
+  useEffect(() => {
+    if (!open || !draftToResume) return;
+
+    const parsed = orderDraftPayloadSchema.safeParse(draftToResume.payload);
+    if (!parsed.success) {
+      setResumeFormatError(true);
+      return;
+    }
+    setResumeFormatError(false);
+    const payload = parsed.data;
+
+    const nextQtyByProduct: Record<number, number> = {};
+    for (const line of payload.lines) {
+      const product = products.find((p) => p.id === line.productId);
+      if (!product) {
+        toast({ title: `Quitamos ${line.productName} porque ya no está disponible.` });
+        continue;
+      }
+      nextQtyByProduct[line.productId] = line.quantity;
+    }
+
+    const stepIndexInSteps = STEPS.indexOf(payload.step);
+    setStepIndex(stepIndexInSteps >= 0 ? stepIndexInSteps : 0);
+    setDiscount(draftStateToDiscount(payload.discountState));
+    setQtyByProduct(nextQtyByProduct);
+    draftAutosave.resumeFrom({ id: draftToResume.id, clientDraftId: draftToResume.clientDraftId });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, draftToResume]);
+
   const totalUnidades = lines.reduce((sum, l) => sum + l.quantity, 0);
   const unitPriceOf = (precio: number) => (typeof discount === "number" ? computeDiscountedCost(precio, discount) : precio);
   const subtotal = lines.reduce((sum, l) => sum + l.precio * l.quantity, 0);
@@ -370,6 +438,9 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
     setDiscount(undefined);
     setQtyByProduct({});
     setImportDialogOpen(false);
+    setResumeFormatError(false);
+    setCloseConfirmOpen(false);
+    draftAutosave.reset();
     onOpenChange(false);
   };
 
@@ -384,9 +455,12 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
       // o nada. `discountPercent` hace que el backend calcule el costo promedio ponderado por
       // unidades de cada línea en la MISMA sentencia que suma el stock (nunca una llamada
       // separada por producto, que ya no sabría cuántas unidades había ANTES de este pedido).
+      // Prompt 7, punto 2: si viene de un borrador retomado, draftId lo borra en la misma
+      // transacción que aplica el stock.
       await apiRequest("PATCH", "/api/products/stock/increment-batch", {
         lines: lines.map((l) => ({ productId: l.productId, delta: l.quantity })),
         discountPercent: chosenDiscount,
+        draftId: draftAutosave.draftId ?? undefined,
       });
 
       // Prompt 1/2 — registro del pedido para el "descuento de compra habitual" (Configuración).
@@ -402,6 +476,9 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/products"] });
       queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
+      // Prompt 7, punto 2: el servidor ya borró el borrador (si había uno) en la misma
+      // transacción — esto solo refresca "Pedidos sin terminar".
+      queryClient.invalidateQueries({ queryKey: ["/api/drafts", "order"] });
       toast({ title: "Pedido cargado", description: "El stock se actualizó correctamente." });
       resetAndClose();
     },
@@ -437,7 +514,20 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
   const removingLine = lines.find((l) => l.productId === removingProductId) ?? null;
 
   return (
-    <Dialog open={open} onOpenChange={(next) => (next ? onOpenChange(next) : resetAndClose())}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (next) {
+          onOpenChange(next);
+          return;
+        }
+        if (hasDraftContent) {
+          setCloseConfirmOpen(true);
+          return;
+        }
+        resetAndClose();
+      }}
+    >
       <DialogContent
         className="top-0 left-0 flex h-[100dvh] max-h-[100dvh] w-screen max-w-none translate-x-0 translate-y-0 flex-col gap-3 rounded-none border-0 p-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:rounded-none"
         data-testid="dialog-load-order"
@@ -446,6 +536,26 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
           <DialogTitle>Cargar pedido</DialogTitle>
         </DialogHeader>
 
+        {resumeFormatError ? (
+          <div className="space-y-4 py-6 text-center" data-testid="text-resume-format-error">
+            <p className="text-sm text-muted-foreground">No pudimos retomar este pedido sin terminar.</p>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={async () => {
+                if (draftToResume) {
+                  await apiRequest("DELETE", `/api/drafts/${draftToResume.id}`);
+                  queryClient.invalidateQueries({ queryKey: ["/api/drafts", "order"] });
+                }
+                resetAndClose();
+              }}
+              data-testid="button-discard-broken-draft"
+            >
+              Descartar
+            </Button>
+          </div>
+        ) : (
+        <>
         <WizardDots total={STEPS.length} current={stepIndex} />
 
         <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain px-1 -mx-1">
@@ -684,9 +794,26 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
             )}
           </div>
         </div>
+        </>
+        )}
       </DialogContent>
 
       <ImportProductsDialog open={importDialogOpen} onOpenChange={setImportDialogOpen} products={products} onImport={handleImport} />
+
+      <UnsavedDraftAlert
+        open={closeConfirmOpen}
+        onKeepEditing={() => setCloseConfirmOpen(false)}
+        onSaveDraft={async () => {
+          setCloseConfirmOpen(false);
+          await draftAutosave.saveNow();
+          resetAndClose();
+        }}
+        onDiscard={async () => {
+          setCloseConfirmOpen(false);
+          await draftAutosave.discardDraft();
+          resetAndClose();
+        }}
+      />
 
       <Dialog open={summaryOpen} onOpenChange={setSummaryOpen}>
         <DialogContent className="max-w-md" data-testid="dialog-order-summary">

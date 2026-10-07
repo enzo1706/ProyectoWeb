@@ -7,7 +7,9 @@ import { SaleCard, type Sale, type SaleDetails } from "@/components/SaleCard";
 import { NewSaleDialog } from "@/components/NewSaleDialog";
 import { SaleDetailDialog } from "@/components/SaleDetailDialog";
 import { AssignClientDialog } from "@/components/AssignClientDialog";
+import { UnfinishedDraftsSection } from "@/components/UnfinishedDraftsSection";
 import { ErrorBlock } from "@/components/ErrorBlock";
+import type { Draft } from "@shared/schema";
 import { Plus, Search, Filter } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -43,6 +45,7 @@ export default function Ventas() {
   const [selectedSaleId, setSelectedSaleId] = useState<number | null>(null);
   const [editingSale, setEditingSale] = useState<SaleDetails | null>(null);
   const [assigningClientSale, setAssigningClientSale] = useState<Sale | null>(null);
+  const [resumingSaleDraft, setResumingSaleDraft] = useState<Draft | null>(null);
 
   // Si venimos de "Ir a Ventas" desde Productos con un carrito ya armado, abrir el diálogo
   // de venta nueva automáticamente en vez de dejar el carrito perdido en un botón sin apretar.
@@ -90,6 +93,8 @@ export default function Ventas() {
 
   return (
     <div className="p-6 space-y-6" data-testid="page-ventas">
+      <UnfinishedDraftsSection type="sale" title="Ventas sin terminar" onResume={setResumingSaleDraft} />
+
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold">Ventas</h1>
@@ -220,12 +225,13 @@ export default function Ventas() {
       )}
 
       <NewSaleDialog
-        open={dialogOpen || editingSale !== null}
+        open={dialogOpen || editingSale !== null || resumingSaleDraft !== null}
         onOpenChange={(next) => {
           if (!next) {
             const wasEditing = editingSale !== null;
             setDialogOpen(false);
             setEditingSale(null);
+            setResumingSaleDraft(null);
             // Solo se limpia el carrito compartido si esta sesión de venta arrancó (o pudo
             // arrancar) desde el carrito de Productos — nunca al cerrar la edición de una
             // venta ya existente, que no tiene relación con el carrito.
@@ -235,6 +241,7 @@ export default function Ventas() {
         products={products}
         existingSale={editingSale}
         initialLines={cart.lines}
+        draftToResume={resumingSaleDraft}
       />
 
       <SaleDetailDialog

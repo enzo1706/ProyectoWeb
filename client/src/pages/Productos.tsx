@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
-import type { Product } from "@shared/schema";
+import type { Product, Draft } from "@shared/schema";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -31,6 +31,7 @@ import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { getProductCategories, toneFamilyKey } from "@/lib/productCategories";
 import { LoadOrderDialog } from "@/components/LoadOrderDialog";
+import { UnfinishedDraftsSection } from "@/components/UnfinishedDraftsSection";
 import { AddProductDialog } from "@/components/stock/AddProductDialog";
 import { EditProductDialog } from "@/components/stock/EditProductDialog";
 import { ProductGroup } from "@/components/stock/ProductRow";
@@ -134,6 +135,7 @@ export default function Productos() {
   const [addProductOpen, setAddProductOpen] = useState(false);
   const [loadOrderOpen, setLoadOrderOpen] = useState(false);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
+  const [resumingOrderDraft, setResumingOrderDraft] = useState<Draft | null>(null);
 
   const { data: products = [], isLoading, isError, error } = useQuery<Product[]>({
     queryKey: ["/api/products"],
@@ -208,6 +210,8 @@ export default function Productos() {
 
   return (
     <div className="min-h-full bg-background p-6 space-y-6" data-testid="page-productos">
+      <UnfinishedDraftsSection type="order" title="Pedidos sin terminar" onResume={setResumingOrderDraft} />
+
       <header className="space-y-1">
         <div className="flex items-center justify-between gap-3">
           <h1 className="text-3xl font-bold text-foreground">Stock</h1>
@@ -393,7 +397,17 @@ export default function Productos() {
         products={products}
       />
 
-      <LoadOrderDialog open={loadOrderOpen} onOpenChange={setLoadOrderOpen} products={products} />
+      <LoadOrderDialog
+        open={loadOrderOpen || resumingOrderDraft !== null}
+        onOpenChange={(next) => {
+          if (!next) {
+            setLoadOrderOpen(false);
+            setResumingOrderDraft(null);
+          }
+        }}
+        products={products}
+        draftToResume={resumingOrderDraft}
+      />
     </div>
   );
 }

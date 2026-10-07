@@ -1,17 +1,17 @@
-# Pruebas: Prompt 4 (Stock) + Prompt 5 (Cargar desde el catálogo) + Prompt 6 (Ventas)
+# Pruebas: Prompt 4 (Stock) + Prompt 5 (Catálogo) + Prompt 6 (Ventas) + Prompt 7 (Borradores)
 
-Esta rama (`prompt-6-ventas`) incluye los Prompts 4, 5 y 6 completos, uno arriba del otro —
-se prueban juntos porque el Prompt 5 depende del agrupamiento por tono que armó el Prompt 4
-en Stock, y el Prompt 6 (Ventas) depende del backend de costos/cuotas que ya estaba.
+Esta rama (`prompt-7-borradores`) incluye los Prompts 4, 5, 6 y 7 completos, uno arriba del
+otro — se prueban juntos porque cada uno depende del anterior (el Prompt 7 agrega borradores
+sobre el wizard de ventas y el de pedidos que armó el Prompt 6/5).
 
 ## Cómo levantarlo
 
 1. `git fetch origin`
-2. `git checkout prompt-6-ventas`
+2. `git checkout prompt-7-borradores`
 3. Variables de entorno: copiá el `.env` que ya tengas, con `DATABASE_URL` apuntando a tu
    Postgres local (no hace falta `TEST_DATABASE_URL` para levantar la app con `npm run dev`).
 4. Si no tenés la base local levantada: `npm run db:dev:up` y después `npm run db:push`
-   (este Prompt 6 agregó una columna nueva, `sales.delivery_status` — `db:push` la aplica sola).
+   (este Prompt 7 agregó una tabla nueva, `drafts` — `db:push` la aplica sola).
 5. `npm run dev` y abrí `http://localhost:5000` (o el puerto que indique la consola).
 6. Entrá con una cuenta de consultora de prueba (o creá una) y una clienta de prueba. Si el
    catálogo está vacío, en Stock aparece el botón "Cargar catálogo de prueba" — tiene
@@ -143,12 +143,64 @@ en el momento. Probar específicamente que esto ya NO pasa (ver primer punto de 
   tenía "Pendientes"/"Entregados"/"Pagados", que ya no significaban nada real).
 - El contador de arriba usa singular/plural correcto ("1 venta registrada" / "2 ventas
   registradas").
+- Una venta creada con "Completar después" muestra el botón "Asignar clienta" en su tarjeta.
+  Al tocarlo se abre un buscador (igual que en el wizard) + "Nueva clienta"; al elegir una, la
+  tarjeta pasa a mostrar su nombre y el botón desaparece.
 
-### Pendiente, fuera de este alcance
-"Asignar clienta" para una venta creada con "Completar después" todavía no tiene botón ni
-endpoint — por ahora esas ventas quedan con "Sin clienta" sin forma de cambiarlo desde la UI.
+## Borradores de ventas y pedidos (Prompt 7)
 
-## En los tres: a 375 px de ancho (celular)
+### El problema que esto arregla
+Antes, tocar la X en "Nueva venta" o "Cargar pedido" con algo ya cargado lo perdía todo sin
+avisar.
+
+### Guardado automático
+- Empezá una venta nueva (elegí una clienta, o agregá un producto) y dejala sin confirmar.
+  Esperá unos segundos (el guardado es automático, no hace falta ningún botón) y cambiá de
+  pestaña o cerrá el navegador. Al volver a entrar a Ventas, tiene que aparecer arriba de todo
+  en "Ventas sin terminar (1)", con la clienta (o "Sin clienta"), la cantidad de productos y
+  "hoy" como fecha.
+- Mismo caso con "Cargar pedido" desde Stock — tiene que aparecer en "Pedidos sin terminar".
+- Abrir el wizard y cerrarlo SIN cargar nada (ni clienta, ni producto) no debe crear ningún
+  borrador — ni en la lista ni en la base.
+- Mientras el borrador está sin confirmar, el stock NO se modificó (para un pedido) y la venta
+  no aparece en Reportes ni afecta el saldo de ninguna clienta (para una venta).
+
+### Al cerrar con algo cargado
+- Tocar la X (o la tecla Escape, o hacer click afuera del diálogo) con algo ya cargado tiene
+  que mostrar la pregunta "¿Querés guardar lo que cargaste?" con tres botones: "Guardar
+  borrador", "Descartar" y "Seguir cargando".
+  - "Seguir cargando": vuelve al wizard, sin perder nada.
+  - "Guardar borrador": cierra y el borrador queda en la lista de "sin terminar".
+  - "Descartar": cierra y NO queda ningún borrador.
+- Sin nada cargado, la X cierra directo, sin preguntar nada.
+
+### Retomar
+- Desde "Ventas sin terminar" (o "Pedidos sin terminar"), tocar "Retomar" abre el wizard
+  exactamente en el paso donde quedó, con todo lo que ya se había cargado.
+- Retomar una venta en borrador que tenía un producto que mientras tanto se borró del catálogo:
+  tiene que sacarlo solo y avisar "Quitamos [producto] porque ya no está disponible." — nunca
+  romper el wizard.
+- En una venta, los precios que ya se habían puesto (ajustes manuales incluidos) se mantienen
+  al retomar. En un pedido, los precios se recalculan con el catálogo actual (pueden haber
+  cambiado desde que se guardó el borrador).
+- Si la clienta de una venta en borrador se eliminó mientras tanto, al retomar la venta queda
+  "Sin clienta" en vez de romper o mostrar datos viejos.
+- Confirmar una venta (o un pedido) retomado tiene que hacer que su borrador desaparezca de la
+  lista — nunca puede quedar un borrador de algo que ya se confirmó.
+- El tacho de cada fila de la lista descarta ese borrador, con la confirmación "¿Querés
+  descartar esta venta/pedido sin terminar?".
+
+### Varios borradores a la vez
+- Dejá dos ventas (o dos pedidos) sin terminar a la vez — tienen que convivir en la lista, cada
+  una con su propio "Retomar" y su propio tacho, sin mezclarse entre sí.
+
+### Aislamiento entre consultoras
+Este punto se probó a nivel de servidor (tests automáticos contra Postgres real, incluidos en
+el repo) — no hace falta reproducirlo a mano, pero si se quiere confirmar: con dos cuentas de
+consultora distintas, ningún borrador de una tiene que aparecer, poder retomarse ni poder
+borrarse desde la otra.
+
+## En los cuatro: a 375 px de ancho (celular)
 
 Probar todo lo de arriba también con el DevTools en modo responsive a 375 px (iPhone SE o
 similar):
@@ -160,6 +212,8 @@ similar):
   usables con el teclado del celular abierto.
 - El wizard de "Nueva venta" (los 4 pasos) y el detalle de venta (con las dos etiquetas y los
   botones nuevos de entrega/cuotas) se ven completos, sin texto cortado ni botones superpuestos.
+- Las secciones "Ventas sin terminar" / "Pedidos sin terminar" y la pregunta de 3 botones al
+  cerrar se ven completas, sin que los botones se corten ni se superpongan.
 
 ## Qué avisar si algo falla
 
