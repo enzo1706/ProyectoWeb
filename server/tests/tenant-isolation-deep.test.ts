@@ -53,6 +53,7 @@ let appointmentBId: number;
 let saleBId: number;
 let installmentBId: number;
 let globalProductId: number;
+let draftBId: number; // Prompt 7
 
 async function loginAs(username: string): Promise<string> {
   const res = await fetch(`${baseUrl}/api/auth/login`, {
@@ -171,6 +172,35 @@ beforeAll(async () => {
   saleBId = saleB.id;
   const [installmentB] = await db.select().from(saleInstallments).where(eq(saleInstallments.saleId, saleBId));
   installmentBId = installmentB.id;
+
+  // Prompt 7 — borrador real de B (venta nueva sin terminar), para probar que A no puede
+  // verlo, retomarlo ni borrarlo.
+  const draftB = await storage.saveDraft(consultantBId, {
+    clientDraftId: randomUUID(),
+    type: "sale",
+    payload: {
+      formatVersion: 1,
+      step: "productos",
+      clientId: clientBId,
+      clientName: clientB.name,
+      clientSkipped: false,
+      date: "2026-09-03",
+      lines: [{ productId: manualProductBId, productName: "Producto manual Tenant B", quantity: 1, originalPrice: 5000, mode: "none", adjustmentValue: null }],
+      paymentMethod: "efectivo",
+      installmentsCount: 1,
+      installmentAmounts: [5000],
+      paidNow: true,
+      dueDatePreset: "7",
+      customDueDate: null,
+      adjustmentsOpen: false,
+      orderDiscountPct: "",
+      orderSurchargePct: "",
+      shippingCharged: null,
+      shippingCostReal: null,
+      notes: "",
+    },
+  });
+  draftBId = draftB.id;
 }, 30_000);
 
 afterAll(async () => {
@@ -460,5 +490,35 @@ describe("Tenant isolation profundo — clientRequestId (Etapa I-B.6)", () => {
     });
     expect(replayA.id).toBe(matchA.id);
     expect(replayA.id).not.toBe(matchB.id);
+  });
+});
+
+describe("Tenant isolation profundo — Borradores (Prompt 7, punto 8)", () => {
+  it("A no ve el borrador de B en su propia lista", async () => {
+    const res = await api(cookieA, "GET", "/api/drafts");
+    expect(res.status).toBe(200);
+    const list = await res.json();
+    expect(list.find((d: { id: number }) => d.id === draftBId)).toBeUndefined();
+  });
+
+  it("A no puede retomar (GET por id) el borrador de B — 404, igual que uno inexistente", async () => {
+    const res = await api(cookieA, "GET", `/api/drafts/${draftBId}`);
+    expect(res.status).toBe(404);
+  });
+
+  it("A no puede borrar el borrador de B — 404, y el borrador de B sigue intacto", async () => {
+    const res = await api(cookieA, "DELETE", `/api/drafts/${draftBId}`);
+    expect(res.status).toBe(404);
+
+    const stillThere = await storage.getDraft(consultantBId, draftBId);
+    expect(stillThere).toBeDefined();
+  });
+
+  it("B sí puede ver y retomar su propio borrador", async () => {
+    const res = await api(cookieB, "GET", `/api/drafts/${draftBId}`);
+    expect(res.status).toBe(200);
+    const draft = await res.json();
+    expect(draft.id).toBe(draftBId);
+    expect(draft.consultantId).toBe(consultantBId);
   });
 });

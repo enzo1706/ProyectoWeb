@@ -310,6 +310,40 @@ export const saleInstallments = pgTable("sale_installments", {
   statusIdx: index("sale_installments_status_idx").on(table.status),
 }));
 
+export const draftTypes = ["sale", "order"] as const;
+export type DraftType = (typeof draftTypes)[number];
+
+/**
+ * Prompt 7 — avance sin terminar de "Nueva venta" o "Cargar pedido" (solo creación: editar una
+ * venta existente nunca genera fila acá, ver Prompt 7 punto 5). `payload` guarda el estado
+ * completo del wizard tal como lo necesita para retomar — jsonb a propósito (mismo criterio que
+ * `payments.rawPayload`): el contenido difiere totalmente entre "sale" y "order", y modelarlo
+ * en columnas propias obligaría a migrar cada vez que el wizard agregue un campo.
+ *
+ * `clientDraftId` es un UUID generado por el cliente al primer guardado (mismo patrón que
+ * `sales.clientRequestId`) — el UNIQUE de abajo es la garantía real contra duplicados: dos
+ * guardados casi simultáneos del mismo borrador hacen upsert sobre la misma fila, nunca crean
+ * una segunda (Prompt 7, regla 1 de la última ronda de ajustes del usuario).
+ *
+ * `onDelete: "cascade"` en consultantId: si se borra la consultora, sus borradores se borran
+ * con ella — no tiene sentido retenerlos (regla 5 de esa misma ronda).
+ */
+export const drafts = pgTable("drafts", {
+  id: serial("id").primaryKey(),
+  consultantId: integer("consultant_id").notNull().references(() => consultants.id, { onDelete: "cascade" }),
+  clientDraftId: text("client_draft_id").notNull(),
+  type: text("type").notNull(),
+  payload: jsonb("payload").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+  consultantUpdatedIdx: index("drafts_consultant_id_updated_at_idx").on(table.consultantId, table.updatedAt),
+  consultantClientDraftIdUnique: unique("drafts_consultant_id_client_draft_id_unique").on(
+    table.consultantId,
+    table.clientDraftId,
+  ),
+}));
+
 export const paymentStatuses = ["pending", "approved", "rejected", "cancelled", "in_process"] as const;
 export type PaymentStatus = (typeof paymentStatuses)[number];
 
@@ -558,6 +592,8 @@ export type Coupon = typeof coupons.$inferSelect;
 export type InsertCoupon = typeof coupons.$inferInsert;
 export type CouponRedemption = typeof couponRedemptions.$inferSelect;
 export type InsertCouponRedemption = typeof couponRedemptions.$inferInsert;
+export type Draft = typeof drafts.$inferSelect;
+export type InsertDraft = typeof drafts.$inferInsert;
 
 export const insertUserSchema = createInsertSchema(users).omit({ id: true });
 export const insertProductSchema = createInsertSchema(products);
@@ -760,6 +796,9 @@ export const incrementProductStockBatchSchema = z.object({
       message: "El descuento debe ser uno de los valores permitidos",
     })
     .optional(),
+  // Prompt 7, punto 2: mismo criterio que createSaleSchema.draftId — si este pedido viene de un
+  // borrador retomado, se borra junto con el incremento de stock, en la misma transacción.
+  draftId: z.number().int().positive().optional(),
 });
 
 export const setProductStockReminderSchema = z.object({
@@ -830,6 +869,10 @@ export const createSaleSchema = z.object({
   // Opcional (compatibilidad con clientes viejos): clave de idempotencia generada por el
   // frontend — ver `sales.clientRequestId` en el schema de arriba y la Etapa I-B.6.
   clientRequestId: z.string().uuid("clientRequestId debe ser un UUID válido").optional(),
+  // Prompt 7, punto 2: si esta venta nació de un borrador retomado, se borra en la MISMA
+  // transacción que la crea — nunca puede quedar un borrador de algo ya confirmado. Ausente =
+  // venta que no viene de un borrador (el camino de siempre).
+  draftId: z.number().int().positive().optional(),
 });
 
 // Edición de una venta ya existente: mismo cuerpo que la creación, salvo clienta/fecha/status
@@ -863,6 +906,99 @@ export const updateSaleDeliveryStatusSchema = z.object({
 export const assignSaleClientSchema = z.object({
   clientId: z.number().int().positive(),
 });
+
+/**
+ * Prompt 7 — formato del `payload` guardado en `drafts`. Versionado a propósito (punto 2 de la
+ * última ronda de ajustes): si el formato cambia a futuro, un borrador viejo con
+ * `formatVersion` distinto se descarta limpio al retomar (ver storage.getDraft) en vez de
+ * romper intentando leer campos que no están.
+ */
+export const DRAFT_FORMAT_VERSION = 1;
+
+const saleDraftStepSchema = z.enum(["cliente", "productos", "pago", "confirmar"]);
+const orderDraftStepSchema = z.enum(["descuento", "catalogo", "confirmar"]);
+
+// Prompt 7, punto 4: una venta en borrador conserva los precios que la consultora ya había
+// puesto (mode/adjustmentValue/originalPrice viajan tal cual los tenía) — a diferencia de un
+// pedido, donde el precio se vuelve a tomar del catálogo actual al retomar (ver
+// orderDraftPayloadSchema, que ni siquiera guarda precio). `productName` viaja en las dos SOLO
+// para poder avisar "Quitamos [producto] porque ya no está disponible" si el producto se borró
+// para cuando se retoma — en ese caso el catálogo en vivo ya no tiene el nombre para mostrar.
+const saleDraftLineSchema = z.object({
+  productId: z.number().int().positive(),
+  productName: z.string(),
+  quantity: z.number().int().positive(),
+  originalPrice: z.number().int().nonnegative(),
+  mode: z.enum(["none", "discountPercent", "surchargePercent", "manualPrice"]),
+  adjustmentValue: z.number().nullable(),
+});
+
+export const saleDraftPayloadSchema = z.object({
+  formatVersion: z.literal(DRAFT_FORMAT_VERSION),
+  step: saleDraftStepSchema,
+  clientId: z.number().int().positive().nullable(),
+  // Prompt 7, punto 4: nombre tal como se veía al guardar — si la clienta se borró para cuando
+  // se retoma, la venta cae a "Sin clienta" (ver la lógica de resume en NewSaleDialog), pero
+  // mientras tanto esto alcanza para mostrarla en "Ventas sin terminar" sin otra consulta.
+  clientName: z.string().nullable(),
+  clientSkipped: z.boolean(),
+  date: z.string().min(1),
+  lines: z.array(saleDraftLineSchema),
+  paymentMethod: z.enum(paymentMethods),
+  installmentsCount: z.number().int().positive(),
+  installmentAmounts: z.array(z.number().int()),
+  paidNow: z.boolean(),
+  dueDatePreset: z.enum(["7", "15", "30", "custom"]),
+  customDueDate: z.string().nullable(),
+  adjustmentsOpen: z.boolean(),
+  orderDiscountPct: z.string(),
+  orderSurchargePct: z.string(),
+  shippingCharged: z.number().int().nullable(),
+  shippingCostReal: z.number().int().nullable(),
+  notes: z.string(),
+});
+export type SaleDraftPayload = z.infer<typeof saleDraftPayloadSchema>;
+export type SaleDraftLine = z.infer<typeof saleDraftLineSchema>;
+
+// "unset" = todavía no elegido (equivalente al `undefined` de LoadOrderDialog, que JSON no
+// puede representar); "later" = "Elegir después" tildado a propósito; "chosen" = ya elegido.
+const orderDraftDiscountStateSchema = z.union([
+  z.object({ kind: z.literal("unset") }),
+  z.object({ kind: z.literal("later") }),
+  z.object({ kind: z.literal("chosen"), value: z.number().int() }),
+]);
+export type OrderDraftDiscountState = z.infer<typeof orderDraftDiscountStateSchema>;
+
+const orderDraftLineSchema = z.object({
+  productId: z.number().int().positive(),
+  productName: z.string(),
+  quantity: z.number().int().positive(),
+});
+
+export const orderDraftPayloadSchema = z.object({
+  formatVersion: z.literal(DRAFT_FORMAT_VERSION),
+  step: orderDraftStepSchema,
+  discountState: orderDraftDiscountStateSchema,
+  lines: z.array(orderDraftLineSchema),
+});
+export type OrderDraftPayload = z.infer<typeof orderDraftPayloadSchema>;
+export type OrderDraftLine = z.infer<typeof orderDraftLineSchema>;
+
+/** Prompt 7, punto 4 del pedido original: valida que el `payload` tenga la forma correcta
+ * SEGÚN el `type` declarado — nunca se mezclan (un payload de pedido no pasa como venta). */
+export const saveDraftSchema = z.discriminatedUnion("type", [
+  z.object({
+    clientDraftId: z.string().uuid("clientDraftId debe ser un UUID válido"),
+    type: z.literal("sale"),
+    payload: saleDraftPayloadSchema,
+  }),
+  z.object({
+    clientDraftId: z.string().uuid("clientDraftId debe ser un UUID válido"),
+    type: z.literal("order"),
+    payload: orderDraftPayloadSchema,
+  }),
+]);
+export type SaveDraftInput = z.infer<typeof saveDraftSchema>;
 
 export const createConsultantSchema = z.object({
   username: z.string().min(3),
