@@ -433,6 +433,15 @@ export interface SaleWithItemCount extends Sale {
   // Prompt 2: true si alguna línea de esta venta tiene costo estimado — Ventas/Reportes lo
   // muestran con "≈" junto a la ganancia (otra tarea de UI).
   hasEstimatedCost: boolean;
+  // Prompt 6: estado de pago derivado de sale_installments, calculado acá (un solo query
+  // agregado, mismo patrón que itemCount) para que la lista de Ventas pueda mostrar
+  // "Cobrada"/"Te debe $X" y filtrar por eso sin un fetch por venta (evita N+1). "cobrada"
+  // = no queda ninguna cuota pendiente (incluye el caso tarjeta, que siempre crea una sola
+  // cuota ya pagada) — nunca se guarda en la base, se recalcula cada vez a partir de las
+  // cuotas reales, así nunca puede quedar desincronizado.
+  paymentStatus: "cobrada" | "te_debe";
+  pendingAmount: number;
+  nextDueDate: string | null;
 }
 
 export interface SaleWithDetails extends Sale {
@@ -835,6 +844,9 @@ export interface IStorage {
   updateSale(consultantId: number, id: number, input: UpdateSaleInput): Promise<Sale | undefined>;
   cancelSale(consultantId: number, id: number): Promise<Sale | undefined>;
   updateInstallmentStatus(consultantId: number, saleId: number, installmentId: number, status: "pendiente" | "pagado"): Promise<SaleInstallment | undefined>;
+  /** Prompt 6, punto 6 — cambiar a mano entre "entregada" y "pendiente_entrega" desde el
+   * detalle de la venta. Independiente del pago: no toca sale_installments ni status. */
+  setSaleDeliveryStatus(consultantId: number, saleId: number, deliveryStatus: "entregada" | "pendiente_entrega"): Promise<Sale | undefined>;
   getSalesSummary(consultantId: number, start: string, end: string, groupBy?: ReportGroupBy): Promise<SalesSummaryPoint[]>;
   getTopCategories(consultantId: number, start?: string, end?: string): Promise<TopCategory[]>;
   getSalesByPaymentMethod(consultantId: number, start?: string, end?: string): Promise<PaymentMethodBreakdown[]>;
@@ -3049,11 +3061,33 @@ export class DatabaseStorage implements IStorage {
       .groupBy(saleItems.saleId);
     const countsBySale = new Map(counts.map((c) => [c.saleId, c]));
 
-    return salesRows.map((s) => ({
-      ...s,
-      itemCount: countsBySale.get(s.id)?.itemCount ?? 0,
-      hasEstimatedCost: countsBySale.get(s.id)?.hasEstimatedCost ?? false,
-    }));
+    // Prompt 6: agregado de cuotas pendientes — mismo patrón que arriba (un solo query extra,
+    // nunca un fetch por venta).
+    const pendingAgg = await db
+      .select({
+        saleId: saleInstallments.saleId,
+        pendingAmount: sql<number>`coalesce(sum(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.amount} else 0 end), 0)`,
+        nextDueDate: sql<string | null>`min(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.dueDate} end)`,
+      })
+      .from(saleInstallments)
+      .where(inArray(saleInstallments.saleId, saleIds))
+      .groupBy(saleInstallments.saleId);
+    const pendingBySale = new Map(pendingAgg.map((p) => [p.saleId, p]));
+
+    return salesRows.map((s) => {
+      // Una venta cancelada no le debe nada a nadie — mismo criterio que
+      // getCollectedPayments/getPendingInstallmentsTotals, que ya excluyen "cancelada" de
+      // cualquier total pendiente/cobrado real.
+      const pendingAmount = s.status === "cancelada" ? 0 : Number(pendingBySale.get(s.id)?.pendingAmount ?? 0);
+      return {
+        ...s,
+        itemCount: countsBySale.get(s.id)?.itemCount ?? 0,
+        hasEstimatedCost: countsBySale.get(s.id)?.hasEstimatedCost ?? false,
+        paymentStatus: pendingAmount > 0 ? "te_debe" : "cobrada",
+        pendingAmount,
+        nextDueDate: s.status === "cancelada" ? null : pendingBySale.get(s.id)?.nextDueDate ?? null,
+      };
+    });
   }
 
   async getSaleDetails(consultantId: number, id: number): Promise<SaleWithDetails | undefined> {
@@ -3667,6 +3701,21 @@ export class DatabaseStorage implements IStorage {
         .returning();
       return updated;
     });
+  }
+
+  async setSaleDeliveryStatus(consultantId: number, saleId: number, deliveryStatus: "entregada" | "pendiente_entrega"): Promise<Sale | undefined> {
+    const db = await this.getDb();
+    const [sale] = await db.select().from(sales).where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)));
+    if (!sale) return undefined;
+    if (sale.status === "cancelada") {
+      throw new SaleValidationError("No se puede cambiar la entrega de una venta cancelada");
+    }
+    const [updated] = await db
+      .update(sales)
+      .set({ deliveryStatus })
+      .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+      .returning();
+    return updated;
   }
 
 }
@@ -5306,10 +5355,19 @@ export class MemoryStorage implements IStorage {
       .sort((a, b) => (a.date === b.date ? b.id - a.id : b.date.localeCompare(a.date)))
       .map((s) => {
         const items = this.saleItems.filter((i) => i.saleId === s.id);
+        // Prompt 6: mismo criterio que DatabaseStorage.getAllSales — cancelada nunca debe nada.
+        const pendingInstallments = s.status === "cancelada" ? [] : this.saleInstallments.filter((i) => i.saleId === s.id && i.status === "pendiente");
+        const pendingAmount = pendingInstallments.reduce((sum, i) => sum + i.amount, 0);
+        const nextDueDate = pendingInstallments.length > 0
+          ? pendingInstallments.map((i) => i.dueDate).sort()[0]
+          : null;
         return {
           ...s,
           itemCount: items.reduce((sum, i) => sum + i.quantity, 0),
           hasEstimatedCost: items.some((i) => i.costIsEstimated === true || i.costPrice === null),
+          paymentStatus: pendingAmount > 0 ? "te_debe" : "cobrada",
+          pendingAmount,
+          nextDueDate,
         };
       });
   }
@@ -5682,6 +5740,16 @@ export class MemoryStorage implements IStorage {
 
     installment.status = status;
     return installment;
+  }
+
+  async setSaleDeliveryStatus(consultantId: number, saleId: number, deliveryStatus: "entregada" | "pendiente_entrega"): Promise<Sale | undefined> {
+    const sale = this.sales.find((s) => s.id === saleId && s.consultantId === consultantId);
+    if (!sale) return undefined;
+    if (sale.status === "cancelada") {
+      throw new SaleValidationError("No se puede cambiar la entrega de una venta cancelada");
+    }
+    sale.deliveryStatus = deliveryStatus;
+    return sale;
   }
 
 }

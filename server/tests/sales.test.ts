@@ -1060,6 +1060,114 @@ describe("PATCH /api/sales/:id — edición con cuotas ya pagadas (Prompt 6)", (
   });
 });
 
+// Prompt 6: estado de pago derivado de sale_installments en GET /api/sales (lista), sin
+// fetch adicional por venta.
+describe("GET /api/sales — Prompt 6: paymentStatus/pendingAmount/nextDueDate derivados", () => {
+  it("tarjeta: paymentStatus 'cobrada', sin saldo pendiente", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({ paymentMethod: "tarjeta", items: [{ productId: highStockProductId, quantity: 2 }], installments: [{ amount: 2000 }] }),
+    );
+    const sale = await res.json();
+    const list = await (await api("GET", "/api/sales")).json();
+    const found = list.find((s: any) => s.id === sale.id);
+    expect(found.paymentStatus).toBe("cobrada");
+    expect(found.pendingAmount).toBe(0);
+    expect(found.nextDueDate).toBeNull();
+  });
+
+  it("efectivo sin pagar en el momento: paymentStatus 'te_debe', pendingAmount y nextDueDate correctos", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        paymentMethod: "efectivo",
+        items: [{ productId: highStockProductId, quantity: 2 }],
+        installments: [{ amount: 2000 }],
+        paidNow: false,
+        firstDueDate: "2026-09-20",
+      }),
+    );
+    const sale = await res.json();
+    const list = await (await api("GET", "/api/sales")).json();
+    const found = list.find((s: any) => s.id === sale.id);
+    expect(found.paymentStatus).toBe("te_debe");
+    expect(found.pendingAmount).toBe(2000);
+    expect(found.nextDueDate).toBe("2026-09-20");
+  });
+
+  it("venta cancelada: paymentStatus 'cobrada' y pendingAmount $0 aunque haya una cuota pendiente sin cobrar", async () => {
+    const res = await api(
+      "POST",
+      "/api/sales",
+      baseSale({
+        paymentMethod: "efectivo",
+        items: [{ productId: highStockProductId, quantity: 2 }],
+        installments: [{ amount: 2000 }],
+        paidNow: false,
+        firstDueDate: "2026-09-20",
+      }),
+    );
+    const sale = await res.json();
+    await api("POST", `/api/sales/${sale.id}/cancel`);
+    const list = await (await api("GET", "/api/sales")).json();
+    const found = list.find((s: any) => s.id === sale.id);
+    expect(found.paymentStatus).toBe("cobrada");
+    expect(found.pendingAmount).toBe(0);
+    expect(found.nextDueDate).toBeNull();
+  });
+});
+
+// Prompt 6, punto 6: cambiar a mano entre "entregada" y "pendiente_entrega".
+describe("PATCH /api/sales/:id/delivery-status", () => {
+  it("toda venta nueva arranca 'entregada', y se puede cambiar a 'pendiente_entrega' y volver", async () => {
+    const createRes = await api(
+      "POST",
+      "/api/sales",
+      baseSale({ paymentMethod: "tarjeta", items: [{ productId: highStockProductId, quantity: 2 }], installments: [{ amount: 2000 }] }),
+    );
+    const sale = await createRes.json();
+    expect(sale.deliveryStatus).toBe("entregada");
+
+    const toPending = await api("PATCH", `/api/sales/${sale.id}/delivery-status`, { deliveryStatus: "pendiente_entrega" });
+    expect(toPending.status).toBe(200);
+    expect((await toPending.json()).deliveryStatus).toBe("pendiente_entrega");
+
+    const backToDelivered = await api("PATCH", `/api/sales/${sale.id}/delivery-status`, { deliveryStatus: "entregada" });
+    expect(backToDelivered.status).toBe(200);
+    expect((await backToDelivered.json()).deliveryStatus).toBe("entregada");
+  });
+
+  it("rechaza un valor inválido de deliveryStatus", async () => {
+    const createRes = await api(
+      "POST",
+      "/api/sales",
+      baseSale({ paymentMethod: "tarjeta", items: [{ productId: highStockProductId, quantity: 2 }], installments: [{ amount: 2000 }] }),
+    );
+    const sale = await createRes.json();
+    const res = await api("PATCH", `/api/sales/${sale.id}/delivery-status`, { deliveryStatus: "entregado" });
+    expect(res.status).toBe(400);
+  });
+
+  it("rechaza cambiar la entrega de una venta cancelada", async () => {
+    const createRes = await api(
+      "POST",
+      "/api/sales",
+      baseSale({ paymentMethod: "tarjeta", items: [{ productId: highStockProductId, quantity: 2 }], installments: [{ amount: 2000 }] }),
+    );
+    const sale = await createRes.json();
+    await api("POST", `/api/sales/${sale.id}/cancel`);
+    const res = await api("PATCH", `/api/sales/${sale.id}/delivery-status`, { deliveryStatus: "pendiente_entrega" });
+    expect(res.status).toBe(400);
+  });
+
+  it("404 sobre una venta inexistente", async () => {
+    const res = await api("PATCH", "/api/sales/99999999/delivery-status", { deliveryStatus: "pendiente_entrega" });
+    expect(res.status).toBe(404);
+  });
+});
+
 describe("POST /api/sales/:id/cancel", () => {
   let saleId: number;
 
