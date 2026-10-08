@@ -159,18 +159,54 @@ Al armar el entorno de staging (sea con `pg_restore` o con un branch de Supabase
 antes de poder usar `seed:staging` por primera vez, correr esto UNA sola vez contra esa base:
 
 ```sql
-CREATE TABLE IF NOT EXISTS staging_marker (
+CREATE SCHEMA IF NOT EXISTS ops;
+CREATE TABLE IF NOT EXISTS ops.staging_marker (
   id serial PRIMARY KEY,
   value text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
-INSERT INTO staging_marker (value) VALUES ('staging');
+INSERT INTO ops.staging_marker (value) VALUES ('staging');
 ```
 
-**Nunca** agregar `staging_marker` a `shared/schema.ts` ni a ninguna migración de Drizzle —
-si quedara declarada ahí, `db:push`/`db:generate` la terminarían creando también contra
+**Nunca** agregar `ops.staging_marker` a `shared/schema.ts` ni a ninguna migración de Drizzle
+— si quedara declarada ahí, `db:push`/`db:generate` la terminarían creando también contra
 producción (donde, por definición, nunca tiene que existir esta tabla). Se crea siempre a mano,
 fuera del esquema versionado, exactamente una vez por base de staging.
+
+**Por qué el schema `ops` y no `public`**: lo probé primero en `public` y encontré un problema
+real — `drizzle-kit push` por default introspecciona TODO lo que hay en `public`, vea o no una
+tabla en `shared/schema.ts`. Con el marcador en `public.staging_marker`, correr `push` (incluso
+sin `--force`) proponía **borrarlo** ("You're about to delete staging_marker table"), porque no
+está declarado en el esquema versionado — y lo mismo le pasaba a `session` (ver más abajo). La
+solución para `session` es excluirla por nombre (`tablesFilter`, ya hecho en
+`drizzle.config.ts`); para el marcador, que no necesita vivir junto a las tablas de la app, es
+más simple todavía: un schema de Postgres aparte. El `schemaFilter` de `drizzle-kit` por
+default solo mira `public`, así que algo en `ops` queda directamente invisible para `push` —
+nunca va a aparecer como "sobrante" ni se va a proponer borrarlo, sin necesidad de mantener
+ninguna lista de exclusiones. Confirmado probándolo: con el marcador en `ops`, `push` da
+"No changes detected".
+
+### `drizzle-kit push` y la tabla `session` — por qué nunca se usa contra producción
+
+Mientras armaba esto encontré otro caso del mismo problema, más serio porque sí puede pasar en
+cualquier entorno, no solo en staging: la tabla `session` (la crea `connect-pg-simple` en
+tiempo de ejecución — ver `server/session.ts` — nunca vive en `shared/schema.ts` a propósito,
+porque Drizzle no tiene nada que decir sobre cómo guarda sesiones una librería de terceros).
+Reproducido contra una base local: arranqué la app una vez (quedó creada `session`, con una
+sesión real adentro) y corrí `drizzle-kit push` **sin** `--force` — avisó
+"You're about to delete session table" antes de pedir confirmación. Con `--force` lo haría
+directo, sin preguntar. Borrar `session` en producción cierra la sesión de **todas** las
+consultoras de una — no es un error cosmético, es un incidente.
+
+Arreglado en `drizzle.config.ts`/`drizzle.config.test.ts` con `tablesFilter: ["!session"]` —
+confirmado de nuevo con el fix puesto: "No changes detected", con `session` y
+`ops.staging_marker` presentes en la base. Pero esa protección vive en el **repo**, no en la
+base — si alguien corre `push` desde una copia vieja del código, el riesgo vuelve. Por eso la
+regla real para producción es más simple y no depende de ningún filtro:
+**`drizzle-kit push` (con o sin `--force`) nunca se corre contra producción, bajo ningún
+motivo** — ni `docs/migracion-produccion-pendiente.md` ni `docs/migracion-deploy-2.md` lo usan
+en ningún paso (confirmado leyendo los dos: son SQL puro de punta a punta), y tiene que seguir
+así. `db:push` es una herramienta de desarrollo/test/staging, nunca de producción.
 
 Si alguna vez se recrea la base de staging desde cero (otro `pg_restore`, otro branch de
 Supabase), hay que volver a correr este SQL — es intencional: una base "nueva" no debería

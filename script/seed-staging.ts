@@ -8,10 +8,12 @@
  *   NODE_ENV (que en staging queda en "production" por otro motivo, ver docs/staging.md).
  * - SEED_CONFIRM debe ser exactamente "yes" — confirmación explícita aparte, para que nadie
  *   lo corra sin querer por tener el comando copiado de otra terminal.
- * - La BASE misma tiene que decir que es de staging: una fila en `staging_marker` con
- *   value = 'staging'. Esa tabla se crea A MANO, una sola vez al armar el entorno de staging
- *   (ver docs/staging.md) — NUNCA agregarla a shared/schema.ts ni a ninguna migración, porque
- *   entonces `db:push` la terminaría creando también en producción. Sin esta fila, las dos
+ * - La BASE misma tiene que decir que es de staging: una fila en `ops.staging_marker` (schema
+ *   `ops`, NO `public`) con value = 'staging'. Ese schema+tabla se crean A MANO, una sola vez
+ *   al armar el entorno de staging (ver docs/staging.md) — NUNCA agregarla a shared/schema.ts
+ *   ni a ninguna migración, y a propósito fuera de `public`: el `schemaFilter` de
+ *   drizzle-kit por default solo mira `public`, así que ni siquiera un `drizzle-kit push` sin
+ *   excluirla la va a ver ni proponer borrarla (confirmado probándolo). Sin esta fila, las dos
  *   variables de arriba no alcanzan: alguien podría tener APP_ENV/SEED_CONFIRM seteadas en su
  *   propia terminal por error (ej. una variable de entorno que quedó de otra sesión) y este
  *   chequeo extra, que vive en la base y no en el entorno del que corre el script, es la
@@ -29,7 +31,7 @@ import { storage } from "../server/storage";
 async function isDatabaseMarkedAsStaging(): Promise<boolean> {
   try {
     const { db } = await import("../server/db");
-    const result = await db.execute(sql`SELECT value FROM staging_marker ORDER BY id LIMIT 1`);
+    const result = await db.execute(sql`SELECT value FROM ops.staging_marker ORDER BY id LIMIT 1`);
     const row = result.rows[0] as { value?: string } | undefined;
     return row?.value === "staging";
   } catch {
@@ -56,7 +58,7 @@ async function main() {
 
   if (!(await isDatabaseMarkedAsStaging())) {
     console.error(
-      'La base no tiene el marcador de staging (tabla "staging_marker" con una fila value=\'staging\'). ' +
+      'La base no tiene el marcador de staging (tabla "ops.staging_marker" con una fila value=\'staging\'). ' +
         "No se tocó la base. Ver docs/staging.md — \"Marcar la base de staging\" para crearlo a mano, una sola vez.",
     );
     process.exitCode = 1;
