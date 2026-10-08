@@ -20,7 +20,8 @@
     "db:test:push": "tsx script/db-test-push.ts",
     "db:dev:up": "docker compose -f docker-compose.dev.yml up -d",
     "db:dev:down": "docker compose -f docker-compose.dev.yml down",
-    "create-admin": "tsx script/bootstrap-admin.ts"
+    "create-admin": "tsx script/bootstrap-admin.ts",
+    "seed:staging": "tsx script/seed-staging.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
