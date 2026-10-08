@@ -357,15 +357,21 @@ CREATE TABLE IF NOT EXISTS subscription_price_history (
   applies_to text NOT NULL DEFAULT 'new_only',
   effective_at timestamptz,
   changed_at timestamptz NOT NULL DEFAULT now(),
-  changed_by_admin_id integer REFERENCES users(id)
+  changed_by_admin_id integer,
+  CONSTRAINT subscription_price_history_changed_by_admin_id_users_id_fk FOREIGN KEY (changed_by_admin_id) REFERENCES users(id)
 );
 CREATE INDEX IF NOT EXISTS subscription_price_history_changed_at_idx
   ON subscription_price_history(changed_at);
 
--- 3d. Cupones de descuento (admin).
+-- 3d. Cupones de descuento (admin). Los nombres de constraint están puestos a mano, IGUAL a
+--     como los nombra Drizzle (no el default de Postgres) — si no, la PRÓXIMA vez que alguien
+--     corra `drizzle-kit push` contra esta tabla, Drizzle ve un nombre que no reconoce y
+--     intenta borrar y recrear la constraint, en vez de ver que ya está. Confirmado con
+--     `pg_dump --schema-only` de una base armada a mano contra una pusheada por Drizzle: sin
+--     esto, salían distintas.
 CREATE TABLE IF NOT EXISTS coupons (
   id serial PRIMARY KEY,
-  code text NOT NULL UNIQUE,
+  code text NOT NULL,
   discount_type text NOT NULL,
   discount_value integer NOT NULL,
   duration text NOT NULL,
@@ -374,14 +380,17 @@ CREATE TABLE IF NOT EXISTS coupons (
   expires_at timestamptz,
   active boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now(),
-  created_by_admin_id integer REFERENCES users(id)
+  created_by_admin_id integer,
+  CONSTRAINT coupons_code_unique UNIQUE (code),
+  CONSTRAINT coupons_created_by_admin_id_users_id_fk FOREIGN KEY (created_by_admin_id) REFERENCES users(id)
 );
 
--- 3e. Usos de cupones (snapshot de condiciones al momento de usarlo).
+-- 3e. Usos de cupones (snapshot de condiciones al momento de usarlo). Mismo criterio de
+--     nombres de constraint que en 3d.
 CREATE TABLE IF NOT EXISTS coupon_redemptions (
   id serial PRIMARY KEY,
-  coupon_id integer NOT NULL REFERENCES coupons(id),
-  consultant_id integer NOT NULL REFERENCES consultants(id),
+  coupon_id integer NOT NULL,
+  consultant_id integer NOT NULL,
   status text NOT NULL DEFAULT 'reserved',
   discount_type text NOT NULL,
   discount_value integer NOT NULL,
@@ -391,7 +400,9 @@ CREATE TABLE IF NOT EXISTS coupon_redemptions (
   confirmed_at timestamptz,
   discount_ends_at timestamptz,
   price_reverted_at timestamptz,
-  CONSTRAINT coupon_redemptions_coupon_consultant_unique UNIQUE (coupon_id, consultant_id)
+  CONSTRAINT coupon_redemptions_coupon_consultant_unique UNIQUE (coupon_id, consultant_id),
+  CONSTRAINT coupon_redemptions_coupon_id_coupons_id_fk FOREIGN KEY (coupon_id) REFERENCES coupons(id),
+  CONSTRAINT coupon_redemptions_consultant_id_consultants_id_fk FOREIGN KEY (consultant_id) REFERENCES consultants(id)
 );
 CREATE INDEX IF NOT EXISTS coupon_redemptions_consultant_id_idx ON coupon_redemptions(consultant_id);
 CREATE INDEX IF NOT EXISTS coupon_redemptions_coupon_id_idx ON coupon_redemptions(coupon_id);
@@ -412,10 +423,11 @@ ALTER TABLE consultants ADD COLUMN IF NOT EXISTS gross_income_tax_percent_tenths
 -- 4c. Historial de pedidos confirmados, para calcular el descuento de compra habitual.
 CREATE TABLE IF NOT EXISTS order_discount_log (
   id serial PRIMARY KEY,
-  consultant_id integer NOT NULL REFERENCES consultants(id),
+  consultant_id integer NOT NULL,
   discount_percent integer NOT NULL,
   public_value_ars integer NOT NULL,
-  confirmed_at timestamptz NOT NULL DEFAULT now()
+  confirmed_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT order_discount_log_consultant_id_consultants_id_fk FOREIGN KEY (consultant_id) REFERENCES consultants(id)
 );
 CREATE INDEX IF NOT EXISTS order_discount_log_consultant_confirmed_idx
   ON order_discount_log(consultant_id, confirmed_at);
