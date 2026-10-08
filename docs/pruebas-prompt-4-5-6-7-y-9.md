@@ -295,6 +295,16 @@ similar):
   (cards, pestañas, diálogo de "Registrar pago") se ven completas, sin botones superpuestos ni
   texto cortado.
 
+## Si corrés `npm test` y falla algo de timing
+
+`server/tests/auth-anti-enumeration.test.ts` mide milisegundos reales (que "olvidé mi
+contraseña" responda rápido sin importar si el email existe o no) — con la máquina cargada
+(otra corrida de tests en simultáneo, un build corriendo al mismo tiempo, etc.) puede fallar
+por unos milisegundos de margen, sin que sea una regresión real. **Si falla justo ahí: volvé a
+correr ese archivo solo antes de preocuparte** — es un archivo que no se tocó desde la Etapa
+7.1-7.9, muy anterior a todos los Prompts de este documento. Si falla repetido, corriéndolo
+solo y con la máquina tranquila, ahí sí es para avisar.
+
 ## Qué avisar si algo falla
 
 Para cada cosa que no coincida con lo de arriba: pantalla, pasos para reproducirlo, y si hay
