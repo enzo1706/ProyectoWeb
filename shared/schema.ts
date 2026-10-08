@@ -108,6 +108,17 @@ export const productStock = pgTable("product_stock", {
   stockMinimo: integer("stock_minimo"),
   costPrice: integer("cost_price"),
   selectedDiscount: integer("selected_discount"),
+  // Prompt 4 — precio de venta PROPIO de la consultora para un producto del catálogo (global,
+  // products.consultantId NULL). NULL = usa products.precio tal cual. Si la consultora carga un
+  // valor igual al del catálogo, se guarda NULL igual (no un override "de casualidad" idéntico)
+  // — así le llegan solas las subas futuras del precio del catálogo, sin que quede "pisado" por
+  // un valor que coincidía justo en el momento de guardarlo. Nunca se usa para costo: el costo
+  // (carga desde catálogo, costo estimado con el descuento habitual) siempre parte de
+  // products.precio — el descuento de la empresa es sobre el precio real del catálogo, nunca
+  // sobre lo que la consultora decidió cobrar. Productos cargados a mano (consultantId propio)
+  // nunca usan esta columna: su precio de venta es directamente products.precio, editable como
+  // cualquier otro campo core de un producto manual.
+  priceOverride: integer("price_override"),
   discontinued: boolean("discontinued").notNull().default(false),
   // Fecha (YYYY-MM-DD) hasta la que se pospone la alerta de stock bajo de este producto —
   // "Recordarme comprar" en Inicio/Productos. NULL = sin recordatorio activo.
@@ -502,10 +513,14 @@ export type InsertProductStock = typeof productStock.$inferInsert;
  * no cargó stock para ese producto. Misma forma que el `Product` de antes de esta etapa —
  * no cambia ningún import en el frontend. */
 export type Product = typeof products.$inferSelect &
-  Pick<ProductStock, "unidades" | "stockMinimo" | "costPrice" | "selectedDiscount" | "discontinued" | "remindStockAt"> & {
+  Pick<ProductStock, "unidades" | "stockMinimo" | "costPrice" | "selectedDiscount" | "discontinued" | "remindStockAt" | "priceOverride"> & {
     /** Umbral de stock bajo ya resuelto (propio del producto, si no el de la consultora, si no
      * el default de la app) — ver `resolveLowStockThreshold` en `shared/stockAlerts.ts`. */
     effectiveStockMinimo: number;
+    /** Precio de venta ya resuelto (`priceOverride ?? precio`) — Prompt 4. Para productos
+     * cargados a mano, `priceOverride` siempre es null acá, así que esto es simplemente
+     * `precio`. Nunca usar para costo (ver comentario de `priceOverride` en product_stock). */
+    effectivePrecio: number;
   };
 export type InsertProduct = typeof products.$inferInsert;
 export type Client = typeof clients.$inferSelect;
@@ -657,10 +672,30 @@ export const updateProductSchema = z
     seccion: z.string().trim().min(1, "La categoría es obligatoria").optional(),
     linea: z.string().trim().optional(),
     producto: z.string().trim().min(1, "El nombre del producto es obligatorio").optional(),
+    // Prompt 4 — "Editar producto" para productos cargados a mano: editable completo, incluidos
+    // tono y puntos (antes excluidos a propósito, "fuera de alcance" de la Etapa I-B.8-C; ahora
+    // sí hace falta). Sigue sin incluir costPrice/selectedDiscount/discontinued/unidades/
+    // stockMinimo, que se administran por sus propios endpoints.
+    variante: z.string().trim().min(1).optional(),
+    puntos: z.number().int().nonnegative().optional(),
     precio: z.number().int().nonnegative().optional(),
     codigo: z.string().trim().min(1).optional(),
   })
   .refine((data) => Object.keys(data).length > 0, { message: "No hay campos para actualizar" });
+
+// Prompt 4 — precio propio de la consultora SOLO para productos del catálogo (consultantId
+// null); el backend rechaza aplicarlo a un producto manual (ahí el precio se edita vía
+// updateProductSchema, en products.precio directo). null = sin override, usa products.precio.
+export const setProductPriceOverrideSchema = z.object({
+  priceOverride: z.number().int().positive().nullable(),
+});
+
+// Prompt 4 — "¿Cuánto te costó?" cuando la consultora escribe el costo directamente en pesos,
+// en vez de elegir uno de los 3 descuentos fijos (eso sigue siendo applyDiscountSchema/
+// /discount). Mismo endpoint de destino (productStock.costPrice) por un camino distinto.
+export const setProductCostSchema = z.object({
+  costPrice: z.number().int().positive(),
+});
 
 export const toggleProductDiscontinuedSchema = z.object({
   discontinued: z.boolean(),

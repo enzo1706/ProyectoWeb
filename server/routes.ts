@@ -4,7 +4,7 @@ import type { z } from "zod";
 import bcrypt from "bcryptjs";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
-import { storage, SaleValidationError, SaleRequestConflictError, ProductConflictError, AppointmentValidationError, AppointmentConflictError, isBcryptHash, DuplicateEmailError, DuplicateUsernameError } from "./storage";
+import { storage, SaleValidationError, SaleRequestConflictError, ProductConflictError, ProductValidationError, AppointmentValidationError, AppointmentConflictError, isBcryptHash, DuplicateEmailError, DuplicateUsernameError } from "./storage";
 import { requestPasswordReset, verifyResetCode, resetPassword } from "./auth-reset";
 import { uploadProductImage, deleteProductImage, isValidImageBuffer, listProductImageFiles, extractStoragePath } from "./image-storage";
 import { findProductImageMatches } from "@shared/imageMatching";
@@ -16,6 +16,8 @@ import {
   createConsultantSchema,
   loginSchema,
   applyDiscountSchema,
+  setProductPriceOverrideSchema,
+  setProductCostSchema,
   clientWriteSchema,
   createSaleSchema,
   updateSaleSchema,
@@ -912,7 +914,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       if (result === "has_relations") {
         return res.status(409).json({
-          error: "No se puede eliminar: el producto tiene ventas asociadas. Usá 'Descontinuar' para dejar de venderlo sin perder el historial.",
+          error: "Este producto tiene ventas registradas, no se puede eliminar.",
         });
       }
       res.status(204).send();
@@ -1375,6 +1377,59 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al aplicar el descuento" });
+    }
+  });
+
+  /** Prompt 4 — precio propio de la consultora sobre un producto del catálogo. */
+  app.patch("/api/products/:id/price-override", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const parsed = setProductPriceOverrideSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const updated = await storage.setProductPriceOverride(req.consultantId!, id, parsed.data.priceOverride);
+      if (!updated) {
+        return res.status(404).json({ error: "Producto no encontrado" });
+      }
+
+      res.json(updated);
+    } catch (error) {
+      if (error instanceof ProductValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar el precio" });
+    }
+  });
+
+  /** Prompt 4 — "¿Cuánto te costó?" cuando se escribe el costo directo en pesos. */
+  app.patch("/api/products/:id/cost", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const parsed = setProductCostSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const updated = await storage.setProductCost(req.consultantId!, id, parsed.data.costPrice);
+      if (!updated) {
+        return res.status(404).json({ error: "Producto no encontrado" });
+      }
+
+      res.json(updated);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar el costo" });
     }
   });
 
