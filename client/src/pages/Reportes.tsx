@@ -101,7 +101,7 @@ interface StockValuationData {
 interface InactiveClientRow {
   clientId: number;
   name: string | null;
-  phone: string;
+  phone: string | null;
   lastPurchase: string | null;
   daysSinceLastPurchase: number | null;
   totalPurchased: number;
@@ -109,7 +109,7 @@ interface InactiveClientRow {
 interface UpcomingBirthdayRow {
   clientId: number;
   name: string | null;
-  phone: string;
+  phone: string | null;
   birthday: string;
   daysUntil: number;
 }
@@ -645,7 +645,7 @@ export default function Reportes() {
       ["Clienta", "Teléfono", "Última Compra", "Días de Inactividad", "Total Histórico"],
       (inactiveClientsQuery.data ?? []).map((c) => [
         c.name ?? "",
-        c.phone,
+        c.phone ?? "",
         c.lastPurchase ?? "Nunca compró",
         c.daysSinceLastPurchase ?? "",
         format(c.totalPurchased),
@@ -654,10 +654,17 @@ export default function Reportes() {
   };
 
   const handleExportBirthdays = () => {
+    // Prompt 9, punto 2 — nunca el string completo (que para una clienta nueva tiene el año
+    // sentinela invisible, no uno real): día y mes nomás, igual que se ve en pantalla.
     exportToCsv(
       "reportes-cumpleanos.csv",
       ["Clienta", "Teléfono", "Cumpleaños", "Días Restantes"],
-      (upcomingBirthdaysQuery.data ?? []).map((c) => [c.name ?? "", c.phone, c.birthday, c.daysUntil]),
+      (upcomingBirthdaysQuery.data ?? []).map((c) => [
+        c.name ?? "",
+        c.phone ?? "",
+        parseLocalDate(c.birthday).toLocaleDateString("es-MX", { day: "numeric", month: "short" }),
+        c.daysUntil,
+      ]),
     );
   };
 
@@ -1168,7 +1175,7 @@ export default function Reportes() {
                       <ReportListRow
                         key={client.clientId}
                         testId={`row-inactive-client-${client.clientId}`}
-                        title={client.name ?? client.phone}
+                        title={client.name ?? client.phone ?? "Sin nombre"}
                         subtitle={<p className="text-sm text-muted-foreground">{client.phone}</p>}
                         right={
                           <>
@@ -1207,7 +1214,7 @@ export default function Reportes() {
                       <ReportListRow
                         key={client.clientId}
                         testId={`row-birthday-${client.clientId}`}
-                        title={client.name ?? client.phone}
+                        title={client.name ?? client.phone ?? "Sin nombre"}
                         subtitle={<p className="text-sm text-muted-foreground">{client.phone}</p>}
                         right={
                           <>

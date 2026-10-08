@@ -9,7 +9,7 @@ import { requestPasswordReset, verifyResetCode, resetPassword } from "./auth-res
 import { uploadProductImage, deleteProductImage, isValidImageBuffer, listProductImageFiles, extractStoragePath } from "./image-storage";
 import { findProductImageMatches } from "@shared/imageMatching";
 import { matchImportedProducts, type ImportCatalogProduct } from "@shared/importMatching";
-import { isBalanceFilter, isStaleFilter } from "@shared/clientFilters";
+import { isClientListFilter } from "@shared/clientFilters";
 import { parseExcelImportRows, parseCsvImportRows, parsePdfImportRows, ImportParseError } from "./importParsers";
 import {
   bulkProductSchema,
@@ -24,6 +24,8 @@ import {
   updateInstallmentStatusSchema,
   updateSaleDeliveryStatusSchema,
   assignSaleClientSchema,
+  createClientNoteSchema,
+  registerClientPaymentSchema,
   saveDraftSchema,
   draftTypes,
   type DraftType,
@@ -1113,20 +1115,33 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       const pageSizeRaw = typeof req.query.pageSize === "string" ? parseInt(req.query.pageSize, 10) : NaN;
       const pageSize = !isNaN(pageSizeRaw) && pageSizeRaw >= 1 ? pageSizeRaw : undefined;
-      const balanceFilter = isBalanceFilter(req.query.balanceFilter) ? req.query.balanceFilter : undefined;
-      const staleFilter = isStaleFilter(req.query.staleFilter) ? req.query.staleFilter : undefined;
+      const filter = isClientListFilter(req.query.filter) ? req.query.filter : undefined;
 
       const result = await storage.searchClientsPaginated(req.consultantId!, {
         query: search,
         page,
         pageSize: pageSize ?? 25,
-        balanceFilter,
-        staleFilter,
+        filter,
       });
       res.json(result);
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al buscar clientas" });
+    }
+  });
+
+  /** Prompt 9, punto 8 — dato para el aviso de Inicio "Tenés N clientas sin celular cargado"
+   * (el diseño del aviso es otra tarea, Prompt 10). Mismo patrón que
+   * /api/products/without-cost-count. Tiene que registrarse ANTES de "/api/clients/:id" —
+   * mismo número de segmentos, Express matchea por orden de registro, así que después de esa
+   * ruta nunca se llegaría acá (quedaría "without-phone-count" interpretado como :id). */
+  app.get("/api/clients/without-phone-count", async (req: Request, res: Response) => {
+    try {
+      const count = await storage.countClientsWithoutPhone(req.consultantId!);
+      res.json({ count });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener las clientas sin celular" });
     }
   });
 
@@ -1257,6 +1272,96 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al obtener las citas de la clienta" });
+    }
+  });
+
+  app.get("/api/clients/:id/notes", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+      const list = await storage.getClientNotes(req.consultantId!, id);
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener las notas de la clienta" });
+    }
+  });
+
+  app.post("/api/clients/:id/notes", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+      const parsed = createClientNoteSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+      const note = await storage.createClientNote(req.consultantId!, id, parsed.data.text);
+      if (!note) {
+        return res.status(404).json({ error: "Clienta no encontrada" });
+      }
+      res.status(201).json(note);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al crear la nota" });
+    }
+  });
+
+  app.get("/api/clients/:id/payments", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+      const list = await storage.getClientPayments(req.consultantId!, id);
+      res.json(list);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener los pagos de la clienta" });
+    }
+  });
+
+  app.delete("/api/clients/:id/notes/:noteId", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      const noteId = parseInt(req.params.noteId, 10);
+      if (isNaN(id) || isNaN(noteId)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+      const deleted = await storage.deleteClientNote(req.consultantId!, id, noteId);
+      if (!deleted) {
+        return res.status(404).json({ error: "Nota no encontrada" });
+      }
+      res.status(204).send();
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al borrar la nota" });
+    }
+  });
+
+  /** Prompt 9, punto 4 — "Registrar pago" desde la ficha: aplica a TODAS las cuotas
+   * pendientes de la clienta, de la más vieja a la más nueva. */
+  app.post("/api/clients/:id/payments", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+      const parsed = registerClientPaymentSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+      const payment = await storage.registerClientPayment(req.consultantId!, id, parsed.data);
+      res.status(201).json(payment);
+    } catch (error) {
+      if (error instanceof SaleValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error(error);
+      res.status(500).json({ error: "Error al registrar el pago" });
     }
   });
 

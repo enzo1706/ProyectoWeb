@@ -16,6 +16,10 @@ import {
   orderDiscountLog,
   passwordResetCodes,
   drafts,
+  clientNotes,
+  clientPayments,
+  paymentAllocations,
+  paymentMethods,
   createSaleSchema,
   updateSaleSchema,
   createAppointmentSchema,
@@ -54,6 +58,10 @@ import {
   type Draft,
   type DraftType,
   type SaveDraftInput,
+  type PaymentMethod,
+  type ClientNote,
+  type ClientPayment,
+  type PaymentAllocation,
 } from "@shared/schema";
 import { normalizeEmail } from "@shared/email";
 import {
@@ -72,13 +80,16 @@ import {
 } from "@shared/saleCalculations";
 import { resolveLowStockThreshold, DEFAULT_LOW_STOCK_THRESHOLD } from "@shared/stockAlerts";
 import {
-  type BalanceFilter,
-  type StaleFilter,
-  STALE_THRESHOLDS,
+  type ClientListFilter,
+  STALE_THRESHOLD_DAYS,
   matchesBalanceFilter,
   matchesStaleFilter,
+  matchesBirthdayMonth,
+  birthdayDay,
   MAX_CLIENTS_PAGE_SIZE,
 } from "@shared/clientFilters";
+import { getArgentinaDateStr, getArgentinaMonth } from "@shared/argentinaTime";
+import { normalizeArgentinaPhoneForStorage } from "@shared/phone";
 import { isKnownEventType, normalizeCustomEventTypeName, KNOWN_EVENT_TYPES } from "@shared/eventTypes";
 import type { z } from "zod";
 import { eq, ne, count, sql, and, gt, gte, lt, asc, desc, isNotNull, isNull, inArray, notInArray, ilike, or } from "drizzle-orm";
@@ -417,8 +428,8 @@ export interface SearchClientsPaginatedParams {
   query?: string;
   page: number;
   pageSize: number;
-  balanceFilter?: BalanceFilter;
-  staleFilter?: StaleFilter;
+  /** Prompt 9, punto 2 — una sola opción a la vez, reemplaza balanceFilter/staleFilter. */
+  filter?: ClientListFilter;
 }
 
 export interface PaginatedClients {
@@ -504,7 +515,7 @@ export interface StockValuation {
 export interface InactiveClient {
   clientId: number;
   name: string | null;
-  phone: string;
+  phone: string | null;
   lastPurchase: string | null;
   daysSinceLastPurchase: number | null;
   totalPurchased: number;
@@ -513,7 +524,7 @@ export interface InactiveClient {
 export interface UpcomingBirthday {
   clientId: number;
   name: string | null;
-  phone: string;
+  phone: string | null;
   birthday: string;
   daysUntil: number;
 }
@@ -831,7 +842,7 @@ export interface IStorage {
   searchClientsPaginated(consultantId: number, params: SearchClientsPaginatedParams): Promise<PaginatedClients>;
   createClient(consultantId: number, input: InsertClient): Promise<Client>;
   updateClient(consultantId: number, id: number, input: Partial<InsertClient>): Promise<Client | undefined>;
-  findDuplicateClient(consultantId: number, phone: string, email: string | null, excludeId?: number): Promise<Client | undefined>;
+  findDuplicateClient(consultantId: number, phone: string | null, email: string | null, excludeId?: number): Promise<Client | undefined>;
   deleteClient(consultantId: number, id: number): Promise<"deleted" | "not_found" | "has_relations">;
   getSalesByClient(consultantId: number, clientId: number, limit?: number): Promise<SaleWithDetails[]>;
   getAppointmentsByClient(consultantId: number, clientId: number, limit?: number): Promise<Appointment[]>;
@@ -855,6 +866,28 @@ export interface IStorage {
   /** Prompt 6, punto 1 — asigna una clienta a una venta creada sin una ("Sin clienta"). Solo
    * de `null` a una clienta real. */
   assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined>;
+  /** Prompt 9, punto 4 — "Registrar pago" desde la ficha: aplica a todas las cuotas
+   * pendientes de la clienta (todas sus ventas no canceladas), de la más vieja a la más
+   * nueva. Tira SaleValidationError si el monto es inválido o supera el saldo. */
+  registerClientPayment(consultantId: number, clientId: number, input: { amount: number; date: string; paymentMethod: string }): Promise<ClientPayment>;
+  /** Prompt 9, punto 5 — "Marcar como pagada"/"Cobrada" de una cuota puntual: paga el resto
+   * de ESA cuota, creando su client_payments/payment_allocations por el mismo camino que
+   * cualquier otro cobro. */
+  registerInstallmentPayment(
+    consultantId: number,
+    saleId: number,
+    installmentId: number,
+    input: { date: string; paymentMethod: string },
+  ): Promise<SaleInstallment | undefined>;
+  /** Prompt 9, punto 1 — notas múltiples de una clienta, ordenadas de la más nueva a la más
+   * vieja (las migradas desde el viejo campo único, sin fecha, van al final). */
+  getClientNotes(consultantId: number, clientId: number): Promise<ClientNote[]>;
+  /** Prompt 9, punto 3 — para mostrar "Pago recibido" en Historial, más nuevo primero. */
+  getClientPayments(consultantId: number, clientId: number): Promise<ClientPayment[]>;
+  createClientNote(consultantId: number, clientId: number, text: string): Promise<ClientNote | undefined>;
+  deleteClientNote(consultantId: number, clientId: number, noteId: number): Promise<boolean>;
+  /** Prompt 9, punto 8 — dato para el aviso de Inicio "Tenés N clientas sin celular cargado". */
+  countClientsWithoutPhone(consultantId: number): Promise<number>;
   /** Prompt 7 — upsert por (consultantId, clientDraftId): el mismo clientDraftId siempre pisa
    * su propia fila (nunca crea una segunda), aunque lleguen dos guardados casi simultáneos del
    * mismo borrador — el UNIQUE de la tabla es la garantía real, esto es solo el camino feliz. */
@@ -2293,7 +2326,7 @@ export class DatabaseStorage implements IStorage {
       .from(clients)
       .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
     if (!client) return undefined;
-    const clientName = client.name ?? client.phone;
+    const clientName = client.name ?? client.phone ?? "Sin nombre";
     const type = await this.resolveEventType(consultantId, input.type);
 
     if (await this.findConflictingAppointment(db, consultantId, input.date, input.time)) {
@@ -2339,7 +2372,7 @@ export class DatabaseStorage implements IStorage {
       .from(clients)
       .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
     if (!client) throw new AppointmentValidationError("Clienta no encontrada");
-    const clientName = client.name ?? client.phone;
+    const clientName = client.name ?? client.phone ?? "Sin nombre";
     const type = input.type === existing.type ? existing.type : await this.resolveEventType(consultantId, input.type);
 
     if (await this.findConflictingAppointment(db, consultantId, input.date, input.time, id)) {
@@ -2483,7 +2516,9 @@ export class DatabaseStorage implements IStorage {
     const balanceRows = await db
       .select({
         clientId: sales.clientId,
-        pendingBalance: sql<number>`coalesce(sum(${saleInstallments.amount}), 0)`,
+        // Prompt 9: el saldo real es lo que falta (amount - amountPaid), no el monto
+        // original de la cuota — una "pendiente" puede tener un pago parcial.
+        pendingBalance: sql<number>`coalesce(sum(${saleInstallments.amount} - ${saleInstallments.amountPaid}), 0)`,
       })
       .from(saleInstallments)
       .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
@@ -2558,8 +2593,7 @@ export class DatabaseStorage implements IStorage {
     const pageSize = Number.isFinite(params.pageSize)
       ? Math.min(Math.max(Math.floor(params.pageSize), 1), MAX_CLIENTS_PAGE_SIZE)
       : MAX_CLIENTS_PAGE_SIZE;
-    const balanceFilter: BalanceFilter = params.balanceFilter ?? "todas";
-    const staleFilter: StaleFilter = params.staleFilter ?? "todas";
+    const filter: ClientListFilter = params.filter ?? "todas";
 
     const matched = term
       ? await db
@@ -2592,25 +2626,36 @@ export class DatabaseStorage implements IStorage {
       pendingBalance: balanceByClient.get(row.id) ?? 0,
     }));
 
-    if (balanceFilter !== "todas") {
-      withStats = withStats.filter((c) => matchesBalanceFilter(c.pendingBalance, balanceFilter));
+    if (filter === "pendiente_pago") {
+      withStats = withStats.filter((c) => matchesBalanceFilter(c.pendingBalance));
+    } else if (filter === "no_compran_hace") {
+      // Prompt 9, punto 6: todas las fechas en hora de Argentina.
+      const cutoff = toDateStr(new Date(parseDateStr(getArgentinaDateStr()).getTime() - STALE_THRESHOLD_DAYS * 86400000));
+      withStats = withStats.filter((c) => matchesStaleFilter(c.lastPurchase, cutoff));
+    } else if (filter === "cumplen_anios") {
+      const currentMonth = getArgentinaMonth();
+      withStats = withStats.filter((c) => matchesBirthdayMonth(c.birthday, currentMonth));
     }
 
-    if (staleFilter !== "todas") {
-      const cutoff = toDateStr(new Date(Date.now() - STALE_THRESHOLDS[staleFilter] * 86400000));
-      withStats = withStats.filter((c) => matchesStaleFilter(c.lastPurchase, staleFilter, cutoff));
+    // Orden estable y reproducible. "Cumplen años este mes" ordena por día (punto 6); el resto
+    // ordena por nombre (o teléfono/"Sin nombre" si no tiene nombre cargado — mismo fallback
+    // que ClientCard), con id como desempate para que nunca dependa de un empate de
+    // nombre/hora de inserción de Postgres.
+    if (filter === "cumplen_anios") {
+      withStats.sort((a, b) => {
+        const dayA = birthdayDay(a.birthday!);
+        const dayB = birthdayDay(b.birthday!);
+        if (dayA !== dayB) return dayA - dayB;
+        return a.id - b.id;
+      });
+    } else {
+      withStats.sort((a, b) => {
+        const keyA = (a.name?.trim() || a.phone || "Sin nombre").toLowerCase();
+        const keyB = (b.name?.trim() || b.phone || "Sin nombre").toLowerCase();
+        if (keyA !== keyB) return keyA < keyB ? -1 : 1;
+        return a.id - b.id;
+      });
     }
-
-    // Orden estable y reproducible: mismo criterio de display que el resto de la app (nombre,
-    // o teléfono si no tiene nombre cargado — ClientCard/ClientCombobox ya usan ese fallback),
-    // con id como desempate para que el orden nunca dependa de un empate de nombre/hora de
-    // inserción de Postgres.
-    withStats.sort((a, b) => {
-      const keyA = (a.name?.trim() || a.phone).toLowerCase();
-      const keyB = (b.name?.trim() || b.phone).toLowerCase();
-      if (keyA !== keyB) return keyA < keyB ? -1 : 1;
-      return a.id - b.id;
-    });
 
     const total = withStats.length;
     const totalPages = Math.ceil(total / pageSize);
@@ -2637,9 +2682,14 @@ export class DatabaseStorage implements IStorage {
     return updated;
   }
 
-  async findDuplicateClient(consultantId: number, phone: string, email: string | null, excludeId?: number): Promise<Client | undefined> {
+  async findDuplicateClient(consultantId: number, phone: string | null, email: string | null, excludeId?: number): Promise<Client | undefined> {
     const db = await this.getDb();
-    const matchCondition = email ? or(eq(clients.phone, phone), ilike(clients.email, email)) : eq(clients.phone, phone);
+    // Prompt 9: el teléfono ahora puede ser null — dos clientas sin teléfono NUNCA se
+    // consideran duplicadas entre sí (mismo criterio que ya tenía el email).
+    const phoneCondition = phone ? eq(clients.phone, phone) : undefined;
+    const emailCondition = email ? ilike(clients.email, email) : undefined;
+    if (!phoneCondition && !emailCondition) return undefined;
+    const matchCondition = phoneCondition && emailCondition ? or(phoneCondition, emailCondition) : (phoneCondition ?? emailCondition)!;
     const conditions = [eq(clients.consultantId, consultantId), matchCondition];
     if (excludeId !== undefined) conditions.push(ne(clients.id, excludeId));
     const [existing] = await db
@@ -2671,6 +2721,52 @@ export class DatabaseStorage implements IStorage {
 
     await db.delete(clients).where(and(eq(clients.id, id), eq(clients.consultantId, consultantId)));
     return "deleted";
+  }
+
+  /** Prompt 9, punto 1 — más nueva primero; las migradas (createdAt NULL) van al final, nunca
+   * mezcladas al azar con las reales. */
+  async getClientNotes(consultantId: number, clientId: number): Promise<ClientNote[]> {
+    const db = await this.getDb();
+    return db
+      .select()
+      .from(clientNotes)
+      .where(and(eq(clientNotes.consultantId, consultantId), eq(clientNotes.clientId, clientId)))
+      .orderBy(desc(sql`${clientNotes.createdAt} IS NOT NULL`), desc(clientNotes.createdAt), desc(clientNotes.id));
+  }
+
+  async getClientPayments(consultantId: number, clientId: number): Promise<ClientPayment[]> {
+    const db = await this.getDb();
+    return db
+      .select()
+      .from(clientPayments)
+      .where(and(eq(clientPayments.consultantId, consultantId), eq(clientPayments.clientId, clientId)))
+      .orderBy(desc(clientPayments.date), desc(clientPayments.id));
+  }
+
+  async createClientNote(consultantId: number, clientId: number, text: string): Promise<ClientNote | undefined> {
+    const db = await this.getDb();
+    const [client] = await db.select().from(clients).where(and(eq(clients.id, clientId), eq(clients.consultantId, consultantId)));
+    if (!client) return undefined;
+    const [note] = await db.insert(clientNotes).values({ consultantId, clientId, text, createdAt: new Date() }).returning();
+    return note;
+  }
+
+  async deleteClientNote(consultantId: number, clientId: number, noteId: number): Promise<boolean> {
+    const db = await this.getDb();
+    const result = await db
+      .delete(clientNotes)
+      .where(and(eq(clientNotes.id, noteId), eq(clientNotes.clientId, clientId), eq(clientNotes.consultantId, consultantId)))
+      .returning({ id: clientNotes.id });
+    return result.length > 0;
+  }
+
+  async countClientsWithoutPhone(consultantId: number): Promise<number> {
+    const db = await this.getDb();
+    const [row] = await db
+      .select({ value: count() })
+      .from(clients)
+      .where(and(eq(clients.consultantId, consultantId), isNull(clients.phone)));
+    return row?.value ?? 0;
   }
 
   async getSalesByClient(consultantId: number, clientId: number, limit = 100): Promise<SaleWithDetails[]> {
@@ -2990,7 +3086,9 @@ export class DatabaseStorage implements IStorage {
         saleId: saleInstallments.saleId,
         clientName: sales.clientName,
         installmentNumber: saleInstallments.installmentNumber,
-        amount: saleInstallments.amount,
+        // Prompt 9: lo que falta de verdad (amount - amountPaid) — una "pendiente" puede
+        // tener un pago parcial.
+        amount: sql<number>`${saleInstallments.amount} - ${saleInstallments.amountPaid}`,
         dueDate: saleInstallments.dueDate,
       })
       .from(saleInstallments)
@@ -3031,15 +3129,41 @@ export class DatabaseStorage implements IStorage {
   }
 
   /** Etapa 7.8 — ver doc de CollectedPayments: acumulado a hoy, nunca filtrado por período. */
+  /** Prompt 9, punto 5 — "Total cobrado" suma por fecha REAL de pago (client_payments, vía sus
+   * payment_allocations), no por el monto total de una cuota marcada "pagado". Dos partes que
+   * nunca se superponen (así que nunca se cuenta el mismo peso dos veces):
+   * 1) Cualquier cuota con al menos una asignación real — se cuenta por esa asignación.
+   * 2) Cuotas "pagado" de antes de este sistema (backfill de amountPaid, sin ningún
+   *    payment_allocations) — se cuentan por su monto completo, UNA sola vez, con el
+   *    NOT EXISTS explícito para no mezclarse con la parte 1.
+   * Las dos excluyen asignaciones/cuotas de una venta cancelada — cancelar una venta "deshace"
+   * también lo que ya se había cobrado de ella, mismo criterio que el resto de los reportes
+   * (ver auditoría en docs/migracion-deploy-2.md, Prompt 9). */
   async getCollectedPayments(consultantId: number): Promise<CollectedPayments> {
     const db = await this.getDb();
-    const [row] = await db
-      .select({ totalCollected: sql<number>`coalesce(sum(${saleInstallments.amount}), 0)` })
+
+    const [allocatedRow] = await db
+      .select({ total: sql<number>`coalesce(sum(${paymentAllocations.amountApplied}), 0)` })
+      .from(paymentAllocations)
+      .innerJoin(clientPayments, eq(paymentAllocations.paymentId, clientPayments.id))
+      .innerJoin(saleInstallments, eq(paymentAllocations.installmentId, saleInstallments.id))
+      .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
+      .where(and(eq(clientPayments.consultantId, consultantId), ne(sales.status, "cancelada")));
+
+    const [legacyRow] = await db
+      .select({ total: sql<number>`coalesce(sum(${saleInstallments.amount}), 0)` })
       .from(saleInstallments)
       .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
-      .where(and(eq(sales.consultantId, consultantId), eq(saleInstallments.status, "pagado"), ne(sales.status, "cancelada")));
+      .where(
+        and(
+          eq(sales.consultantId, consultantId),
+          eq(saleInstallments.status, "pagado"),
+          ne(sales.status, "cancelada"),
+          sql`NOT EXISTS (SELECT 1 FROM ${paymentAllocations} WHERE ${paymentAllocations.installmentId} = ${saleInstallments.id})`,
+        ),
+      );
 
-    return { totalCollected: Number(row?.totalCollected ?? 0) };
+    return { totalCollected: Number(allocatedRow?.total ?? 0) + Number(legacyRow?.total ?? 0) };
   }
 
   /** Etapa 7.8 — totales reales (no capados por `limit` como getPendingInstallments). */
@@ -3049,9 +3173,11 @@ export class DatabaseStorage implements IStorage {
 
     const [row] = await db
       .select({
-        totalAmount: sql<number>`coalesce(sum(${saleInstallments.amount}), 0)`,
+        // Prompt 9: el saldo real es amount - amountPaid — una "pendiente" puede tener un
+        // pago parcial (nunca el monto original de la cuota).
+        totalAmount: sql<number>`coalesce(sum(${saleInstallments.amount} - ${saleInstallments.amountPaid}), 0)`,
         totalCount: count(saleInstallments.id),
-        overdueAmount: sql<number>`coalesce(sum(${saleInstallments.amount}) filter (where ${saleInstallments.dueDate} < ${today}), 0)`,
+        overdueAmount: sql<number>`coalesce(sum(${saleInstallments.amount} - ${saleInstallments.amountPaid}) filter (where ${saleInstallments.dueDate} < ${today}), 0)`,
         overdueCount: sql<number>`coalesce(count(*) filter (where ${saleInstallments.dueDate} < ${today}), 0)`,
       })
       .from(saleInstallments)
@@ -3090,7 +3216,9 @@ export class DatabaseStorage implements IStorage {
     const pendingAgg = await db
       .select({
         saleId: saleInstallments.saleId,
-        pendingAmount: sql<number>`coalesce(sum(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.amount} else 0 end), 0)`,
+        // Prompt 9: el saldo real es amount - amountPaid — una "pendiente" puede tener un
+        // pago parcial.
+        pendingAmount: sql<number>`coalesce(sum(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.amount} - ${saleInstallments.amountPaid} else 0 end), 0)`,
         nextDueDate: sql<string | null>`min(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.dueDate} end)`,
       })
       .from(saleInstallments)
@@ -3155,6 +3283,154 @@ export class DatabaseStorage implements IStorage {
     throw new SaleRequestConflictError("El clientRequestId ya fue utilizado para otra venta");
   }
 
+  /** Prompt 9, punto 5 — toda cuota que nace YA "pagado" (tarjeta, o "paga en el momento")
+   * tiene que crear su client_payments/payment_allocations, igual que cualquier otro cobro —
+   * nunca una excepción silenciosa a "todo cobro pasa por el mismo camino". Agrupa por
+   * dueDate (en la práctica buildInstallmentPlans nunca devuelve más de una cuota "pagado"
+   * por llamada, pero esto no asume ese límite a propósito — si alguna vez cambiara, sigue
+   * siendo correcto). */
+  private async recordInitialPaidInstallments(
+    tx: Pick<Database, "insert">,
+    consultantId: number,
+    clientId: number | null,
+    paymentMethod: string,
+    insertedRows: SaleInstallment[],
+  ): Promise<void> {
+    const paidRows = insertedRows.filter((r) => r.status === "pagado");
+    if (paidRows.length === 0) return;
+
+    const byDate = new Map<string, SaleInstallment[]>();
+    for (const row of paidRows) {
+      const group = byDate.get(row.dueDate) ?? [];
+      group.push(row);
+      byDate.set(row.dueDate, group);
+    }
+
+    for (const [date, rows] of Array.from(byDate.entries())) {
+      const totalAmount = rows.reduce((sum, r) => sum + r.amount, 0);
+      const [payment] = await tx.insert(clientPayments).values({ consultantId, clientId, amount: totalAmount, date, paymentMethod }).returning();
+      await tx.insert(paymentAllocations).values(rows.map((row) => ({ paymentId: payment.id, installmentId: row.id, amountApplied: row.amount })));
+    }
+  }
+
+  /** Prompt 9, punto 5 — núcleo compartido de TODO cobro (ficha, cuota puntual, Inicio): aplica
+   * `amount` a `pendingRows` (ya bloqueadas con FOR UPDATE, ya ordenadas de la más vieja a la
+   * más nueva) de más vieja a más nueva, creando el client_payments + sus payment_allocations
+   * en la MISMA transacción. Nunca dos caminos separados para "lo mismo" — esto ES "lo mismo". */
+  private async applyPaymentToInstallments(
+    tx: Pick<Database, "insert" | "update">,
+    consultantId: number,
+    clientId: number | null,
+    pendingRows: SaleInstallment[],
+    amount: number,
+    date: string,
+    paymentMethod: string,
+  ): Promise<ClientPayment> {
+    const [payment] = await tx.insert(clientPayments).values({ consultantId, clientId, amount, date, paymentMethod }).returning();
+    let remaining = amount;
+    for (const row of pendingRows) {
+      if (remaining <= 0) break;
+      const owed = row.amount - row.amountPaid;
+      if (owed <= 0) continue;
+      const applied = Math.min(remaining, owed);
+      await tx.insert(paymentAllocations).values({ paymentId: payment.id, installmentId: row.id, amountApplied: applied });
+      const newAmountPaid = row.amountPaid + applied;
+      await tx
+        .update(saleInstallments)
+        .set({ amountPaid: newAmountPaid, status: newAmountPaid >= row.amount ? "pagado" : "pendiente" })
+        .where(eq(saleInstallments.id, row.id));
+      remaining -= applied;
+    }
+    return payment;
+  }
+
+  /** Prompt 9, punto 4 — "Registrar pago" desde la ficha: aplica a TODAS las cuotas pendientes
+   * de la clienta (de todas sus ventas no canceladas), de la más vieja a la más nueva. Nunca
+   * puede dejar el saldo negativo (valida acá, bajo el mismo lock que aplica el pago) ni
+   * contarse dos veces si dos pagos llegan casi juntos (FOR UPDATE bloquea la segunda hasta
+   * que la primera termine su transacción). */
+  async registerClientPayment(
+    consultantId: number,
+    clientId: number,
+    input: { amount: number; date: string; paymentMethod: string },
+  ): Promise<ClientPayment> {
+    const db = await this.getDb();
+    return db.transaction(async (tx) => {
+      const [client] = await tx
+        .select()
+        .from(clients)
+        .where(and(eq(clients.id, clientId), eq(clients.consultantId, consultantId)))
+        .for("update");
+      if (!client) throw new SaleValidationError("Clienta no encontrada");
+
+      const rows = await tx
+        .select({
+          id: saleInstallments.id,
+          saleId: saleInstallments.saleId,
+          installmentNumber: saleInstallments.installmentNumber,
+          amount: saleInstallments.amount,
+          dueDate: saleInstallments.dueDate,
+          status: saleInstallments.status,
+          amountPaid: saleInstallments.amountPaid,
+        })
+        .from(saleInstallments)
+        .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
+        .where(
+          and(
+            eq(sales.consultantId, consultantId),
+            eq(sales.clientId, clientId),
+            eq(saleInstallments.status, "pendiente"),
+            ne(sales.status, "cancelada"),
+          ),
+        )
+        .orderBy(asc(saleInstallments.dueDate), asc(saleInstallments.id))
+        .for("update");
+
+      const totalOwed = rows.reduce((sum, r) => sum + (r.amount - r.amountPaid), 0);
+      if (input.amount <= 0) throw new SaleValidationError("El monto tiene que ser mayor a 0");
+      if (input.amount > totalOwed) throw new SaleValidationError("El monto no puede superar lo que debe");
+
+      return this.applyPaymentToInstallments(tx, consultantId, clientId, rows, input.amount, input.date, input.paymentMethod);
+    });
+  }
+
+  /** Prompt 9, punto 5 — "Marcar como pagada" de una cuota puntual (el acceso "Cobrada" de
+   * Inicio abre el mismo detalle de venta, nunca un camino separado) — paga el resto de ESA
+   * cuota nada más, nunca otras. */
+  async registerInstallmentPayment(
+    consultantId: number,
+    saleId: number,
+    installmentId: number,
+    input: { date: string; paymentMethod: string },
+  ): Promise<SaleInstallment | undefined> {
+    const db = await this.getDb();
+    return db.transaction(async (tx) => {
+      const [sale] = await tx
+        .select()
+        .from(sales)
+        .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+        .for("update");
+      if (!sale) return undefined;
+      if (sale.status === "cancelada") {
+        throw new SaleValidationError("No se puede modificar una cuota de una venta cancelada");
+      }
+      const [installment] = await tx
+        .select()
+        .from(saleInstallments)
+        .where(and(eq(saleInstallments.id, installmentId), eq(saleInstallments.saleId, saleId)))
+        .for("update");
+      if (!installment) return undefined;
+
+      const owed = installment.amount - installment.amountPaid;
+      if (owed <= 0) return installment;
+
+      await this.applyPaymentToInstallments(tx, consultantId, sale.clientId, [installment], owed, input.date, input.paymentMethod);
+
+      const [updated] = await tx.select().from(saleInstallments).where(eq(saleInstallments.id, installmentId));
+      return updated;
+    });
+  }
+
   async createSale(consultantId: number, input: CreateSaleInput): Promise<Sale> {
     const db = await this.getDb();
 
@@ -3187,7 +3463,7 @@ export class DatabaseStorage implements IStorage {
         .from(clients)
         .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
       if (!client) throw new SaleValidationError("Clienta no encontrada");
-      clientName = client.name ?? client.phone;
+      clientName = client.name ?? client.phone ?? "Sin nombre";
     } else {
       clientName = "Sin clienta";
     }
@@ -3352,15 +3628,23 @@ export class DatabaseStorage implements IStorage {
         })),
       );
 
-      await tx.insert(saleInstallments).values(
-        installmentPlans.map((plan, index) => ({
-          saleId: sale.id,
-          installmentNumber: index + 1,
-          amount: plan.amount,
-          dueDate: plan.dueDate,
-          status: plan.status,
-        })),
-      );
+      const insertedInstallments = await tx
+        .insert(saleInstallments)
+        .values(
+          installmentPlans.map((plan, index) => ({
+            saleId: sale.id,
+            installmentNumber: index + 1,
+            amount: plan.amount,
+            dueDate: plan.dueDate,
+            status: plan.status,
+            // Prompt 9: una cuota que nace "pagado" (tarjeta, o "paga en el momento") nace con
+            // amountPaid = amount — nunca en 0 (el default de la columna), que diría "no cobró
+            // nada" de una cuota que en realidad está cobrada completa desde el día uno.
+            amountPaid: plan.status === "pagado" ? plan.amount : 0,
+          })),
+        )
+        .returning();
+      await this.recordInitialPaidInstallments(tx, consultantId, sale.clientId, input.paymentMethod, insertedInstallments);
 
       for (const line of lines) {
         await tx
@@ -3443,7 +3727,14 @@ export class DatabaseStorage implements IStorage {
         .from(saleInstallments)
         .where(eq(saleInstallments.saleId, id))
         .for("update");
-      const paidInstallments = existingInstallments.filter((i) => i.status === "pagado");
+      // Prompt 9: "ya cobrada" ahora incluye tanto una cuota totalmente pagada como una
+      // "pendiente" con un pago PARCIAL real (amountPaid > 0) — las dos tienen su propio
+      // payment_allocations de verdad, y borrarlas violaría esa referencia (además de
+      // perder el registro de lo ya cobrado). Se preservan intactas, igual que antes se
+      // preservaban las totalmente pagadas — el saldo que sigue sin cobrar de una cuota
+      // parcial queda representado por su propio amount - amountPaid, no se refunde en la
+      // redistribución nueva de más abajo.
+      const paidInstallments = existingInstallments.filter((i) => i.amountPaid > 0);
       const alreadyPaidAmount = paidInstallments.reduce((sum, i) => sum + i.amount, 0);
 
       const existingItems = await tx.select().from(saleItems).where(eq(saleItems.saleId, id));
@@ -3576,9 +3867,12 @@ export class DatabaseStorage implements IStorage {
       }
 
       await tx.delete(saleItems).where(eq(saleItems.saleId, id));
-      // Prompt 6: solo se borran las cuotas que seguían PENDIENTES — las ya cobradas (arriba)
-      // quedan intactas, con su mismo id, status y dueDate (su fecha de pago).
-      await tx.delete(saleInstallments).where(and(eq(saleInstallments.saleId, id), eq(saleInstallments.status, "pendiente")));
+      // Prompt 6/9: solo se borran las cuotas pendientes que NUNCA cobraron nada (amountPaid
+      // = 0) — las ya cobradas, parcial o completa (arriba), quedan intactas, con su mismo
+      // id, status, dueDate y amountPaid.
+      await tx
+        .delete(saleInstallments)
+        .where(and(eq(saleInstallments.saleId, id), eq(saleInstallments.status, "pendiente"), eq(saleInstallments.amountPaid, 0)));
 
       await tx.insert(saleItems).values(
         lines.map((l) => ({
@@ -3599,16 +3893,21 @@ export class DatabaseStorage implements IStorage {
       );
 
       if (installmentPlans.length > 0) {
-        await tx.insert(saleInstallments).values(
-          // El número sigue después de las cuotas ya cobradas (que conservan el suyo).
-          installmentPlans.map((plan, index) => ({
-            saleId: id,
-            installmentNumber: paidInstallments.length + index + 1,
-            amount: plan.amount,
-            dueDate: plan.dueDate,
-            status: plan.status,
-          })),
-        );
+        const insertedInstallments = await tx
+          .insert(saleInstallments)
+          .values(
+            // El número sigue después de las cuotas ya cobradas (que conservan el suyo).
+            installmentPlans.map((plan, index) => ({
+              saleId: id,
+              installmentNumber: paidInstallments.length + index + 1,
+              amount: plan.amount,
+              dueDate: plan.dueDate,
+              status: plan.status,
+              amountPaid: plan.status === "pagado" ? plan.amount : 0,
+            })),
+          )
+          .returning();
+        await this.recordInitialPaidInstallments(tx, consultantId, existingSale.clientId, input.paymentMethod, insertedInstallments);
       }
 
       // Prompt 6: cuántas cuotas tiene la venta en total (ya cobradas + nuevas) — con tarjeta
@@ -3707,7 +4006,24 @@ export class DatabaseStorage implements IStorage {
    * lock que `cancelSale`/`updateSale` (`sales` `FOR UPDATE`) — mismo orden global de locks,
    * así que las tres operaciones se serializan entre sí en este punto antes de tocar nada más.
    */
+  /** Prompt 9, punto 5 — "Marcar como pagada" (status "pagado") ahora pasa por
+   * registerInstallmentPayment: crea su client_payments/payment_allocations, con la fecha de
+   * hoy (hora de Argentina) y la forma de pago de la propia venta — mismo botón de siempre,
+   * un solo click, sin pedir nada nuevo, pero por el mismo camino que cualquier otro cobro.
+   * "Marcar pendiente" (revertir) resetea amountPaid a 0 — es una corrección manual
+   * excepcional, no el camino principal de cobro; los payment_allocations que ya existan
+   * quedan sin reconciliar (no se borran, para no perder el registro de que ese pago pasó). */
   async updateInstallmentStatus(consultantId: number, saleId: number, installmentId: number, status: "pendiente" | "pagado"): Promise<SaleInstallment | undefined> {
+    if (status === "pagado") {
+      const db = await this.getDb();
+      const [sale] = await db.select().from(sales).where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)));
+      if (!sale) return undefined;
+      return this.registerInstallmentPayment(consultantId, saleId, installmentId, {
+        date: getArgentinaDateStr(),
+        paymentMethod: sale.paymentMethod,
+      });
+    }
+
     const db = await this.getDb();
     return db.transaction(async (tx) => {
       const [sale] = await tx
@@ -3728,7 +4044,7 @@ export class DatabaseStorage implements IStorage {
 
       const [updated] = await tx
         .update(saleInstallments)
-        .set({ status })
+        .set({ status: "pendiente", amountPaid: 0 })
         .where(and(eq(saleInstallments.id, installmentId), eq(saleInstallments.saleId, saleId)))
         .returning();
       return updated;
@@ -3764,7 +4080,7 @@ export class DatabaseStorage implements IStorage {
     if (!client) throw new SaleValidationError("Clienta no encontrada");
     const [updated] = await db
       .update(sales)
-      .set({ clientId: client.id, clientName: client.name ?? client.phone })
+      .set({ clientId: client.id, clientName: client.name ?? client.phone ?? "Sin nombre" })
       .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
       .returning();
     return updated;
@@ -3827,8 +4143,14 @@ export class MemoryStorage implements IStorage {
   private couponRedemptions: CouponRedemption[] = [];
   private orderDiscountLog: OrderDiscountLogEntry[] = [];
   private draftRecords: Draft[] = [];
+  private clientNoteRecords: ClientNote[] = [];
+  private clientPaymentRecords: ClientPayment[] = [];
+  private paymentAllocationRecords: PaymentAllocation[] = [];
   private nextOrderDiscountLogId = 1;
   private nextDraftId = 1;
+  private nextClientNoteId = 1;
+  private nextClientPaymentId = 1;
+  private nextPaymentAllocationId = 1;
   private nextUserId = 1;
   private nextConsultantId = 1;
   private nextProductId = 1;
@@ -4866,7 +5188,7 @@ export class MemoryStorage implements IStorage {
   async createAppointment(consultantId: number, input: CreateAppointmentInput): Promise<Appointment | undefined> {
     const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
     if (!client) return undefined;
-    const clientName = client.name ?? client.phone;
+    const clientName = client.name ?? client.phone ?? "Sin nombre";
     const type = await this.resolveEventType(consultantId, input.type);
 
     if (this.hasConflictingAppointment(consultantId, input.date, input.time)) {
@@ -4895,7 +5217,7 @@ export class MemoryStorage implements IStorage {
 
     const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
     if (!client) throw new AppointmentValidationError("Clienta no encontrada");
-    const clientName = client.name ?? client.phone;
+    const clientName = client.name ?? client.phone ?? "Sin nombre";
     const type = input.type === existing.type ? existing.type : await this.resolveEventType(consultantId, input.type);
 
     if (this.hasConflictingAppointment(consultantId, input.date, input.time, id)) {
@@ -4976,7 +5298,7 @@ export class MemoryStorage implements IStorage {
     return ownClients.filter(
       (c) =>
         (c.name ?? "").toLowerCase().includes(term) ||
-        c.phone.includes(term) ||
+        (c.phone ?? "").includes(term) ||
         (c.email ?? "").toLowerCase().includes(term) ||
         (c.address ?? "").toLowerCase().includes(term) ||
         (c.notes ?? "").toLowerCase().includes(term),
@@ -4997,19 +5319,21 @@ export class MemoryStorage implements IStorage {
 
       // Misma condición que getPendingInstallments (cuota "pendiente" de una venta no cancelada).
       const clientSaleIds = new Set(clientSales.map((s) => s.id));
+      // Prompt 9: el saldo real es amount - amountPaid — una "pendiente" puede tener un pago
+      // parcial (nunca el monto original de la cuota).
       const pendingBalance = this.saleInstallments
         .filter((i) => i.status === "pendiente" && clientSaleIds.has(i.saleId))
-        .reduce((sum, i) => sum + i.amount, 0);
+        .reduce((sum, i) => sum + (i.amount - i.amountPaid), 0);
       balanceByClient.set(clientId, pendingBalance);
     }
 
     return { statsByClient, balanceByClient };
   }
 
-  private static sortClientsDeterministically<T extends { id: number; name: string | null; phone: string }>(rows: T[]): T[] {
+  private static sortClientsDeterministically<T extends { id: number; name: string | null; phone: string | null }>(rows: T[]): T[] {
     return [...rows].sort((a, b) => {
-      const keyA = (a.name?.trim() || a.phone).toLowerCase();
-      const keyB = (b.name?.trim() || b.phone).toLowerCase();
+      const keyA = (a.name?.trim() || a.phone || "Sin nombre").toLowerCase();
+      const keyB = (b.name?.trim() || b.phone || "Sin nombre").toLowerCase();
       if (keyA !== keyB) return keyA < keyB ? -1 : 1;
       return a.id - b.id;
     });
@@ -5033,8 +5357,7 @@ export class MemoryStorage implements IStorage {
     const pageSize = Number.isFinite(params.pageSize)
       ? Math.min(Math.max(Math.floor(params.pageSize), 1), MAX_CLIENTS_PAGE_SIZE)
       : MAX_CLIENTS_PAGE_SIZE;
-    const balanceFilter: BalanceFilter = params.balanceFilter ?? "todas";
-    const staleFilter: StaleFilter = params.staleFilter ?? "todas";
+    const filter: ClientListFilter = params.filter ?? "todas";
 
     const matched = this.matchClients(consultantId, params.query ?? "");
     if (matched.length === 0) {
@@ -5050,16 +5373,26 @@ export class MemoryStorage implements IStorage {
       pendingBalance: balanceByClient.get(c.id) ?? 0,
     }));
 
-    if (balanceFilter !== "todas") {
-      withStats = withStats.filter((c) => matchesBalanceFilter(c.pendingBalance, balanceFilter));
+    if (filter === "pendiente_pago") {
+      withStats = withStats.filter((c) => matchesBalanceFilter(c.pendingBalance));
+    } else if (filter === "no_compran_hace") {
+      const cutoff = toDateStr(new Date(parseDateStr(getArgentinaDateStr()).getTime() - STALE_THRESHOLD_DAYS * 86400000));
+      withStats = withStats.filter((c) => matchesStaleFilter(c.lastPurchase, cutoff));
+    } else if (filter === "cumplen_anios") {
+      const currentMonth = getArgentinaMonth();
+      withStats = withStats.filter((c) => matchesBirthdayMonth(c.birthday, currentMonth));
     }
 
-    if (staleFilter !== "todas") {
-      const cutoff = toDateStr(new Date(Date.now() - STALE_THRESHOLDS[staleFilter] * 86400000));
-      withStats = withStats.filter((c) => matchesStaleFilter(c.lastPurchase, staleFilter, cutoff));
+    if (filter === "cumplen_anios") {
+      withStats.sort((a, b) => {
+        const dayA = birthdayDay(a.birthday!);
+        const dayB = birthdayDay(b.birthday!);
+        if (dayA !== dayB) return dayA - dayB;
+        return a.id - b.id;
+      });
+    } else {
+      withStats = MemoryStorage.sortClientsDeterministically(withStats);
     }
-
-    withStats = MemoryStorage.sortClientsDeterministically(withStats);
 
     const total = withStats.length;
     const totalPages = Math.ceil(total / pageSize);
@@ -5075,7 +5408,7 @@ export class MemoryStorage implements IStorage {
       id: this.nextClientId++,
       consultantId,
       name: input.name ?? null,
-      phone: input.phone,
+      phone: input.phone ?? null,
       email: input.email ?? null,
       birthday: input.birthday ?? null,
       address: input.address ?? null,
@@ -5092,11 +5425,11 @@ export class MemoryStorage implements IStorage {
     return client;
   }
 
-  async findDuplicateClient(consultantId: number, phone: string, email: string | null, excludeId?: number): Promise<Client | undefined> {
+  async findDuplicateClient(consultantId: number, phone: string | null, email: string | null, excludeId?: number): Promise<Client | undefined> {
     return this.clients.find((c) => {
       if (c.consultantId !== consultantId) return false;
       if (excludeId !== undefined && c.id === excludeId) return false;
-      if (c.phone === phone) return true;
+      if (phone && c.phone === phone) return true;
       if (email && c.email && c.email.toLowerCase() === email.toLowerCase()) return true;
       return false;
     });
@@ -5114,6 +5447,46 @@ export class MemoryStorage implements IStorage {
 
     this.clients = this.clients.filter((c) => c.id !== id);
     return "deleted";
+  }
+
+  /** Espejo de DatabaseStorage.getClientNotes. */
+  async getClientNotes(consultantId: number, clientId: number): Promise<ClientNote[]> {
+    return this.clientNoteRecords
+      .filter((n) => n.consultantId === consultantId && n.clientId === clientId)
+      .sort((a, b) => {
+        const aHasDate = a.createdAt !== null;
+        const bHasDate = b.createdAt !== null;
+        if (aHasDate !== bHasDate) return aHasDate ? -1 : 1;
+        if (aHasDate && bHasDate) return b.createdAt!.getTime() - a.createdAt!.getTime();
+        return b.id - a.id;
+      });
+  }
+
+  async getClientPayments(consultantId: number, clientId: number): Promise<ClientPayment[]> {
+    return this.clientPaymentRecords
+      .filter((p) => p.consultantId === consultantId && p.clientId === clientId)
+      .sort((a, b) => (a.date === b.date ? b.id - a.id : b.date.localeCompare(a.date)));
+  }
+
+  async createClientNote(consultantId: number, clientId: number, text: string): Promise<ClientNote | undefined> {
+    const client = this.clients.find((c) => c.id === clientId && c.consultantId === consultantId);
+    if (!client) return undefined;
+    const note: ClientNote = { id: this.nextClientNoteId++, consultantId, clientId, text, createdAt: new Date() };
+    this.clientNoteRecords.push(note);
+    return note;
+  }
+
+  async deleteClientNote(consultantId: number, clientId: number, noteId: number): Promise<boolean> {
+    const index = this.clientNoteRecords.findIndex(
+      (n) => n.id === noteId && n.clientId === clientId && n.consultantId === consultantId,
+    );
+    if (index === -1) return false;
+    this.clientNoteRecords.splice(index, 1);
+    return true;
+  }
+
+  async countClientsWithoutPhone(consultantId: number): Promise<number> {
+    return this.clients.filter((c) => c.consultantId === consultantId && !c.phone).length;
   }
 
   async getSalesByClient(consultantId: number, clientId: number, limit = 100): Promise<SaleWithDetails[]> {
@@ -5383,7 +5756,8 @@ export class MemoryStorage implements IStorage {
         saleId: i.saleId,
         clientName: saleById.get(i.saleId)?.clientName ?? "—",
         installmentNumber: i.installmentNumber,
-        amount: i.amount,
+        // Prompt 9: lo que falta de verdad (amount - amountPaid).
+        amount: i.amount - i.amountPaid,
         dueDate: i.dueDate,
         isOverdue: i.dueDate < today,
       }));
@@ -5414,14 +5788,31 @@ export class MemoryStorage implements IStorage {
   }
 
   /** Espejo de DatabaseStorage.getCollectedPayments. */
+  /** Espejo de DatabaseStorage.getCollectedPayments. */
   async getCollectedPayments(consultantId: number): Promise<CollectedPayments> {
     const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
+    const allocatedInstallmentIds = new Set(this.paymentAllocationRecords.map((a) => a.installmentId));
+
     let totalCollected = 0;
+
+    for (const payment of this.clientPaymentRecords) {
+      if (payment.consultantId !== consultantId) continue;
+      for (const alloc of this.paymentAllocationRecords.filter((a) => a.paymentId === payment.id)) {
+        const inst = this.saleInstallments.find((i) => i.id === alloc.installmentId);
+        if (!inst) continue;
+        const sale = saleById.get(inst.saleId);
+        if (!sale || sale.status === "cancelada") continue;
+        totalCollected += alloc.amountApplied;
+      }
+    }
+
     for (const inst of this.saleInstallments) {
+      if (inst.status !== "pagado" || allocatedInstallmentIds.has(inst.id)) continue;
       const sale = saleById.get(inst.saleId);
-      if (!sale || sale.status === "cancelada" || inst.status !== "pagado") continue;
+      if (!sale || sale.status === "cancelada") continue;
       totalCollected += inst.amount;
     }
+
     return { totalCollected };
   }
 
@@ -5436,10 +5827,13 @@ export class MemoryStorage implements IStorage {
     for (const inst of this.saleInstallments) {
       const sale = saleById.get(inst.saleId);
       if (!sale || sale.status === "cancelada" || inst.status !== "pendiente") continue;
-      totalPendingAmount += inst.amount;
+      // Prompt 9: el saldo real es amount - amountPaid — una "pendiente" puede tener un pago
+      // parcial.
+      const owed = inst.amount - inst.amountPaid;
+      totalPendingAmount += owed;
       totalPendingCount += 1;
       if (inst.dueDate < today) {
-        overdueAmount += inst.amount;
+        overdueAmount += owed;
         overdueCount += 1;
       }
     }
@@ -5454,7 +5848,8 @@ export class MemoryStorage implements IStorage {
         const items = this.saleItems.filter((i) => i.saleId === s.id);
         // Prompt 6: mismo criterio que DatabaseStorage.getAllSales — cancelada nunca debe nada.
         const pendingInstallments = s.status === "cancelada" ? [] : this.saleInstallments.filter((i) => i.saleId === s.id && i.status === "pendiente");
-        const pendingAmount = pendingInstallments.reduce((sum, i) => sum + i.amount, 0);
+        // Prompt 9: el saldo real es amount - amountPaid.
+        const pendingAmount = pendingInstallments.reduce((sum, i) => sum + (i.amount - i.amountPaid), 0);
         const nextDueDate = pendingInstallments.length > 0
           ? pendingInstallments.map((i) => i.dueDate).sort()[0]
           : null;
@@ -5499,6 +5894,128 @@ export class MemoryStorage implements IStorage {
       return existing;
     }
     throw new SaleRequestConflictError("El clientRequestId ya fue utilizado para otra venta");
+  }
+
+  /** Espejo de DatabaseStorage.recordInitialPaidInstallments. */
+  private recordInitialPaidInstallmentsMemory(
+    consultantId: number,
+    clientId: number | null,
+    paymentMethod: string,
+    insertedRows: SaleInstallment[],
+  ): void {
+    const paidRows = insertedRows.filter((r) => r.status === "pagado");
+    if (paidRows.length === 0) return;
+
+    const byDate = new Map<string, SaleInstallment[]>();
+    for (const row of paidRows) {
+      const group = byDate.get(row.dueDate) ?? [];
+      group.push(row);
+      byDate.set(row.dueDate, group);
+    }
+
+    for (const [date, rows] of Array.from(byDate.entries())) {
+      const totalAmount = rows.reduce((sum, r) => sum + r.amount, 0);
+      const payment: ClientPayment = {
+        id: this.nextClientPaymentId++,
+        consultantId,
+        clientId,
+        amount: totalAmount,
+        date,
+        paymentMethod,
+        createdAt: new Date(),
+      };
+      this.clientPaymentRecords.push(payment);
+      for (const row of rows) {
+        this.paymentAllocationRecords.push({
+          id: this.nextPaymentAllocationId++,
+          paymentId: payment.id,
+          installmentId: row.id,
+          amountApplied: row.amount,
+        });
+      }
+    }
+  }
+
+  /** Espejo de DatabaseStorage.applyPaymentToInstallments. */
+  private applyPaymentToInstallmentsMemory(
+    consultantId: number,
+    clientId: number | null,
+    pendingRows: SaleInstallment[],
+    amount: number,
+    date: string,
+    paymentMethod: string,
+  ): ClientPayment {
+    const payment: ClientPayment = {
+      id: this.nextClientPaymentId++,
+      consultantId,
+      clientId,
+      amount,
+      date,
+      paymentMethod,
+      createdAt: new Date(),
+    };
+    this.clientPaymentRecords.push(payment);
+
+    let remaining = amount;
+    for (const row of pendingRows) {
+      if (remaining <= 0) break;
+      const owed = row.amount - row.amountPaid;
+      if (owed <= 0) continue;
+      const applied = Math.min(remaining, owed);
+      this.paymentAllocationRecords.push({
+        id: this.nextPaymentAllocationId++,
+        paymentId: payment.id,
+        installmentId: row.id,
+        amountApplied: applied,
+      });
+      row.amountPaid += applied;
+      row.status = row.amountPaid >= row.amount ? "pagado" : "pendiente";
+      remaining -= applied;
+    }
+    return payment;
+  }
+
+  /** Espejo de DatabaseStorage.registerClientPayment. */
+  async registerClientPayment(
+    consultantId: number,
+    clientId: number,
+    input: { amount: number; date: string; paymentMethod: string },
+  ): Promise<ClientPayment> {
+    const client = this.clients.find((c) => c.id === clientId && c.consultantId === consultantId);
+    if (!client) throw new SaleValidationError("Clienta no encontrada");
+
+    const saleIds = new Set(this.sales.filter((s) => s.consultantId === consultantId && s.clientId === clientId && s.status !== "cancelada").map((s) => s.id));
+    const rows = this.saleInstallments
+      .filter((i) => saleIds.has(i.saleId) && i.status === "pendiente")
+      .sort((a, b) => (a.dueDate === b.dueDate ? a.id - b.id : a.dueDate.localeCompare(b.dueDate)));
+
+    const totalOwed = rows.reduce((sum, r) => sum + (r.amount - r.amountPaid), 0);
+    if (input.amount <= 0) throw new SaleValidationError("El monto tiene que ser mayor a 0");
+    if (input.amount > totalOwed) throw new SaleValidationError("El monto no puede superar lo que debe");
+
+    return this.applyPaymentToInstallmentsMemory(consultantId, clientId, rows, input.amount, input.date, input.paymentMethod);
+  }
+
+  /** Espejo de DatabaseStorage.registerInstallmentPayment. */
+  async registerInstallmentPayment(
+    consultantId: number,
+    saleId: number,
+    installmentId: number,
+    input: { date: string; paymentMethod: string },
+  ): Promise<SaleInstallment | undefined> {
+    const sale = this.sales.find((s) => s.id === saleId && s.consultantId === consultantId);
+    if (!sale) return undefined;
+    if (sale.status === "cancelada") {
+      throw new SaleValidationError("No se puede modificar una cuota de una venta cancelada");
+    }
+    const installment = this.saleInstallments.find((i) => i.id === installmentId && i.saleId === saleId);
+    if (!installment) return undefined;
+
+    const owed = installment.amount - installment.amountPaid;
+    if (owed <= 0) return installment;
+
+    this.applyPaymentToInstallmentsMemory(consultantId, sale.clientId, [installment], owed, input.date, input.paymentMethod);
+    return installment;
   }
 
   async createSale(consultantId: number, input: CreateSaleInput): Promise<Sale> {
@@ -5549,7 +6066,7 @@ export class MemoryStorage implements IStorage {
     if (input.clientId !== undefined) {
       client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
       if (!client) throw new SaleValidationError("Clienta no encontrada");
-      clientName = client.name ?? client.phone;
+      clientName = client.name ?? client.phone ?? "Sin nombre";
     } else {
       clientName = "Sin clienta";
     }
@@ -5625,16 +6142,17 @@ export class MemoryStorage implements IStorage {
       stock.unidades -= line.quantity;
     }
 
-    installmentPlans.forEach((plan, index) => {
-      this.saleInstallments.push({
-        id: this.nextSaleInstallmentId++,
-        saleId: sale.id,
-        installmentNumber: index + 1,
-        amount: plan.amount,
-        dueDate: plan.dueDate,
-        status: plan.status,
-      });
-    });
+    const insertedInstallments: SaleInstallment[] = installmentPlans.map((plan, index) => ({
+      id: this.nextSaleInstallmentId++,
+      saleId: sale.id,
+      installmentNumber: index + 1,
+      amount: plan.amount,
+      dueDate: plan.dueDate,
+      status: plan.status,
+      amountPaid: plan.status === "pagado" ? plan.amount : 0,
+    }));
+    this.saleInstallments.push(...insertedInstallments);
+    this.recordInitialPaidInstallmentsMemory(consultantId, sale.clientId, input.paymentMethod, insertedInstallments);
 
     // Prompt 7, punto 2: mismo criterio que DatabaseStorage.createSale.
     if (input.draftId !== undefined) {
@@ -5657,7 +6175,9 @@ export class MemoryStorage implements IStorage {
     // sobre el saldo que falta después de lo ya cobrado. Sin lock especial: no hay ningún
     // `await` entre este chequeo y las mutaciones de más abajo (Node es single-threaded).
     const existingInstallments = this.saleInstallments.filter((i) => i.saleId === id);
-    const paidInstallments = existingInstallments.filter((i) => i.status === "pagado");
+    // Prompt 9: "ya cobrada" incluye una cuota pendiente con pago PARCIAL (amountPaid > 0),
+    // no solo las totalmente pagadas — ver el mismo comentario en DatabaseStorage.updateSale.
+    const paidInstallments = existingInstallments.filter((i) => i.amountPaid > 0);
     const alreadyPaidAmount = paidInstallments.reduce((sum, i) => sum + i.amount, 0);
 
     const existingItems = this.saleItems.filter((i) => i.saleId === id);
@@ -5761,7 +6281,9 @@ export class MemoryStorage implements IStorage {
 
     this.saleItems = this.saleItems.filter((i) => i.saleId !== id);
     // Prompt 6: solo se borran las cuotas PENDIENTES — las ya cobradas quedan intactas.
-    this.saleInstallments = this.saleInstallments.filter((i) => i.saleId !== id || i.status === "pagado");
+    // Prompt 9: se conserva cualquier cuota con algo cobrado (amountPaid > 0), no solo las
+    // "pagado" — ver el mismo comentario en DatabaseStorage.updateSale.
+    this.saleInstallments = this.saleInstallments.filter((i) => i.saleId !== id || i.amountPaid > 0);
 
     for (const line of lines) {
       this.saleItems.push({
@@ -5780,16 +6302,17 @@ export class MemoryStorage implements IStorage {
       });
     }
 
-    installmentPlans.forEach((plan, index) => {
-      this.saleInstallments.push({
-        id: this.nextSaleInstallmentId++,
-        saleId: id,
-        installmentNumber: paidInstallments.length + index + 1,
-        amount: plan.amount,
-        dueDate: plan.dueDate,
-        status: plan.status,
-      });
-    });
+    const insertedInstallments: SaleInstallment[] = installmentPlans.map((plan, index) => ({
+      id: this.nextSaleInstallmentId++,
+      saleId: id,
+      installmentNumber: paidInstallments.length + index + 1,
+      amount: plan.amount,
+      dueDate: plan.dueDate,
+      status: plan.status,
+      amountPaid: plan.status === "pagado" ? plan.amount : 0,
+    }));
+    this.saleInstallments.push(...insertedInstallments);
+    this.recordInitialPaidInstallmentsMemory(consultantId, existingSale.clientId, input.paymentMethod, insertedInstallments);
 
     existingSale.subtotal = subtotal;
     existingSale.orderDiscountType = input.orderDiscount?.type ?? null;
@@ -5834,6 +6357,14 @@ export class MemoryStorage implements IStorage {
   async updateInstallmentStatus(consultantId: number, saleId: number, installmentId: number, status: "pendiente" | "pagado"): Promise<SaleInstallment | undefined> {
     const sale = this.sales.find((s) => s.id === saleId && s.consultantId === consultantId);
     if (!sale) return undefined;
+
+    if (status === "pagado") {
+      return this.registerInstallmentPayment(consultantId, saleId, installmentId, {
+        date: getArgentinaDateStr(),
+        paymentMethod: sale.paymentMethod,
+      });
+    }
+
     if (sale.status === "cancelada") {
       throw new SaleValidationError("No se puede modificar una cuota de una venta cancelada");
     }
@@ -5841,7 +6372,10 @@ export class MemoryStorage implements IStorage {
     const installment = this.saleInstallments.find((i) => i.id === installmentId && i.saleId === saleId);
     if (!installment) return undefined;
 
-    installment.status = status;
+    // Prompt 9: revertir a "pendiente" resetea amountPaid a 0 (corrección manual excepcional,
+    // ver el mismo comentario en DatabaseStorage.updateInstallmentStatus).
+    installment.status = "pendiente";
+    installment.amountPaid = 0;
     return installment;
   }
 
@@ -5864,7 +6398,7 @@ export class MemoryStorage implements IStorage {
     const client = this.clients.find((c) => c.id === clientId && c.consultantId === consultantId);
     if (!client) throw new SaleValidationError("Clienta no encontrada");
     sale.clientId = client.id;
-    sale.clientName = client.name ?? client.phone;
+    sale.clientName = client.name ?? client.phone ?? "Sin nombre";
     return sale;
   }
 

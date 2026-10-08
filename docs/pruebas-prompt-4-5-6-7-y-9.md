@@ -1,17 +1,20 @@
-# Pruebas: Prompt 4 (Stock) + Prompt 5 (Catálogo) + Prompt 6 (Ventas) + Prompt 7 (Borradores)
+# Pruebas: Prompt 4 (Stock) + Prompt 5 (Catálogo) + Prompt 6 (Ventas) + Prompt 7 (Borradores) + Prompt 9 (Clientas)
 
-Esta rama (`prompt-7-borradores`) incluye los Prompts 4, 5, 6 y 7 completos, uno arriba del
-otro — se prueban juntos porque cada uno depende del anterior (el Prompt 7 agrega borradores
-sobre el wizard de ventas y el de pedidos que armó el Prompt 6/5).
+Esta rama (`prompt-9-clientas`) incluye los Prompts 4, 5, 6, 7 y 9 completos, uno arriba del
+otro — se prueban juntos porque cada uno depende del anterior (el Prompt 9 agrega pagos
+parciales sobre las cuotas y ventas que armó el Prompt 6, y notas/filtros sobre la ficha de
+clienta).
 
 ## Cómo levantarlo
 
 1. `git fetch origin`
-2. `git checkout prompt-7-borradores`
+2. `git checkout prompt-9-clientas`
 3. Variables de entorno: copiá el `.env` que ya tengas, con `DATABASE_URL` apuntando a tu
    Postgres local (no hace falta `TEST_DATABASE_URL` para levantar la app con `npm run dev`).
 4. Si no tenés la base local levantada: `npm run db:dev:up` y después `npm run db:push`
-   (este Prompt 7 agregó una tabla nueva, `drafts` — `db:push` la aplica sola).
+   (el Prompt 7 agregó la tabla `drafts` y el Prompt 9 agregó `client_notes`,
+   `client_payments`, `payment_allocations` y la columna `amount_paid` — `db:push` las aplica
+   solas).
 5. `npm run dev` y abrí `http://localhost:5000` (o el puerto que indique la consola).
 6. Entrá con una cuenta de consultora de prueba (o creá una) y una clienta de prueba. Si el
    catálogo está vacío, en Stock aparece el botón "Cargar catálogo de prueba" — tiene
@@ -200,7 +203,81 @@ el repo) — no hace falta reproducirlo a mano, pero si se quiere confirmar: con
 consultora distintas, ningún borrador de una tiene que aparecer, poder retomarse ni poder
 borrarse desde la otra.
 
-## En los cuatro: a 375 px de ancho (celular)
+## Clientas: alta, filtros y ficha (Prompt 9)
+
+### Alta y edición de clienta
+- El nombre es obligatorio (no se puede guardar sin nombre). El teléfono ahora es **opcional**
+  — se puede guardar una clienta sin teléfono.
+- Si cargás un teléfono, admite cualquier formato razonable (con espacios, guiones, "+54",
+  con o sin el "9" de celular) y se guarda normalizado. Un teléfono incompleto o con todos los
+  dígitos iguales se rechaza con un error claro.
+- Cumpleaños: se eligen por separado "Día" y "Mes" (ya no hay campo de año en ningún lado del
+  formulario).
+- En Chrome para Android aparece un botón para importar nombre y teléfono desde los contactos
+  del celular (Contact Picker). En cualquier otro navegador/dispositivo, ese botón simplemente
+  no aparece — no es un bug.
+
+### Cumpleaños: nunca se muestra el año ni se calcula la edad
+Revisar las 5 pantallas que muestran un cumpleaños y confirmar que **ninguna** diga el año ni
+la edad, solo día y mes:
+- Ficha de la clienta.
+- Lista de clientas.
+- Inicio ("Cumple hoy" / próximos cumpleaños).
+- Agenda.
+- Reportes (tanto en pantalla como en el Excel/CSV que se exporta).
+
+### Filtro único de la lista de clientas
+- El botón "Filtros" abre una sola pantalla con 3 opciones grandes para tocar: "Debe dinero",
+  "Hace tiempo que no compra" (60 días sin compras) y "Cumple años este mes" — más "Ver
+  todas". Ya no están los dos desplegables viejos, y el filtro de "más de 3 meses" se sacó.
+- Con un filtro activo aparece un chip arriba de la lista con el nombre del filtro y una X
+  para sacarlo.
+- "Cumple años este mes" ordena por día del mes (el que cumple más pronto, primero).
+
+### Ficha de la clienta
+- Si debe dinero, aparece una card "Te debe $X" con el botón "Registrar pago" y el botón de
+  WhatsApp. Si no debe nada, esa card no aparece.
+- El botón de WhatsApp (en la ficha y en la tarjeta de la lista) tiene que abrir
+  `wa.me/549...` con el número correcto, sin ningún mensaje prellenado. En una clienta **sin
+  teléfono cargado**, ese botón no tiene que aparecer en ningún lado (ni ficha ni tarjeta).
+- "Registrar pago": el monto viene precargado con lo que debe, se puede bajar pero no se puede
+  poner en 0 ni superar lo que debe. Al confirmar, se reparte solo entre sus cuotas más viejas
+  primero (si debe de varias ventas a la vez).
+- El botón "Eliminar" quedó chico y abajo del todo (ya no es un botón grande). Al tocarlo pide
+  confirmación con el texto exacto "¿Seguro que querés eliminar a [nombre]? Esta acción no se
+  puede deshacer." — **ya no hay botón de "Deshacer"** después de borrar.
+- Eliminar una clienta que tiene ventas o citas registradas tiene que bloquearse con el mensaje
+  "No podés eliminar a [nombre] porque tiene ventas o citas registradas." — sin ningún texto
+  técnico ni código de error.
+- Pestaña "Notas": se pueden agregar varias notas (no una sola), cada una con su fecha y un
+  tacho para borrarla con confirmación. Una nota migrada de antes de este cambio (si la
+  clienta ya tenía algo escrito en el campo de notas viejo) aparece como "Nota anterior", sin
+  ninguna fecha inventada.
+- Pestaña "Historial": muestra las ventas Y los pagos recibidos mezclados por fecha — un pago
+  parcial se ve como "Pago recibido" con su monto, fecha y forma de pago.
+
+### Pagos parciales (en cualquier venta con cuotas)
+- Dentro del detalle de una venta con una cuota pendiente: "Marcar como pagada" sigue
+  funcionando igual que antes (un clic, queda pagada entera) — por abajo ahora también genera
+  un registro de pago real, pero el botón no cambió.
+- Si una cuota tiene un pago parcial (por ejemplo, pagaron $4.000 de una cuota de $10.000), el
+  detalle de la venta tiene que mostrar "$6.000 de $10.000 (pago parcial)" en vez de solo el
+  monto total — en todos lados donde se ve esa cuota (detalle de venta, lista de cuotas
+  pendientes de Reportes/Inicio).
+- Editar una venta que tiene una cuota con pago parcial (sin estar pagada del todo): esa cuota
+  no se puede borrar ni perder — el guardado tiene que preservarla igual que a una cuota ya
+  pagada entera.
+- Reportes → "Total cobrado": tiene que sumar exactamente lo cobrado en el mes, sin importar
+  si viene de tarjeta (automático), "Marcar como pagada" o un pago parcial — nunca contar dos
+  veces el mismo cobro. Cancelar una venta que ya tenía algo cobrado tiene que sacar ese monto
+  del total.
+
+### Aislamiento entre consultoras
+Este punto (igual que los borradores del Prompt 7) se probó a nivel de servidor con tests
+automáticos contra Postgres real — no hace falta reproducirlo a mano: ninguna consultora puede
+ver, pagar, anotar ni marcar como pagada una cuota de una clienta que no es suya.
+
+## En los cinco: a 375 px de ancho (celular)
 
 Probar todo lo de arriba también con el DevTools en modo responsive a 375 px (iPhone SE o
 similar):
@@ -214,6 +291,9 @@ similar):
   botones nuevos de entrega/cuotas) se ven completos, sin texto cortado ni botones superpuestos.
 - Las secciones "Ventas sin terminar" / "Pedidos sin terminar" y la pregunta de 3 botones al
   cerrar se ven completas, sin que los botones se corten ni se superpongan.
+- La pantalla de "Filtros" de Clientas (las 3 opciones grandes) y la ficha de la clienta
+  (cards, pestañas, diálogo de "Registrar pago") se ven completas, sin botones superpuestos ni
+  texto cortado.
 
 ## Qué avisar si algo falla
 

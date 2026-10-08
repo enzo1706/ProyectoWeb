@@ -3,6 +3,7 @@ import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { sql } from "drizzle-orm";
 import { z } from "zod";
 import { CUSTOM_EVENT_TYPE_MAX_LENGTH } from "./eventTypes";
+import { normalizeArgentinaPhoneForStorage } from "./phone";
 
 /**
  * La consultora es la entidad de negocio (tenant). Separada de `users` para que la
@@ -136,13 +137,42 @@ export const clients = pgTable("clients", {
   id: serial("id").primaryKey(),
   consultantId: integer("consultant_id").references(() => consultants.id),
   name: text("name"),
-  phone: text("phone").notNull(),
+  // Prompt 9: pasa a ser opcional — antes era obligatorio. findDuplicateClient nunca trata dos
+  // teléfonos NULL como duplicados entre sí (mismo criterio que ya tenía email).
+  phone: text("phone"),
   email: text("email"),
+  // Prompt 9, punto 3: el día y mes son el dato real; el año es un sentinela invisible para
+  // entradas nuevas/editadas desde el formulario nuevo (que ya no lo pide) — nunca se muestra
+  // ni se usa para calcular edad en ningún lado (auditado: ficha, lista, Inicio, Agenda,
+  // Reportes). Las clientas que ya tenían un cumpleaños con año real lo conservan tal cual,
+  // sin ninguna migración — nadie lo toca hasta que se edite esa clienta desde el formulario
+  // nuevo, momento en el que el año real se reemplaza por el sentinela (se avisó, aceptado).
   birthday: text("birthday"),
   address: text("address"),
+  // Prompt 9: una sola nota de texto libre, reemplazada por la tabla client_notes (múltiples
+  // notas con fecha). Esta columna queda sin usarse — nunca se borra, por si algo de la
+  // migración de datos necesita revisarse después. Ver clientNotes más abajo.
   notes: text("notes"),
 }, (table) => ({
   consultantIdx: index("clients_consultant_id_idx").on(table.consultantId),
+}));
+
+/**
+ * Prompt 9 — notas múltiples de una clienta (reemplaza el texto único de clients.notes).
+ * `createdAt` es NULLABLE a propósito: las notas migradas desde el viejo campo único no tienen
+ * fecha real (nunca se guardó una) — se insertan con NULL y el frontend las muestra como
+ * "Nota anterior" en vez de inventar una fecha (decisión explícita del usuario, nunca la fecha
+ * de la migración disfrazada de fecha real). Las notas nuevas, creadas desde "+ Nueva nota",
+ * siempre llevan la fecha real (la pone la aplicación al insertar, no un default de la base).
+ */
+export const clientNotes = pgTable("client_notes", {
+  id: serial("id").primaryKey(),
+  consultantId: integer("consultant_id").notNull().references(() => consultants.id),
+  clientId: integer("client_id").notNull().references(() => clients.id, { onDelete: "cascade" }),
+  text: text("text").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }),
+}, (table) => ({
+  consultantClientIdx: index("client_notes_consultant_id_client_id_idx").on(table.consultantId, table.clientId),
 }));
 
 // El tipo de evento ya no es un enum cerrado: además de los tipos fijos (ver
@@ -302,12 +332,62 @@ export const saleInstallments = pgTable("sale_installments", {
   id: serial("id").primaryKey(),
   saleId: integer("sale_id").notNull().references(() => sales.id),
   installmentNumber: integer("installment_number").notNull(),
+  // Monto TOTAL de la cuota — nunca se toca al registrar un pago parcial (ver amountPaid).
   amount: integer("amount").notNull(),
   dueDate: text("due_date").notNull(),
+  // Prompt 9: sigue siendo binario a propósito ("pendiente" hasta que amountPaid cubre el
+  // total completo, recién ahí pasa a "pagado") — evita tocar todo el código existente que ya
+  // filtra/cuenta por este status (reportes, SaleDetailDialog, etc.). Lo que hay que mostrar
+  // como saldo real de una cuota SIEMPRE es `amount - amountPaid`, nunca `amount` solo.
   status: text("status").notNull().default("pendiente"),
+  // Prompt 9, punto 4 — cuánto se cobró de esta cuota hasta ahora (puede ser menor a `amount`
+  // si hubo un pago parcial). Default 0: toda cuota nace sin nada cobrado. Las cuotas ya
+  // "pagado" de antes de esta columna se backfillean a amountPaid = amount en la migración de
+  // datos (nunca quedan en 0 pareciendo pendientes).
+  amountPaid: integer("amount_paid").notNull().default(0),
 }, (table) => ({
   dueDateIdx: index("sale_installments_due_date_idx").on(table.dueDate),
   statusIdx: index("sale_installments_status_idx").on(table.status),
+}));
+
+/**
+ * Prompt 9 — un pago real, registrado con fecha y forma de pago. Puede nacer de "Registrar
+ * pago" en la ficha (puede cubrir varias cuotas de varias ventas de la misma clienta), de
+ * "Marcar como pagada" sobre una cuota puntual, o del cobro en el momento al crear una venta —
+ * los tres caminos crean un client_payments + sus payment_allocations en la MISMA transacción
+ * (regla explícita del usuario: todo cobro pasa por el mismo camino).
+ *
+ * `clientId` es NULLABLE: una venta "Sin clienta" (Prompt 6) también puede cobrarse (solo vía
+ * "Marcar como pagada" sobre una cuota puntual, nunca desde una ficha que no existe) — el pago
+ * sigue siendo trazable hasta esa venta a través de payment_allocations, aunque no haya
+ * clienta. Nunca se cascadea al borrar una clienta: si tiene pagos, necesariamente tiene una
+ * venta, y eso ya bloquea el borrado (ver deleteClient) — este caso es inalcanzable en la
+ * práctica, pero se deja sin cascade por seguridad, nunca "por si total nunca pasa".
+ */
+export const clientPayments = pgTable("client_payments", {
+  id: serial("id").primaryKey(),
+  consultantId: integer("consultant_id").notNull().references(() => consultants.id),
+  clientId: integer("client_id").references(() => clients.id),
+  amount: integer("amount").notNull(),
+  date: text("date").notNull(),
+  paymentMethod: text("payment_method").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+  consultantClientIdx: index("client_payments_consultant_id_client_id_idx").on(table.consultantId, table.clientId),
+  consultantDateIdx: index("client_payments_consultant_id_date_idx").on(table.consultantId, table.date),
+}));
+
+/** Cómo se repartió UN pago entre una o más cuotas — nunca se infiere, queda guardado para
+ * poder reconstruir "a qué cuota fue cada peso" (auditoría, y la base de "Total cobrado" por
+ * fecha real de pago, ver Prompt 9 punto 5). */
+export const paymentAllocations = pgTable("payment_allocations", {
+  id: serial("id").primaryKey(),
+  paymentId: integer("payment_id").notNull().references(() => clientPayments.id, { onDelete: "cascade" }),
+  installmentId: integer("installment_id").notNull().references(() => saleInstallments.id),
+  amountApplied: integer("amount_applied").notNull(),
+}, (table) => ({
+  paymentIdx: index("payment_allocations_payment_id_idx").on(table.paymentId),
+  installmentIdx: index("payment_allocations_installment_id_idx").on(table.installmentId),
 }));
 
 export const draftTypes = ["sale", "order"] as const;
@@ -594,12 +674,32 @@ export type CouponRedemption = typeof couponRedemptions.$inferSelect;
 export type InsertCouponRedemption = typeof couponRedemptions.$inferInsert;
 export type Draft = typeof drafts.$inferSelect;
 export type InsertDraft = typeof drafts.$inferInsert;
+export type ClientNote = typeof clientNotes.$inferSelect;
+export type InsertClientNote = typeof clientNotes.$inferInsert;
+export type ClientPayment = typeof clientPayments.$inferSelect;
+export type InsertClientPayment = typeof clientPayments.$inferInsert;
+export type PaymentAllocation = typeof paymentAllocations.$inferSelect;
+export type InsertPaymentAllocation = typeof paymentAllocations.$inferInsert;
 
 export const insertUserSchema = createInsertSchema(users).omit({ id: true });
 export const insertProductSchema = createInsertSchema(products);
 export const selectProductSchema = createSelectSchema(products);
 export const insertClientSchema = createInsertSchema(clients).omit({ id: true }).extend({
-  phone: z.string().regex(PHONE_REGEX, PHONE_ERROR_MESSAGE),
+  // Prompt 9, punto 1: "Nombre y apellido" pasa a ser obligatorio (antes era opcional). La
+  // columna sigue siendo nullable en la base — una clienta vieja sin nombre no se migra ni se
+  // fuerza a completarlo fuera de este formulario — pero toda alta/edición nueva lo exige.
+  name: z.string().trim().min(1, "El nombre es obligatorio"),
+  // Prompt 9, punto 1: opcional — si viene, se normaliza con la MISMA función que usa el link
+  // de WhatsApp (shared/phone.ts), nunca una validación de formato aparte. Acepta cualquier
+  // forma razonable de escribirlo (con espacios, guiones, +54, etc.) y lo rechaza solo si de
+  // verdad no se puede normalizar con seguridad. Ausente/"" se guarda como NULL.
+  phone: z
+    .string()
+    .nullable()
+    .optional()
+    .transform((val) => (val && val.trim() ? val.trim() : null))
+    .refine((val) => val === null || normalizeArgentinaPhoneForStorage(val) !== null, { message: PHONE_ERROR_MESSAGE })
+    .transform((val) => (val === null ? null : normalizeArgentinaPhoneForStorage(val)!)),
   // Etapa I-B.8-E (F6): el frontend ya validaba el FORMATO de email (ClientDialog.tsx), el
   // backend no lo espejaba — aceptaba cualquier string. Se preserva exactamente el mismo
   // conjunto de valores ya aceptados (string vacío, null, undefined) — solo se rechaza un
@@ -611,6 +711,20 @@ export const insertClientSchema = createInsertSchema(clients).omit({ id: true })
  * (nunca el body) — este schema es el que de verdad se usa para crear/editar, así que ni
  * siquiera parsea si alguien manda `consultantId`, sea o no el propio. */
 export const clientWriteSchema = insertClientSchema.omit({ consultantId: true });
+
+export const createClientNoteSchema = z.object({
+  text: z.string().trim().min(1, "La nota no puede estar vacía").max(2000),
+});
+
+/** Prompt 9, punto 4 — "Registrar pago" desde la ficha: aplica a TODAS las cuotas pendientes
+ * de la clienta (de todas sus ventas no canceladas), empezando por la más vieja. El backend
+ * valida `amount > 0` y `amount <= saldo pendiente` (nunca acá en el schema — el saldo es un
+ * valor que depende de la base en el momento exacto de la transacción). */
+export const registerClientPaymentSchema = z.object({
+  amount: z.number().int().positive(),
+  date: z.string().min(1),
+  paymentMethod: z.enum(paymentMethods),
+});
 export const insertAppointmentSchema = createInsertSchema(appointments).omit({ id: true });
 
 export const createAppointmentSchema = z.object({

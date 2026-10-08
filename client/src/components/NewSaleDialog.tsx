@@ -259,7 +259,10 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
       // únicamente el SALDO PENDIENTE. Si no queda nada pendiente (venta ya cobrada entera),
       // no hay nada para repartir: un solo "pago" de $0 (el servidor lo interpreta como "sin
       // cuota nueva que crear", ver buildInstallmentPlans).
-      const pendingExisting = existingSale.installments.filter((i) => i.status === "pendiente");
+      // Prompt 9: una cuota "pendiente" con un pago PARCIAL real (amountPaid > 0) se preserva
+      // igual que una totalmente pagada — nunca se vuelve a repartir en el editor de cuotas
+      // (mismo criterio que storage.updateSale, que tampoco la borra/recrea).
+      const pendingExisting = existingSale.installments.filter((i) => i.status === "pendiente" && i.amountPaid === 0);
       setInstallmentsCount(pendingExisting.length > 0 ? pendingExisting.length : 1);
       setInstallmentAmounts(pendingExisting.length > 0 ? pendingExisting.map((i) => i.amount) : [0]);
       setPaidNow(false);
@@ -420,7 +423,9 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
   // Prompt 6 — "edición inteligente": lo que se reparte en cuotas acá es el SALDO PENDIENTE
   // (total nuevo menos lo ya cobrado), no el total — en creación no hay nada ya cobrado, así
   // que coincide con el total de siempre.
-  const alreadyPaidAmount = existingSale ? existingSale.installments.filter((i) => i.status === "pagado").reduce((sum, i) => sum + i.amount, 0) : 0;
+  // Prompt 9: incluye cuotas totalmente pagadas Y las "pendiente" con pago parcial real —
+  // ambas quedan intactas server-side, nunca se refunden en esta edición.
+  const alreadyPaidAmount = existingSale ? existingSale.installments.filter((i) => i.amountPaid > 0).reduce((sum, i) => sum + i.amount, 0) : 0;
   const remainingTotal = Math.max(totals.total - alreadyPaidAmount, 0);
   const remainingTotalIsNegative = totals.total - alreadyPaidAmount < 0;
   const effectiveInstallments = installmentsCount === 1 ? [remainingTotal] : installmentAmounts;

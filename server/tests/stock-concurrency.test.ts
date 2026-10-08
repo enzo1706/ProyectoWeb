@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { randomUUID } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
 import { testDb as db, testPool as pool } from "../test-db";
-import { consultants, products, productStock, clients, sales, saleItems, saleInstallments } from "@shared/schema";
+import { consultants, products, productStock, clients, sales, saleItems, saleInstallments, clientPayments, paymentAllocations } from "@shared/schema";
 import { DatabaseStorage, SaleValidationError, ProductConflictError } from "../storage";
 
 /** Segunda consultora, exclusiva del test de aislamiento de tenant del batch de stock (Etapa
@@ -218,6 +218,14 @@ afterAll(async () => {
   const testSales = await db.select({ id: sales.id }).from(sales).where(eq(sales.consultantId, testConsultantId));
   const saleIds = testSales.map((s) => s.id);
   if (saleIds.length > 0) {
+    // Prompt 9: payment_allocations referencia sale_installments — hay que borrarla primero
+    // (puede haber filas reales si alguna cuota nació "pagado", ej. tarjeta).
+    const testInstallments = await db.select({ id: saleInstallments.id }).from(saleInstallments).where(inArray(saleInstallments.saleId, saleIds));
+    const testInstallmentIds = testInstallments.map((i) => i.id);
+    if (testInstallmentIds.length > 0) {
+      await db.delete(paymentAllocations).where(inArray(paymentAllocations.installmentId, testInstallmentIds));
+    }
+    await db.delete(clientPayments).where(eq(clientPayments.consultantId, testConsultantId));
     await db.delete(saleInstallments).where(inArray(saleInstallments.saleId, saleIds));
     await db.delete(saleItems).where(inArray(saleItems.saleId, saleIds));
     await db.delete(sales).where(inArray(sales.id, saleIds));

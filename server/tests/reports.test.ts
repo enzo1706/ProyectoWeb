@@ -4,7 +4,7 @@ import { eq, inArray } from "drizzle-orm";
 import type { AddressInfo } from "net";
 import type { Server } from "http";
 import { testDb as db, testPool as pool } from "../test-db";
-import { consultants, users, clients, products, productStock, sales, saleItems, saleInstallments, subscriptions } from "@shared/schema";
+import { consultants, users, clients, products, productStock, sales, saleItems, saleInstallments, subscriptions, clientPayments, paymentAllocations } from "@shared/schema";
 import { DatabaseStorage } from "../storage";
 
 /**
@@ -207,6 +207,14 @@ afterAll(async () => {
   const ownSales = await db.select({ id: sales.id }).from(sales).where(inArray(sales.consultantId, [consultantAId, consultantBId]));
   const ownSaleIds = ownSales.map((s) => s.id);
   if (ownSaleIds.length > 0) {
+    // Prompt 9: payment_allocations referencia sale_installments — hay que borrarla primero
+    // (puede haber filas reales si alguna cuota nació "pagado", ej. tarjeta).
+    const ownInstallments = await db.select({ id: saleInstallments.id }).from(saleInstallments).where(inArray(saleInstallments.saleId, ownSaleIds));
+    const ownInstallmentIds = ownInstallments.map((i) => i.id);
+    if (ownInstallmentIds.length > 0) {
+      await db.delete(paymentAllocations).where(inArray(paymentAllocations.installmentId, ownInstallmentIds));
+    }
+    await db.delete(clientPayments).where(inArray(clientPayments.consultantId, [consultantAId, consultantBId]));
     await db.delete(saleInstallments).where(inArray(saleInstallments.saleId, ownSaleIds));
     await db.delete(saleItems).where(inArray(saleItems.saleId, ownSaleIds));
   }

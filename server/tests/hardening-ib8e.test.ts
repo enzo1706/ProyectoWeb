@@ -48,28 +48,28 @@ afterAll(async () => {
 
 describe("POST/PATCH /api/clients — validación de email en backend (Etapa I-B.8-E, F6)", () => {
   it("acepta un email con formato válido", async () => {
-    const res = await api("POST", "/api/clients", { phone: "2610000001", email: "clienta@example.com" });
+    const res = await api("POST", "/api/clients", { name: "Clienta Hardening 1", phone: "2610000001", email: "clienta@example.com" });
     expect(res.status).toBe(201);
     expect((await res.json()).email).toBe("clienta@example.com");
   });
 
   it("rechaza un email con formato inválido (antes lo aceptaba tal cual)", async () => {
-    const res = await api("POST", "/api/clients", { phone: "2610000002", email: "no-es-un-email" });
+    const res = await api("POST", "/api/clients", { name: "Clienta Hardening 2", phone: "2610000002", email: "no-es-un-email" });
     expect(res.status).toBe(400);
   });
 
   it("email ausente sigue siendo válido (sigue siendo opcional)", async () => {
-    const res = await api("POST", "/api/clients", { phone: "2610000003" });
+    const res = await api("POST", "/api/clients", { name: "Clienta Hardening 3", phone: "2610000003" });
     expect(res.status).toBe(201);
   });
 
   it("email vacío ('') sigue aceptándose tal cual (comportamiento preexistente, no se inventa una conversión a null)", async () => {
-    const res = await api("POST", "/api/clients", { phone: "2610000004", email: "" });
+    const res = await api("POST", "/api/clients", { name: "Clienta Hardening 4", phone: "2610000004", email: "" });
     expect(res.status).toBe(201);
   });
 
   it("PATCH también valida el formato al editar", async () => {
-    const created = await (await api("POST", "/api/clients", { phone: "2610000005" })).json();
+    const created = await (await api("POST", "/api/clients", { name: "Clienta Hardening 5", phone: "2610000005" })).json();
     const res = await api("PATCH", `/api/clients/${created.id}`, { email: "tampoco-es-un-email" });
     expect(res.status).toBe(400);
 
