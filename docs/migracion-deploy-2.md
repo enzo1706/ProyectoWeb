@@ -154,6 +154,9 @@ regla sigue siendo la misma del primer paquete: verificar antes de asumir.
    confirmar que los números tienen sentido (cuotas pagadas de siempre, notas viejas reales).
 6. Con todo revisado: aplicar el mismo SQL de estructura + las 2 migraciones de datos contra
    producción real.
+6b. Correr el "Chequeo posterior" (más abajo) contra producción real. Las dos primeras
+   consultas tienen que dar 0 — si alguna no da 0, FRENAR y avisarme antes de publicar el
+   código; no seguir al paso 7.
 7. Publicar el código de los Prompts 4, 5, 6, 7 y 9 en Railway.
 8. Probar en la app real:
    - Stock: editar un producto del catálogo global y cargarle un precio propio (Prompt 4),
@@ -304,3 +307,38 @@ FROM clients c
 WHERE c.notes IS NOT NULL AND c.notes <> ''
   AND NOT EXISTS (SELECT 1 FROM client_notes cn WHERE cn.client_id = c.id);
 ```
+
+## Chequeo posterior (correr después de aplicar las migraciones de datos, antes de publicar el código)
+
+Confirma que el backfill de `amount_paid` dejó la base exactamente como el código nuevo la
+necesita — que esto dé 0 en ambas filas es la condición para que la deuda de las clientas
+actuales se calcule bien desde el primer momento en que corra el código del Prompt 9 (lee
+`amount - amount_paid` en todos lados, nunca el monto bruto de la cuota):
+
+```sql
+-- Tiene que dar 0: ninguna cuota "pagado" puede tener amount_paid distinto de su propio monto
+-- (si el backfill no corrió, o corrió mal, acá aparecerían filas).
+SELECT count(*) AS cuotas_pagadas_con_amount_paid_mal
+FROM sale_installments
+WHERE status = 'pagado' AND amount_paid <> amount;
+
+-- Tiene que dar 0: ninguna cuota "pendiente" puede tener amount_paid distinto de 0 — antes de
+-- este prompt no existía el concepto de pago parcial, así que no hay ninguna cuota pendiente
+-- que debiera nacer con algo ya cobrado (si diera más de 0, es señal de que el backfill tocó
+-- filas que no debía).
+SELECT count(*) AS cuotas_pendientes_con_amount_paid_mal
+FROM sale_installments
+WHERE status = 'pendiente' AND amount_paid <> 0;
+
+-- Informativo, no tiene que dar 0 necesariamente: cuántas notas viejas se migraron a
+-- client_notes con created_at NULL — para cotejar contra el conteo de "notas_a_migrar" del
+-- chequeo previo (tienen que coincidir).
+SELECT count(*) AS notas_migradas_sin_fecha
+FROM client_notes
+WHERE created_at IS NULL;
+```
+
+Si cualquiera de las dos primeras consultas devuelve algo distinto de 0: NO seguir con el
+deploy del código — avisarme antes. Significa que alguna cuota quedó con un saldo pendiente
+mal calculado, y el código del Prompt 9 (ficha de la clienta, Reportes, "Total cobrado") se
+lo mostraría mal a la consultora desde el primer momento.

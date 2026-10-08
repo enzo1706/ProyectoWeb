@@ -237,6 +237,9 @@ la edad, solo día y mes:
 ### Ficha de la clienta
 - Si debe dinero, aparece una card "Te debe $X" con el botón "Registrar pago" y el botón de
   WhatsApp. Si no debe nada, esa card no aparece.
+- El botón de WhatsApp (en la ficha y en la tarjeta de la lista) tiene que abrir
+  `wa.me/549...` con el número correcto, sin ningún mensaje prellenado. En una clienta **sin
+  teléfono cargado**, ese botón no tiene que aparecer en ningún lado (ni ficha ni tarjeta).
 - "Registrar pago": el monto viene precargado con lo que debe, se puede bajar pero no se puede
   poner en 0 ni superar lo que debe. Al confirmar, se reparte solo entre sus cuotas más viejas
   primero (si debe de varias ventas a la vez).
