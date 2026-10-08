@@ -210,15 +210,23 @@ ALTER TABLE sales ADD COLUMN IF NOT EXISTS delivery_status text NOT NULL DEFAULT
 --     client_draft_id es un UUID generado por el cliente al primer guardado (mismo patrón que
 --     sales.client_request_id) — el UNIQUE de abajo es la garantía real contra duplicados: dos
 --     guardados casi simultáneos del mismo borrador hacen upsert sobre la misma fila.
+--     Nombre de la FK puesto a mano, IGUAL al que nombra Drizzle (no el default de Postgres)
+--     — confirmado comparando pg_dump --schema-only de una base armada con este SQL contra una
+--     pusheada con `drizzle-kit push` desde el código actual: sin esto, "drafts_consultant_id_
+--     fkey" (Postgres) no coincidía con "drafts_consultant_id_consultants_id_fk" (Drizzle), y
+--     la próxima vez que alguien correra `drizzle-kit push` contra la base real, Drizzle no
+--     reconocería el nombre viejo e intentaría borrar y recrear la constraint. Mismo criterio
+--     aplicado a TODAS las FK nuevas de esta sección (4c, 4d, 4e más abajo).
 CREATE TABLE IF NOT EXISTS drafts (
   id serial PRIMARY KEY,
-  consultant_id integer NOT NULL REFERENCES consultants(id) ON DELETE CASCADE,
+  consultant_id integer NOT NULL,
   client_draft_id text NOT NULL,
   type text NOT NULL,
   payload jsonb NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT drafts_consultant_id_client_draft_id_unique UNIQUE (consultant_id, client_draft_id)
+  CONSTRAINT drafts_consultant_id_client_draft_id_unique UNIQUE (consultant_id, client_draft_id),
+  CONSTRAINT drafts_consultant_id_consultants_id_fk FOREIGN KEY (consultant_id) REFERENCES consultants(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS drafts_consultant_id_updated_at_idx ON drafts(consultant_id, updated_at);
 
@@ -240,10 +248,12 @@ ALTER TABLE sale_installments ADD COLUMN IF NOT EXISTS amount_paid integer NOT N
 --     el campo viejo no tienen fecha real (ver migración de datos más abajo).
 CREATE TABLE IF NOT EXISTS client_notes (
   id serial PRIMARY KEY,
-  consultant_id integer NOT NULL REFERENCES consultants(id),
-  client_id integer NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+  consultant_id integer NOT NULL,
+  client_id integer NOT NULL,
   text text NOT NULL,
-  created_at timestamptz
+  created_at timestamptz,
+  CONSTRAINT client_notes_consultant_id_consultants_id_fk FOREIGN KEY (consultant_id) REFERENCES consultants(id),
+  CONSTRAINT client_notes_client_id_clients_id_fk FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS client_notes_consultant_id_client_id_idx ON client_notes(consultant_id, client_id);
 
@@ -251,12 +261,14 @@ CREATE INDEX IF NOT EXISTS client_notes_consultant_id_client_id_idx ON client_no
 --     (Prompt 6) también puede cobrarse por una cuota puntual, sin que exista una clienta.
 CREATE TABLE IF NOT EXISTS client_payments (
   id serial PRIMARY KEY,
-  consultant_id integer NOT NULL REFERENCES consultants(id),
-  client_id integer REFERENCES clients(id),
+  consultant_id integer NOT NULL,
+  client_id integer,
   amount integer NOT NULL,
   date text NOT NULL,
   payment_method text NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT client_payments_consultant_id_consultants_id_fk FOREIGN KEY (consultant_id) REFERENCES consultants(id),
+  CONSTRAINT client_payments_client_id_clients_id_fk FOREIGN KEY (client_id) REFERENCES clients(id)
 );
 CREATE INDEX IF NOT EXISTS client_payments_consultant_id_client_id_idx ON client_payments(consultant_id, client_id);
 CREATE INDEX IF NOT EXISTS client_payments_consultant_id_date_idx ON client_payments(consultant_id, date);
@@ -266,9 +278,11 @@ CREATE INDEX IF NOT EXISTS client_payments_consultant_id_date_idx ON client_paym
 --     "a qué cuota fue cada peso" y para que "Total cobrado" sume por fecha real de pago.
 CREATE TABLE IF NOT EXISTS payment_allocations (
   id serial PRIMARY KEY,
-  payment_id integer NOT NULL REFERENCES client_payments(id) ON DELETE CASCADE,
-  installment_id integer NOT NULL REFERENCES sale_installments(id),
-  amount_applied integer NOT NULL
+  payment_id integer NOT NULL,
+  installment_id integer NOT NULL,
+  amount_applied integer NOT NULL,
+  CONSTRAINT payment_allocations_payment_id_client_payments_id_fk FOREIGN KEY (payment_id) REFERENCES client_payments(id) ON DELETE CASCADE,
+  CONSTRAINT payment_allocations_installment_id_sale_installments_id_fk FOREIGN KEY (installment_id) REFERENCES sale_installments(id)
 );
 CREATE INDEX IF NOT EXISTS payment_allocations_installment_id_idx ON payment_allocations(installment_id);
 CREATE INDEX IF NOT EXISTS payment_allocations_payment_id_idx ON payment_allocations(payment_id);
