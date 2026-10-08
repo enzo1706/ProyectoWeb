@@ -139,18 +139,43 @@ Fuentes (Mercado Pago Developers, Argentina):
 
 `script/seed-staging.ts` crea una cuenta de consultora de prueba para poder entrar a la app
 recién desplegada en staging sin usar una cuenta ni datos reales. Es el único script de este
-plan que puede escribir en una base — por eso tiene dos guardas explícitas, las dos
-obligatorias (ninguna alcanza por sí sola), y se niega a correr si falta cualquiera de las dos:
+plan que puede escribir en una base — por eso tiene **tres** guardas explícitas, las tres
+obligatorias (ninguna alcanza por sí sola), y se niega a correr si falta cualquiera:
 
 - `APP_ENV` tiene que ser exactamente `staging` (la variable propia de este plan — ver arriba
   por qué no se usa `NODE_ENV` para esto).
 - `SEED_CONFIRM` tiene que ser exactamente `yes` — una confirmación explícita aparte, para que
   nadie lo corra sin querer por tener el comando copiado de otra terminal/sesión.
+- **La base misma tiene que decir que es de staging**: una fila en la tabla `staging_marker`
+  con `value = 'staging'`. Esta es la guarda más fuerte de las tres, porque no depende de
+  ninguna variable de entorno de quien corre el comando (que se puede pisar o copiar mal) sino
+  de un dato que vive en la base de destino — si alguien corre el script apuntando por error a
+  otra base (por un `DATABASE_URL` mal copiado, por ejemplo), esa base no va a tener la fila y
+  el script se va a negar igual, aunque las dos variables de entorno estén bien puestas.
 
-Si falta cualquiera de las dos, el script termina con error y **no toca la base**. No hace
-falta ningún chequeo adicional de hostname: como el script nunca corre con esas dos variables
-seteadas en un entorno real de producción (ninguna de las dos se define ahí), ya alcanza para
-que nunca se ejecute por error contra datos reales.
+### Marcar la base de staging (una sola vez, a mano)
+
+Al armar el entorno de staging (sea con `pg_restore` o con un branch de Supabase, ver arriba),
+antes de poder usar `seed:staging` por primera vez, correr esto UNA sola vez contra esa base:
+
+```sql
+CREATE TABLE IF NOT EXISTS staging_marker (
+  id serial PRIMARY KEY,
+  value text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO staging_marker (value) VALUES ('staging');
+```
+
+**Nunca** agregar `staging_marker` a `shared/schema.ts` ni a ninguna migración de Drizzle —
+si quedara declarada ahí, `db:push`/`db:generate` la terminarían creando también contra
+producción (donde, por definición, nunca tiene que existir esta tabla). Se crea siempre a mano,
+fuera del esquema versionado, exactamente una vez por base de staging.
+
+Si alguna vez se recrea la base de staging desde cero (otro `pg_restore`, otro branch de
+Supabase), hay que volver a correr este SQL — es intencional: una base "nueva" no debería
+heredar el marcador de la vieja sin que alguien confirme a mano que la nueva sigue siendo de
+staging y no, por error, una restauración apuntada al lugar equivocado.
 
 ```bash
 APP_ENV=staging SEED_CONFIRM=yes SEED_USERNAME=consultora_staging SEED_PASSWORD="algo-largo-y-random" npm run seed:staging
