@@ -22,6 +22,13 @@ export default defineConfig({
   out: "./drizzle",
   schema: "./shared/schema.ts",
   dialect: "postgresql",
+  // "session" la crea connect-pg-simple en tiempo de ejecución (server/session.ts,
+  // createTableIfMissing) — no vive en shared/schema.ts a propósito, así que push NUNCA debe
+  // tocarla. Sin esto, push la ve como "sobrante" y propone borrarla — en producción eso
+  // cierra la sesión de TODAS las consultoras de una, y con --force lo hace sin preguntar.
+  // Confirmado reproduciendo el caso real: con la tabla ya creada por la app, "push" (sin
+  // --force) mostraba "You're about to delete session table" antes de este filtro.
+  tablesFilter: ["!session"],
   dbCredentials: {
     host: databaseUrl.hostname,
     port: Number(databaseUrl.port) || 5432,

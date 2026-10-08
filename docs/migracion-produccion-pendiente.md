@@ -1,5 +1,27 @@
 # Migraciones pendientes en producción (al 2026-10-06)
 
+## ⚠️ Nunca correr `drizzle-kit push` (con o sin `--force`) contra producción
+
+Todo lo de este documento es **SQL puro, aplicado a mano** (`psql` o el panel de Supabase) —
+confirmado revisando el documento entero, no hay ningún paso que use `drizzle-kit push`,
+`db:push` ni ningún otro comando de Drizzle contra producción. Así tiene que seguir.
+
+La razón: `drizzle-kit push` compara la base real contra `shared/schema.ts` y propone borrar
+cualquier tabla que esté en la base pero no en ese archivo. La tabla `session` (la crea
+`connect-pg-simple` en tiempo de ejecución, nunca vive en `shared/schema.ts` a propósito) es
+exactamente ese caso — confirmado reproduciéndolo contra una base local: sin `--force`, `push`
+avisa "You're about to delete session table" antes de pedir confirmación; con `--force`, lo
+hace directo, sin preguntar. Borrar `session` en producción **cierra la sesión de todas las
+consultoras de una** (nadie queda logueada) — no es solo un error cosmético.
+
+`drizzle.config.ts`/`drizzle.config.test.ts` ya excluyen `session` explícitamente
+(`tablesFilter: ["!session"]`) para que esto no pase ni por accidente en desarrollo/test/staging
+— pero esa protección vive en el repo, no en Supabase/Railway: si alguien corre `push` desde una
+copia vieja del código, o pasa `--force` sin revisar el aviso, el riesgo vuelve. Por eso la
+regla para producción es más simple y más dura: **nunca `drizzle-kit push` ahí, bajo ningún
+motivo** — todo lo que haga falta migrar se escribe como SQL explícito (como el de este
+documento) y se aplica a mano.
+
 ## Estado real de producción, verificado recién (no es la foto del 15/9)
 
 Antes de armar este documento asumí que nadie había tocado la base desde el 12/9 (último dato
