@@ -1,39 +1,55 @@
-/** Único lugar donde viven los filtros de listado de Clientas (saldo pendiente / antigüedad de
- * compra) y la paginación — reusado por client/src/pages/Clientas.tsx (opciones de UI) y por
- * server/storage.ts (WHERE/HAVING real). No duplicar estos valores ni la semántica en otro lado. */
+/** Único lugar donde vive el filtro de listado de Clientas y la paginación — reusado por
+ * client/src/pages/Clientas.tsx (opciones de UI) y por server/storage.ts (WHERE/HAVING real).
+ * No duplicar estos valores ni la semántica en otro lado.
+ *
+ * Prompt 9, punto 2 — reemplaza los dos desplegables independientes de antes (balance/
+ * antigüedad) por un solo filtro de selección única: "se usa una opción por vez". También
+ * retira la opción de "más de 3 meses" (el prompt fija un único umbral, 2 meses) y agrega
+ * "cumplen años este mes", que no existía. */
 
-export type BalanceFilter = "todas" | "con_saldo" | "sin_saldo";
-export type StaleFilter = "todas" | "mas_2_meses" | "mas_3_meses";
+export type ClientListFilter = "todas" | "pendiente_pago" | "no_compran_hace" | "cumplen_anios";
 
-export const BALANCE_FILTERS: BalanceFilter[] = ["todas", "con_saldo", "sin_saldo"];
-export const STALE_FILTERS: StaleFilter[] = ["todas", "mas_2_meses", "mas_3_meses"];
+export const CLIENT_LIST_FILTERS: ClientListFilter[] = ["todas", "pendiente_pago", "no_compran_hace", "cumplen_anios"];
 
-export const STALE_THRESHOLDS: Record<Exclude<StaleFilter, "todas">, number> = {
-  mas_2_meses: 60,
-  mas_3_meses: 90,
+export const CLIENT_LIST_FILTER_LABELS: Record<ClientListFilter, string> = {
+  todas: "Todas",
+  pendiente_pago: "Pendiente de pago",
+  no_compran_hace: "Hace tiempo que no compran",
+  cumplen_anios: "Cumplen años este mes",
 };
+
+/** "Hace tiempo que no compran" = al menos una compra Y la última hace más de 2 meses (60
+ * días) — un único umbral fijo, ya no es elegible entre 2 y 3 meses. */
+export const STALE_THRESHOLD_DAYS = 60;
 
 export const DEFAULT_CLIENTS_PAGE_SIZE = 25;
 export const MAX_CLIENTS_PAGE_SIZE = 100;
 
-/** "Nunca compró" (lastPurchase null) nunca matchea un filtro de antigüedad — solo se
- * distingue de "compró hace tiempo" cuando el filtro está en "Todas". Mismo criterio desde
- * que el filtro vivía en el frontend (Etapa 6); ahora es la fuente única, server y cliente. */
-export function matchesStaleFilter(lastPurchase: string | null, filter: StaleFilter, cutoff: string): boolean {
-  if (filter === "todas") return true;
+export function isClientListFilter(value: unknown): value is ClientListFilter {
+  return typeof value === "string" && (CLIENT_LIST_FILTERS as string[]).includes(value);
+}
+
+/** "Nunca compró" (lastPurchase null) nunca matchea "hace tiempo que no compran" — hace falta
+ * al menos una compra real para que la antigüedad tenga sentido. */
+export function matchesStaleFilter(lastPurchase: string | null, cutoff: string): boolean {
   if (!lastPurchase) return false;
   return lastPurchase < cutoff;
 }
 
-export function matchesBalanceFilter(pendingBalance: number, filter: BalanceFilter): boolean {
-  if (filter === "todas") return true;
-  return filter === "con_saldo" ? pendingBalance > 0 : pendingBalance <= 0;
+export function matchesBalanceFilter(pendingBalance: number): boolean {
+  return pendingBalance > 0;
 }
 
-export function isBalanceFilter(value: unknown): value is BalanceFilter {
-  return typeof value === "string" && (BALANCE_FILTERS as string[]).includes(value);
+/** Mes de un cumpleaños guardado ("YYYY-MM-DD", año real o sentinela — nunca importa cuál)
+ * comparado contra el mes actual en hora de Argentina (Prompt 9, punto 6). */
+export function matchesBirthdayMonth(birthday: string | null, currentMonth: number): boolean {
+  if (!birthday) return false;
+  const month = Number(birthday.split("-")[1]);
+  return month === currentMonth;
 }
 
-export function isStaleFilter(value: unknown): value is StaleFilter {
-  return typeof value === "string" && (STALE_FILTERS as string[]).includes(value);
+/** Día del mes de un cumpleaños guardado — para ordenar "Cumplen años este mes" de forma
+ * ascendente. */
+export function birthdayDay(birthday: string): number {
+  return Number(birthday.split("-")[2]);
 }

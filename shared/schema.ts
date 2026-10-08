@@ -3,6 +3,7 @@ import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { sql } from "drizzle-orm";
 import { z } from "zod";
 import { CUSTOM_EVENT_TYPE_MAX_LENGTH } from "./eventTypes";
+import { normalizeArgentinaPhoneForStorage } from "./phone";
 
 /**
  * La consultora es la entidad de negocio (tenant). Separada de `users` para que la
@@ -684,9 +685,21 @@ export const insertUserSchema = createInsertSchema(users).omit({ id: true });
 export const insertProductSchema = createInsertSchema(products);
 export const selectProductSchema = createSelectSchema(products);
 export const insertClientSchema = createInsertSchema(clients).omit({ id: true }).extend({
-  // Prompt 9: opcional — si viene, sigue exigiendo el mismo formato de siempre (10 dígitos,
-  // sin 0/15/+54). Ausente/"" se guarda como NULL, nunca como string vacío.
-  phone: z.union([z.literal(""), z.string().regex(PHONE_REGEX, PHONE_ERROR_MESSAGE)]).nullable().optional(),
+  // Prompt 9, punto 1: "Nombre y apellido" pasa a ser obligatorio (antes era opcional). La
+  // columna sigue siendo nullable en la base — una clienta vieja sin nombre no se migra ni se
+  // fuerza a completarlo fuera de este formulario — pero toda alta/edición nueva lo exige.
+  name: z.string().trim().min(1, "El nombre es obligatorio"),
+  // Prompt 9, punto 1: opcional — si viene, se normaliza con la MISMA función que usa el link
+  // de WhatsApp (shared/phone.ts), nunca una validación de formato aparte. Acepta cualquier
+  // forma razonable de escribirlo (con espacios, guiones, +54, etc.) y lo rechaza solo si de
+  // verdad no se puede normalizar con seguridad. Ausente/"" se guarda como NULL.
+  phone: z
+    .string()
+    .nullable()
+    .optional()
+    .transform((val) => (val && val.trim() ? val.trim() : null))
+    .refine((val) => val === null || normalizeArgentinaPhoneForStorage(val) !== null, { message: PHONE_ERROR_MESSAGE })
+    .transform((val) => (val === null ? null : normalizeArgentinaPhoneForStorage(val)!)),
   // Etapa I-B.8-E (F6): el frontend ya validaba el FORMATO de email (ClientDialog.tsx), el
   // backend no lo espejaba — aceptaba cualquier string. Se preserva exactamente el mismo
   // conjunto de valores ya aceptados (string vacío, null, undefined) — solo se rechaza un

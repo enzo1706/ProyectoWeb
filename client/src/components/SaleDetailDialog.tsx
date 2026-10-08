@@ -119,7 +119,9 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
   // "pendiente"/"cancelada") — se deriva de las cuotas, ya presentes en la respuesta de
   // GET /api/sales/:id, igual criterio que storage.getAllSales.
   const pendingInstallments = sale?.installments.filter((i) => i.status === "pendiente") ?? [];
-  const pendingAmount = pendingInstallments.reduce((sum, i) => sum + i.amount, 0);
+  // Prompt 9: lo que falta de verdad por cuota es amount - amountPaid (puede tener un pago
+  // parcial), nunca el monto original.
+  const pendingAmount = pendingInstallments.reduce((sum, i) => sum + (i.amount - i.amountPaid), 0);
   const paymentStatus: "cobrada" | "te_debe" = pendingAmount > 0 ? "te_debe" : "cobrada";
   const isPendingDelivery = !isCancelled && sale?.deliveryStatus === "pendiente_entrega";
 
@@ -220,7 +222,8 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                     {pendingInstallments.map((inst) => (
                       <div key={inst.id} className="flex items-center justify-between gap-2 text-sm" data-testid={`row-pending-installment-${inst.id}`}>
                         <span>
-                          Cuota {inst.installmentNumber} · {format(inst.amount)} · vence{" "}
+                          Cuota {inst.installmentNumber} · {format(inst.amount - inst.amountPaid)}
+                          {inst.amountPaid > 0 ? ` de ${format(inst.amount)} (pago parcial)` : ""} · vence{" "}
                           {parseLocalDate(inst.dueDate).toLocaleDateString("es-MX", { day: "numeric", month: "short" })}
                         </span>
                         <Button
@@ -347,6 +350,7 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                         </p>
                         <p className="text-xs text-muted-foreground">
                           Vence {parseLocalDate(inst.dueDate).toLocaleDateString("es-MX", { day: "numeric", month: "short" })}
+                          {inst.status === "pendiente" && inst.amountPaid > 0 && ` · Pagado parcial: ${format(inst.amountPaid)}`}
                         </p>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">

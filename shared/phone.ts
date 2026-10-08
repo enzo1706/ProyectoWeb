@@ -1,29 +1,24 @@
 /**
- * Etapa 4 — normalización de teléfonos argentinos para WhatsApp. Auditoría previa: no existía
- * ninguna utilidad de teléfono en el proyecto — solo `PHONE_REGEX` (shared/schema.ts), que
- * exige exactamente 10 dígitos al cargar una clienta (área + abonado, sin "0" ni "15" ni "+54").
- * Esta función es más permisiva a propósito: tiene que poder normalizar también números
- * pegados/pasteados con formatos previos a esa validación, o tipeados a mano en otros lugares.
- *
- * No adivina números incompletos ni ambiguos — ver el caso "15 1234567" (sin área) en los
- * tests: se rechaza en vez de inventar una zona.
+ * Etapa 4 / Prompt 9 — normalización de teléfonos argentinos. Único lugar donde vive esta
+ * lógica (la reusan ClientDialog, el registro de consultoras del Prompt 14, y WhatsApp) — no
+ * se duplica en ningún otro lado.
  */
 
-export type NormalizedWhatsAppNumber = { valid: true; e164: string } | { valid: false };
+export type NormalizedArgentinaPhone = { valid: true; digits: string } | { valid: false };
 
 /**
- * Normaliza un teléfono argentino a formato E.164 para WhatsApp (sin el "+", como exige
- * `https://wa.me/<numero>`). Reglas, en este orden:
+ * Núcleo de la normalización: reduce cualquier entrada razonable a los 10 dígitos locales
+ * (área + abonado, código de área incluido, sin "0", sin "15" y sin "+54") — o inválido. Reglas,
+ * en este orden:
  * 1. Se descartan todos los caracteres que no sean dígitos (espacios, guiones, paréntesis, +).
  * 2. Si empieza con "54" (código de país), se saca.
  * 3. Si lo que queda tiene 11 dígitos y empieza con "9" (indicador de móvil ya presente), se saca.
  * 4. Si lo que queda tiene 11 dígitos y empieza con "0" (prefijo de larga distancia local), se saca.
- * 5. Lo que quede tiene que ser EXACTAMENTE el número local de 10 dígitos (área + abonado, el
- *    mismo formato que ya exige `PHONE_REGEX`) — si no calza justo, es ambiguo o incompleto
- *    (ej. un "15" suelto sin área) y se rechaza en vez de adivinar.
- * 6. Se descartan números evidentemente inválidos (los 10 dígitos todos iguales, ej. "0000000000").
+ * 5. Lo que quede tiene que ser EXACTAMENTE 10 dígitos — si no calza justo, es ambiguo o
+ *    incompleto (ej. un "15" suelto sin área) y se rechaza en vez de adivinar.
+ * 6. Se descartan números evidentemente inválidos (los 10 dígitos todos iguales).
  */
-export function normalizeArgentinaWhatsAppNumber(raw: string | null | undefined): NormalizedWhatsAppNumber {
+export function normalizeArgentinaPhoneDigits(raw: string | null | undefined): NormalizedArgentinaPhone {
   if (!raw) return { valid: false };
 
   let digits = raw.replace(/\D/g, "");
@@ -49,8 +44,34 @@ export function normalizeArgentinaWhatsAppNumber(raw: string | null | undefined)
     return { valid: false };
   }
 
-  // E.164 real para celulares argentinos vía WhatsApp: 54 (país) + 9 (móvil) + área + abonado.
-  return { valid: true, e164: `549${digits}` };
+  return { valid: true, digits };
+}
+
+/** Para guardar en `clients.phone` (o el registro de consultoras del Prompt 14): los 10
+ * dígitos locales normalizados, o `null` si no se puede normalizar de forma segura. */
+export function normalizeArgentinaPhoneForStorage(raw: string | null | undefined): string | null {
+  const result = normalizeArgentinaPhoneDigits(raw);
+  return result.valid ? result.digits : null;
+}
+
+/** Para mostrar: "261 555 1234" sobre un valor YA guardado (10 dígitos). Agrupa de a 3-3-4 a
+ * propósito simple (es el formato del ejemplo pedido) — no detecta el código de área real, no
+ * existe ninguna tabla de áreas en este proyecto. Un valor legacy que no calce 10 dígitos se
+ * muestra tal cual, nunca rompe. */
+export function formatArgentinaPhoneDisplay(phone: string | null | undefined): string | null {
+  if (!phone) return null;
+  if (!/^\d{10}$/.test(phone)) return phone;
+  return `${phone.slice(0, 3)} ${phone.slice(3, 6)} ${phone.slice(6)}`;
+}
+
+export type NormalizedWhatsAppNumber = { valid: true; e164: string } | { valid: false };
+
+/** Normaliza un teléfono argentino a formato E.164 para WhatsApp (sin el "+", como exige
+ * `https://wa.me/<numero>`) — mismo núcleo que `normalizeArgentinaPhoneDigits`, con el
+ * indicador de móvil ("549") agregado adelante. */
+export function normalizeArgentinaWhatsAppNumber(raw: string | null | undefined): NormalizedWhatsAppNumber {
+  const result = normalizeArgentinaPhoneDigits(raw);
+  return result.valid ? { valid: true, e164: `549${result.digits}` } : { valid: false };
 }
 
 /** Único lugar que arma la URL de WhatsApp — nunca hardcodear `wa.me` en un componente. Sin

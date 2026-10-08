@@ -40,14 +40,14 @@ interface PendingInstallmentRow {
 interface UpcomingBirthdayRow {
   clientId: number;
   name: string | null;
-  phone: string;
+  phone: string | null;
   birthday: string;
   daysUntil: number;
 }
 interface InactiveClientRow {
   clientId: number;
   name: string | null;
-  phone: string;
+  phone: string | null;
   lastPurchase: string | null;
   daysSinceLastPurchase: number | null;
   totalPurchased: number;
@@ -378,7 +378,7 @@ export default function Dashboard() {
                 key: `birthday-${b.clientId}`,
                 icon: Gift,
                 colorClass: "bg-purple-500/10 text-purple-600 dark:text-purple-400",
-                title: b.name ?? b.phone,
+                title: b.name ?? b.phone ?? "Sin nombre",
                 subtitle: b.daysUntil === 0 ? "Hoy" : b.daysUntil === 1 ? "Mañana" : `En ${b.daysUntil} días`,
                 actionLabel: "Saludar",
                 onAction: () => setLocation("/clientas"),
@@ -397,7 +397,7 @@ export default function Dashboard() {
                 key: `inactive-${c.clientId}`,
                 icon: Users,
                 colorClass: "bg-muted text-muted-foreground",
-                title: c.name ?? c.phone,
+                title: c.name ?? c.phone ?? "Sin nombre",
                 subtitle:
                   c.daysSinceLastPurchase !== null
                     ? `Hace ${c.daysSinceLastPurchase} días sin comprarte`

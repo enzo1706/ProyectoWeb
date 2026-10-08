@@ -19,7 +19,11 @@ interface ClientCardProps {
 
 export function ClientCard({ client, onClick }: ClientCardProps) {
   const { format } = useHideMoney();
-  const displayName = client.name?.trim() || client.phone;
+  // Prompt 9: el nombre pasa a ser obligatorio para las clientas nuevas, pero una clienta
+  // vieja puede seguir sin uno (nunca se la fuerza a completarlo fuera del formulario de
+  // edición) — y ahora el teléfono también es opcional, así que puede faltar el fallback de
+  // siempre. "Sin nombre" es el último recurso, nunca debería verse en una clienta nueva.
+  const displayName = client.name?.trim() || client.phone || "Sin nombre";
   const initials = displayName
     .split(" ")
     .map((n) => n[0])
@@ -50,13 +54,15 @@ export function ClientCard({ client, onClick }: ClientCardProps) {
               </h3>
             </div>
             <div className="mt-2 space-y-1">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2 text-sm text-muted-foreground min-w-0">
-                  <Phone className="h-3 w-3 shrink-0" />
-                  <span className="truncate">{client.phone}</span>
+              {client.phone && (
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground min-w-0">
+                    <Phone className="h-3 w-3 shrink-0" />
+                    <span className="truncate">{client.phone}</span>
+                  </div>
+                  <WhatsAppButton phone={client.phone} className="-my-2" />
                 </div>
-                <WhatsAppButton phone={client.phone} className="-my-2" />
-              </div>
+              )}
               {client.email && (
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
                   <Mail className="h-3 w-3" />

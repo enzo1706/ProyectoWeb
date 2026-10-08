@@ -215,7 +215,7 @@ describe("GET /api/clients — modo paginado (page presente)", () => {
     expect(body.total).toBe(10);
   });
 
-  it("balanceFilter=con_saldo excluye clientas sin cuotas pendientes reales (via storage.createSale)", async () => {
+  it("filter=pendiente_pago excluye clientas sin cuotas pendientes reales (via storage.createSale)", async () => {
     const product = await storage.createProduct(consultantId, { seccion: "Test", producto: "Producto Saldo 3400", precio: 1000, unidades: 10, puntos: 1 });
     const withBalance = await storage.createClient(consultantId, { name: "Con Saldo 3400", phone: "3400000001" });
     const withoutBalance = await storage.createClient(consultantId, { name: "Con Saldo 3400 Sin Cuota", phone: "3400000002" });
@@ -231,7 +231,7 @@ describe("GET /api/clients — modo paginado (page presente)", () => {
       status: "pendiente",
     });
 
-    const { body } = await fetchClients(cookie, { page: "1", pageSize: "25", search: "Con Saldo 3400", balanceFilter: "con_saldo" });
+    const { body } = await fetchClients(cookie, { page: "1", pageSize: "25", search: "Con Saldo 3400", filter: "pendiente_pago" });
     expect(body.items.map((c: { id: number }) => c.id)).toEqual([withBalance.id]);
     expect(body.items.some((c: { id: number }) => c.id === withoutBalance.id)).toBe(false);
   });

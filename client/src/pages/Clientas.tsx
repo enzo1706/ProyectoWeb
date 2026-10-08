@@ -3,24 +3,22 @@ import { useQuery } from "@tanstack/react-query";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ClientCard, type Client } from "@/components/ClientCard";
 import { ClientDialog } from "@/components/ClientDialog";
 import { ClientDetailSheet } from "@/components/ClientDetailSheet";
 import { NewSaleDialog } from "@/components/NewSaleDialog";
 import { ErrorBlock } from "@/components/ErrorBlock";
-import { Plus, Search, ChevronLeft, ChevronRight } from "lucide-react";
+import { Plus, Search, ChevronLeft, ChevronRight, Filter, X } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
+import { cn } from "@/lib/utils";
 import type { InsertClient, Product } from "@shared/schema";
-import { type BalanceFilter, type StaleFilter, DEFAULT_CLIENTS_PAGE_SIZE } from "@shared/clientFilters";
+import { type ClientListFilter, CLIENT_LIST_FILTER_LABELS, DEFAULT_CLIENTS_PAGE_SIZE } from "@shared/clientFilters";
+
+// Prompt 9, punto 2 — las 3 opciones del botón "Filtros" (nunca "todas", que es "sin filtro").
+const FILTER_OPTIONS: ClientListFilter[] = ["pendiente_pago", "no_compran_hace", "cumplen_anios"];
 
 // Espejo de PaginatedClients (server/storage.ts) — contrato de GET /api/clients en modo
 // paginado (con `page` presente). Mismo criterio que Reportes.tsx para tipos de respuesta.
@@ -43,8 +41,8 @@ export default function Clientas() {
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
   const [saleDialogOpen, setSaleDialogOpen] = useState(false);
-  const [balanceFilter, setBalanceFilter] = useState<BalanceFilter>("todas");
-  const [staleFilter, setStaleFilter] = useState<StaleFilter>("todas");
+  const [filter, setFilter] = useState<ClientListFilter>("todas");
+  const [filterSheetOpen, setFilterSheetOpen] = useState(false);
   const [saleClient, setSaleClient] = useState<Client | null>(null);
   const [page, setPage] = useState(1);
 
@@ -53,22 +51,21 @@ export default function Clientas() {
     return () => clearTimeout(timeout);
   }, [search]);
 
-  // Volver a página 1 cada vez que cambia el criterio (búsqueda o filtros) — nunca quedar
+  // Volver a página 1 cada vez que cambia el criterio (búsqueda o filtro) — nunca quedar
   // parada en la página 5 de un resultado que ahora solo tiene 2 páginas.
   useEffect(() => {
     setPage(1);
-  }, [debouncedSearch, balanceFilter, staleFilter]);
+  }, [debouncedSearch, filter]);
 
   const { data, isLoading, isError } = useQuery<PaginatedClientsResponse>({
-    queryKey: ["/api/clients", debouncedSearch, balanceFilter, staleFilter, page],
+    queryKey: ["/api/clients", debouncedSearch, filter, page],
     queryFn: async () => {
       const params = new URLSearchParams({
         page: String(page),
         pageSize: String(DEFAULT_CLIENTS_PAGE_SIZE),
       });
       if (debouncedSearch) params.set("search", debouncedSearch);
-      if (balanceFilter !== "todas") params.set("balanceFilter", balanceFilter);
-      if (staleFilter !== "todas") params.set("staleFilter", staleFilter);
+      if (filter !== "todas") params.set("filter", filter);
       const res = await apiRequest("GET", `/api/clients?${params.toString()}`);
       return res.json();
     },
@@ -171,27 +168,34 @@ export default function Clientas() {
             data-testid="input-search-clients"
           />
         </div>
-        <Select value={balanceFilter} onValueChange={(v) => setBalanceFilter(v as BalanceFilter)}>
-          <SelectTrigger className="w-full sm:w-[190px]" data-testid="select-balance-filter">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="todas" data-testid="option-balance-todas">Todas</SelectItem>
-            <SelectItem value="con_saldo" data-testid="option-balance-con-saldo">Con saldo pendiente</SelectItem>
-            <SelectItem value="sin_saldo" data-testid="option-balance-sin-saldo">Sin saldo pendiente</SelectItem>
-          </SelectContent>
-        </Select>
-        <Select value={staleFilter} onValueChange={(v) => setStaleFilter(v as StaleFilter)}>
-          <SelectTrigger className="w-full sm:w-[190px]" data-testid="select-stale-filter">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="todas" data-testid="option-stale-todas">Todas</SelectItem>
-            <SelectItem value="mas_2_meses" data-testid="option-stale-2-meses">Más de 2 meses</SelectItem>
-            <SelectItem value="mas_3_meses" data-testid="option-stale-3-meses">Más de 3 meses</SelectItem>
-          </SelectContent>
-        </Select>
+        <Button
+          type="button"
+          variant="outline"
+          className="relative w-full sm:w-auto"
+          onClick={() => setFilterSheetOpen(true)}
+          data-testid="button-open-filters"
+        >
+          <Filter className="h-4 w-4 mr-2" />
+          Filtros
+          {filter !== "todas" && (
+            <span className="absolute -top-1 -right-1 h-2.5 w-2.5 rounded-full bg-primary" data-testid="dot-filter-active" />
+          )}
+        </Button>
       </div>
+
+      {filter !== "todas" && (
+        <div>
+          <button
+            type="button"
+            onClick={() => setFilter("todas")}
+            className="inline-flex items-center gap-1.5 rounded-full border bg-muted/50 px-3 py-1.5 text-sm font-medium hover-elevate active-elevate-2"
+            data-testid="chip-active-filter"
+          >
+            {CLIENT_LIST_FILTER_LABELS[filter]}
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
 
       {isLoading ? (
         <div className="text-center py-12 text-muted-foreground">Cargando clientas...</div>
@@ -266,6 +270,44 @@ export default function Clientas() {
         products={products}
         preselectedClient={saleClient}
       />
+
+      <Dialog open={filterSheetOpen} onOpenChange={setFilterSheetOpen}>
+        <DialogContent className="max-w-sm" data-testid="dialog-filters">
+          <DialogHeader>
+            <DialogTitle>Filtros</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2">
+            {FILTER_OPTIONS.map((option) => (
+              <button
+                key={option}
+                type="button"
+                onClick={() => {
+                  setFilter(option);
+                  setFilterSheetOpen(false);
+                }}
+                className={cn(
+                  "w-full rounded-xl border-2 p-4 text-left text-sm font-semibold hover-elevate active-elevate-2",
+                  filter === option ? "border-primary bg-primary/10 text-primary" : "border-transparent bg-muted/50",
+                )}
+                data-testid={`option-filter-${option}`}
+              >
+                {CLIENT_LIST_FILTER_LABELS[option]}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => {
+                setFilter("todas");
+                setFilterSheetOpen(false);
+              }}
+              className="w-full rounded-xl border-2 border-dashed border-border p-3 text-center text-sm font-medium text-muted-foreground hover-elevate active-elevate-2"
+              data-testid="option-filter-ver-todas"
+            >
+              Ver todas
+            </button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
