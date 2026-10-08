@@ -143,6 +143,26 @@ describe("GET /api/reports/overview — pagos parciales", () => {
   });
 });
 
+describe("GET /api/reports/overview — 'Vendiste'/'Ganaste' coinciden con Inicio (sales-summary)", () => {
+  it("usa la MISMA fuente que 'Este mes vendiste' de Inicio, no un cálculo paralelo", async () => {
+    await api("POST", "/api/sales", baseSale({ installments: [{ amount: 1234 }] }));
+    await api("POST", "/api/sales", baseSale({ paymentMethod: "tarjeta", installments: [{ amount: 4321 }] }));
+
+    const overviewResult = await overview("custom", "2026-10-01", "2026-10-31");
+
+    // Mismo endpoint y mismo rango que usa Dashboard.tsx para "Este mes vendiste" (sales-summary,
+    // sumando los puntos que devuelve) — si "Vendiste" alguna vez se recalculara distinto acá,
+    // este test se rompe.
+    const summaryRes = await api("GET", "/api/reports/sales-summary?start=2026-10-01&end=2026-10-31&groupBy=day");
+    const summaryPoints = (await summaryRes.json()) as { totalSales: number; totalProfit: number }[];
+    const totalSalesFromSummary = summaryPoints.reduce((sum, p) => sum + p.totalSales, 0);
+    const totalProfitFromSummary = summaryPoints.reduce((sum, p) => sum + p.totalProfit, 0);
+
+    expect(overviewResult.totalSales).toBe(totalSalesFromSummary);
+    expect(overviewResult.totalProfit).toBe(totalProfitFromSummary);
+  });
+});
+
 describe("GET /api/reports/overview — ventas sin clienta", () => {
   it("cuenta en Vendiste/Ganaste pero no en 'Compra promedio por clienta'", async () => {
     const before = await overview("custom", "2026-10-01", "2026-10-31");
@@ -203,5 +223,18 @@ describe("GET /api/reports/overview — 'hoy' en hora de Argentina, no UTC del p
     // "hoy" sigue siendo el 31 de marzo — los mismos días contra febrero, que es más corto
     // (28 días en 2026), así que se toma completo.
     expect(result.comparisonPeriod).toEqual({ start: "2026-02-01", end: "2026-03-01", truncated: true });
+  });
+
+  it("una venta cargada a las 23:30 del 31/03 (Argentina) cuenta en marzo, no se corre a abril", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-01T02:30:00.000Z")); // 23:30 del 31/03 en Argentina
+
+    const before = await overview("this_month", "2026-03-01", "2026-04-01");
+    // El date de la venta es el que ya elige el navegador (hora local, no el reloj del
+    // servidor) — acá se simula directamente con el string que habría guardado esa carga.
+    await api("POST", "/api/sales", baseSale({ date: "2026-03-31", installments: [{ amount: 777 }] }));
+    const after = await overview("this_month", "2026-03-01", "2026-04-01");
+
+    expect(after.totalSales - before.totalSales).toBe(777);
   });
 });

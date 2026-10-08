@@ -644,6 +644,25 @@ Cómo verifico que quedó bien:
 - En un celular de 375 px no se cortan los nombres.
 ```
 
+#### Advertencia para cuando se implemente (encontrado haciendo el Prompt 11, sin tocar acá)
+
+El aviso **"N clientas hace más de 2 meses que no compran"** (línea de arriba, bloque "Para
+mejorar tu negocio") tiene que armarse con cuidado: `GET /api/reports/inactive-clients`, el
+endpoint que ya existe y que este aviso va a reusar, **incluye a las clientas que NUNCA
+compraron** (`lastPurchase: null`) junto con las que sí compraron hace tiempo — confirmado
+leyendo `getInactiveClients`/`getInactiveClientsMemory` en `server/storage.ts`. El código
+ACTUAL de Inicio (antes de este Prompt 10, sección "Seguimiento de clientas" de
+`client/src/pages/Dashboard.tsx`) ya tiene este mismo problema de fondo: usa la lista cruda de
+`inactiveClients` sin filtrar, así que una clienta que nunca compró puede ocupar uno de los 5
+lugares de esa sección como si "hace tiempo que no compra" (se la distingue con el texto
+"Todavía no te compró" en vez de "Hace N días sin comprarte", pero igual cuenta para el cupo y
+para cualquier conteo "N clientas..."). Si no se filtra (`lastPurchase !== null`) al armar este
+aviso nuevo, el número "N" de "N clientas hace más de 2 meses que no compran" va a contar
+clientas que nunca compraron — inconsistente con Clientas (filtro "Hace tiempo que no
+compran", que SÍ las excluye, vía `matchesStaleFilter`) y con "Clientas para recontactar" de
+Reportes (Prompt 11), que también las excluye explícitamente. **No se corrige ahora** — queda
+para cuando se implemente este Prompt 10.
+
 ## Reportes
 
 ### Prompt 11 · Reportes: claro y liviano
