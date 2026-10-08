@@ -15,7 +15,7 @@ import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { cn } from "@/lib/utils";
 import type { InsertClient, Product } from "@shared/schema";
-import { type ClientListFilter, CLIENT_LIST_FILTER_LABELS, DEFAULT_CLIENTS_PAGE_SIZE } from "@shared/clientFilters";
+import { type ClientListFilter, CLIENT_LIST_FILTER_LABELS, DEFAULT_CLIENTS_PAGE_SIZE, isClientListFilter } from "@shared/clientFilters";
 
 // Prompt 9, punto 2 — las 3 opciones del botón "Filtros" (nunca "todas", que es "sin filtro").
 const FILTER_OPTIONS: ClientListFilter[] = ["pendiente_pago", "no_compran_hace", "cumplen_anios"];
@@ -41,7 +41,12 @@ export default function Clientas() {
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
   const [saleDialogOpen, setSaleDialogOpen] = useState(false);
-  const [filter, setFilter] = useState<ClientListFilter>("todas");
+  // Prompt 11 — Reportes ("Te deben hoy", "Ver todas" de Clientas para recontactar) navega
+  // acá con "?filter=..." en la URL, para abrir Clientas ya con ese filtro aplicado.
+  const [filter, setFilter] = useState<ClientListFilter>(() => {
+    const fromUrl = new URLSearchParams(window.location.search).get("filter");
+    return isClientListFilter(fromUrl) ? fromUrl : "todas";
+  });
   const [filterSheetOpen, setFilterSheetOpen] = useState(false);
   const [saleClient, setSaleClient] = useState<Client | null>(null);
   const [page, setPage] = useState(1);

@@ -89,6 +89,7 @@ import {
   MAX_CLIENTS_PAGE_SIZE,
 } from "@shared/clientFilters";
 import { getArgentinaDateStr, getArgentinaMonth } from "@shared/argentinaTime";
+import { type ReportPeriodKind, getComparisonPeriod } from "@shared/reportsPeriods";
 import { normalizeArgentinaPhoneForStorage } from "@shared/phone";
 import { isKnownEventType, normalizeCustomEventTypeName, KNOWN_EVENT_TYPES } from "@shared/eventTypes";
 import type { z } from "zod";
@@ -576,6 +577,41 @@ export interface PendingInstallmentsTotals {
   overdueCount: number;
 }
 
+export interface ReportsOverviewParams {
+  start: string;
+  end: string;
+  period: ReportPeriodKind;
+}
+
+/** Prompt 11 — todo lo que necesita la pantalla de Reportes de arranque, en una sola llamada.
+ * Quedan AFUERA a propósito "Productos más vendidos" y "Mejores clientas" (siguen pegándole a
+ * getTopProductsByCategory/getTopClients, ya existentes y compartidos con el wizard de venta) y
+ * "Clientas para recontactar" (reusa getInactiveClients, compartido con Inicio) — ninguno de
+ * los tres necesitaba cambiar, así que no se duplicó su lógica acá adentro. */
+export interface ReportsOverview {
+  // "Vendiste"/"Ganaste" del período — MISMA fuente que Inicio (getSalesSummary), nunca un
+  // cálculo paralelo, para que los dos números coincidan siempre.
+  totalSales: number;
+  totalProfit: number;
+  hasIncompleteCostData: boolean;
+  // Período anterior (ver getComparisonPeriod) — null en los dos si no hubo ninguna venta ahí
+  // (nunca se divide por cero, y la línea de comparación no se muestra).
+  previousTotalSales: number | null;
+  previousTotalProfit: number | null;
+  comparisonPeriod: { start: string; end: string; truncated: boolean };
+  // "Compra promedio por clienta": ventas CON clienta ÷ clientas distintas — las ventas "Sin
+  // clienta" no entran ni al numerador ni al denominador (mismo criterio que ya usa
+  // getTopClients con `isNotNull(sales.clientId)`, no se les reparte ni se les inventa una fila).
+  distinctClientCount: number;
+  totalSalesToClients: number;
+  averagePurchasePerClient: number | null;
+  // "Te deben hoy" / "de eso, $X ya venció" — no depende del período elegido. Calculado con la
+  // MISMA función que ya usa el filtro "Pendiente de pago" de Clientas
+  // (getClientsPendingBalanceDetail), sumada sobre TODAS las clientas — nunca una fórmula nueva.
+  pendingBalanceToday: number;
+  overdueBalanceToday: number;
+}
+
 function getCurrentMonthRange(): { monthStart: string; monthEnd: string } {
   const now = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -909,6 +945,7 @@ export interface IStorage {
   getProductCostSummary(consultantId: number, start?: string, end?: string): Promise<ProductCostSummary>;
   getCollectedPayments(consultantId: number): Promise<CollectedPayments>;
   getPendingInstallmentsTotals(consultantId: number): Promise<PendingInstallmentsTotals>;
+  getReportsOverview(consultantId: number, params: ReportsOverviewParams): Promise<ReportsOverview>;
 }
 
 type Database = typeof database;
@@ -2484,6 +2521,46 @@ export class DatabaseStorage implements IStorage {
     return client;
   }
 
+  /** Prompt 9 + Prompt 11 — condición y suma del saldo pendiente real de una clienta
+   * (`amount - amountPaid` de cuotas "pendiente" de ventas no canceladas), compartida por
+   * `computeClientStats` (filtro "Pendiente de pago" de Clientas) y `getReportsOverview`
+   * ("Te deben hoy"). Sin `clientIds`, agrega TODAS las clientas de la consultora de una —
+   * nunca incluye ventas "Sin clienta" (mismo criterio que ya usa `getTopClients` con
+   * `isNotNull(sales.clientId)`). `todayStr` tiene que venir siempre de
+   * `getArgentinaDateStr()` (nunca `new Date()` del proceso) — define el subconjunto vencido
+   * (`dueDate < todayStr`), igual criterio que ya usa `getPendingInstallments`. */
+  private async getClientsPendingBalanceDetail(
+    consultantId: number,
+    todayStr: string,
+    clientIds?: number[],
+  ): Promise<Map<number, { balance: number; overdueBalance: number }>> {
+    const db = await this.getDb();
+    if (clientIds && clientIds.length === 0) {
+      return new Map();
+    }
+
+    const conditions = [
+      eq(sales.consultantId, consultantId),
+      isNotNull(sales.clientId),
+      eq(saleInstallments.status, "pendiente"),
+      ne(sales.status, "cancelada"),
+    ];
+    if (clientIds) conditions.push(inArray(sales.clientId, clientIds));
+
+    const rows = await db
+      .select({
+        clientId: sales.clientId,
+        balance: sql<number>`coalesce(sum(${saleInstallments.amount} - ${saleInstallments.amountPaid}), 0)`,
+        overdueBalance: sql<number>`coalesce(sum(case when ${saleInstallments.dueDate} < ${todayStr} then ${saleInstallments.amount} - ${saleInstallments.amountPaid} else 0 end), 0)`,
+      })
+      .from(saleInstallments)
+      .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
+      .where(and(...conditions))
+      .groupBy(sales.clientId);
+
+    return new Map(rows.map((r) => [r.clientId as number, { balance: Number(r.balance), overdueBalance: Number(r.overdueBalance) }]));
+  }
+
   /** Compartido por searchClients (combobox, truncado) y searchClientsPaginated (listado
    * real) — dos queries agregadas separadas (nunca un JOIN sales+saleInstallments directo,
    * que produciría un fan-out y falsearía las sumas) unidas en JS por clientId. */
@@ -2511,28 +2588,8 @@ export class DatabaseStorage implements IStorage {
 
     const statsByClient = new Map(statsRows.map((s) => [s.clientId, s]));
 
-    // Misma condición que getPendingInstallments (cuota "pendiente" de una venta no cancelada),
-    // acá agregada por clienta en vez de listada por cuota individual.
-    const balanceRows = await db
-      .select({
-        clientId: sales.clientId,
-        // Prompt 9: el saldo real es lo que falta (amount - amountPaid), no el monto
-        // original de la cuota — una "pendiente" puede tener un pago parcial.
-        pendingBalance: sql<number>`coalesce(sum(${saleInstallments.amount} - ${saleInstallments.amountPaid}), 0)`,
-      })
-      .from(saleInstallments)
-      .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
-      .where(
-        and(
-          eq(sales.consultantId, consultantId),
-          inArray(sales.clientId, clientIds),
-          eq(saleInstallments.status, "pendiente"),
-          ne(sales.status, "cancelada"),
-        ),
-      )
-      .groupBy(sales.clientId);
-
-    const balanceByClient = new Map(balanceRows.map((b) => [b.clientId, Number(b.pendingBalance)]));
+    const balanceDetailByClient = await this.getClientsPendingBalanceDetail(consultantId, getArgentinaDateStr(), clientIds);
+    const balanceByClient = new Map(Array.from(balanceDetailByClient.entries()).map(([clientId, detail]) => [clientId, detail.balance]));
 
     return { statsByClient, balanceByClient };
   }
@@ -3189,6 +3246,77 @@ export class DatabaseStorage implements IStorage {
       totalPendingCount: Number(row?.totalCount ?? 0),
       overdueAmount: Number(row?.overdueAmount ?? 0),
       overdueCount: Number(row?.overdueCount ?? 0),
+    };
+  }
+
+  /** Prompt 11 — pantalla de Reportes de arranque, en una sola llamada. Ver el comentario de
+   * `ReportsOverview` sobre qué queda afuera a propósito. */
+  async getReportsOverview(consultantId: number, params: ReportsOverviewParams): Promise<ReportsOverview> {
+    const db = await this.getDb();
+    const { start, end, period } = params;
+
+    // "Vendiste"/"Ganaste" — misma función que usa Inicio (getSalesSummary), nunca un cálculo
+    // paralelo, para que los dos números coincidan siempre.
+    const currentPoints = await this.getSalesSummary(consultantId, start, end, "day");
+    const totalSales = currentPoints.reduce((sum, p) => sum + p.totalSales, 0);
+    const totalProfit = currentPoints.reduce((sum, p) => sum + p.totalProfit, 0);
+
+    // "hoy" siempre en hora de Argentina — nunca el reloj del proceso (en Railway es UTC),
+    // tanto para el período de comparación como para "Te deben hoy"/"vencido" más abajo.
+    const todayStr = getArgentinaDateStr();
+    const comparisonPeriod = getComparisonPeriod(period, start, end, todayStr);
+    const previousPoints = await this.getSalesSummary(consultantId, comparisonPeriod.start, comparisonPeriod.end, "day");
+    const previousSalesCount = previousPoints.reduce((sum, p) => sum + p.salesCount, 0);
+    // Si el período anterior no tuvo ninguna venta, no se compara (nunca se divide por cero,
+    // y la línea de comparación directamente no se muestra).
+    const previousTotalSales = previousSalesCount > 0 ? previousPoints.reduce((sum, p) => sum + p.totalSales, 0) : null;
+    const previousTotalProfit = previousSalesCount > 0 ? previousPoints.reduce((sum, p) => sum + p.totalProfit, 0) : null;
+
+    const { hasIncompleteCostData } = await this.getProductCostSummary(consultantId, start, end);
+
+    // "Compra promedio por clienta": ventas CON clienta ÷ clientas distintas — las ventas "Sin
+    // clienta" no entran ni al numerador ni al denominador (mismo criterio que getTopClients).
+    const [clientAgg] = await db
+      .select({
+        distinctClientCount: sql<number>`coalesce(count(distinct ${sales.clientId}), 0)`,
+        totalSalesToClients: sql<number>`coalesce(sum(${sales.total}), 0)`,
+      })
+      .from(sales)
+      .where(
+        and(
+          eq(sales.consultantId, consultantId),
+          isNotNull(sales.clientId),
+          gte(sales.date, start),
+          lt(sales.date, end),
+          ne(sales.status, "cancelada"),
+        ),
+      );
+    const distinctClientCount = Number(clientAgg?.distinctClientCount ?? 0);
+    const totalSalesToClients = Number(clientAgg?.totalSalesToClients ?? 0);
+    const averagePurchasePerClient = distinctClientCount > 0 ? Math.round(totalSalesToClients / distinctClientCount) : null;
+
+    // "Te deben hoy" / "de eso, $X ya venció" — no depende del período elegido. Misma función
+    // que ya usa el filtro "Pendiente de pago" de Clientas, sumada sobre TODAS las clientas.
+    const balanceDetail = await this.getClientsPendingBalanceDetail(consultantId, todayStr);
+    let pendingBalanceToday = 0;
+    let overdueBalanceToday = 0;
+    for (const detail of Array.from(balanceDetail.values())) {
+      pendingBalanceToday += detail.balance;
+      overdueBalanceToday += detail.overdueBalance;
+    }
+
+    return {
+      totalSales,
+      totalProfit,
+      hasIncompleteCostData,
+      previousTotalSales,
+      previousTotalProfit,
+      comparisonPeriod,
+      distinctClientCount,
+      totalSalesToClients,
+      averagePurchasePerClient,
+      pendingBalanceToday,
+      overdueBalanceToday,
     };
   }
 
@@ -5305,27 +5433,54 @@ export class MemoryStorage implements IStorage {
     );
   }
 
+  /** Espejo de DatabaseStorage.getClientsPendingBalanceDetail — misma condición y suma,
+   * compartida por computeClientStatsMemory y getReportsOverviewMemory. Sin `clientIds`,
+   * agrega TODAS las clientas de la consultora (nunca ventas "Sin clienta"). */
+  private getClientsPendingBalanceDetailMemory(
+    consultantId: number,
+    todayStr: string,
+    clientIds?: number[],
+  ): Map<number, { balance: number; overdueBalance: number }> {
+    const idSet = clientIds ? new Set(clientIds) : null;
+    const result = new Map<number, { balance: number; overdueBalance: number }>();
+
+    const relevantSaleIds = new Map(
+      this.sales
+        .filter((s) => s.consultantId === consultantId && s.clientId !== null && s.status !== "cancelada" && (!idSet || idSet.has(s.clientId)))
+        .map((s) => [s.id, s.clientId as number]),
+    );
+
+    for (const inst of this.saleInstallments) {
+      if (inst.status !== "pendiente") continue;
+      const clientId = relevantSaleIds.get(inst.saleId);
+      if (clientId === undefined) continue;
+      const entry = result.get(clientId) ?? { balance: 0, overdueBalance: 0 };
+      const owed = inst.amount - inst.amountPaid;
+      entry.balance += owed;
+      if (inst.dueDate < todayStr) entry.overdueBalance += owed;
+      result.set(clientId, entry);
+    }
+
+    return result;
+  }
+
   /** Espejo de DatabaseStorage.computeClientStats. */
-  private computeClientStatsMemory(clientIds: number[]): { statsByClient: Map<number, { totalAmount: number; lastDate: string | null }>; balanceByClient: Map<number, number> } {
+  private computeClientStatsMemory(
+    consultantId: number,
+    clientIds: number[],
+  ): { statsByClient: Map<number, { totalAmount: number; lastDate: string | null }>; balanceByClient: Map<number, number> } {
     const idSet = new Set(clientIds);
     const statsByClient = new Map<number, { totalAmount: number; lastDate: string | null }>();
-    const balanceByClient = new Map<number, number>();
 
     for (const clientId of Array.from(idSet)) {
       const clientSales = this.sales.filter((s) => s.clientId === clientId && s.status !== "cancelada");
       const totalAmount = clientSales.reduce((sum, s) => sum + s.total, 0);
       const lastDate = clientSales.length ? clientSales.map((s) => s.date).sort().slice(-1)[0] : null;
       statsByClient.set(clientId, { totalAmount, lastDate });
-
-      // Misma condición que getPendingInstallments (cuota "pendiente" de una venta no cancelada).
-      const clientSaleIds = new Set(clientSales.map((s) => s.id));
-      // Prompt 9: el saldo real es amount - amountPaid — una "pendiente" puede tener un pago
-      // parcial (nunca el monto original de la cuota).
-      const pendingBalance = this.saleInstallments
-        .filter((i) => i.status === "pendiente" && clientSaleIds.has(i.saleId))
-        .reduce((sum, i) => sum + (i.amount - i.amountPaid), 0);
-      balanceByClient.set(clientId, pendingBalance);
     }
+
+    const balanceDetailByClient = this.getClientsPendingBalanceDetailMemory(consultantId, getArgentinaDateStr(), clientIds);
+    const balanceByClient = new Map(Array.from(balanceDetailByClient.entries()).map(([clientId, detail]) => [clientId, detail.balance]));
 
     return { statsByClient, balanceByClient };
   }
@@ -5342,7 +5497,7 @@ export class MemoryStorage implements IStorage {
   async searchClients(consultantId: number, query = "", limit = 20): Promise<ClientWithStats[]> {
     const filtered = MemoryStorage.sortClientsDeterministically(this.matchClients(consultantId, query));
     const page = filtered.slice(0, limit);
-    const { statsByClient, balanceByClient } = this.computeClientStatsMemory(page.map((c) => c.id));
+    const { statsByClient, balanceByClient } = this.computeClientStatsMemory(consultantId, page.map((c) => c.id));
 
     return page.map((c) => ({
       ...c,
@@ -5364,7 +5519,7 @@ export class MemoryStorage implements IStorage {
       return { items: [], total: 0, page, pageSize, totalPages: 0, totalRevenue: 0 };
     }
 
-    const { statsByClient, balanceByClient } = this.computeClientStatsMemory(matched.map((c) => c.id));
+    const { statsByClient, balanceByClient } = this.computeClientStatsMemory(consultantId, matched.map((c) => c.id));
 
     let withStats: ClientWithStats[] = matched.map((c) => ({
       ...c,
@@ -5838,6 +5993,53 @@ export class MemoryStorage implements IStorage {
       }
     }
     return { totalPendingAmount, totalPendingCount, overdueAmount, overdueCount };
+  }
+
+  /** Espejo de DatabaseStorage.getReportsOverview. */
+  async getReportsOverview(consultantId: number, params: ReportsOverviewParams): Promise<ReportsOverview> {
+    const { start, end, period } = params;
+
+    const currentPoints = await this.getSalesSummary(consultantId, start, end, "day");
+    const totalSales = currentPoints.reduce((sum, p) => sum + p.totalSales, 0);
+    const totalProfit = currentPoints.reduce((sum, p) => sum + p.totalProfit, 0);
+
+    const todayStr = getArgentinaDateStr();
+    const comparisonPeriod = getComparisonPeriod(period, start, end, todayStr);
+    const previousPoints = await this.getSalesSummary(consultantId, comparisonPeriod.start, comparisonPeriod.end, "day");
+    const previousSalesCount = previousPoints.reduce((sum, p) => sum + p.salesCount, 0);
+    const previousTotalSales = previousSalesCount > 0 ? previousPoints.reduce((sum, p) => sum + p.totalSales, 0) : null;
+    const previousTotalProfit = previousSalesCount > 0 ? previousPoints.reduce((sum, p) => sum + p.totalProfit, 0) : null;
+
+    const { hasIncompleteCostData } = await this.getProductCostSummary(consultantId, start, end);
+
+    const salesToClients = this.sales.filter(
+      (s) => s.consultantId === consultantId && s.clientId !== null && s.date >= start && s.date < end && s.status !== "cancelada",
+    );
+    const distinctClientCount = new Set(salesToClients.map((s) => s.clientId)).size;
+    const totalSalesToClients = salesToClients.reduce((sum, s) => sum + s.total, 0);
+    const averagePurchasePerClient = distinctClientCount > 0 ? Math.round(totalSalesToClients / distinctClientCount) : null;
+
+    const balanceDetail = this.getClientsPendingBalanceDetailMemory(consultantId, todayStr);
+    let pendingBalanceToday = 0;
+    let overdueBalanceToday = 0;
+    for (const detail of Array.from(balanceDetail.values())) {
+      pendingBalanceToday += detail.balance;
+      overdueBalanceToday += detail.overdueBalance;
+    }
+
+    return {
+      totalSales,
+      totalProfit,
+      hasIncompleteCostData,
+      previousTotalSales,
+      previousTotalProfit,
+      comparisonPeriod,
+      distinctClientCount,
+      totalSalesToClients,
+      averagePurchasePerClient,
+      pendingBalanceToday,
+      overdueBalanceToday,
+    };
   }
 
   async getAllSales(consultantId: number): Promise<SaleWithItemCount[]> {

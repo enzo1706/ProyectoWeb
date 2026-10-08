@@ -715,6 +715,28 @@ Cómo verifico que quedó bien:
 - **Qué cuenta y qué no**: las ventas canceladas y los borradores no cuentan en nada de esta
   pantalla. Las ventas con entrega pendiente SÍ cuentan (la entrega es un estado aparte del
   pago, no afecta nada de Reportes).
+- **Endpoint único + reutilización, sin borrar nada del backend**: la pantalla nueva pega a un
+  endpoint nuevo (`GET /api/reports/overview`) más 2 que ya existían sin cambios
+  (`/api/reports/top-products`, `/api/reports/top-clients`) y uno más con un parámetro fijo en
+  vez de un selector (`/api/reports/inactive-clients?days=60`). Ningún endpoint ni función de
+  `storage.ts` se borró — `Reportes.tsx` simplemente dejó de llamar a los que ya no necesita,
+  para poder reusarlos el día que se arme el PDF de reportes. Quedan sin ningún consumidor
+  (ni Reportes, ni ninguna otra pantalla) desde este Prompt:
+  - `GET /api/reports/top-categories` (`getTopCategories`)
+  - `GET /api/reports/payment-methods` (`getSalesByPaymentMethod`)
+  - `GET /api/reports/installments-breakdown` (`getInstallmentsBreakdown`)
+  - `GET /api/reports/appointments-summary` (`getAppointmentsSummary`) — `Agenda.tsx` y
+    `AppointmentDetailDialog.tsx` todavía invalidan esta query al crear/editar una cita (no se
+    tocó, revisar si sigue teniendo sentido cuando se arme el PDF)
+  - `GET /api/reports/collected-payments` (`getCollectedPayments`) — **cuidado**: sigue siendo
+    la verificación de "nunca se cuenta dos veces" de los tests del Prompt 9
+    (`clients-payments.test.ts`, `clients-payments-legacy.test.ts`), no es solo un bloque de UI
+  - `GET /api/reports/pending-installments-totals` (`getPendingInstallmentsTotals`)
+  - `GET /api/reports/product-cost-summary` (`getProductCostSummary`)
+
+  Siguen con consumidor real, sin cambios: `sales-summary`/`pending-installments`/
+  `upcoming-birthdays` (Inicio), `stock-valuation` (Stock), `top-products` (wizard de venta +
+  Reportes), `top-clients`/`inactive-clients` (Reportes).
 
 ## Agenda
 

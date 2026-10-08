@@ -10,6 +10,7 @@ import { uploadProductImage, deleteProductImage, isValidImageBuffer, listProduct
 import { findProductImageMatches } from "@shared/imageMatching";
 import { matchImportedProducts, type ImportCatalogProduct } from "@shared/importMatching";
 import { isClientListFilter } from "@shared/clientFilters";
+import { isReportPeriodKind } from "@shared/reportsPeriods";
 import { parseExcelImportRows, parseCsvImportRows, parsePdfImportRows, ImportParseError } from "./importParsers";
 import {
   bulkProductSchema,
@@ -2636,6 +2637,25 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al obtener los totales de cuotas pendientes" });
+    }
+  });
+
+  // Prompt 11 — pantalla de Reportes de arranque, en una sola llamada.
+  app.get("/api/reports/overview", async (req: Request, res: Response) => {
+    try {
+      const { start, end } = parseDateRange(req);
+      if (!start || !end) {
+        return res.status(400).json({ error: "Los parámetros start y end son requeridos" });
+      }
+      const period = req.query.period;
+      if (!isReportPeriodKind(period)) {
+        return res.status(400).json({ error: "El parámetro period es inválido" });
+      }
+      const overview = await storage.getReportsOverview(req.consultantId!, { start, end, period });
+      res.json(overview);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener el resumen de reportes" });
     }
   });
 
