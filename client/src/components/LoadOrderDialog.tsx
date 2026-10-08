@@ -1,16 +1,26 @@
 import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogFooter,
+  AlertDialogTitle,
+  AlertDialogAction,
+  AlertDialogCancel,
+} from "@/components/ui/alert-dialog";
 import { WizardDots } from "./WizardDots";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
-import { cn } from "@/lib/utils";
-import { getProductCategories } from "@/lib/productCategories";
+import { cn, onActivationKeyDown } from "@/lib/utils";
+import { getProductCategories, toneFamilyKey } from "@/lib/productCategories";
+import { computeDiscountedCost } from "@shared/saleCalculations";
 import { discountOptions, type Product } from "@shared/schema";
-import { Minus, Package, Plus, Search, Upload, X } from "lucide-react";
+import { ChevronDown, Minus, Package, Pencil, Plus, Search, Trash2, Upload } from "lucide-react";
 import { ImportProductsDialog, type ImportedOrderLine } from "./ImportProductsDialog";
 
 interface LoadOrderDialogProps {
@@ -22,6 +32,7 @@ interface LoadOrderDialogProps {
 interface OrderLine {
   productId: number;
   productName: string;
+  variante: string;
   category: string;
   precio: number;
   quantity: number;
@@ -35,6 +46,181 @@ const stepLabels: Record<PedidoStep, string> = {
   confirmar: "Revisá tu pedido",
 };
 
+/** Precio tachado al público + precio con descuento destacado (Prompt 5) — o solo el precio
+ * al público si todavía no se eligió el descuento ("Elegir después"). SIEMPRE sobre
+ * `product.precio` (el del catálogo): el descuento de la empresa se aplica sobre ese precio,
+ * nunca sobre `priceOverride` (el precio propio de la consultora, que es para vender, no para
+ * lo que paga ella por el pedido — ver Prompt 4). */
+function OrderPrice({ precio, discount, format }: { precio: number; discount: number | null | undefined; format: (n: number) => string }) {
+  if (typeof discount === "number") {
+    return (
+      <span className="flex shrink-0 flex-col items-end leading-tight">
+        <span className="text-xs text-muted-foreground line-through">{format(precio)}</span>
+        <span className="text-sm font-semibold">{format(computeDiscountedCost(precio, discount))}</span>
+      </span>
+    );
+  }
+  return <span className="shrink-0 text-xs text-muted-foreground">{format(precio)}</span>;
+}
+
+function QtyStepper({ productId, qty, onAdjust }: { productId: number; qty: number; onAdjust: (productId: number, delta: number) => void }) {
+  return (
+    <div className="flex shrink-0 items-center gap-1.5">
+      <Button
+        type="button"
+        variant="outline"
+        size="icon"
+        className="h-8 w-8"
+        disabled={qty <= 0}
+        onClick={(e) => {
+          e.stopPropagation();
+          onAdjust(productId, -1);
+        }}
+        aria-label="Disminuir cantidad"
+        data-testid={`button-order-qty-minus-${productId}`}
+      >
+        <Minus className="h-3.5 w-3.5" />
+      </Button>
+      <span className={cn("w-5 text-center text-sm tabular-nums", qty > 0 && "font-bold text-primary")} data-testid={`text-order-qty-${productId}`}>
+        {qty}
+      </span>
+      <Button
+        type="button"
+        variant="outline"
+        size="icon"
+        className="h-8 w-8"
+        onClick={(e) => {
+          e.stopPropagation();
+          onAdjust(productId, 1);
+        }}
+        aria-label="Aumentar cantidad"
+        data-testid={`button-order-qty-plus-${productId}`}
+      >
+        <Plus className="h-3.5 w-3.5" />
+      </Button>
+    </div>
+  );
+}
+
+/** Una fila de un tono puntual (producto sin tonos, o un tono dentro de una familia
+ * desplegada) — se destaca con fondo rosado suave y el número en negrita apenas tiene
+ * cantidad elegida (Prompt 5, punto 2), para que se note a simple vista qué se eligió. */
+function ToneRow({
+  product,
+  discount,
+  qty,
+  onAdjust,
+  format,
+  compact = false,
+}: {
+  product: Product;
+  discount: number | null | undefined;
+  qty: number;
+  onAdjust: (productId: number, delta: number) => void;
+  format: (n: number) => string;
+  compact?: boolean;
+}) {
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-3 rounded-xl border p-2.5",
+        qty > 0 ? "border-primary/30 bg-primary/10" : "bg-muted/40",
+        compact && "ml-4",
+      )}
+      data-testid={`order-catalog-row-${product.id}`}
+    >
+      {!compact && (
+        product.imagen ? (
+          <img src={product.imagen} alt={product.producto} className="h-9 w-9 shrink-0 rounded-md object-cover" />
+        ) : (
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-muted">
+            <Package className="h-4 w-4 text-muted-foreground" />
+          </div>
+        )
+      )}
+      <p className="min-w-0 flex-1 truncate text-sm font-semibold">
+        {compact ? product.variante : product.producto}
+        {!compact && product.variante !== "Estándar" && <span className="font-normal text-muted-foreground"> {product.variante}</span>}
+      </p>
+      <OrderPrice precio={product.precio} discount={discount} format={format} />
+      <QtyStepper productId={product.id} qty={qty} onAdjust={onAdjust} />
+    </div>
+  );
+}
+
+/** Una familia (sección+línea+nombre) con un solo tono se muestra como una fila común, sin
+ * desplegar (Prompt 3/5). Con más de un tono, se agrupa en una fila desplegable que muestra
+ * cuántos tonos tiene y, si ya se eligió alguna cantidad, "N unidades elegidas" — destacada
+ * aunque esté plegada, para no tener que abrirla para saber que ya hay algo elegido ahí. */
+function FamilyRow({
+  members,
+  discount,
+  getQty,
+  onAdjust,
+  forceExpanded,
+  expanded,
+  onToggleExpand,
+  format,
+}: {
+  members: Product[];
+  discount: number | null | undefined;
+  getQty: (productId: number) => number;
+  onAdjust: (productId: number, delta: number) => void;
+  forceExpanded: boolean;
+  expanded: boolean;
+  onToggleExpand: (key: string) => void;
+  format: (n: number) => string;
+}) {
+  if (members.length === 1) {
+    const product = members[0];
+    return <ToneRow product={product} discount={discount} qty={getQty(product.id)} onAdjust={onAdjust} format={format} />;
+  }
+
+  const primary = members[0];
+  const key = toneFamilyKey(primary);
+  const totalQty = members.reduce((sum, m) => sum + getQty(m.id), 0);
+  const isExpanded = forceExpanded || expanded;
+
+  return (
+    <div data-testid={`order-family-${primary.id}`}>
+      <div
+        className={cn(
+          "flex items-center gap-3 rounded-xl border p-2.5 hover-elevate cursor-pointer",
+          totalQty > 0 ? "border-primary/30 bg-primary/10" : "bg-muted/40",
+        )}
+        onClick={() => onToggleExpand(key)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={onActivationKeyDown(() => onToggleExpand(key))}
+        data-testid={`button-order-toggle-family-${primary.id}`}
+      >
+        {primary.imagen ? (
+          <img src={primary.imagen} alt={primary.producto} className="h-9 w-9 shrink-0 rounded-md object-cover" />
+        ) : (
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-muted">
+            <Package className="h-4 w-4 text-muted-foreground" />
+          </div>
+        )}
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-semibold">{primary.producto}</p>
+          <p className={cn("text-xs", totalQty > 0 ? "font-semibold text-primary" : "text-muted-foreground")}>
+            {members.length} tonos
+            {totalQty > 0 && ` · ${totalQty} unidad${totalQty !== 1 ? "es" : ""} elegida${totalQty !== 1 ? "s" : ""}`}
+          </p>
+        </div>
+        <ChevronDown className={cn("h-4 w-4 shrink-0 transition-transform", isExpanded && "rotate-180")} />
+      </div>
+      {isExpanded && (
+        <div className="mt-1.5 space-y-1.5" data-testid={`order-family-tones-${primary.id}`}>
+          {members.map((m) => (
+            <ToneRow key={m.id} product={m} discount={discount} qty={getQty(m.id)} onAdjust={onAdjust} format={format} compact />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialogProps) {
   const { toast } = useToast();
   const { format } = useHideMoney();
@@ -44,11 +230,19 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
   // undefined = todavía sin elegir (bloquea avanzar del paso 1); null = "elegir después"
   // (bloquea confirmar hasta resolverse); número = descuento ya elegido.
   const [discount, setDiscount] = useState<number | null | undefined>(undefined);
-  const [lines, setLines] = useState<OrderLine[]>([]);
+  // Prompt 5: una sola fuente de verdad para las cantidades — arranca en 0 en todos los
+  // productos. Las líneas del pedido (para el contador, el resumen y "Revisá tu pedido") se
+  // derivan de este mapa filtrando qty > 0, en vez de mantener una lista aparte que había que
+  // confirmar producto por producto con un botón "Agregar" (eliminado en esta tarea).
+  const [qtyByProduct, setQtyByProduct] = useState<Record<number, number>>({});
   const [search, setSearch] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("Todas");
-  const [qtyByProduct, setQtyByProduct] = useState<Record<number, number>>({});
+  const [expandedFamilies, setExpandedFamilies] = useState<Set<string>>(new Set());
   const [importDialogOpen, setImportDialogOpen] = useState(false);
+  const [summaryOpen, setSummaryOpen] = useState(false);
+  const [editingQtyProductId, setEditingQtyProductId] = useState<number | null>(null);
+  const [editQtyDraft, setEditQtyDraft] = useState(1);
+  const [removingProductId, setRemovingProductId] = useState<number | null>(null);
 
   const categories = useMemo(() => getProductCategories(products), [products]);
 
@@ -56,60 +250,116 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
     if (open) {
       setStepIndex(0);
       setDiscount(undefined);
-      setLines([]);
+      setQtyByProduct({});
       setSearch("");
       setCategoryFilter("Todas");
-      setQtyByProduct({});
+      setExpandedFamilies(new Set());
+      setImportDialogOpen(false);
+      setSummaryOpen(false);
+      setEditingQtyProductId(null);
+      setRemovingProductId(null);
     }
   }, [open]);
 
-  const filteredCatalog = useMemo(() => {
-    const term = search.trim().toLowerCase();
-    return products.filter((p) => {
-      const matchesSearch =
-        !term || p.producto.toLowerCase().includes(term) || p.codigo.toLowerCase().includes(term) || p.seccion.toLowerCase().includes(term);
-      const matchesCategory = categoryFilter === "Todas" || p.seccion === categoryFilter;
-      return matchesSearch && matchesCategory;
-    });
-  }, [products, search, categoryFilter]);
+  const getQty = (productId: number) => qtyByProduct[productId] ?? 0;
 
+  const setQty = (productId: number, qty: number) => {
+    setQtyByProduct((prev) => {
+      const next = { ...prev };
+      if (qty <= 0) delete next[productId];
+      else next[productId] = qty;
+      return next;
+    });
+  };
+
+  const adjustQty = (productId: number, delta: number) => setQty(productId, Math.max(0, getQty(productId) + delta));
+
+  const toggleExpand = (key: string) => {
+    setExpandedFamilies((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  // Prompt 3/5 — familias de tono (misma heurística que Stock, toneFamilyKey/getToneSiblings)
+  // armadas sobre TODO el catálogo, para que un tono expandido no cambie de familia al tipear
+  // en el buscador. El filtro de categoría y de búsqueda se aplican después, a nivel familia.
+  const families = useMemo(() => {
+    const map = new Map<string, Product[]>();
+    for (const p of products) {
+      const key = toneFamilyKey(p);
+      const existing = map.get(key);
+      if (existing) existing.push(p);
+      else map.set(key, [p]);
+    }
+    Array.from(map.values()).forEach((members) => {
+      members.sort((a, b) => a.variante.localeCompare(b.variante));
+    });
+    return map;
+  }, [products]);
+
+  const term = search.trim().toLowerCase();
+
+  const filteredFamilies = useMemo(() => {
+    const result: { key: string; members: Product[] }[] = [];
+    for (const [key, members] of Array.from(families.entries())) {
+      const primary = members[0];
+      if (categoryFilter !== "Todas" && primary.seccion !== categoryFilter) continue;
+      // Prompt 5, punto 2: el buscador matchea por nombre del producto O por nombre de
+      // cualquier tono de la familia — si matchea, la familia entera se muestra ya desplegada
+      // (ver `forceExpanded` en FamilyRow), no solo el tono que matcheó.
+      const matchesSearch =
+        !term ||
+        members.some(
+          (m) =>
+            m.producto.toLowerCase().includes(term) ||
+            m.variante.toLowerCase().includes(term) ||
+            m.codigo.toLowerCase().includes(term) ||
+            m.seccion.toLowerCase().includes(term),
+        );
+      if (!matchesSearch) continue;
+      result.push({ key, members });
+    }
+    return result;
+  }, [families, categoryFilter, term]);
+
+  // Líneas derivadas del mapa de cantidades — nunca al revés. `variante` viaja en la línea
+  // para poder mostrar "nombre (con tono)" en el resumen y en "Revisá tu pedido" sin tener que
+  // volver a buscar el producto por id ahí.
+  const lines: OrderLine[] = useMemo(() => {
+    return products
+      .filter((p) => getQty(p.id) > 0)
+      .map((p) => ({
+        productId: p.id,
+        productName: p.producto,
+        variante: p.variante,
+        category: p.seccion,
+        precio: p.precio,
+        quantity: getQty(p.id),
+      }));
+  }, [products, qtyByProduct]);
+
+  const totalUnidades = lines.reduce((sum, l) => sum + l.quantity, 0);
+  const unitPriceOf = (precio: number) => (typeof discount === "number" ? computeDiscountedCost(precio, discount) : precio);
   const subtotal = lines.reduce((sum, l) => sum + l.precio * l.quantity, 0);
   const discountAmount = typeof discount === "number" ? Math.round(subtotal * (discount / 100)) : 0;
   const total = subtotal - discountAmount;
 
-  const addLine = (product: Product) => {
-    const qty = qtyByProduct[product.id] ?? 1;
-    setLines((prev) => {
-      const existing = prev.find((l) => l.productId === product.id);
-      if (existing) {
-        return prev.map((l) => (l.productId === product.id ? { ...l, quantity: l.quantity + qty } : l));
-      }
-      return [...prev, { productId: product.id, productName: product.producto, category: product.seccion, precio: product.precio, quantity: qty }];
-    });
-    setQtyByProduct((prev) => ({ ...prev, [product.id]: 1 }));
-  };
+  const lineLabel = (l: { productName: string; variante: string }) => (l.variante !== "Estándar" ? `${l.productName} ${l.variante}` : l.productName);
 
-  const removeLine = (productId: number) => {
-    setLines((prev) => prev.filter((l) => l.productId !== productId));
-  };
-
-  /** Etapa 5 — mismo criterio de merge que addLine (suma cantidad si el producto ya estaba
-   * en el pedido, agrega línea nueva si no) — así da igual si la consultora arma el pedido
-   * a mano, importando un archivo, o combinando ambos. Etapa 7.2: una línea con cantidad 0
+  /** Etapa 5 — mismo criterio de merge que antes: una importación suma cantidad a lo que ya
+   * había (a mano o de una importación previa), nunca lo reemplaza. Ahora el destino es el
+   * mapa de cantidades, no una lista de líneas aparte. Etapa 7.2: una línea con cantidad 0
    * (posible si la consultora tildó a mano una fila "sin stock en el archivo" en
-   * ImportProductsDialog) nunca se agrega — no representa ninguna entrada de mercadería real,
-   * y el batch de confirmación exige delta positivo en cada línea. */
+   * ImportProductsDialog) nunca se agrega. */
   const handleImport = (imported: ImportedOrderLine[]) => {
-    setLines((prev) => {
-      const next = [...prev];
+    setQtyByProduct((prev) => {
+      const next = { ...prev };
       for (const line of imported) {
         if (line.quantity <= 0) continue;
-        const idx = next.findIndex((l) => l.productId === line.productId);
-        if (idx !== -1) {
-          next[idx] = { ...next[idx], quantity: next[idx].quantity + line.quantity };
-        } else {
-          next.push(line);
-        }
+        next[line.productId] = (next[line.productId] ?? 0) + line.quantity;
       }
       return next;
     });
@@ -118,7 +368,7 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
   const resetAndClose = () => {
     setStepIndex(0);
     setDiscount(undefined);
-    setLines([]);
+    setQtyByProduct({});
     setImportDialogOpen(false);
     onOpenChange(false);
   };
@@ -183,9 +433,15 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
     currentStep === "descuento" ? "Siguiente" : currentStep === "catalogo" ? "Continuar" : confirmMutation.isPending ? "Confirmando..." : "Confirmar pedido";
   const showNextButton = currentStep !== "confirmar" || discount !== null;
 
+  const editingLine = lines.find((l) => l.productId === editingQtyProductId) ?? null;
+  const removingLine = lines.find((l) => l.productId === removingProductId) ?? null;
+
   return (
     <Dialog open={open} onOpenChange={(next) => (next ? onOpenChange(next) : resetAndClose())}>
-      <DialogContent className="flex max-w-lg flex-col gap-3" data-testid="dialog-load-order">
+      <DialogContent
+        className="top-0 left-0 flex h-[100dvh] max-h-[100dvh] w-screen max-w-none translate-x-0 translate-y-0 flex-col gap-3 rounded-none border-0 p-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:rounded-none"
+        data-testid="dialog-load-order"
+      >
         <DialogHeader>
           <DialogTitle>Cargar pedido</DialogTitle>
         </DialogHeader>
@@ -237,13 +493,15 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
             <div className="space-y-3">
               <div
                 className={cn(
-                  "flex items-center justify-between rounded-lg px-3 py-2.5 text-sm font-medium",
+                  "flex items-center justify-between gap-2 rounded-lg px-3 py-2.5 text-sm font-medium",
                   typeof discount === "number" ? "bg-primary/10 text-primary" : "bg-amber-500/10 text-amber-700 dark:text-amber-400",
                 )}
                 data-testid="text-order-discount-badge"
               >
-                <span>{typeof discount === "number" ? `Descuento aplicado: ${discount}%` : "⚠ Descuento: pendiente de elegir"}</span>
-                <button type="button" className="font-semibold underline underline-offset-2" onClick={() => setStepIndex(0)}>
+                <span>
+                  {typeof discount === "number" ? `Descuento aplicado: ${discount}%` : "Elegí el descuento para ver cuánto te cuesta cada producto"}
+                </span>
+                <button type="button" className="shrink-0 font-semibold underline underline-offset-2" onClick={() => setStepIndex(0)}>
                   {typeof discount === "number" ? "Cambiar" : "Elegir ahora"}
                 </button>
               </div>
@@ -288,68 +546,22 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
               </div>
 
               <div className="space-y-2">
-                {filteredCatalog.map((product) => {
-                  const qty = qtyByProduct[product.id] ?? 1;
-                  return (
-                    <div key={product.id} className="flex items-center gap-3 rounded-xl border bg-muted/40 p-2.5" data-testid={`order-catalog-row-${product.id}`}>
-                      {product.imagen ? (
-                        <img src={product.imagen} alt={product.producto} className="h-9 w-9 shrink-0 rounded-md object-cover" />
-                      ) : (
-                        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-muted">
-                          <Package className="h-4 w-4 text-muted-foreground" />
-                        </div>
-                      )}
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-semibold">
-                          {product.producto}
-                          {product.variante !== "Estándar" && <span className="font-normal text-muted-foreground"> {product.variante}</span>}
-                        </p>
-                        <p className="text-xs text-muted-foreground">{format(product.precio)}</p>
-                      </div>
-                      <div className="flex shrink-0 items-center gap-1.5">
-                        <Button type="button" variant="outline" size="icon" className="h-8 w-8" onClick={() => setQtyByProduct((p) => ({ ...p, [product.id]: Math.max(1, qty - 1) }))} aria-label="Disminuir cantidad" data-testid={`button-order-qty-minus-${product.id}`}>
-                          <Minus className="h-3.5 w-3.5" />
-                        </Button>
-                        <span className="w-4 text-center text-sm tabular-nums" data-testid={`text-order-qty-${product.id}`}>{qty}</span>
-                        <Button type="button" variant="outline" size="icon" className="h-8 w-8" onClick={() => setQtyByProduct((p) => ({ ...p, [product.id]: qty + 1 }))} aria-label="Aumentar cantidad" data-testid={`button-order-qty-plus-${product.id}`}>
-                          <Plus className="h-3.5 w-3.5" />
-                        </Button>
-                        <Button type="button" size="sm" className="h-7 px-2.5 text-xs" onClick={() => addLine(product)} data-testid={`button-order-add-${product.id}`}>
-                          Agregar
-                        </Button>
-                      </div>
-                    </div>
-                  );
-                })}
-                {filteredCatalog.length === 0 && (
+                {filteredFamilies.map(({ key, members }) => (
+                  <FamilyRow
+                    key={key}
+                    members={members}
+                    discount={discount}
+                    getQty={getQty}
+                    onAdjust={adjustQty}
+                    forceExpanded={term !== ""}
+                    expanded={expandedFamilies.has(key)}
+                    onToggleExpand={toggleExpand}
+                    format={format}
+                  />
+                ))}
+                {filteredFamilies.length === 0 && (
                   <p className="py-6 text-center text-sm text-muted-foreground">No hay productos con esos criterios</p>
                 )}
-              </div>
-
-              {lines.length > 0 && (
-                <div className="space-y-2 border-t pt-3">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Ya agregaste a este pedido</p>
-                  {lines.map((line) => (
-                    <div key={line.productId} className="flex items-center gap-3 rounded-xl border bg-background p-2.5" data-testid={`order-line-${line.productId}`}>
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-semibold">{line.productName}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {line.quantity} unidad{line.quantity !== 1 ? "es" : ""} · {format(line.precio * line.quantity)}
-                        </p>
-                      </div>
-                      <Button type="button" variant="ghost" size="icon" className="h-8 w-8 shrink-0" onClick={() => removeLine(line.productId)} aria-label={`Quitar ${line.productName} del pedido`} data-testid={`button-order-remove-${line.productId}`}>
-                        <X className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              <div className="flex items-center justify-between border-t pt-3">
-                <span className="text-sm text-muted-foreground" data-testid="text-order-count">
-                  {lines.length} producto{lines.length !== 1 ? "s" : ""} agregado{lines.length !== 1 ? "s" : ""}
-                </span>
-                <span className="text-lg font-bold" data-testid="text-order-subtotal">{format(subtotal)}</span>
               </div>
             </div>
           )}
@@ -375,12 +587,50 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
             </div>
           )}
 
-          {currentStep === "confirmar" && discount !== null && (
+          {currentStep === "confirmar" && discount !== null && lines.length === 0 && (
+            <div className="flex flex-col items-center justify-center gap-3 py-10 text-center" data-testid="text-order-empty">
+              <p className="text-sm text-muted-foreground">Tu pedido está vacío</p>
+              <Button type="button" variant="outline" onClick={() => setStepIndex(1)} data-testid="button-order-go-pick-products">
+                Elegir productos
+              </Button>
+            </div>
+          )}
+
+          {currentStep === "confirmar" && discount !== null && lines.length > 0 && (
             <div className="space-y-1.5 rounded-xl bg-muted/60 p-4" data-testid="order-summary">
               {lines.map((line) => (
-                <div key={line.productId} className="flex justify-between gap-3 text-sm">
-                  <span className="text-muted-foreground">{line.productName} x{line.quantity}</span>
-                  <span className="font-medium">{format(line.precio * line.quantity)}</span>
+                <div key={line.productId} className="flex items-center justify-between gap-2 text-sm" data-testid={`order-line-${line.productId}`}>
+                  <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                    {lineLabel(line)} x{line.quantity}
+                  </span>
+                  <span className="shrink-0 font-medium">{format(unitPriceOf(line.precio) * line.quantity)}</span>
+                  <div className="flex shrink-0 items-center gap-0.5">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7"
+                      onClick={() => {
+                        setEditingQtyProductId(line.productId);
+                        setEditQtyDraft(line.quantity);
+                      }}
+                      aria-label={`Cambiar cantidad de ${lineLabel(line)}`}
+                      data-testid={`button-order-edit-qty-${line.productId}`}
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7"
+                      onClick={() => setRemovingProductId(line.productId)}
+                      aria-label={`Quitar ${lineLabel(line)} del pedido`}
+                      data-testid={`button-order-remove-${line.productId}`}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
                 </div>
               ))}
               <div className="flex justify-between border-t pt-2 text-sm">
@@ -399,26 +649,146 @@ export function LoadOrderDialog({ open, onOpenChange, products }: LoadOrderDialo
           )}
         </div>
 
-        <div className="flex gap-2 border-t pt-3">
-          {stepIndex > 0 && (
-            <Button type="button" variant="outline" className="h-12 shrink-0 px-4" onClick={goBack} data-testid="button-order-back">
-              Atrás
+        <div className="space-y-2">
+          {currentStep === "catalogo" && (
+            <Button
+              type="button"
+              variant={lines.length > 0 ? "default" : "outline"}
+              className="h-12 w-full justify-between"
+              disabled={lines.length === 0}
+              onClick={() => setSummaryOpen(true)}
+              data-testid="button-order-counter"
+            >
+              {lines.length === 0 ? (
+                <span className="w-full text-center text-sm text-muted-foreground">Todavía no elegiste productos</span>
+              ) : (
+                <>
+                  <span>
+                    {lines.length} producto{lines.length !== 1 ? "s" : ""} · {totalUnidades} unidad{totalUnidades !== 1 ? "es" : ""}
+                  </span>
+                  <span className="font-bold">{format(total)}</span>
+                </>
+              )}
             </Button>
           )}
-          {showNextButton && (
-            <Button type="button" className="h-12 flex-1" onClick={goNext} disabled={nextDisabled} data-testid="button-order-next">
-              {nextLabel}
-            </Button>
-          )}
+          <div className="flex gap-2 border-t pt-3">
+            {stepIndex > 0 && (
+              <Button type="button" variant="outline" className="h-12 shrink-0 px-4" onClick={goBack} data-testid="button-order-back">
+                Atrás
+              </Button>
+            )}
+            {showNextButton && (
+              <Button type="button" className="h-12 flex-1" onClick={goNext} disabled={nextDisabled} data-testid="button-order-next">
+                {nextLabel}
+              </Button>
+            )}
+          </div>
         </div>
       </DialogContent>
 
-      <ImportProductsDialog
-        open={importDialogOpen}
-        onOpenChange={setImportDialogOpen}
-        products={products}
-        onImport={handleImport}
-      />
+      <ImportProductsDialog open={importDialogOpen} onOpenChange={setImportDialogOpen} products={products} onImport={handleImport} />
+
+      <Dialog open={summaryOpen} onOpenChange={setSummaryOpen}>
+        <DialogContent className="max-w-md" data-testid="dialog-order-summary">
+          <DialogHeader>
+            <DialogTitle>Tu pedido hasta ahora</DialogTitle>
+          </DialogHeader>
+          <div className="max-h-[60vh] space-y-2 overflow-y-auto">
+            {lines.map((l) => (
+              <div key={l.productId} className="flex items-center justify-between gap-3 rounded-lg border p-2.5 text-sm" data-testid={`order-summary-row-${l.productId}`}>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate font-medium">{lineLabel(l)}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {l.quantity} x {format(unitPriceOf(l.precio))}
+                  </p>
+                </div>
+                <span className="shrink-0 font-semibold">{format(unitPriceOf(l.precio) * l.quantity)}</span>
+              </div>
+            ))}
+            {lines.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">Todavía no elegiste productos</p>}
+          </div>
+          <DialogFooter>
+            <Button type="button" className="w-full" onClick={() => setSummaryOpen(false)} data-testid="button-order-summary-close">
+              Seguir eligiendo
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={editingQtyProductId !== null} onOpenChange={(v) => !v && setEditingQtyProductId(null)}>
+        <DialogContent className="max-w-sm" data-testid="dialog-order-edit-qty">
+          <DialogHeader>
+            <DialogTitle>Cambiar cantidad</DialogTitle>
+          </DialogHeader>
+          {editingLine && (
+            <div className="space-y-4">
+              <p className="text-center text-sm font-medium">{lineLabel(editingLine)}</p>
+              <div className="flex items-center justify-center gap-4">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  disabled={editQtyDraft <= 1}
+                  onClick={() => setEditQtyDraft((q) => Math.max(1, q - 1))}
+                  aria-label="Disminuir cantidad"
+                  data-testid="button-edit-qty-minus"
+                >
+                  <Minus className="h-4 w-4" />
+                </Button>
+                <span className="w-10 text-center text-lg font-semibold tabular-nums" data-testid="text-edit-qty-value">
+                  {editQtyDraft}
+                </span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  onClick={() => setEditQtyDraft((q) => q + 1)}
+                  aria-label="Aumentar cantidad"
+                  data-testid="button-edit-qty-plus"
+                >
+                  <Plus className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setEditingQtyProductId(null)} data-testid="button-edit-qty-cancel">
+              Cancelar
+            </Button>
+            <Button
+              type="button"
+              onClick={() => {
+                if (editingQtyProductId !== null) setQty(editingQtyProductId, editQtyDraft);
+                setEditingQtyProductId(null);
+              }}
+              data-testid="button-edit-qty-save"
+            >
+              Guardar
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <AlertDialog open={removingProductId !== null} onOpenChange={(v) => !v && setRemovingProductId(null)}>
+        <AlertDialogContent data-testid="dialog-order-confirm-remove">
+          <AlertDialogHeader>
+            <AlertDialogTitle>¿Querés quitar {removingLine ? lineLabel(removingLine) : "este producto"} de tu pedido?</AlertDialogTitle>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel data-testid="button-order-remove-cancel">Cancelar</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                if (removingProductId !== null) setQty(removingProductId, 0);
+                setRemovingProductId(null);
+              }}
+              data-testid="button-order-remove-confirm"
+            >
+              Sí, quitar
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Dialog>
   );
 }
