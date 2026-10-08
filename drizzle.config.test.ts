@@ -15,6 +15,9 @@ export default defineConfig({
   out: "./drizzle",
   schema: "./shared/schema.ts",
   dialect: "postgresql",
+  // Mismo motivo que drizzle.config.ts: "session" la crea connect-pg-simple en tiempo de
+  // ejecución, no vive en shared/schema.ts, y push no debe proponer borrarla.
+  tablesFilter: ["!session"],
   dbCredentials: {
     host: url.hostname,
     port: Number(url.port) || 5432,
