@@ -6,6 +6,21 @@ aplicado y publicado — todo lo de abajo se calculó diffeando `shared/schema.t
 de `deploy-paquete-1` (commit `b0fd119`, el que ya está aprobado para el primer deploy) y el
 código actual (`prompt-7-borradores`), no de memoria ni de una lista armada a mano.
 
+## ⚠️ Nunca correr `drizzle-kit push` (con o sin `--force`) contra producción
+
+Todo lo de este documento es **SQL puro, aplicado a mano** (`psql` o el panel de Supabase) — no
+hay ningún paso que use `drizzle-kit push`, `db:push` ni ningún otro comando de Drizzle contra
+producción, y tiene que seguir así. `drizzle-kit push` compara la base real contra
+`shared/schema.ts` y propone borrar cualquier tabla que esté en la base pero no en ese archivo
+— la tabla `session` (la crea `connect-pg-simple` en tiempo de ejecución, nunca vive en
+`shared/schema.ts` a propósito) es exactamente ese caso: confirmado reproduciéndolo contra una
+base local, sin `--force` avisa "You're about to delete session table" antes de pedir
+confirmación, y con `--force` lo hace directo. Borrar `session` en producción cierra la sesión
+de todas las consultoras de una. `drizzle.config.ts` ya la excluye explícitamente
+(`tablesFilter: ["!session"]`), pero esa protección vive en el repo, no en la base — la regla
+para producción sigue siendo más simple y más dura: nunca `drizzle-kit push` ahí, todo se migra
+con SQL explícito como el de este documento.
+
 ## Qué prompts entran en este paquete
 
 - **Prompt 4** (Stock: lista, filtros y edición) — 1 columna nueva.
