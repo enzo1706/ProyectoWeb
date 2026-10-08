@@ -15,6 +15,7 @@ import {
   couponRedemptions,
   orderDiscountLog,
   passwordResetCodes,
+  drafts,
   createSaleSchema,
   updateSaleSchema,
   createAppointmentSchema,
@@ -50,6 +51,9 @@ import {
   type CouponRedemption,
   type CouponRedemptionStatus,
   type OrderDiscountLogEntry,
+  type Draft,
+  type DraftType,
+  type SaveDraftInput,
 } from "@shared/schema";
 import { normalizeEmail } from "@shared/email";
 import {
@@ -789,6 +793,7 @@ export interface IStorage {
     consultantId: number,
     lines: { productId: number; delta: number }[],
     discountPercent?: number,
+    draftId?: number,
   ): Promise<{ updated: number }>;
   /** Prompt 2 — corrige las líneas de venta estimadas (producto sin costo al momento de
    * vender) de un producto con el costo recién conocido, y recalcula el `profit` cacheado de
@@ -850,6 +855,15 @@ export interface IStorage {
   /** Prompt 6, punto 1 — asigna una clienta a una venta creada sin una ("Sin clienta"). Solo
    * de `null` a una clienta real. */
   assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined>;
+  /** Prompt 7 — upsert por (consultantId, clientDraftId): el mismo clientDraftId siempre pisa
+   * su propia fila (nunca crea una segunda), aunque lleguen dos guardados casi simultáneos del
+   * mismo borrador — el UNIQUE de la tabla es la garantía real, esto es solo el camino feliz. */
+  saveDraft(consultantId: number, input: SaveDraftInput): Promise<Draft>;
+  /** Ordenados por updatedAt descendente — la lista de "sin terminar" muestra el más reciente
+   * primero. */
+  getDrafts(consultantId: number, type?: DraftType): Promise<Draft[]>;
+  getDraft(consultantId: number, id: number): Promise<Draft | undefined>;
+  deleteDraft(consultantId: number, id: number): Promise<boolean>;
   getSalesSummary(consultantId: number, start: string, end: string, groupBy?: ReportGroupBy): Promise<SalesSummaryPoint[]>;
   getTopCategories(consultantId: number, start?: string, end?: string): Promise<TopCategory[]>;
   getSalesByPaymentMethod(consultantId: number, start?: string, end?: string): Promise<PaymentMethodBreakdown[]>;
@@ -1980,6 +1994,7 @@ export class DatabaseStorage implements IStorage {
     consultantId: number,
     lines: { productId: number; delta: number }[],
     discountPercent?: number,
+    draftId?: number,
   ): Promise<{ updated: number }> {
     if (lines.length === 0) {
       throw new SaleValidationError("El lote no puede estar vacío");
@@ -2081,6 +2096,12 @@ export class DatabaseStorage implements IStorage {
         if (stock.unidades < 0) {
           throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${stock.unidades} unidades`);
         }
+      }
+
+      // Prompt 7, punto 2: mismo criterio que createSale.draftId — si este pedido viene de un
+      // borrador retomado, se borra en la MISMA transacción que aplica el stock.
+      if (draftId !== undefined) {
+        await tx.delete(drafts).where(and(eq(drafts.id, draftId), eq(drafts.consultantId, consultantId)));
       }
     });
 
@@ -3348,6 +3369,14 @@ export class DatabaseStorage implements IStorage {
           .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, line.product.id)));
       }
 
+      // Prompt 7, punto 2: si esta venta viene de un borrador retomado, se borra en la MISMA
+      // transacción que la crea — nunca puede quedar un borrador de algo ya confirmado. El
+      // `and(... consultantId)` evita borrar el borrador de otra consultora si llegara un id
+      // ajeno (nunca pasa por la UI, pero el storage no confía en eso).
+      if (input.draftId !== undefined) {
+        await tx.delete(drafts).where(and(eq(drafts.id, input.draftId), eq(drafts.consultantId, consultantId)));
+      }
+
       return sale;
       });
     } catch (err) {
@@ -3741,6 +3770,43 @@ export class DatabaseStorage implements IStorage {
     return updated;
   }
 
+  async saveDraft(consultantId: number, input: SaveDraftInput): Promise<Draft> {
+    const db = await this.getDb();
+    const [draft] = await db
+      .insert(drafts)
+      .values({ consultantId, clientDraftId: input.clientDraftId, type: input.type, payload: input.payload })
+      .onConflictDoUpdate({
+        target: [drafts.consultantId, drafts.clientDraftId],
+        // Prompt 7, regla 1: el mismo clientDraftId siempre pisa su propia fila — el UNIQUE de
+        // abajo (ver shared/schema.ts) es la garantía real contra dos guardados casi
+        // simultáneos, nunca un "find primero, insert/update después" con ventana de carrera.
+        set: { type: input.type, payload: input.payload, updatedAt: new Date() },
+      })
+      .returning();
+    return draft;
+  }
+
+  async getDrafts(consultantId: number, type?: DraftType): Promise<Draft[]> {
+    const db = await this.getDb();
+    const condition = type ? and(eq(drafts.consultantId, consultantId), eq(drafts.type, type)) : eq(drafts.consultantId, consultantId);
+    return db.select().from(drafts).where(condition).orderBy(desc(drafts.updatedAt));
+  }
+
+  async getDraft(consultantId: number, id: number): Promise<Draft | undefined> {
+    const db = await this.getDb();
+    const [draft] = await db.select().from(drafts).where(and(eq(drafts.id, id), eq(drafts.consultantId, consultantId)));
+    return draft;
+  }
+
+  async deleteDraft(consultantId: number, id: number): Promise<boolean> {
+    const db = await this.getDb();
+    const result = await db
+      .delete(drafts)
+      .where(and(eq(drafts.id, id), eq(drafts.consultantId, consultantId)))
+      .returning({ id: drafts.id });
+    return result.length > 0;
+  }
+
 }
 
 export class MemoryStorage implements IStorage {
@@ -3760,7 +3826,9 @@ export class MemoryStorage implements IStorage {
   private coupons: Coupon[] = [];
   private couponRedemptions: CouponRedemption[] = [];
   private orderDiscountLog: OrderDiscountLogEntry[] = [];
+  private draftRecords: Draft[] = [];
   private nextOrderDiscountLogId = 1;
+  private nextDraftId = 1;
   private nextUserId = 1;
   private nextConsultantId = 1;
   private nextProductId = 1;
@@ -4617,6 +4685,7 @@ export class MemoryStorage implements IStorage {
     consultantId: number,
     lines: { productId: number; delta: number }[],
     discountPercent?: number,
+    draftId?: number,
   ): Promise<{ updated: number }> {
     if (lines.length === 0) {
       throw new SaleValidationError("El lote no puede estar vacío");
@@ -4674,6 +4743,11 @@ export class MemoryStorage implements IStorage {
         stock.costPrice = nextCostPrice;
         stock.selectedDiscount = discountPercent!;
       }
+    }
+
+    if (draftId !== undefined) {
+      const index = this.draftRecords.findIndex((d) => d.id === draftId && d.consultantId === consultantId);
+      if (index !== -1) this.draftRecords.splice(index, 1);
     }
 
     return { updated: orderedProductIds.length };
@@ -5562,6 +5636,12 @@ export class MemoryStorage implements IStorage {
       });
     });
 
+    // Prompt 7, punto 2: mismo criterio que DatabaseStorage.createSale.
+    if (input.draftId !== undefined) {
+      const index = this.draftRecords.findIndex((d) => d.id === input.draftId && d.consultantId === consultantId);
+      if (index !== -1) this.draftRecords.splice(index, 1);
+    }
+
     return sale;
   }
 
@@ -5786,6 +5866,44 @@ export class MemoryStorage implements IStorage {
     sale.clientId = client.id;
     sale.clientName = client.name ?? client.phone;
     return sale;
+  }
+
+  async saveDraft(consultantId: number, input: SaveDraftInput): Promise<Draft> {
+    const existing = this.draftRecords.find((d) => d.consultantId === consultantId && d.clientDraftId === input.clientDraftId);
+    if (existing) {
+      existing.type = input.type;
+      existing.payload = input.payload;
+      existing.updatedAt = new Date();
+      return existing;
+    }
+    const draft: Draft = {
+      id: this.nextDraftId++,
+      consultantId,
+      clientDraftId: input.clientDraftId,
+      type: input.type,
+      payload: input.payload,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    this.draftRecords.push(draft);
+    return draft;
+  }
+
+  async getDrafts(consultantId: number, type?: DraftType): Promise<Draft[]> {
+    return this.draftRecords
+      .filter((d) => d.consultantId === consultantId && (type === undefined || d.type === type))
+      .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+  }
+
+  async getDraft(consultantId: number, id: number): Promise<Draft | undefined> {
+    return this.draftRecords.find((d) => d.id === id && d.consultantId === consultantId);
+  }
+
+  async deleteDraft(consultantId: number, id: number): Promise<boolean> {
+    const index = this.draftRecords.findIndex((d) => d.id === id && d.consultantId === consultantId);
+    if (index === -1) return false;
+    this.draftRecords.splice(index, 1);
+    return true;
   }
 
 }

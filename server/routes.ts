@@ -24,6 +24,9 @@ import {
   updateInstallmentStatusSchema,
   updateSaleDeliveryStatusSchema,
   assignSaleClientSchema,
+  saveDraftSchema,
+  draftTypes,
+  type DraftType,
   createAppointmentSchema,
   updateAppointmentSchema,
   updateAppointmentStatusSchema,
@@ -559,6 +562,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.use("/api/products", requireAuth, requireConsultant, requireActiveSubscription);
   app.use("/api/clients", requireAuth, requireConsultant, requireActiveSubscription);
   app.use("/api/sales", requireAuth, requireConsultant, requireActiveSubscription);
+  app.use("/api/drafts", requireAuth, requireConsultant, requireActiveSubscription);
   app.use("/api/appointments", requireAuth, requireConsultant, requireActiveSubscription);
   app.use("/api/reports", requireAuth, requireConsultant, requireActiveSubscription);
   app.use("/api/dashboard", requireAuth, requireConsultant, requireActiveSubscription);
@@ -1126,6 +1130,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // Prompt 7, punto 4: al retomar un borrador de venta con clienta asignada, hay que confirmar
+  // que esa clienta TODAVÍA existe (si se borró, la venta cae a "Sin clienta") y traer sus
+  // datos reales para precargar el picker — no alcanza con el nombre snapshoteado en el
+  // borrador. No existía ningún GET por id individual antes de esto.
+  app.get("/api/clients/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+      const client = await storage.getClientById(req.consultantId!, id);
+      if (!client) {
+        return res.status(404).json({ error: "Clienta no encontrada" });
+      }
+      res.json(client);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener la clienta" });
+    }
+  });
+
   app.post("/api/clients", async (req: Request, res: Response) => {
     try {
       const parsed = clientWriteSchema.safeParse(req.body);
@@ -1410,6 +1435,83 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  // Prompt 7 — límite propio, bien por debajo del límite de 100kb que express.json() ya le
+  // impone al body COMPLETO de cualquier request (ver server/app.ts): si usáramos los mismos
+  // 100kb, body-parser cortaría primero con un 413 genérico antes de que este chequeo llegara a
+  // correr, y nunca devolveríamos el mensaje claro de abajo. Un payload de borrador (unas pocas
+  // líneas de un wizard) nunca debería acercarse ni a esto.
+  const DRAFT_PAYLOAD_MAX_BYTES = 50_000;
+
+  app.post("/api/drafts", async (req: Request, res: Response) => {
+    try {
+      const parsed = saveDraftSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+      const payloadSize = Buffer.byteLength(JSON.stringify(parsed.data.payload));
+      if (payloadSize > DRAFT_PAYLOAD_MAX_BYTES) {
+        return res.status(400).json({ error: "El borrador es demasiado grande" });
+      }
+      const draft = await storage.saveDraft(req.consultantId!, parsed.data);
+      res.json(draft);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al guardar el borrador" });
+    }
+  });
+
+  app.get("/api/drafts", async (req: Request, res: Response) => {
+    try {
+      const typeParam = typeof req.query.type === "string" ? req.query.type : undefined;
+      if (typeParam !== undefined && !(draftTypes as readonly string[]).includes(typeParam)) {
+        return res.status(400).json({ error: "Tipo de borrador inválido" });
+      }
+      const result = await storage.getDrafts(req.consultantId!, typeParam as DraftType | undefined);
+      res.json(result);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener los borradores" });
+    }
+  });
+
+  // Prompt 7, punto 8: una consultora nunca puede ver/retomar/borrar un borrador de otra —
+  // storage.getDraft/deleteDraft siempre filtran por consultantId, así que un id ajeno da
+  // exactamente el mismo 404 que uno inexistente (nunca se distingue, mismo criterio que el
+  // resto de la app con recursos de otra consultora).
+  app.get("/api/drafts/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+      const draft = await storage.getDraft(req.consultantId!, id);
+      if (!draft) {
+        return res.status(404).json({ error: "Borrador no encontrado" });
+      }
+      res.json(draft);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener el borrador" });
+    }
+  });
+
+  app.delete("/api/drafts/:id", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+      const deleted = await storage.deleteDraft(req.consultantId!, id);
+      if (!deleted) {
+        return res.status(404).json({ error: "Borrador no encontrado" });
+      }
+      res.status(204).send();
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al descartar el borrador" });
+    }
+  });
+
   app.patch("/api/products/:id/discount", async (req: Request, res: Response) => {
     try {
       const id = parseInt(req.params.id, 10);
@@ -1582,7 +1684,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
 
-      const result = await storage.incrementProductStockBatch(req.consultantId!, parsed.data.lines, parsed.data.discountPercent);
+      const result = await storage.incrementProductStockBatch(req.consultantId!, parsed.data.lines, parsed.data.discountPercent, parsed.data.draftId);
       res.json(result);
     } catch (error) {
       if (error instanceof SaleValidationError) {

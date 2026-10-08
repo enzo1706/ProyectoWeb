@@ -28,7 +28,7 @@ import {
   addDays,
   type OrderAdjustment,
 } from "@shared/saleCalculations";
-import { paymentMethods, type PaymentMethod } from "@shared/schema";
+import { paymentMethods, saleDraftPayloadSchema, type PaymentMethod, type Draft, type SaleDraftPayload } from "@shared/schema";
 import type { Product } from "@shared/schema";
 import { SaleOrderTable, getLineFinalPrice, type OrderLine } from "./SaleOrderTable";
 import { SaleProductStep, type ProductSubView, type SaleProductStepHandle } from "./SaleProductStep";
@@ -36,6 +36,8 @@ import { EditSaleItemDialog } from "./EditSaleItemDialog";
 import { ClientDialog } from "./ClientDialog";
 import { SaleInstallmentsEditor } from "./SaleInstallmentsEditor";
 import { WizardDots } from "./WizardDots";
+import { UnsavedDraftAlert } from "./UnsavedDraftAlert";
+import { useDraftAutosave } from "@/hooks/use-draft-autosave";
 import type { Client } from "./ClientCard";
 import type { SaleDetails } from "./SaleCard";
 
@@ -49,6 +51,9 @@ interface NewSaleDialogProps {
   preselectedClient?: Client | null;
   /** Líneas con las que arranca precargado el pedido (ej. viene del carrito armado en Productos). Solo aplica en modo creación. */
   initialLines?: OrderLine[];
+  /** Prompt 7 — borrador a retomar (desde "Ventas sin terminar"). Solo aplica en modo creación
+   * (punto 5: editar una venta existente nunca genera ni retoma un borrador). */
+  draftToResume?: Draft | null;
 }
 
 const paymentMethodLabels: Record<PaymentMethod, string> = {
@@ -92,7 +97,7 @@ function parseLocalDate(dateStr: string): Date {
   return new Date(year, month - 1, day);
 }
 
-export function NewSaleDialog({ open, onOpenChange, products, existingSale, preselectedClient, initialLines }: NewSaleDialogProps) {
+export function NewSaleDialog({ open, onOpenChange, products, existingSale, preselectedClient, initialLines, draftToResume }: NewSaleDialogProps) {
   const { toast } = useToast();
   const { format } = useHideMoney();
   const isEditMode = !!existingSale;
@@ -154,6 +159,11 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
   const [debouncedClientSearch, setDebouncedClientSearch] = useState("");
   const [createClientOpen, setCreateClientOpen] = useState(false);
 
+  // Prompt 7 — borradores: aviso de 3 botones al cerrar con algo cargado, y el estado de
+  // "este borrador no se pudo retomar" (formato viejo/incompatible, punto 2).
+  const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
+  const [resumeFormatError, setResumeFormatError] = useState(false);
+
   // En modo edición, el stock real ya tiene descontado lo que esta venta reservó — para poder
   // elegir las mismas cantidades (o más) hay que sumárselo de vuelta antes de mostrarlo.
   const effectiveProducts = useMemo(() => {
@@ -164,6 +174,61 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
     if (reserved.size === 0) return products;
     return products.map((p) => (reserved.has(p.id) ? { ...p, unidades: p.unidades + (reserved.get(p.id) as number) } : p));
   }, [products, existingSale]);
+
+  // Prompt 7 — borradores: nunca en modo edición (punto 5: editar una venta existente no
+  // genera borrador). "Algo cargado" (punto 1) es clienta elegida O al menos un producto —
+  // "Completar después" por sí solo no alcanza para crear un borrador vacío.
+  const hasDraftContent = !isEditMode && (client !== null || lines.length > 0);
+  const saleDraftPayload: SaleDraftPayload = useMemo(
+    () => ({
+      formatVersion: 1,
+      step: currentStep,
+      clientId: client?.id ?? null,
+      clientName: client ? client.name?.trim() || client.phone : null,
+      clientSkipped,
+      date: toDateInputValue(date),
+      lines: lines.map((l) => ({
+        productId: l.productId,
+        productName: l.productName,
+        quantity: l.quantity,
+        originalPrice: l.originalPrice,
+        mode: l.mode,
+        adjustmentValue: l.adjustmentValue,
+      })),
+      paymentMethod,
+      installmentsCount,
+      installmentAmounts,
+      paidNow,
+      dueDatePreset,
+      customDueDate: customDueDate ? toDateInputValue(customDueDate) : null,
+      adjustmentsOpen,
+      orderDiscountPct,
+      orderSurchargePct,
+      shippingCharged,
+      shippingCostReal,
+      notes,
+    }),
+    [
+      currentStep,
+      client,
+      clientSkipped,
+      date,
+      lines,
+      paymentMethod,
+      installmentsCount,
+      installmentAmounts,
+      paidNow,
+      dueDatePreset,
+      customDueDate,
+      adjustmentsOpen,
+      orderDiscountPct,
+      orderSurchargePct,
+      shippingCharged,
+      shippingCostReal,
+      notes,
+    ],
+  );
+  const draftAutosave = useDraftAutosave({ type: "sale", enabled: open && hasDraftContent, payload: saleDraftPayload, step: currentStep });
 
   useEffect(() => {
     if (open && existingSale) {
@@ -217,7 +282,7 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
       setShippingCostReal(existingSale.shippingCost ?? null);
       setNotes(existingSale.notes ?? "");
       setDate(parseLocalDate(existingSale.date));
-    } else if (open && !existingSale) {
+    } else if (open && !existingSale && !draftToResume) {
       setStepIndex(0);
       const hasInitialLines = !!initialLines && initialLines.length > 0;
       setProductSubView(hasInitialLines ? "cart" : "category");
@@ -233,7 +298,85 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
       setCustomDueDate(null);
       setAdjustmentsOpen(false);
     }
-  }, [open, existingSale, preselectedClient, initialLines, effectiveProducts]);
+  }, [open, existingSale, draftToResume, preselectedClient, initialLines, effectiveProducts]);
+
+  // Prompt 7, punto 4 — "Retomar" un borrador: abre en el paso donde quedó, con todo lo
+  // cargado. Un producto que ya no existe se saca con un aviso; la clienta se reconfirma en
+  // vivo (si se borró, la venta queda "Sin clienta"); si el formato no es compatible, no
+  // rompe nada — solo muestra el aviso de "no pudimos retomar" (ver el render de abajo).
+  useEffect(() => {
+    if (!open || !draftToResume || existingSale) return;
+
+    const parsed = saleDraftPayloadSchema.safeParse(draftToResume.payload);
+    if (!parsed.success) {
+      setResumeFormatError(true);
+      return;
+    }
+    setResumeFormatError(false);
+    const payload = parsed.data;
+
+    let cancelled = false;
+    (async () => {
+      const keptLines: OrderLine[] = [];
+      for (const line of payload.lines) {
+        const product = effectiveProducts.find((p) => p.id === line.productId);
+        if (!product) {
+          toast({ title: `Quitamos ${line.productName} porque ya no está disponible.` });
+          continue;
+        }
+        keptLines.push({
+          productId: line.productId,
+          productName: product.producto,
+          category: product.seccion,
+          imagen: product.imagen,
+          // Prompt 7, punto 4: una venta conserva el precio que ya tenía cargado.
+          originalPrice: line.originalPrice,
+          quantity: line.quantity,
+          maxQuantity: product.unidades,
+          mode: line.mode,
+          adjustmentValue: line.adjustmentValue,
+        });
+      }
+
+      let resolvedClient: Client | null = null;
+      if (payload.clientId !== null) {
+        try {
+          const res = await apiRequest("GET", `/api/clients/${payload.clientId}`);
+          if (res.ok) resolvedClient = await res.json();
+        } catch {
+          // Tratado igual que "no encontrada" — nunca rompe el resume.
+        }
+      }
+
+      if (cancelled) return;
+
+      const stepIndexInSteps = CREATE_STEPS.indexOf(payload.step);
+      setStepIndex(stepIndexInSteps >= 0 ? stepIndexInSteps : 0);
+      setProductSubView(keptLines.length > 0 ? "cart" : "category");
+      setLines(keptLines);
+      setClient(resolvedClient);
+      setClientSkipped(payload.clientSkipped);
+      setDate(parseLocalDate(payload.date));
+      setPaymentMethod(payload.paymentMethod);
+      setInstallmentsCount(payload.installmentsCount);
+      setInstallmentAmounts(payload.installmentAmounts);
+      setPaidNow(payload.paidNow);
+      setDueDatePreset(payload.dueDatePreset);
+      setCustomDueDate(payload.customDueDate ? parseLocalDate(payload.customDueDate) : null);
+      setAdjustmentsOpen(payload.adjustmentsOpen);
+      setOrderDiscountPct(payload.orderDiscountPct);
+      setOrderSurchargePct(payload.orderSurchargePct);
+      setShippingCharged(payload.shippingCharged);
+      setShippingCostReal(payload.shippingCostReal);
+      setNotes(payload.notes);
+      draftAutosave.resumeFrom({ id: draftToResume.id, clientDraftId: draftToResume.clientDraftId });
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, draftToResume, existingSale]);
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedClientSearch(clientSearch), 300);
@@ -369,6 +512,9 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
     setProductSubView("category");
     setClientSearch("");
     clientRequestIdRef.current = null;
+    setResumeFormatError(false);
+    setCloseConfirmOpen(false);
+    draftAutosave.reset();
     onOpenChange(false);
   };
 
@@ -381,6 +527,9 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
     queryClient.invalidateQueries({
       predicate: (query) => typeof query.queryKey[0] === "string" && query.queryKey[0].startsWith("/api/reports"),
     });
+    // Prompt 7, punto 2: el servidor ya borró el borrador (si había uno) en la misma
+    // transacción — esto solo refresca "Ventas sin terminar" para que deje de mostrarlo.
+    queryClient.invalidateQueries({ queryKey: ["/api/drafts", "sale"] });
     if (existingSale) {
       queryClient.invalidateQueries({ queryKey: ["/api/sales", existingSale.id] });
     }
@@ -421,6 +570,9 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
         firstDueDate: needsFirstDueDate ? resolvedFirstDueDate ?? undefined : undefined,
         notes: notes.trim() ? notes.trim() : undefined,
         clientRequestId: getOrCreateClientRequestId(),
+        // Prompt 7, punto 2: si esta venta nació de un borrador retomado, se borra en la
+        // MISMA operación que la crea.
+        draftId: draftAutosave.draftId ?? undefined,
       };
       const res = await apiRequest("POST", "/api/sales", payload);
       return res.json();
@@ -491,12 +643,52 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
   const productsLine = lines.map((l) => `${l.productName}${l.quantity > 1 ? ` x${l.quantity}` : ""}`).join(", ");
 
   return (
-    <Dialog open={open} onOpenChange={(next) => (next ? onOpenChange(next) : resetAndClose())}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (next) {
+          onOpenChange(next);
+          return;
+        }
+        // Prompt 7, punto 2: con algo cargado, preguntar antes de cerrar — sin nada cargado
+        // (o en edición, que nunca genera borrador), se cierra directo como siempre.
+        if (hasDraftContent) {
+          setCloseConfirmOpen(true);
+          return;
+        }
+        resetAndClose();
+      }}
+    >
       <DialogContent className="flex max-w-lg flex-col gap-3" data-testid="dialog-new-sale">
         <DialogHeader>
           <DialogTitle>{isEditMode ? "Editar venta" : "Nueva venta"}</DialogTitle>
         </DialogHeader>
 
+        {resumeFormatError ? (
+          // Prompt 7, punto 2 — borrador con un formato viejo/incompatible: nunca se intenta
+          // adivinar ni completar con defaults, solo se ofrece descartarlo.
+          <div className="space-y-4 py-6 text-center" data-testid="text-resume-format-error">
+            <p className="text-sm text-muted-foreground">No pudimos retomar esta venta sin terminar.</p>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={async () => {
+                // El borrador roto nunca llegó a pasar por resumeFrom() (ver el effect de
+                // resume, que corta antes de eso si el parse falla) — se borra directo por su
+                // id real, no por el que trackea el hook de autoguardado.
+                if (draftToResume) {
+                  await apiRequest("DELETE", `/api/drafts/${draftToResume.id}`);
+                  queryClient.invalidateQueries({ queryKey: ["/api/drafts", "sale"] });
+                }
+                resetAndClose();
+              }}
+              data-testid="button-discard-broken-draft"
+            >
+              Descartar
+            </Button>
+          </div>
+        ) : (
+        <>
         <WizardDots total={steps.length} current={stepIndex} />
 
         <div className="min-h-0 flex-1 space-y-1 overflow-y-auto overscroll-contain px-1 -mx-1">
@@ -1026,6 +1218,8 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
             </Button>
           )}
         </div>
+        </>
+        )}
 
         <EditSaleItemDialog
           open={editingProductId !== null}
@@ -1041,6 +1235,20 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
           client={null}
           onSave={(data) => createClientMutation.mutate(data)}
           isSaving={createClientMutation.isPending}
+        />
+        <UnsavedDraftAlert
+          open={closeConfirmOpen}
+          onKeepEditing={() => setCloseConfirmOpen(false)}
+          onSaveDraft={async () => {
+            setCloseConfirmOpen(false);
+            await draftAutosave.saveNow();
+            resetAndClose();
+          }}
+          onDiscard={async () => {
+            setCloseConfirmOpen(false);
+            await draftAutosave.discardDraft();
+            resetAndClose();
+          }}
         />
       </DialogContent>
     </Dialog>
