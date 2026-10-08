@@ -696,6 +696,26 @@ Cómo verifico que quedó bien:
 - En un celular de 375 px se lee todo sin hacer zoom.
 ```
 
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **Comparación con el período anterior**: si el período está EN CURSO ("Este mes", "Esta
+  semana"), se compara con los mismos días del período anterior equivalente — hoy 8 de
+  octubre → del 1 al 8 de octubre contra del 1 al 8 de septiembre, con el texto
+  "▲ 12% vs. mismos días de septiembre". Si el mes anterior es más corto (31 de marzo contra
+  febrero), se toma hasta su último día real. Los períodos CERRADOS ("El mes pasado",
+  "Últimos 3 meses", "Personalizado") se comparan con el período anterior completo, de la
+  misma duración.
+- **"Te deben hoy"**: todo lo que falta cobrar a HOY (no depende del período elegido),
+  incluidas las cuotas que todavía no vencen, descontando los pagos parciales (`amount_paid`
+  del Prompt 9). Debajo va una línea chica en rojo, "de eso, $ X ya venció", solo si hay algo
+  vencido. El total tiene que coincidir exactamente con lo que suma Clientas con el filtro
+  "Pendiente de pago" — se reusa el mismo cálculo de saldo del Prompt 9, nunca uno nuevo.
+- **"Ganaste"**: se reusa la misma función de ganancia del Prompt 2 (con "≈" si hay costos
+  estimados, Ingresos Brutos incluidos) — no se recalcula de cero.
+- **Qué cuenta y qué no**: las ventas canceladas y los borradores no cuentan en nada de esta
+  pantalla. Las ventas con entrega pendiente SÍ cuentan (la entrega es un estado aparte del
+  pago, no afecta nada de Reportes).
+
 ## Agenda
 
 ### Prompt 12 · Agenda: tipos, eventos automáticos y WhatsApp
