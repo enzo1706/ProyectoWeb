@@ -58,7 +58,7 @@ import {
   computeProductCost,
   computeSaleProfit,
   installmentsSumMatches,
-  computeInstallmentDueDate,
+  buildInstallmentPlans,
   computeHistoricalProductCost,
   computeWeightedDiscountPercent,
   DEFAULT_HABITUAL_DISCOUNT_PERCENT,
@@ -200,7 +200,11 @@ function saleRequestMatchesExisting(
   >,
   existingItems: { productId: number | null; quantity: number; price: number }[],
 ): boolean {
-  if (existing.clientId !== input.clientId) return false;
+  // Prompt 6: clientId ahora es opcional en el input ("Completar después") — se normaliza
+  // contra `null` (lo que queda persistido en la venta sin clienta) para no tratar
+  // `undefined !== null` como "es una operación distinta" cuando en realidad las dos
+  // representan "sin clienta".
+  if ((existing.clientId ?? null) !== (input.clientId ?? null)) return false;
   if (existing.date !== input.date) return false;
   if (existing.paymentMethod !== input.paymentMethod) return false;
   if ((existing.orderDiscountType ?? null) !== (input.orderDiscount?.type ?? null)) return false;
@@ -429,6 +433,15 @@ export interface SaleWithItemCount extends Sale {
   // Prompt 2: true si alguna línea de esta venta tiene costo estimado — Ventas/Reportes lo
   // muestran con "≈" junto a la ganancia (otra tarea de UI).
   hasEstimatedCost: boolean;
+  // Prompt 6: estado de pago derivado de sale_installments, calculado acá (un solo query
+  // agregado, mismo patrón que itemCount) para que la lista de Ventas pueda mostrar
+  // "Cobrada"/"Te debe $X" y filtrar por eso sin un fetch por venta (evita N+1). "cobrada"
+  // = no queda ninguna cuota pendiente (incluye el caso tarjeta, que siempre crea una sola
+  // cuota ya pagada) — nunca se guarda en la base, se recalcula cada vez a partir de las
+  // cuotas reales, así nunca puede quedar desincronizado.
+  paymentStatus: "cobrada" | "te_debe";
+  pendingAmount: number;
+  nextDueDate: string | null;
 }
 
 export interface SaleWithDetails extends Sale {
@@ -831,6 +844,12 @@ export interface IStorage {
   updateSale(consultantId: number, id: number, input: UpdateSaleInput): Promise<Sale | undefined>;
   cancelSale(consultantId: number, id: number): Promise<Sale | undefined>;
   updateInstallmentStatus(consultantId: number, saleId: number, installmentId: number, status: "pendiente" | "pagado"): Promise<SaleInstallment | undefined>;
+  /** Prompt 6, punto 6 — cambiar a mano entre "entregada" y "pendiente_entrega" desde el
+   * detalle de la venta. Independiente del pago: no toca sale_installments ni status. */
+  setSaleDeliveryStatus(consultantId: number, saleId: number, deliveryStatus: "entregada" | "pendiente_entrega"): Promise<Sale | undefined>;
+  /** Prompt 6, punto 1 — asigna una clienta a una venta creada sin una ("Sin clienta"). Solo
+   * de `null` a una clienta real. */
+  assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined>;
   getSalesSummary(consultantId: number, start: string, end: string, groupBy?: ReportGroupBy): Promise<SalesSummaryPoint[]>;
   getTopCategories(consultantId: number, start?: string, end?: string): Promise<TopCategory[]>;
   getSalesByPaymentMethod(consultantId: number, start?: string, end?: string): Promise<PaymentMethodBreakdown[]>;
@@ -3045,11 +3064,33 @@ export class DatabaseStorage implements IStorage {
       .groupBy(saleItems.saleId);
     const countsBySale = new Map(counts.map((c) => [c.saleId, c]));
 
-    return salesRows.map((s) => ({
-      ...s,
-      itemCount: countsBySale.get(s.id)?.itemCount ?? 0,
-      hasEstimatedCost: countsBySale.get(s.id)?.hasEstimatedCost ?? false,
-    }));
+    // Prompt 6: agregado de cuotas pendientes — mismo patrón que arriba (un solo query extra,
+    // nunca un fetch por venta).
+    const pendingAgg = await db
+      .select({
+        saleId: saleInstallments.saleId,
+        pendingAmount: sql<number>`coalesce(sum(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.amount} else 0 end), 0)`,
+        nextDueDate: sql<string | null>`min(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.dueDate} end)`,
+      })
+      .from(saleInstallments)
+      .where(inArray(saleInstallments.saleId, saleIds))
+      .groupBy(saleInstallments.saleId);
+    const pendingBySale = new Map(pendingAgg.map((p) => [p.saleId, p]));
+
+    return salesRows.map((s) => {
+      // Una venta cancelada no le debe nada a nadie — mismo criterio que
+      // getCollectedPayments/getPendingInstallmentsTotals, que ya excluyen "cancelada" de
+      // cualquier total pendiente/cobrado real.
+      const pendingAmount = s.status === "cancelada" ? 0 : Number(pendingBySale.get(s.id)?.pendingAmount ?? 0);
+      return {
+        ...s,
+        itemCount: countsBySale.get(s.id)?.itemCount ?? 0,
+        hasEstimatedCost: countsBySale.get(s.id)?.hasEstimatedCost ?? false,
+        paymentStatus: pendingAmount > 0 ? "te_debe" : "cobrada",
+        pendingAmount,
+        nextDueDate: s.status === "cancelada" ? null : pendingBySale.get(s.id)?.nextDueDate ?? null,
+      };
+    });
   }
 
   async getSaleDetails(consultantId: number, id: number): Promise<SaleWithDetails | undefined> {
@@ -3114,12 +3155,21 @@ export class DatabaseStorage implements IStorage {
       .where(and(inArray(products.id, productIds), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
     const catalogById = new Map(catalogRows.map((p) => [p.id, p]));
 
-    const [client] = await db
-      .select()
-      .from(clients)
-      .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
-    if (!client) throw new SaleValidationError("Clienta no encontrada");
-    const clientName = client.name ?? client.phone;
+    // Prompt 6: clienta opcional ("Completar después") — sin input.clientId, la venta se
+    // guarda con client_id NULL (la columna ya lo permite) y un nombre fijo "Sin clienta". Si
+    // mandan un clientId, tiene que existir — mismo criterio que siempre.
+    let client: Client | undefined;
+    let clientName: string;
+    if (input.clientId !== undefined) {
+      [client] = await db
+        .select()
+        .from(clients)
+        .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
+      if (!client) throw new SaleValidationError("Clienta no encontrada");
+      clientName = client.name ?? client.phone;
+    } else {
+      clientName = "Sin clienta";
+    }
 
     // Prompt 2: costo estimado (cuando el producto no tiene costPrice) y el % de IIBB vigente
     // se resuelven ANTES de la transacción — son lecturas de otras tablas, no de productStock,
@@ -3189,6 +3239,23 @@ export class DatabaseStorage implements IStorage {
         throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
       }
 
+      // Prompt 6: sin `paidNow` (compatibilidad), se preserva el comportamiento de siempre —
+      // cuota pendiente con vencimiento en la fecha de la venta. Con tarjeta `firstDueDate` no
+      // se usa (buildInstallmentPlans cobra todo en una sola cuota igual).
+      const paidNow = input.paidNow ?? false;
+      const firstDueDate = paidNow ? null : input.firstDueDate ?? input.date;
+      const installmentPlans = buildInstallmentPlans({
+        amounts: installmentAmounts,
+        saleDate: input.date,
+        paymentMethod: input.paymentMethod,
+        paidNow,
+        firstDueDate,
+      });
+      // Prompt 6: una venta con algo pendiente de cobro necesita una clienta a quien reclamarle.
+      if (client === undefined && installmentPlans.some((p) => p.status === "pendiente")) {
+        throw new SaleValidationError("Para dejar una venta pendiente de cobro tenés que elegir la clienta");
+      }
+
       // Prompt 2: costo de mercadería SIEMPRE real o explícitamente estimado — nunca más el
       // precio de venta como sustituto (costPrice ya viene resuelto de arriba, nunca null).
       const productCost = computeProductCost(lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice })));
@@ -3214,7 +3281,7 @@ export class DatabaseStorage implements IStorage {
           .insert(sales)
           .values({
             consultantId,
-            clientId: client.id,
+            clientId: client?.id ?? null,
             clientName,
             date: input.date,
             subtotal,
@@ -3229,9 +3296,14 @@ export class DatabaseStorage implements IStorage {
             total: totals.total,
             profit,
             paymentMethod: input.paymentMethod,
+            // Prompt 6: con tarjeta esto es solo informativo (la cuenta real con el banco) —
+            // sale_installments siempre tiene una sola fila pagada en ese caso, ver abajo.
             installmentsCount: input.installments.length,
             installmentFrequency: input.installments.length > 1 ? input.installmentFrequency ?? null : null,
-            status: input.status,
+            // Prompt 6: único valor real que se escribe hoy en creación — "entregado"/"pagado"
+            // quedaron retirados (ver comentario en shared/schema.ts).
+            status: "pendiente",
+            deliveryStatus: "entregada",
             notes: input.notes ?? null,
             clientRequestId: input.clientRequestId ?? null,
           })
@@ -3260,12 +3332,12 @@ export class DatabaseStorage implements IStorage {
       );
 
       await tx.insert(saleInstallments).values(
-        installmentAmounts.map((amount, index) => ({
+        installmentPlans.map((plan, index) => ({
           saleId: sale.id,
           installmentNumber: index + 1,
-          amount,
-          dueDate: computeInstallmentDueDate(input.date, input.installmentFrequency, index),
-          status: "pendiente",
+          amount: plan.amount,
+          dueDate: plan.dueDate,
+          status: plan.status,
         })),
       );
 
@@ -3327,24 +3399,23 @@ export class DatabaseStorage implements IStorage {
         throw new SaleValidationError("No se puede editar una venta cancelada");
       }
 
-      // Etapa I-B.7-B: una venta con al menos una cuota ya cobrada no puede editarse — el
-      // flujo de abajo borra y recrea TODAS las cuotas como "pendiente", así que editar sin
-      // este chequeo resetearía en silencio dinero que ya se registró como cobrado (hallazgo
-      // P0 de la auditoría I-B.7-A). `FOR UPDATE` acá, no un SELECT simple: cierra la ventana
-      // donde `updateInstallmentStatus` marca una cuota "pagado" justo en el medio de esta
-      // transacción — esa marca, al no tener transacción propia, queda bloqueada por este
-      // lock hasta que esta transacción termine; si terminamos viendo 0 cuotas pagadas y
-      // seguimos, el UPDATE de esa marca (cuando se desbloquea) ya no encuentra la fila vieja
-      // (fue borrada y reemplazada) y no tiene efecto — nunca un "pagado" que se pierde en
-      // silencio con una respuesta 200 exitosa, que es lo que pasa hoy sin este lock.
+      // Prompt 6 — "edición inteligente": una cuota ya cobrada se preserva tal cual (nunca se
+      // borra ni se re-crea, nunca pierde su estado ni su fecha de pago). Solo se recalculan
+      // las cuotas que seguían pendientes, sobre el saldo que falta después de lo ya cobrado.
+      // Antes de esta etapa, cualquier cuota pagada bloqueaba la edición ENTERA (Etapa
+      // I-B.7-B) — eso dejó de ser viable en la práctica: con "paga en el momento" (Prompt 6),
+      // la mayoría de las ventas nuevas tienen su primera cuota pagada desde el instante de la
+      // creación. `FOR UPDATE` acá, no un SELECT simple: cierra la ventana donde
+      // `updateInstallmentStatus` marca una cuota "pagado" justo en el medio de esta
+      // transacción — ver Etapa I-B.7-B para el detalle de esa carrera, que sigue protegida
+      // igual: las cuotas pagadas (bajo este lock) nunca se tocan más abajo.
       const existingInstallments = await tx
         .select()
         .from(saleInstallments)
         .where(eq(saleInstallments.saleId, id))
         .for("update");
-      if (existingInstallments.some((i) => i.status === "pagado")) {
-        throw new SaleValidationError("No se puede editar una venta que tiene cuotas pagadas.");
-      }
+      const paidInstallments = existingInstallments.filter((i) => i.status === "pagado");
+      const alreadyPaidAmount = paidInstallments.reduce((sum, i) => sum + i.amount, 0);
 
       const existingItems = await tx.select().from(saleItems).where(eq(saleItems.saleId, id));
 
@@ -3428,9 +3499,31 @@ export class DatabaseStorage implements IStorage {
         shippingCharged: input.shippingCharged ?? null,
       });
 
+      // Prompt 6: `input.installments` describe el SALDO que falta — no el total de la venta
+      // — cuando ya se cobró algo antes de esta edición. El total nuevo nunca puede quedar
+      // por debajo de lo ya cobrado (bajarlo ahí sería borrar un cobro real).
       const installmentAmounts = input.installments.map((i) => i.amount);
-      if (!installmentsSumMatches(installmentAmounts, totals.total)) {
-        throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
+      const remainingTotal = totals.total - alreadyPaidAmount;
+      if (remainingTotal < 0) {
+        throw new SaleValidationError(`El nuevo total no puede ser menor que lo que ya se cobró (${alreadyPaidAmount})`);
+      }
+      if (!installmentsSumMatches(installmentAmounts, remainingTotal)) {
+        throw new SaleValidationError("La suma de las cuotas no coincide con el saldo pendiente de la venta");
+      }
+
+      const paidNow = input.paidNow ?? false;
+      const firstDueDate = paidNow ? null : input.firstDueDate ?? existingSale.date;
+      // Solo describe las cuotas NUEVAS (el saldo pendiente) — las ya cobradas, arriba, no
+      // pasan por acá nunca.
+      const installmentPlans = buildInstallmentPlans({
+        amounts: installmentAmounts,
+        saleDate: existingSale.date,
+        paymentMethod: input.paymentMethod,
+        paidNow,
+        firstDueDate,
+      }).filter((plan) => plan.amount > 0); // saldo pendiente en $0: no hay cuota nueva que crear
+      if (existingSale.clientId === null && installmentPlans.some((p) => p.status === "pendiente")) {
+        throw new SaleValidationError("Para dejar una venta pendiente de cobro tenés que elegir la clienta");
       }
 
       // Prompt 2: misma fórmula que createSale — total autoritativo menos costo real/estimado
@@ -3454,7 +3547,9 @@ export class DatabaseStorage implements IStorage {
       }
 
       await tx.delete(saleItems).where(eq(saleItems.saleId, id));
-      await tx.delete(saleInstallments).where(eq(saleInstallments.saleId, id));
+      // Prompt 6: solo se borran las cuotas que seguían PENDIENTES — las ya cobradas (arriba)
+      // quedan intactas, con su mismo id, status y dueDate (su fecha de pago).
+      await tx.delete(saleInstallments).where(and(eq(saleInstallments.saleId, id), eq(saleInstallments.status, "pendiente")));
 
       await tx.insert(saleItems).values(
         lines.map((l) => ({
@@ -3474,15 +3569,22 @@ export class DatabaseStorage implements IStorage {
         })),
       );
 
-      await tx.insert(saleInstallments).values(
-        installmentAmounts.map((amount, index) => ({
-          saleId: id,
-          installmentNumber: index + 1,
-          amount,
-          dueDate: computeInstallmentDueDate(existingSale.date, input.installmentFrequency, index),
-          status: "pendiente",
-        })),
-      );
+      if (installmentPlans.length > 0) {
+        await tx.insert(saleInstallments).values(
+          // El número sigue después de las cuotas ya cobradas (que conservan el suyo).
+          installmentPlans.map((plan, index) => ({
+            saleId: id,
+            installmentNumber: paidInstallments.length + index + 1,
+            amount: plan.amount,
+            dueDate: plan.dueDate,
+            status: plan.status,
+          })),
+        );
+      }
+
+      // Prompt 6: cuántas cuotas tiene la venta en total (ya cobradas + nuevas) — con tarjeta
+      // esto es solo informativo, igual que en createSale (una sola fila real se crea arriba).
+      const installmentsCount = paidInstallments.length + installmentAmounts.filter((a) => a > 0).length;
 
       const [updated] = await tx
         .update(sales)
@@ -3499,8 +3601,8 @@ export class DatabaseStorage implements IStorage {
           total: totals.total,
           profit,
           paymentMethod: input.paymentMethod,
-          installmentsCount: installmentAmounts.length,
-          installmentFrequency: installmentAmounts.length > 1 ? input.installmentFrequency ?? null : null,
+          installmentsCount,
+          installmentFrequency: installmentsCount > 1 ? input.installmentFrequency ?? null : null,
           notes: input.notes ?? null,
         })
         .where(and(eq(sales.id, id), eq(sales.consultantId, consultantId)))
@@ -3602,6 +3704,41 @@ export class DatabaseStorage implements IStorage {
         .returning();
       return updated;
     });
+  }
+
+  async setSaleDeliveryStatus(consultantId: number, saleId: number, deliveryStatus: "entregada" | "pendiente_entrega"): Promise<Sale | undefined> {
+    const db = await this.getDb();
+    const [sale] = await db.select().from(sales).where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)));
+    if (!sale) return undefined;
+    if (sale.status === "cancelada") {
+      throw new SaleValidationError("No se puede cambiar la entrega de una venta cancelada");
+    }
+    const [updated] = await db
+      .update(sales)
+      .set({ deliveryStatus })
+      .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+      .returning();
+    return updated;
+  }
+
+  /** Prompt 6, punto 1 — "Completar después": asigna una clienta a una venta que se creó sin
+   * una ("Sin clienta"). Solo de `null` a una clienta real — nunca reemplaza una ya asignada
+   * (para eso no hace falta este endpoint, la clienta no es editable por otra vía a propósito). */
+  async assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined> {
+    const db = await this.getDb();
+    const [sale] = await db.select().from(sales).where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)));
+    if (!sale) return undefined;
+    if (sale.clientId !== null) {
+      throw new SaleValidationError("Esta venta ya tiene una clienta asignada");
+    }
+    const [client] = await db.select().from(clients).where(and(eq(clients.id, clientId), eq(clients.consultantId, consultantId)));
+    if (!client) throw new SaleValidationError("Clienta no encontrada");
+    const [updated] = await db
+      .update(sales)
+      .set({ clientId: client.id, clientName: client.name ?? client.phone })
+      .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+      .returning();
+    return updated;
   }
 
 }
@@ -5241,10 +5378,19 @@ export class MemoryStorage implements IStorage {
       .sort((a, b) => (a.date === b.date ? b.id - a.id : b.date.localeCompare(a.date)))
       .map((s) => {
         const items = this.saleItems.filter((i) => i.saleId === s.id);
+        // Prompt 6: mismo criterio que DatabaseStorage.getAllSales — cancelada nunca debe nada.
+        const pendingInstallments = s.status === "cancelada" ? [] : this.saleInstallments.filter((i) => i.saleId === s.id && i.status === "pendiente");
+        const pendingAmount = pendingInstallments.reduce((sum, i) => sum + i.amount, 0);
+        const nextDueDate = pendingInstallments.length > 0
+          ? pendingInstallments.map((i) => i.dueDate).sort()[0]
+          : null;
         return {
           ...s,
           itemCount: items.reduce((sum, i) => sum + i.quantity, 0),
           hasEstimatedCost: items.some((i) => i.costIsEstimated === true || i.costPrice === null),
+          paymentStatus: pendingAmount > 0 ? "te_debe" : "cobrada",
+          pendingAmount,
+          nextDueDate,
         };
       });
   }
@@ -5323,9 +5469,30 @@ export class MemoryStorage implements IStorage {
       throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
     }
 
-    const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
-    if (!client) throw new SaleValidationError("Clienta no encontrada");
-    const clientName = client.name ?? client.phone;
+    // Prompt 6: clienta opcional ("Completar después") — mismo criterio que DatabaseStorage.
+    let client: Client | undefined;
+    let clientName: string;
+    if (input.clientId !== undefined) {
+      client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
+      if (!client) throw new SaleValidationError("Clienta no encontrada");
+      clientName = client.name ?? client.phone;
+    } else {
+      clientName = "Sin clienta";
+    }
+
+    // Prompt 6: mismo criterio que DatabaseStorage.createSale.
+    const paidNow = input.paidNow ?? false;
+    const firstDueDate = paidNow ? null : input.firstDueDate ?? input.date;
+    const installmentPlans = buildInstallmentPlans({
+      amounts: installmentAmounts,
+      saleDate: input.date,
+      paymentMethod: input.paymentMethod,
+      paidNow,
+      firstDueDate,
+    });
+    if (client === undefined && installmentPlans.some((p) => p.status === "pendiente")) {
+      throw new SaleValidationError("Para dejar una venta pendiente de cobro tenés que elegir la clienta");
+    }
 
     // Prompt 2: costo siempre real o explícitamente estimado — ver shared/saleCalculations.ts.
     const productCost = computeProductCost(lines.map((l) => ({ quantity: l.quantity, costPrice: l.costPrice })));
@@ -5342,7 +5509,7 @@ export class MemoryStorage implements IStorage {
     const sale: Sale = {
       id: this.nextSaleId++,
       consultantId,
-      clientId: client.id,
+      clientId: client?.id ?? null,
       clientName,
       date: input.date,
       subtotal,
@@ -5359,7 +5526,8 @@ export class MemoryStorage implements IStorage {
       paymentMethod: input.paymentMethod,
       installmentsCount: input.installments.length,
       installmentFrequency: input.installments.length > 1 ? input.installmentFrequency ?? null : null,
-      status: input.status,
+      status: "pendiente",
+      deliveryStatus: "entregada",
       notes: input.notes ?? null,
       clientRequestId: input.clientRequestId ?? null,
     };
@@ -5383,14 +5551,14 @@ export class MemoryStorage implements IStorage {
       stock.unidades -= line.quantity;
     }
 
-    installmentAmounts.forEach((amount, index) => {
+    installmentPlans.forEach((plan, index) => {
       this.saleInstallments.push({
         id: this.nextSaleInstallmentId++,
         saleId: sale.id,
         installmentNumber: index + 1,
-        amount,
-        dueDate: computeInstallmentDueDate(input.date, input.installmentFrequency, index),
-        status: "pendiente",
+        amount: plan.amount,
+        dueDate: plan.dueDate,
+        status: plan.status,
       });
     });
 
@@ -5404,16 +5572,13 @@ export class MemoryStorage implements IStorage {
       throw new SaleValidationError("No se puede editar una venta cancelada");
     }
 
-    // Etapa I-B.7-B: misma regla que DatabaseStorage — una venta con al menos una cuota ya
-    // cobrada no puede editarse (el flujo de abajo reemplaza todas las cuotas por
-    // "pendiente"). Sin lock especial: no hay ningún `await` entre este chequeo y las
-    // mutaciones de más abajo, así que no existe ventana de interleaving posible (Node es
-    // single-threaded) — el mismo motivo por el que `createSale`/`cancelSale` en memoria
-    // tampoco necesitan uno.
+    // Prompt 6 — "edición inteligente": mismo criterio que DatabaseStorage.updateSale. Una
+    // cuota ya cobrada se preserva tal cual; solo se recalculan las que seguían pendientes,
+    // sobre el saldo que falta después de lo ya cobrado. Sin lock especial: no hay ningún
+    // `await` entre este chequeo y las mutaciones de más abajo (Node es single-threaded).
     const existingInstallments = this.saleInstallments.filter((i) => i.saleId === id);
-    if (existingInstallments.some((i) => i.status === "pagado")) {
-      throw new SaleValidationError("No se puede editar una venta que tiene cuotas pagadas.");
-    }
+    const paidInstallments = existingInstallments.filter((i) => i.status === "pagado");
+    const alreadyPaidAmount = paidInstallments.reduce((sum, i) => sum + i.amount, 0);
 
     const existingItems = this.saleItems.filter((i) => i.saleId === id);
 
@@ -5472,9 +5637,28 @@ export class MemoryStorage implements IStorage {
       shippingCharged: input.shippingCharged ?? null,
     });
 
+    // Prompt 6: `input.installments` describe el SALDO que falta, no el total de la venta,
+    // cuando ya se cobró algo antes de esta edición.
     const installmentAmounts = input.installments.map((i) => i.amount);
-    if (!installmentsSumMatches(installmentAmounts, totals.total)) {
-      throw new SaleValidationError("La suma de las cuotas no coincide con el total de la venta");
+    const remainingTotal = totals.total - alreadyPaidAmount;
+    if (remainingTotal < 0) {
+      throw new SaleValidationError(`El nuevo total no puede ser menor que lo que ya se cobró (${alreadyPaidAmount})`);
+    }
+    if (!installmentsSumMatches(installmentAmounts, remainingTotal)) {
+      throw new SaleValidationError("La suma de las cuotas no coincide con el saldo pendiente de la venta");
+    }
+
+    const paidNow = input.paidNow ?? false;
+    const firstDueDate = paidNow ? null : input.firstDueDate ?? existingSale.date;
+    const installmentPlans = buildInstallmentPlans({
+      amounts: installmentAmounts,
+      saleDate: existingSale.date,
+      paymentMethod: input.paymentMethod,
+      paidNow,
+      firstDueDate,
+    }).filter((plan) => plan.amount > 0);
+    if (existingSale.clientId === null && installmentPlans.some((p) => p.status === "pendiente")) {
+      throw new SaleValidationError("Para dejar una venta pendiente de cobro tenés que elegir la clienta");
     }
 
     // Prompt 2: misma fórmula que DatabaseStorage.updateSale.
@@ -5496,7 +5680,8 @@ export class MemoryStorage implements IStorage {
     });
 
     this.saleItems = this.saleItems.filter((i) => i.saleId !== id);
-    this.saleInstallments = this.saleInstallments.filter((i) => i.saleId !== id);
+    // Prompt 6: solo se borran las cuotas PENDIENTES — las ya cobradas quedan intactas.
+    this.saleInstallments = this.saleInstallments.filter((i) => i.saleId !== id || i.status === "pagado");
 
     for (const line of lines) {
       this.saleItems.push({
@@ -5515,14 +5700,14 @@ export class MemoryStorage implements IStorage {
       });
     }
 
-    installmentAmounts.forEach((amount, index) => {
+    installmentPlans.forEach((plan, index) => {
       this.saleInstallments.push({
         id: this.nextSaleInstallmentId++,
         saleId: id,
-        installmentNumber: index + 1,
-        amount,
-        dueDate: computeInstallmentDueDate(existingSale.date, input.installmentFrequency, index),
-        status: "pendiente",
+        installmentNumber: paidInstallments.length + index + 1,
+        amount: plan.amount,
+        dueDate: plan.dueDate,
+        status: plan.status,
       });
     });
 
@@ -5538,8 +5723,10 @@ export class MemoryStorage implements IStorage {
     existingSale.total = totals.total;
     existingSale.profit = profit;
     existingSale.paymentMethod = input.paymentMethod;
-    existingSale.installmentsCount = installmentAmounts.length;
-    existingSale.installmentFrequency = installmentAmounts.length > 1 ? input.installmentFrequency ?? null : null;
+    // Prompt 6: ya cobradas + nuevas — mismo criterio que DatabaseStorage.updateSale.
+    const installmentsCount = paidInstallments.length + installmentAmounts.filter((a) => a > 0).length;
+    existingSale.installmentsCount = installmentsCount;
+    existingSale.installmentFrequency = installmentsCount > 1 ? input.installmentFrequency ?? null : null;
     existingSale.notes = input.notes ?? null;
 
     return existingSale;
@@ -5576,6 +5763,29 @@ export class MemoryStorage implements IStorage {
 
     installment.status = status;
     return installment;
+  }
+
+  async setSaleDeliveryStatus(consultantId: number, saleId: number, deliveryStatus: "entregada" | "pendiente_entrega"): Promise<Sale | undefined> {
+    const sale = this.sales.find((s) => s.id === saleId && s.consultantId === consultantId);
+    if (!sale) return undefined;
+    if (sale.status === "cancelada") {
+      throw new SaleValidationError("No se puede cambiar la entrega de una venta cancelada");
+    }
+    sale.deliveryStatus = deliveryStatus;
+    return sale;
+  }
+
+  async assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined> {
+    const sale = this.sales.find((s) => s.id === saleId && s.consultantId === consultantId);
+    if (!sale) return undefined;
+    if (sale.clientId !== null) {
+      throw new SaleValidationError("Esta venta ya tiene una clienta asignada");
+    }
+    const client = this.clients.find((c) => c.id === clientId && c.consultantId === consultantId);
+    if (!client) throw new SaleValidationError("Clienta no encontrada");
+    sale.clientId = client.id;
+    sale.clientName = client.name ?? client.phone;
+    return sale;
   }
 
 }

@@ -20,11 +20,15 @@ const mockSale: Sale = {
   paymentMethod: "efectivo",
   installmentsCount: 1,
   installmentFrequency: null,
-  status: "pagado",
+  status: "pendiente",
+  deliveryStatus: "entregada",
   notes: null,
   clientRequestId: null,
   itemCount: 3,
   hasEstimatedCost: false,
+  paymentStatus: "te_debe",
+  pendingAmount: 10100,
+  nextDueDate: "2025-12-05",
 };
 
 export default function SaleCardExample() {

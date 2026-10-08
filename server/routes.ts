@@ -22,6 +22,8 @@ import {
   createSaleSchema,
   updateSaleSchema,
   updateInstallmentStatusSchema,
+  updateSaleDeliveryStatusSchema,
+  assignSaleClientSchema,
   createAppointmentSchema,
   updateAppointmentSchema,
   updateAppointmentStatusSchema,
@@ -1353,6 +1355,58 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       console.error(error);
       res.status(500).json({ error: "Error al actualizar la cuota" });
+    }
+  });
+
+  app.patch("/api/sales/:id/delivery-status", async (req: Request, res: Response) => {
+    try {
+      const saleId = parseInt(req.params.id, 10);
+      if (isNaN(saleId)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const parsed = updateSaleDeliveryStatusSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const updated = await storage.setSaleDeliveryStatus(req.consultantId!, saleId, parsed.data.deliveryStatus);
+      if (!updated) {
+        return res.status(404).json({ error: "Venta no encontrada" });
+      }
+      res.json(updated);
+    } catch (error) {
+      if (error instanceof SaleValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar la entrega" });
+    }
+  });
+
+  app.patch("/api/sales/:id/client", async (req: Request, res: Response) => {
+    try {
+      const saleId = parseInt(req.params.id, 10);
+      if (isNaN(saleId)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const parsed = assignSaleClientSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const updated = await storage.assignSaleClient(req.consultantId!, saleId, parsed.data.clientId);
+      if (!updated) {
+        return res.status(404).json({ error: "Venta no encontrada" });
+      }
+      res.json(updated);
+    } catch (error) {
+      if (error instanceof SaleValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error(error);
+      res.status(500).json({ error: "Error al asignar la clienta" });
     }
   });
 

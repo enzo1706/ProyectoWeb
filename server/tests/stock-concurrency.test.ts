@@ -326,8 +326,12 @@ describe("Idempotencia bajo concurrencia real (clientRequestId, Etapa I-B.6)", (
   });
 });
 
-describe("Protección de cuotas pagadas al editar (Etapa I-B.7-B)", () => {
-  it("venta con una cuota pagada -> updateSale la rechaza, installments/items/stock quedan intactos", async () => {
+// Prompt 6 — "edición inteligente": antes de esta etapa, CUALQUIER cuota pagada bloqueaba la
+// edición entera (Etapa I-B.7-B). De acá en más, una cuota ya cobrada se preserva tal cual
+// (mismo id, status y dueDate) y solo se recalculan las que seguían pendientes, sobre el
+// saldo que falta — `installments` en el input describe ESE saldo, no el total de la venta.
+describe("Edición con cuotas ya pagadas, contra Postgres real (Prompt 6)", () => {
+  it("venta con una cuota pagada: el saldo pendiente real (no el total) habilita la edición; installments/stock se actualizan, la cuota pagada no se toca", async () => {
     const sale = await storage.createSale(testConsultantId, {
       clientId: testClientId,
       date: "2026-01-01",
@@ -341,11 +345,14 @@ describe("Protección de cuotas pagadas al editar (Etapa I-B.7-B)", () => {
 
     const allInstallments = await db.select().from(saleInstallments).where(eq(saleInstallments.saleId, sale.id));
     const firstInstallment = allInstallments.find((i) => i.installmentNumber === 1)!;
+    const paidDueDate = firstInstallment.dueDate;
     await storage.updateInstallmentStatus(testConsultantId, sale.id, firstInstallment.id, "pagado");
 
-    const itemsBefore = await db.select().from(saleItems).where(eq(saleItems.saleId, sale.id));
     const [stockBeforePatch] = await db.select().from(productStock).where(eq(productStock.productId, idempotencyProductId));
 
+    // Mandar el total completo (1000) como si nada se hubiera cobrado NO coincide con el
+    // saldo pendiente real (0, ya se cobró esa misma cantidad) — se rechaza por eso, no por
+    // tener una cuota pagada.
     await expect(
       storage.updateSale(testConsultantId, sale.id, {
         items: [{ productId: idempotencyProductId, quantity: 1 }],
@@ -354,21 +361,30 @@ describe("Protección de cuotas pagadas al editar (Etapa I-B.7-B)", () => {
         paymentMethod: "efectivo",
         installments: [{ amount: 1000 }],
       }),
-    ).rejects.toThrow(/cuotas pagadas/i);
+    ).rejects.toThrow(/saldo pendiente/i);
 
-    // installments: exactamente las mismas filas (mismos IDs), el pago sigue ahí.
+    // Con el saldo pendiente correcto ($0, porque la quantity:1 también deja el total en 1000,
+    // igual a lo ya cobrado), la edición se aplica de verdad.
+    const updated = await storage.updateSale(testConsultantId, sale.id, {
+      items: [{ productId: idempotencyProductId, quantity: 1 }],
+      orderDiscount: null,
+      orderSurcharge: null,
+      paymentMethod: "efectivo",
+      installments: [{ amount: 0 }],
+    });
+    expect(updated?.total).toBe(1000);
+
+    // installments: la cuota pagada sigue siendo la MISMA fila (mismo id, status y fecha de
+    // pago) — nunca se borró ni se recreó. La que estaba pendiente desaparece (saldo $0).
     const installmentsAfter = await db.select().from(saleInstallments).where(eq(saleInstallments.saleId, sale.id));
-    expect(installmentsAfter).toHaveLength(2);
-    expect(installmentsAfter.find((i) => i.id === firstInstallment.id)?.status).toBe("pagado");
-    expect(installmentsAfter.find((i) => i.installmentNumber === 2)?.status).toBe("pendiente");
+    expect(installmentsAfter).toHaveLength(1);
+    expect(installmentsAfter[0].id).toBe(firstInstallment.id);
+    expect(installmentsAfter[0].status).toBe("pagado");
+    expect(installmentsAfter[0].dueDate).toBe(paidDueDate);
 
-    // sale_items: sin cambios.
-    const itemsAfter = await db.select().from(saleItems).where(eq(saleItems.saleId, sale.id));
-    expect(itemsAfter).toEqual(itemsBefore);
-
-    // stock: sin cambios (el rechazo ocurre antes de tocar product_stock).
+    // stock: se liberó la unidad que ya no forma parte de la venta editada (de 2 a 1).
     const [stockAfter] = await db.select().from(productStock).where(eq(productStock.productId, idempotencyProductId));
-    expect(stockAfter.unidades).toBe(stockBeforePatch.unidades);
+    expect(stockAfter.unidades).toBe(stockBeforePatch.unidades + 1);
   });
 
   it("venta sin cuotas pagadas -> updateSale sigue funcionando exactamente igual que antes de esta etapa", async () => {
@@ -434,8 +450,12 @@ describe("Protección de cuotas pagadas al editar (Etapa I-B.7-B)", () => {
     if (editSucceeded) {
       expect(installmentSucceeded).toBe(false);
     } else {
+      // Prompt 6: si el pago ganó el lock primero, la edición ve la cuota ya pagada y el
+      // saldo pendiente real pasa a ser $0 — pero el input de este test sigue mandando el
+      // total completo (1000) como si nada se hubiera cobrado, así que no coincide y se
+      // rechaza por eso (ya no por una regla de "cualquier cuota pagada bloquea todo").
       expect((editResult as PromiseRejectedResult).reason).toBeInstanceOf(SaleValidationError);
-      expect((editResult as PromiseRejectedResult).reason.message).toMatch(/cuotas pagadas/i);
+      expect((editResult as PromiseRejectedResult).reason.message).toMatch(/saldo pendiente/i);
     }
   });
 });
@@ -602,12 +622,12 @@ describe("Concurrencia de cancelación/cuotas/edición (Etapa I-B.7-C)", () => {
     // etapa), el resultado es determinístico según quién gane ese lock primero — nunca los
     // dos "ganan" de forma incoherente.
     if (installmentSucceeded) {
-      // El pago ganó el lock primero y committeó mientras la venta seguía sin cuotas
-      // pagadas -> la edición, al tomar el lock después, ve la cuota ya pagada (I-B.7-B) y
-      // se rechaza.
+      // Prompt 6: el pago ganó el lock primero -> la edición, al tomar el lock después, ve
+      // la cuota ya pagada y el saldo pendiente real pasa a ser $0 — pero el input sigue
+      // mandando el total completo (1000), que ya no coincide, así que se rechaza por eso.
       expect(updateSucceeded).toBe(false);
       expect((updateResult as PromiseRejectedResult).reason).toBeInstanceOf(SaleValidationError);
-      expect((updateResult as PromiseRejectedResult).reason.message).toMatch(/cuotas pagadas/i);
+      expect((updateResult as PromiseRejectedResult).reason.message).toMatch(/saldo pendiente/i);
     } else if (updateSucceeded) {
       // La edición ganó el lock primero, vio 0 cuotas pagadas y reemplazó las installments
       // -> el intento de pago, al tomar el lock después, busca el `installmentId` viejo, que
@@ -752,20 +772,44 @@ describe("Ganancia (profit) — Etapa I-B.7-D-C, contra Postgres real", () => {
     });
     expect(afterShippingCost?.profit).toBe(550); // 1300 - 600 - 150
 
-    // La regla de I-B.7-B sigue intacta: si esta venta tuviera una cuota pagada, cualquiera
-    // de las ediciones de arriba debería haber sido rechazada — se confirma acá con un caso
-    // real, marcando la única cuota como pagada y reintentando.
+    // Prompt 6 — "edición inteligente": una cuota pagada ya no bloquea la edición entera.
+    // Mandar el total completo (1300) como saldo pendiente no coincide con la realidad (ya
+    // se cobró esa misma cantidad, el saldo pendiente real es $0) y se rechaza por eso.
     const [installment] = await db.select().from(saleInstallments).where(eq(saleInstallments.saleId, sale.id));
+    const paidDueDate = installment.dueDate;
     await storage.updateInstallmentStatus(testConsultantId, sale.id, installment.id, "pagado");
     await expect(
       storage.updateSale(testConsultantId, sale.id, {
         items: [{ productId: profitProductId, quantity: 1 }],
         orderDiscount: null,
         orderSurcharge: null,
+        // shippingCharged/shippingCost repetidos a propósito: updateSale reemplaza la
+        // composición completa (no un patch parcial) — omitirlos bajaría el total a 1000,
+        // probando otra cosa (el chequeo de "no bajar del todo lo ya cobrado").
+        shippingCharged: 300,
+        shippingCost: 150,
         paymentMethod: "efectivo",
         installments: [{ amount: 1300 }],
       }),
-    ).rejects.toThrow(/cuotas pagadas/i);
+    ).rejects.toThrow(/saldo pendiente/i);
+
+    // Con el saldo pendiente correcto ($0), la edición se permite y la cuota pagada no se toca.
+    const afterPaid = await storage.updateSale(testConsultantId, sale.id, {
+      items: [{ productId: profitProductId, quantity: 1 }],
+      orderDiscount: null,
+      orderSurcharge: null,
+      shippingCharged: 300,
+      shippingCost: 150,
+      paymentMethod: "efectivo",
+      installments: [{ amount: 0 }],
+    });
+    expect(afterPaid?.profit).toBe(550); // misma composición, sin cambios de fondo
+
+    const installmentsAfter = await db.select().from(saleInstallments).where(eq(saleInstallments.saleId, sale.id));
+    expect(installmentsAfter).toHaveLength(1);
+    expect(installmentsAfter[0].id).toBe(installment.id);
+    expect(installmentsAfter[0].status).toBe("pagado");
+    expect(installmentsAfter[0].dueDate).toBe(paidDueDate);
   });
 });
 

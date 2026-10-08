@@ -15,7 +15,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { User, Calendar, FileText, AlertTriangle, Pencil, Ban } from "lucide-react";
+import { User, Calendar, FileText, AlertTriangle, Pencil, Ban, Truck, CheckCircle2 } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
@@ -28,19 +28,12 @@ interface SaleDetailDialogProps {
   onEdit: (sale: SaleDetails) => void;
 }
 
-const statusColors: Record<string, string> = {
-  pendiente: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200",
-  entregado: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200",
-  pagado: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200",
-  cancelada: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200",
+// Prompt 6: dos etiquetas separadas (pago/entrega) en vez de un único "status".
+const paymentColors: Record<"cobrada" | "te_debe", string> = {
+  cobrada: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200",
+  te_debe: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200",
 };
-
-const statusLabels: Record<string, string> = {
-  pendiente: "Pendiente",
-  entregado: "Entregado",
-  pagado: "Pagado",
-  cancelada: "Cancelada",
-};
+const cancelledColor = "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200";
 
 const installmentStatusLabels: Record<string, string> = {
   pendiente: "Pendiente",
@@ -105,13 +98,30 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
     },
   });
 
+  // Prompt 6, punto 6 — cambiar a mano entre "Entregada" y "Pendiente de entrega".
+  const deliveryMutation = useGuardedMutation({
+    mutationFn: async (deliveryStatus: "entregada" | "pendiente_entrega") => {
+      const res = await apiRequest("PATCH", `/api/sales/${saleId}/delivery-status`, { deliveryStatus });
+      return res.json();
+    },
+    onSuccess: () => {
+      invalidateAfterChange();
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo actualizar la entrega", description: err.message, variant: "destructive" });
+    },
+  });
+
   const open = saleId !== null;
   const sale = saleQuery.data;
   const isCancelled = sale?.status === "cancelada";
-  // Etapa I-B.7-B: solo UX — el backend es quien realmente rechaza esto (ver
-  // DatabaseStorage/MemoryStorage.updateSale). Reutiliza `sale.installments`, ya presente en
-  // la respuesta de GET /api/sales/:id — no hace falta ningún fetch adicional.
-  const hasPaidInstallments = sale?.installments.some((i) => i.status === "pagado") ?? false;
+  // Prompt 6: el estado de pago ya no vive en `sale.status` (quedó reducido a
+  // "pendiente"/"cancelada") — se deriva de las cuotas, ya presentes en la respuesta de
+  // GET /api/sales/:id, igual criterio que storage.getAllSales.
+  const pendingInstallments = sale?.installments.filter((i) => i.status === "pendiente") ?? [];
+  const pendingAmount = pendingInstallments.reduce((sum, i) => sum + i.amount, 0);
+  const paymentStatus: "cobrada" | "te_debe" = pendingAmount > 0 ? "te_debe" : "cobrada";
+  const isPendingDelivery = !isCancelled && sale?.deliveryStatus === "pendiente_entrega";
 
   // Etapa 7.7 — descuento/recargo de la orden no se guardan como monto ($) en `sales`, solo
   // como tipo+valor (`orderDiscountType`/`orderDiscountValue`) — se resuelven acá con el mismo
@@ -143,9 +153,18 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
               {sale ? (
                 <>
                   <span>Venta #{sale.id}</span>
-                  <Badge className={statusColors[sale.status] ?? statusColors.pendiente}>
-                    {statusLabels[sale.status] ?? sale.status}
-                  </Badge>
+                  {isCancelled ? (
+                    <Badge className={cancelledColor}>Cancelada</Badge>
+                  ) : (
+                    <Badge className={paymentColors[paymentStatus]} data-testid="badge-payment-status">
+                      {paymentStatus === "cobrada" ? "Cobrada" : `Te debe ${format(pendingAmount)}`}
+                    </Badge>
+                  )}
+                  {!isCancelled && (
+                    <Badge variant="outline" data-testid="badge-delivery-status">
+                      {isPendingDelivery ? "Pendiente de entrega" : "Entregada"}
+                    </Badge>
+                  )}
                 </>
               ) : (
                 "Detalle de venta"
@@ -176,12 +195,46 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                   </div>
                 )}
 
-                {!isCancelled && hasPaidInstallments && (
-                  <div
-                    className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"
-                    data-testid="banner-sale-has-paid-installments"
-                  >
-                    Esta venta tiene cuotas ya pagadas y no puede editarse.
+                {!isCancelled && (
+                  <div className="flex items-center justify-between gap-2 rounded-lg border bg-muted/40 p-2.5 text-sm">
+                    <div className="flex items-center gap-2">
+                      <Truck className="h-4 w-4 text-muted-foreground shrink-0" />
+                      <span>{isPendingDelivery ? "Pendiente de entrega" : "Entregada"}</span>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={deliveryMutation.isPending}
+                      onClick={() => deliveryMutation.mutate(isPendingDelivery ? "entregada" : "pendiente_entrega")}
+                      data-testid="button-toggle-delivery-status"
+                    >
+                      {isPendingDelivery ? "Marcar como entregada" : "Marcar pendiente de entrega"}
+                    </Button>
+                  </div>
+                )}
+
+                {!isCancelled && pendingInstallments.length > 0 && (
+                  <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3" data-testid="section-pending-installments">
+                    <p className="text-sm font-semibold text-amber-700 dark:text-amber-400">Cuotas pendientes</p>
+                    {pendingInstallments.map((inst) => (
+                      <div key={inst.id} className="flex items-center justify-between gap-2 text-sm" data-testid={`row-pending-installment-${inst.id}`}>
+                        <span>
+                          Cuota {inst.installmentNumber} · {format(inst.amount)} · vence{" "}
+                          {parseLocalDate(inst.dueDate).toLocaleDateString("es-MX", { day: "numeric", month: "short" })}
+                        </span>
+                        <Button
+                          type="button"
+                          size="sm"
+                          disabled={installmentMutation.isPending}
+                          onClick={() => installmentMutation.mutate({ installmentId: inst.id, status: "pagado" })}
+                          data-testid={`button-mark-paid-${inst.id}`}
+                        >
+                          <CheckCircle2 className="h-3.5 w-3.5 mr-1.5" />
+                          Marcar como pagada
+                        </Button>
+                      </div>
+                    ))}
                   </div>
                 )}
 
@@ -338,13 +391,19 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
             </Button>
             {sale && !isCancelled && (
               <>
-                {!hasPaidInstallments && (
-                  <Button variant="outline" onClick={() => onEdit(sale)} data-testid="button-edit-sale">
-                    <Pencil className="h-4 w-4 mr-2" />
-                    Editar
-                  </Button>
-                )}
-                <Button variant="destructive" onClick={() => setCancelConfirmOpen(true)} data-testid="button-cancel-sale">
+                {/* Prompt 6: "edición inteligente" ya permite editar con cuotas pagadas (las
+                   preserva intactas) — el botón ya no se oculta por eso. */}
+                <Button variant="outline" onClick={() => onEdit(sale)} data-testid="button-edit-sale">
+                  <Pencil className="h-4 w-4 mr-2" />
+                  Editar
+                </Button>
+                {/* Menos peso visual que antes (borde + texto rojo, no un bloque rojo lleno). */}
+                <Button
+                  variant="outline"
+                  className="text-destructive border-destructive/40 hover:text-destructive hover:bg-destructive/10"
+                  onClick={() => setCancelConfirmOpen(true)}
+                  data-testid="button-cancel-sale"
+                >
                   <Ban className="h-4 w-4 mr-2" />
                   Cancelar Venta
                 </Button>

@@ -93,7 +93,10 @@ describe("Flujo integral de negocio de punta a punta (Etapa 7.9, Fase 21)", () =
     const payRes = await api("PATCH", `/api/sales/${sale.id}/installments/${firstInstallment.id}`, { status: "pagado" });
     expect(payRes.status).toBe(200);
 
-    // 11/12. Editar una venta con una cuota ya pagada: rechazado (regla ya aprobada, no se rompe).
+    // 11/12. Editar una venta con una cuota ya pagada (Prompt 6, "edición inteligente"): ya no
+    // se bloquea la edición entera — pero `installments` describe el SALDO PENDIENTE, no el
+    // total. Mandar el total completo (1000, como si nada se hubiera cobrado) no coincide con
+    // el saldo real (0, porque ya se cobró esa misma cantidad) y se rechaza por eso.
     const editRes = await api("PATCH", `/api/sales/${sale.id}`, {
       items: [{ productId: product.id, quantity: 1 }],
       orderDiscount: null, orderSurcharge: null, paymentMethod: "efectivo",
@@ -101,7 +104,7 @@ describe("Flujo integral de negocio de punta a punta (Etapa 7.9, Fase 21)", () =
     });
     expect(editRes.status).toBe(400);
     const editBody = await editRes.json();
-    expect(editBody.error).toMatch(/cuotas pagadas/i);
+    expect(editBody.error).toMatch(/saldo pendiente/i);
 
     // La composición de la venta sigue intacta después del intento rechazado.
     const detailAfterRejectedEdit = await (await api("GET", `/api/sales/${sale.id}`)).json();

@@ -1,12 +1,16 @@
 import { forwardRef, useImperativeHandle, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Package, Plus, Minus, ImagePlus } from "lucide-react";
+import { Package, Plus, Minus, ImagePlus, Search } from "lucide-react";
+import { apiRequest } from "@/lib/queryClient";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { cn } from "@/lib/utils";
+import { toDateStr } from "@/lib/date";
 import { getProductCategories, getToneSiblings } from "@/lib/productCategories";
 import { SaleOrderTable, type OrderLine } from "./SaleOrderTable";
+import type { TopProductByCategory } from "./CategoryProductsDialog";
 import type { Product } from "@shared/schema";
 
 export type ProductSubView = "cart" | "category" | "product" | "tone" | "qty";
@@ -45,6 +49,39 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
   const [selectedTone, setSelectedTone] = useState<Product | null>(null);
   const [quantity, setQuantity] = useState(1);
   const [priceInput, setPriceInput] = useState("");
+  // Prompt 6, punto 2 — buscador por nombre o tono, en el punto de entrada de este paso.
+  const [productSearch, setProductSearch] = useState("");
+
+  // Prompt 6, punto 2 — "Más vendidos (últimos 3 meses)": reusa el mismo endpoint y la misma
+  // función de storage que ya filtra por consultantId y excluye canceladas (ver
+  // /api/reports/top-products) — nada nuevo del lado del servidor.
+  const topProductsQuery = useQuery<TopProductByCategory[]>({
+    queryKey: ["/api/reports/top-products", "sale-wizard-3m"],
+    queryFn: async () => {
+      const end = toDateStr(new Date());
+      const startDate = new Date();
+      startDate.setMonth(startDate.getMonth() - 3);
+      const res = await apiRequest("GET", `/api/reports/top-products?start=${toDateStr(startDate)}&end=${end}&limit=6`);
+      return res.json();
+    },
+    enabled: subView === "category" && productSearch.trim() === "",
+  });
+  const topProducts = useMemo(() => {
+    const byId = new Map(sellableProducts.map((p) => [p.id, p]));
+    return (topProductsQuery.data ?? [])
+      .map((t) => (t.productId !== null ? byId.get(t.productId) : undefined))
+      .filter((p): p is Product => p !== undefined);
+  }, [topProductsQuery.data, sellableProducts]);
+
+  const inStockProducts = useMemo(() => sellableProducts.filter((p) => p.unidades > 0), [sellableProducts]);
+
+  const searchResults = useMemo(() => {
+    const term = productSearch.trim().toLowerCase();
+    if (!term) return [];
+    return sellableProducts.filter(
+      (p) => p.producto.toLowerCase().includes(term) || p.variante.toLowerCase().includes(term),
+    );
+  }, [sellableProducts, productSearch]);
 
   const toneSiblings = useMemo(
     () => (selectedProduct ? getToneSiblings(selectedProduct, sellableProducts) : []),
@@ -142,25 +179,94 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
   }
 
   if (subView === "category") {
+    const renderProductButton = (product: Product, testIdPrefix: string) => {
+      const remaining = remainingFor(product);
+      return (
+        <button
+          key={product.id}
+          type="button"
+          disabled={remaining <= 0}
+          onClick={() => openProduct(product)}
+          className="flex w-full items-center gap-3 rounded-xl border bg-muted/40 p-3 text-left hover-elevate active-elevate-2 disabled:opacity-50 disabled:cursor-not-allowed"
+          data-testid={`${testIdPrefix}-${product.id}`}
+        >
+          {product.imagen ? (
+            <img src={product.imagen} alt={product.producto} className="h-10 w-10 rounded-md object-cover shrink-0" />
+          ) : (
+            <div className="flex h-10 w-10 items-center justify-center rounded-md bg-muted shrink-0">
+              <Package className="h-5 w-5 text-muted-foreground" />
+            </div>
+          )}
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-sm font-semibold">
+              {product.producto}
+              {product.variante !== "Estándar" && <span className="font-normal text-muted-foreground"> {product.variante}</span>}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {format(product.precio)} · {remaining <= 0 ? "Sin stock" : `${remaining} disponibles`}
+            </p>
+          </div>
+        </button>
+      );
+    };
+
     return (
-      <div className="space-y-3">
-        <p className="text-sm text-muted-foreground">Elegí una categoría</p>
-        <div className="grid grid-cols-2 gap-3">
-          {categories.map((category) => (
-            <button
-              key={category}
-              type="button"
-              onClick={() => openCategory(category)}
-              className="flex flex-col items-start gap-2 rounded-xl border bg-muted/40 p-4 text-left hover-elevate active-elevate-2"
-              data-testid={`sale-picker-category-${category}`}
-            >
-              <span className="h-3.5 w-3.5 rounded-full bg-primary" />
-              <span className="text-sm font-semibold">{category}</span>
-            </button>
-          ))}
+      <div className="space-y-4">
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            className="pl-9"
+            placeholder="Buscá el producto por nombre"
+            value={productSearch}
+            onChange={(e) => setProductSearch(e.target.value)}
+            data-testid="input-sale-product-search"
+          />
         </div>
-        {categories.length === 0 && (
-          <p className="py-6 text-center text-sm text-muted-foreground">No hay productos en el catálogo</p>
+
+        {productSearch.trim() !== "" ? (
+          <div className="space-y-2">
+            {searchResults.map((p) => renderProductButton(p, "sale-picker-search"))}
+            {searchResults.length === 0 && (
+              <p className="py-6 text-center text-sm text-muted-foreground">No encontramos productos con ese nombre</p>
+            )}
+          </div>
+        ) : (
+          <div className="space-y-5">
+            {inStockProducts.length > 0 && (
+              <div className="space-y-2">
+                <p className="text-sm font-semibold text-muted-foreground">Tus productos en stock</p>
+                {inStockProducts.map((p) => renderProductButton(p, "sale-picker-in-stock"))}
+              </div>
+            )}
+
+            {topProducts.length > 0 && (
+              <div className="space-y-2">
+                <p className="text-sm font-semibold text-muted-foreground">Más vendidos</p>
+                {topProducts.map((p) => renderProductButton(p, "sale-picker-top"))}
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <p className="text-sm font-semibold text-muted-foreground">Todas las categorías</p>
+              <div className="grid grid-cols-2 gap-3">
+                {categories.map((category) => (
+                  <button
+                    key={category}
+                    type="button"
+                    onClick={() => openCategory(category)}
+                    className="flex flex-col items-start gap-2 rounded-xl border bg-muted/40 p-4 text-left hover-elevate active-elevate-2"
+                    data-testid={`sale-picker-category-${category}`}
+                  >
+                    <span className="h-3.5 w-3.5 rounded-full bg-primary" />
+                    <span className="text-sm font-semibold">{category}</span>
+                  </button>
+                ))}
+              </div>
+              {categories.length === 0 && (
+                <p className="py-6 text-center text-sm text-muted-foreground">No hay productos en el catálogo</p>
+              )}
+            </div>
+          </div>
         )}
       </div>
     );
@@ -303,7 +409,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
           disabled={maxQty <= 0 || quantity > maxQty}
           data-testid="button-step-add-to-cart"
         >
-          Agregar al carrito
+          Agregar a la venta
         </Button>
       </div>
     );
