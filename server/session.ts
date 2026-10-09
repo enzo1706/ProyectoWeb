@@ -37,6 +37,8 @@ async function createPostgresSessionStore(): Promise<Store> {
   return new PgSession({ pool, tableName: "session", createTableIfMissing: true });
 }
 
+const SESSION_MAX_AGE_MS = 10 * 24 * 60 * 60 * 1000;
+
 export async function setupSession(app: Express) {
   const mode = resolveStorageMode();
   const store = mode === "postgres" ? await createPostgresSessionStore() : new MemoryStore({ checkPeriod: 86400000 });
@@ -55,11 +57,28 @@ export async function setupSession(app: Express) {
       cookie: {
         secure: process.env.NODE_ENV === "production",
         httpOnly: true,
-        maxAge: 10 * 24 * 60 * 60 * 1000,
+        maxAge: SESSION_MAX_AGE_MS,
         sameSite: "lax",
       },
     }),
   );
+
+  // Prompt 13, punto 4 — una sesión que ya existía ANTES de este deploy (creada con el
+  // `maxAge` viejo, de 7 días) trae su propio `cookie.originalMaxAge` guardado en la fila de
+  // `session`. express-session SIEMPRE renueva por ESE valor guardado en cada `touch()`
+  // (ver node_modules/express-session/session/session.js: `resetMaxAge` hace
+  // `cookie.maxAge = cookie.originalMaxAge`) — el `maxAge` nuevo del middleware de arriba
+  // solo se aplica a sesiones RECIÉN creadas, nunca "upgradea" solo a las que ya existían.
+  // Sin esto, cualquier consultora logueada antes del deploy seguiría renovando por 7 días
+  // (no 10) indefinidamente, aunque nunca se la desloguea — fijar `cookie.maxAge` en cada
+  // request migra ese valor guardado a 10 días desde la primera vez que esa sesión vuelve a
+  // entrar, sin interrumpir la sesión.
+  app.use((req, _res, next) => {
+    if (req.session) {
+      req.session.cookie.maxAge = SESSION_MAX_AGE_MS;
+    }
+    next();
+  });
 }
 
 /**

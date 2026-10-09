@@ -870,10 +870,26 @@ Cómo verifico que quedó bien:
 - **Sesión (10 días, renovación en cada visita)**: implementado con `rolling: true` +
   `maxAge: 10 días` en `server/session.ts` — no requiere ninguna columna, tabla ni variable de
   Railway nueva (la tabla `session` y `trust proxy` ya existen y ya están probados en
-  producción), así que no se agregó ninguna entrada en `docs/migracion-deploy-2.md`. Un deploy
-  con este cambio desloguea sin aviso a cualquier consultora con una sesión activa en ese
-  momento (el formato de la cookie no cambia, pero `maxAge` sí) — no es grave (vuelve a loguear
-  normal), pero vale que quien haga el deploy lo sepa de antemano.
+  producción), así que no se agregó ninguna entrada en `docs/migracion-deploy-2.md`.
+  **Corrección (antes decía, sin verificar, que el deploy desloguea a todas — es falso, quedó
+  probado con un test real):** el día del deploy **nadie se desloguea**. Una sesión creada
+  ANTES del deploy (con el `maxAge` viejo de 7 días, sin `rolling`) sigue siendo válida —
+  `express-session` guarda el `cookie.originalMaxAge` de cada sesión en la fila de `session`, y
+  por diseño de la librería (`resetMaxAge`/`touch()`, ver
+  `node_modules/express-session/session/session.js`) SIEMPRE renueva por ese valor guardado,
+  nunca por el `maxAge` nuevo del middleware — sin arreglar esto, cualquier sesión de antes del
+  deploy seguiría renovándose de a 7 días (no 10) para siempre, aunque nunca se la desloguee.
+  Arreglado fijando `req.session.cookie.maxAge` en un middleware que corre en cada request
+  (`server/session.ts`, después de `setupSession`) — así la primera visita después del deploy
+  ya migra esa sesión a 10 días. Un detalle de la librería: `connect-pg-simple`'s `touch()`
+  (lo que usa `rolling` cuando nada más cambió) solo pisa la columna `expire`, nunca reescribe
+  el JSON de `sess` — la fila en la base se queda para siempre con `originalMaxAge: 7 días`
+  guardado ahí (inofensivo, nada más lo lee), pero no importa: cada visita futura de esa misma
+  sesión vuelve a pasar por el middleware y recibe 10 días igual, siempre. Probado en
+  `server/tests/session-old-maxage-migration.test.ts`: inserta una fila de `session` real con
+  la forma exacta que dejaba el código viejo, hace una request con esa cookie, y confirma que
+  sigue logueada (200, no 401) y que la cookie renovada ya es de 10 días desde la primera
+  visita.
 - **Test de la cookie de sesión**: `server/tests/session-rolling.test.ts` prueba que el login
   deja una cookie que vence en 10 días y que una request autenticada posterior (`GET
   /api/auth/me`) renueva ese vencimiento (`Set-Cookie` en cada response, no solo en el login).
