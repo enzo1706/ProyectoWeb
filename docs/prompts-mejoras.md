@@ -837,6 +837,15 @@ Cómo verifico que quedó bien:
 - Cierro el navegador, vuelvo a los 2 días y la sesión sigue iniciada.
 ```
 
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **Menú "Más"**: suma "Ventas" como primera opción (lleva al listado de ventas). Queda, en
+  este orden: Ventas, Agenda, Reportes, Configuración, Suscripción y, al final y separado,
+  "Cerrar sesión".
+- **Panel de administración** (precio de suscripción y cupones, Prompt U): si hoy tiene una
+  entrada en el menú, se mantiene igual y visible solo para el rol admin — no es parte de este
+  rediseño.
+
 ## Ingreso, registro y suscripción
 
 ### Prompt 14 · Ingreso, registro y prueba gratis
