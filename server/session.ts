@@ -5,6 +5,7 @@ import MemoryStoreFactory from "memorystore";
 import connectPgSimple from "connect-pg-simple";
 import { storage } from "./storage";
 import { resolveStorageMode } from "./storage-mode";
+import { shouldUseTestDatabase } from "./test-db-guard";
 
 const MemoryStore = MemoryStoreFactory(session);
 
@@ -26,11 +27,10 @@ declare module "express-session" {
  * DatabaseStorage.getDb() en storage.ts).
  */
 async function createPostgresSessionStore(): Promise<Store> {
-  // Igual criterio que DatabaseStorage.getDb() (Etapa I-B.5.1): si TEST_DATABASE_URL está
-  // seteada (solo pasa en los tests de Postgres real, después de pasar el guard de
-  // test-db-guard.ts), la tabla "session" de esos tests vive en la base de test, aislada de
-  // la real — producción nunca tiene esa variable, así que este branch nunca se activa ahí.
-  const pool = process.env.TEST_DATABASE_URL
+  // Igual criterio que DatabaseStorage.getDb() (Etapa I-B.5.1 + hardening posterior): hace
+  // falta NODE_ENV=test ADEMÁS de TEST_DATABASE_URL (ver shouldUseTestDatabase en
+  // test-db-guard.ts) — la sola presencia de la variable ya no alcanza para elegir la base.
+  const pool = shouldUseTestDatabase()
     ? (await import("./test-db")).testPool
     : (await import("./db")).pool;
   const PgSession = connectPgSimple(session);
@@ -80,7 +80,7 @@ export async function invalidateUserSessions(userId: number): Promise<void> {
   if (resolveStorageMode() !== "postgres") return;
 
   try {
-    const pool = process.env.TEST_DATABASE_URL ? (await import("./test-db")).testPool : (await import("./db")).pool;
+    const pool = shouldUseTestDatabase() ? (await import("./test-db")).testPool : (await import("./db")).pool;
     await pool.query(`DELETE FROM "session" WHERE (sess->>'userId')::int = $1`, [userId]);
   } catch (err) {
     console.error("No se pudieron invalidar las sesiones anteriores tras el reset de contraseña:", err);
