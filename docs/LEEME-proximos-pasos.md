@@ -23,7 +23,8 @@ Supabase ni Mercado Pago reales.
 - **Qué es**: levantar el servicio de staging en Railway apuntando a la rama `staging` (ya
   pusheada), con su propia base (restaurada con `pg_restore` o un branch de Supabase, según el
   plan vigente), sus propias variables (`APP_ENV=staging`, credenciales TEST de Mercado Pago,
-  etc.).
+  etc.). `TEST_DATABASE_URL` nunca va en las variables de ese servicio (ver
+  `docs/migracion-produccion-pendiente.md`).
 - **Cuándo frenar y avisar**: si el plan de Supabase resultó distinto al asumido en
   `docs/staging.md` (Free vs Pro cambia cómo se origina la base de staging), o si falta algún
   dato para crear las cuentas de prueba de Mercado Pago.
@@ -59,7 +60,8 @@ el bug antes de decidir dónde arreglarlo.
   restauración en una base de prueba, los chequeos antes y después.
 - **Qué es**: migrar la base de producción real (todo es SQL puro, aplicado a mano) y publicar
   en Railway el código de `main` (el commit tiene que ser el mismo que ya se validó — confirmar
-  con quien coordinó este plan cuál es exactamente antes de publicar).
+  con quien coordinó este plan cuál es exactamente antes de publicar). La rama
+  `deploy-paquete-1` tiene que estar al día con `main` antes de este paso.
 - **Cuándo frenar y avisar**: cualquiera de los chequeos de datos del documento devuelve filas
   (hay instrucciones explícitas de PARAR para cada caso); el deploy del código falla por
   cualquier motivo (hay un plan de vuelta atrás documentado, no hace falta deshacer la
@@ -93,13 +95,14 @@ el bug antes de decidir dónde arreglarlo.
 - **Si el arreglo es de algo de los Prompts 4-9**: va directo a `staging` (o a la rama del
   Prompt correspondiente, después mergeada a `staging` con el mismo método ya usado — merge,
   nunca rebase).
-- **Los Prompts nuevos** (ej. el Prompt 8 de notificaciones push, pausado hasta tener staging
-  andando) se desarrollan en su propia rama a partir de `staging`, pero **se mergean a
-  `staging` recién después del deploy 2** — no antes, para no mezclar código sin probar con el
-  que ya está en camino a producción.
+- **Los Prompts nuevos** (ej. el Prompt 8 de notificaciones push, el Prompt 11 de Reportes, el
+  Prompt 13 de menú/sesión) se desarrollan en su propia rama a partir de `staging` (ya con los
+  Prompts anteriores mergeados), pero **se mergean a `staging` recién después del deploy 2** —
+  no antes, para no mezclar código sin probar con el que ya está en camino a producción.
 
 ## Qué rama pushear en cada paso
 
-Todo esto ya está pusheado: `staging-plan` y `staging`. **`main` no se pushea** hasta que se
-decida explícitamente publicar el deploy 1 — regla fija, con OK explícito en el momento, no de
-una conversación anterior.
+Todo esto ya está pusheado: `staging-plan`, `staging`, y las ramas de Prompt nuevas
+(`prompt-11-reportes`, `prompt-13-menu`, etc., a medida que se cierran). **`main` no se
+pushea** hasta que se decida explícitamente publicar el deploy 1 — regla fija, con OK explícito
+en el momento, no de una conversación anterior.

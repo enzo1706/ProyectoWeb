@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { assertTestDatabaseAuthorized } from "../test-db-guard";
+import { assertTestDatabaseAuthorized, shouldUseTestDatabase } from "../test-db-guard";
 
 /**
  * Etapa I-B.5.1 — prueba el guard en sí, en aislamiento total: nunca crea un pg.Pool real,
@@ -75,6 +75,29 @@ describe("MemoryStorage no requiere TEST_DATABASE_URL", () => {
     process.env.DATABASE_MODE = saved.DATABASE_MODE;
     process.env.DATABASE_URL = saved.DATABASE_URL;
     process.env.NODE_ENV = saved.NODE_ENV;
+  });
+});
+
+describe("shouldUseTestDatabase — segunda señal, independiente del guard de arriba", () => {
+  it("12. fuera de un test (NODE_ENV distinto de 'test'), nunca elige la base de test, con o sin TEST_DATABASE_URL", () => {
+    process.env.NODE_ENV = "production";
+    process.env.TEST_DATABASE_URL = "postgresql://test:test@localhost:5433/marykaymanager_test";
+    expect(shouldUseTestDatabase()).toBe(false);
+
+    delete process.env.TEST_DATABASE_URL;
+    expect(shouldUseTestDatabase()).toBe(false);
+  });
+
+  it("13. NODE_ENV=test + TEST_DATABASE_URL presente: elige la base de test", () => {
+    process.env.NODE_ENV = "test";
+    process.env.TEST_DATABASE_URL = "postgresql://test:test@localhost:5433/marykaymanager_test";
+    expect(shouldUseTestDatabase()).toBe(true);
+  });
+
+  it("14. NODE_ENV=test SIN TEST_DATABASE_URL: tira en vez de caer de vuelta a la base real en silencio (reproduce el hallazgo real: un usuario de test terminó en la base de desarrollo)", () => {
+    process.env.NODE_ENV = "test";
+    delete process.env.TEST_DATABASE_URL;
+    expect(() => shouldUseTestDatabase()).toThrow(/falta TEST_DATABASE_URL/i);
   });
 });
 

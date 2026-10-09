@@ -22,6 +22,18 @@ regla para producción es más simple y más dura: **nunca `drizzle-kit push` ah
 motivo** — todo lo que haga falta migrar se escribe como SQL explícito (como el de este
 documento) y se aplica a mano.
 
+## ⚠️ `TEST_DATABASE_URL` nunca debe existir en las variables de Railway
+
+Es exclusiva de los tests que corren en la máquina local (`vitest`, que fija `NODE_ENV=test`
+antes de usarla) — nunca de un servicio real. `server/storage.ts`, `server/session.ts` y
+`server/app.ts` deciden qué base usar con `shouldUseTestDatabase()`
+(`server/test-db-guard.ts`), que exige `NODE_ENV=test` ADEMÁS de esta variable — como
+`NODE_ENV` en Railway siempre es `production`, agregarla ahí por error no tendría efecto. Aun
+así, antes de cada deploy conviene confirmarla ausente en el panel de variables del servicio:
+antes de este chequeo, la sola presencia de la variable alcanzaba para que `getDb()` eligiera
+la base de test — "producción nunca la tiene" era un supuesto, no algo que el código
+garantizara.
+
 ## Estado real de producción, verificado recién (no es la foto del 15/9)
 
 Antes de armar este documento asumí que nadie había tocado la base desde el 12/9 (último dato
