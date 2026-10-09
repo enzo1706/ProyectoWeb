@@ -11,7 +11,15 @@ import { DatabaseStorage } from "../storage";
  * solo está implementado para DATABASE_MODE=postgres — la tabla `session` real de
  * connect-pg-simple es justamente lo que se necesita probar acá; el modo memoria de
  * memorystore queda documentado como limitación conocida, no hace falta un test para un no-op.
+ *
+ * Hardening (ver shouldUseTestDatabase en test-db-guard.ts): este era el ÚNICO archivo de
+ * server/tests que no fijaba NODE_ENV=test — antes "funcionaba" solo porque la sola presencia
+ * de TEST_DATABASE_URL alcanzaba para que getDb() elegiera la base de test. Ahora getDb()
+ * exige NODE_ENV=test ADEMÁS de TEST_DATABASE_URL, así que sin esta línea este archivo
+ * escribiría silenciosamente en la base de DESARROLLO real en vez de la de test — reproducido
+ * de verdad: así es como terminó un usuario `vitest_sess_...` en `marykaymanager_dev`.
  */
+process.env.NODE_ENV = "test";
 
 const sentCodes: Record<string, string> = {};
 vi.mock("../email", () => ({

@@ -4,6 +4,7 @@ import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { setupSession, ensureDefaultAdmin } from "./session";
 import { resolveStorageMode } from "./storage-mode";
+import { shouldUseTestDatabase } from "./test-db-guard";
 
 declare module "http" {
   interface IncomingMessage {
@@ -91,9 +92,9 @@ export async function createApp(): Promise<{ app: Express; httpServer: Server }>
       return res.json({ status: "ok", database: "memory" });
     }
     try {
-      // Mismo criterio que DatabaseStorage.getDb() (Etapa I-B.5.1) — producción nunca tiene
-      // TEST_DATABASE_URL, así que acá siempre entra por "./db".
-      const pool = process.env.TEST_DATABASE_URL
+      // Mismo criterio que DatabaseStorage.getDb() — hace falta NODE_ENV=test ADEMÁS de
+      // TEST_DATABASE_URL (shouldUseTestDatabase, ver test-db-guard.ts).
+      const pool = shouldUseTestDatabase()
         ? (await import("./test-db")).testPool
         : (await import("./db")).pool;
       await pool.query("SELECT 1");
