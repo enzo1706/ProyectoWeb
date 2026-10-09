@@ -10,8 +10,11 @@ import {
   Settings,
   CreditCard,
   Tag,
+  LogOut,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { LipstickIcon } from "@/components/icons/LipstickIcon";
+import { useState } from "react";
 import {
   Sidebar,
   SidebarContent,
@@ -25,8 +28,10 @@ import {
   SidebarFooter,
   useSidebar,
 } from "@/components/ui/sidebar";
+import { Button } from "@/components/ui/button";
 import { useAuth } from "@/hooks/useAuth";
 import { BrandLogo } from "@/components/BrandLogo";
+import { LogoutConfirmDialog } from "@/components/LogoutConfirmDialog";
 import type { Consultant } from "@shared/schema";
 
 interface MenuItem {
@@ -37,8 +42,8 @@ interface MenuItem {
 
 const consultantMenuItems: MenuItem[] = [
   { title: "Inicio", url: "/", icon: LayoutDashboard },
-  { title: "Stock", url: "/productos", icon: Package },
-  { title: "Clientes", url: "/clientas", icon: Users },
+  { title: "Stock", url: "/productos", icon: LipstickIcon },
+  { title: "Clientas", url: "/clientas", icon: Users },
   { title: "Ventas", url: "/ventas", icon: ShoppingCart },
   { title: "Agenda", url: "/agenda", icon: Calendar },
   { title: "Reportes", url: "/reportes", icon: BarChart3 },
@@ -62,10 +67,16 @@ function isItemActive(location: string, url: string) {
 
 export function AppSidebar() {
   const [location] = useLocation();
-  const { user } = useAuth();
+  const { user, logout } = useAuth();
   const { isMobile, setOpenMobile } = useSidebar();
   const isAdmin = user?.role === "admin";
   const menuItems = isAdmin ? adminMenuItems : consultantMenuItems;
+  const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
+
+  const handleLogout = () => {
+    setLogoutConfirmOpen(false);
+    logout().then(() => window.location.assign("/login"));
+  };
 
   const { data: businessSettings } = useQuery<Consultant>({
     queryKey: ["/api/business-settings"],
@@ -115,11 +126,26 @@ export function AppSidebar() {
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarContent>
-      <SidebarFooter className="p-4">
+      <SidebarFooter className="p-4 gap-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="w-full justify-start gap-2 text-muted-foreground"
+          onClick={() => setLogoutConfirmOpen(true)}
+          data-testid="button-sidebar-logout"
+        >
+          <LogOut className="h-4 w-4" />
+          Cerrar sesión
+        </Button>
         <p className="text-xs text-muted-foreground text-center truncate">
           {isAdmin ? "Manager v1.0" : `${businessName} · Manager v1.0`}
         </p>
       </SidebarFooter>
+      <LogoutConfirmDialog
+        open={logoutConfirmOpen}
+        onOpenChange={setLogoutConfirmOpen}
+        onConfirm={handleLogout}
+      />
     </Sidebar>
   );
 }

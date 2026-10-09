@@ -7,14 +7,14 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { ClientCard, type Client } from "@/components/ClientCard";
 import { ClientDialog } from "@/components/ClientDialog";
 import { ClientDetailSheet } from "@/components/ClientDetailSheet";
-import { NewSaleDialog } from "@/components/NewSaleDialog";
+import { useSaleDialog } from "@/hooks/use-sale-dialog";
 import { ErrorBlock } from "@/components/ErrorBlock";
 import { Plus, Search, ChevronLeft, ChevronRight, Filter, X } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { cn } from "@/lib/utils";
-import type { InsertClient, Product } from "@shared/schema";
+import type { InsertClient } from "@shared/schema";
 import { type ClientListFilter, CLIENT_LIST_FILTER_LABELS, DEFAULT_CLIENTS_PAGE_SIZE, isClientListFilter } from "@shared/clientFilters";
 
 // Prompt 9, punto 2 — las 3 opciones del botón "Filtros" (nunca "todas", que es "sin filtro").
@@ -40,7 +40,7 @@ export default function Clientas() {
   const [editingClient, setEditingClient] = useState<Client | null>(null);
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
-  const [saleDialogOpen, setSaleDialogOpen] = useState(false);
+  const { openCreateSale } = useSaleDialog();
   // Prompt 11 — Reportes ("Te deben hoy", "Ver todas" de Clientas para recontactar) navega
   // acá con "?filter=..." en la URL, para abrir Clientas ya con ese filtro aplicado.
   const [filter, setFilter] = useState<ClientListFilter>(() => {
@@ -48,7 +48,6 @@ export default function Clientas() {
     return isClientListFilter(fromUrl) ? fromUrl : "todas";
   });
   const [filterSheetOpen, setFilterSheetOpen] = useState(false);
-  const [saleClient, setSaleClient] = useState<Client | null>(null);
   const [page, setPage] = useState(1);
 
   useEffect(() => {
@@ -80,8 +79,6 @@ export default function Clientas() {
   const total = data?.total ?? 0;
   const totalPages = data?.totalPages ?? 0;
   const totalRevenue = data?.totalRevenue ?? 0;
-
-  const { data: products = [] } = useQuery<Product[]>({ queryKey: ["/api/products"] });
 
   const createMutation = useGuardedMutation({
     mutationFn: async (data: Partial<InsertClient>) => {
@@ -140,8 +137,7 @@ export default function Clientas() {
   };
 
   const handleNewSale = (client: Client) => {
-    setSaleClient(client);
-    setSaleDialogOpen(true);
+    openCreateSale({ preselectedClient: client });
     setDetailOpen(false);
   };
 
@@ -267,13 +263,6 @@ export default function Clientas() {
         client={selectedClient}
         onEdit={handleEdit}
         onNewSale={handleNewSale}
-      />
-
-      <NewSaleDialog
-        open={saleDialogOpen}
-        onOpenChange={setSaleDialogOpen}
-        products={products}
-        preselectedClient={saleClient}
       />
 
       <Dialog open={filterSheetOpen} onOpenChange={setFilterSheetOpen}>

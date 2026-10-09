@@ -46,11 +46,16 @@ export async function setupSession(app: Express) {
       secret: process.env.SESSION_SECRET as string,
       resave: false,
       saveUninitialized: false,
+      // Prompt 13: la sesión dura 10 días de INACTIVIDAD, no 10 días fijos desde el login.
+      // `rolling: true` hace que express-session recalcule `cookie.expires` en cada request
+      // (entre o no), así que cada visita corre el vencimiento 10 días más — sin esto, el
+      // vencimiento queda clavado al momento del login, sea que entre todos los días o ninguno.
+      rolling: true,
       store,
       cookie: {
         secure: process.env.NODE_ENV === "production",
         httpOnly: true,
-        maxAge: 7 * 24 * 60 * 60 * 1000,
+        maxAge: 10 * 24 * 60 * 60 * 1000,
         sameSite: "lax",
       },
     }),

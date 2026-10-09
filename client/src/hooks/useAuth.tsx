@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useState, useCallback } from "react";
 import { apiRequest } from "@/lib/queryClient";
+import { markSessionActive, clearSessionActivity } from "@/lib/sessionActivity";
 
 export interface AuthUser {
   id: number;
@@ -34,6 +35,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const current = await fetchCurrentUser();
       setUser(current);
+      // Prompt 13: "entrar a la app" con sesión iniciada — cada confirmación exitosa corre
+      // la fecha, para que la pantalla de ingreso pueda distinguir "se cerró por inactividad"
+      // de "nunca entró"/"se cerró por otro motivo".
+      if (current) markSessionActive();
     } catch {
       setUser(null);
     } finally {
@@ -49,6 +54,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const res = await apiRequest("POST", "/api/auth/login", { username, password });
     const data = await res.json();
     setUser(data);
+    markSessionActive();
     return data;
   };
 
@@ -56,12 +62,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const res = await apiRequest("POST", "/api/auth/register", input);
     const data = await res.json();
     setUser(data);
+    markSessionActive();
     return data;
   };
 
   const logout = async () => {
     await apiRequest("POST", "/api/auth/logout");
     setUser(null);
+    // Cierre A PROPÓSITO — nunca tiene que mostrarse como "se cerró por inactividad".
+    clearSessionActivity();
   };
 
   return (

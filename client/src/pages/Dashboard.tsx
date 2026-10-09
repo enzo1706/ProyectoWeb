@@ -10,7 +10,7 @@ import { LowStockDialog } from "@/components/LowStockDialog";
 import { ErrorBlock } from "@/components/ErrorBlock";
 import { AppointmentDetailDialog } from "@/components/AppointmentDetailDialog";
 import { SaleDetailDialog } from "@/components/SaleDetailDialog";
-import { NewSaleDialog } from "@/components/NewSaleDialog";
+import { useSaleDialog } from "@/hooks/use-sale-dialog";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { toDateStr, daysBetween } from "@/lib/date";
 import { isReminderActive } from "@shared/stockAlerts";
@@ -162,7 +162,7 @@ export default function Dashboard() {
   const [appointmentDetailOpen, setAppointmentDetailOpen] = useState(false);
   const [selectedAppointmentId, setSelectedAppointmentId] = useState<number | null>(null);
   const [selectedSaleId, setSelectedSaleId] = useState<number | null>(null);
-  const [newSaleOpen, setNewSaleOpen] = useState(false);
+  const { openCreateSale } = useSaleDialog();
 
   const today = toDateStr(new Date());
   const { start: monthStart, end: monthEnd } = currentMonthRange();
@@ -211,8 +211,6 @@ export default function Dashboard() {
       return res.json();
     },
   });
-
-  const { data: products = [], isError: errorProducts } = useQuery<Product[]>({ queryKey: ["/api/products"] });
 
   const detailAppointment = upcomingAppointments.find((a) => a.id === selectedAppointmentId) ?? null;
 
@@ -269,11 +267,12 @@ export default function Dashboard() {
   // Ninguna de estas queries tiene un estado de error visible propio (a diferencia de
   // Reportes.tsx) — sin este flag, un fetch fallido cae en el default `[]` y termina
   // mostrando "no hay nada pendiente" / "$0 este mes" como si fuera un dato real. Etapa
-  // I-B.8-E (F5): previousMonthPoints y products faltaban acá — sin errorProducts, un fallo en
-  // "/api/products" dejaba el diálogo de nueva venta con el catálogo vacío en silencio; sin
-  // errorPreviousMonth, un fallo ahí se mostraba como "$0 el mes pasado" (un dato falso, no un
-  // error). Hardening post-I-B.8-F: businessSettings también faltaba — acá el fallback
-  // (user?.username) no es un dato financiero falso, pero el fallo quedaba invisible igual.
+  // I-B.8-E (F5): previousMonthPoints faltaba acá — sin errorPreviousMonth, un fallo ahí se
+  // mostraba como "$0 el mes pasado" (un dato falso, no un error). Hardening post-I-B.8-F:
+  // businessSettings también faltaba — acá el fallback (user?.username) no es un dato
+  // financiero falso, pero el fallo quedaba invisible igual. "/api/products" (para la venta
+  // nueva) ya no se consulta en esta página — su propio aviso de error vive en
+  // use-sale-dialog.tsx, que es quien lo consulta ahora.
   const hasLoadError =
     errorLowStock ||
     errorAppointments ||
@@ -282,7 +281,6 @@ export default function Dashboard() {
     errorInactive ||
     errorCurrentMonth ||
     errorPreviousMonth ||
-    errorProducts ||
     errorBusinessSettings;
 
   const hasNothing =
@@ -428,7 +426,7 @@ export default function Dashboard() {
         type="button"
         size="lg"
         className="h-14 w-full text-base font-semibold"
-        onClick={() => setNewSaleOpen(true)}
+        onClick={() => openCreateSale()}
         data-testid="button-register-sale"
       >
         <Plus className="mr-2 h-5 w-5" />
@@ -487,7 +485,6 @@ export default function Dashboard() {
           setLocation("/ventas");
         }}
       />
-      <NewSaleDialog open={newSaleOpen} onOpenChange={setNewSaleOpen} products={products} />
     </div>
   );
 }

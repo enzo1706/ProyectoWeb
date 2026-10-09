@@ -11,12 +11,13 @@ import { HideMoneyToggle } from "@/components/HideMoneyToggle";
 import { BrandLogo } from "@/components/BrandLogo";
 import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import { SaleCartProvider } from "@/hooks/use-sale-cart";
+import { SaleDialogProvider } from "@/hooks/use-sale-dialog";
 import { HideMoneyProvider } from "@/hooks/use-hide-money";
+import { BottomNav } from "@/components/BottomNav";
 import NotFound from "@/pages/not-found";
 import Dashboard from "@/pages/Dashboard";
 import Login from "@/pages/auth/Login";
-import { Loader2, LogOut } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { Loader2 } from "lucide-react";
 
 // Dashboard queda de carga inmediata (es la pantalla con la que arranca toda consultora).
 // El resto son rutas "secundarias" — code splitting por ruta para que nadie descargue
@@ -73,7 +74,7 @@ function getHomeRoute(role: string) {
 
 function AppShell() {
   const [location] = useLocation();
-  const { user, isLoading, logout } = useAuth();
+  const { user, isLoading } = useAuth();
   const isLoginRoute = location === "/login";
   // Etapa 3: mismo trato que /login — accesibles sin sesión, y si ya hay una sesión activa
   // se redirige a home en vez de dejar crear una segunda cuenta o resetear por las dudas.
@@ -151,50 +152,47 @@ function AppShell() {
   };
 
   return (
-    <SidebarProvider style={style as React.CSSProperties}>
-      <div className="flex h-screen w-full bg-background print:h-auto">
-        <AppSidebar />
-        <div className="flex flex-col flex-1 overflow-hidden print:overflow-visible">
-          <header className="flex items-center justify-between gap-2 p-2 pt-[max(0.5rem,env(safe-area-inset-top))] border-b shrink-0 bg-background/80 backdrop-blur-sm print:hidden">
-            <div className="flex items-center gap-2">
-              <SidebarTrigger data-testid="button-sidebar-toggle" />
-              <BrandLogo size={28} alt="Mary Kay Manager" className="md:hidden" />
-              {isAdmin && (
-                <span className="text-sm font-medium text-foreground hidden md:inline">
-                  Perfil de Administrador
+    <SaleDialogProvider enabled={!isAdmin}>
+      <SidebarProvider style={style as React.CSSProperties}>
+        <div className="flex h-screen w-full bg-background print:h-auto">
+          <AppSidebar />
+          <div className="flex flex-col flex-1 overflow-hidden print:overflow-visible">
+            <header className="flex items-center justify-between gap-2 p-2 pt-[max(0.5rem,env(safe-area-inset-top))] border-b shrink-0 bg-background/80 backdrop-blur-sm print:hidden">
+              <div className="flex items-center gap-2">
+                <SidebarTrigger data-testid="button-sidebar-toggle" className="md:inline-flex hidden" />
+                <BrandLogo size={28} alt="Mary Kay Manager" className="md:hidden" />
+                {isAdmin && (
+                  <span className="text-sm font-medium text-foreground hidden md:inline">
+                    Perfil de Administrador
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground hidden md:inline">
+                  {user.username}
                 </span>
+                <HideMoneyToggle />
+                <ThemeToggle />
+              </div>
+            </header>
+            <main
+              className={`flex-1 overflow-auto print:overflow-visible ${
+                isAdmin ? "" : "pb-[calc(4rem+env(safe-area-inset-bottom))] md:pb-0"
+              }`}
+            >
+              {isAdmin ? (
+                <Suspense fallback={<PageLoader />}>
+                  <AdminRouter />
+                </Suspense>
+              ) : (
+                <ConsultantRouter />
               )}
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-muted-foreground hidden md:inline">
-                {user.username}
-              </span>
-              <HideMoneyToggle />
-              <ThemeToggle />
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => logout().then(() => window.location.assign("/login"))}
-                title="Cerrar sesión"
-                aria-label="Cerrar sesión"
-                data-testid="button-logout"
-              >
-                <LogOut className="h-4 w-4" />
-              </Button>
-            </div>
-          </header>
-          <main className="flex-1 overflow-auto print:overflow-visible">
-            {isAdmin ? (
-              <Suspense fallback={<PageLoader />}>
-                <AdminRouter />
-              </Suspense>
-            ) : (
-              <ConsultantRouter />
-            )}
-          </main>
+            </main>
+            {!isAdmin && <BottomNav />}
+          </div>
         </div>
-      </div>
-    </SidebarProvider>
+      </SidebarProvider>
+    </SaleDialogProvider>
   );
 }
 

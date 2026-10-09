@@ -1,15 +1,14 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useSaleCart } from "@/hooks/use-sale-cart";
+import { useSaleDialog } from "@/hooks/use-sale-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { SaleCard, type Sale, type SaleDetails } from "@/components/SaleCard";
-import { NewSaleDialog } from "@/components/NewSaleDialog";
+import { SaleCard, type Sale } from "@/components/SaleCard";
 import { SaleDetailDialog } from "@/components/SaleDetailDialog";
 import { AssignClientDialog } from "@/components/AssignClientDialog";
 import { UnfinishedDraftsSection } from "@/components/UnfinishedDraftsSection";
 import { ErrorBlock } from "@/components/ErrorBlock";
-import type { Draft } from "@shared/schema";
 import { Plus, Search, Filter } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -21,7 +20,6 @@ import {
 } from "@/components/ui/select";
 import { apiRequest } from "@/lib/queryClient";
 import { useHideMoney } from "@/hooks/use-hide-money";
-import type { Product } from "@shared/schema";
 import type { TopProductByCategory } from "@/components/CategoryProductsDialog";
 
 // Prompt 6, punto 8: reemplaza el filtro viejo, que filtraba por `sale.status` — ese campo ya
@@ -39,27 +37,26 @@ const statusFilters = [
 export default function Ventas() {
   const { format } = useHideMoney();
   const cart = useSaleCart();
+  const { isOpen: isSaleDialogOpen, openCreateSale, openEditSale } = useSaleDialog();
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("todas");
-  const [dialogOpen, setDialogOpen] = useState(false);
   const [selectedSaleId, setSelectedSaleId] = useState<number | null>(null);
-  const [editingSale, setEditingSale] = useState<SaleDetails | null>(null);
   const [assigningClientSale, setAssigningClientSale] = useState<Sale | null>(null);
-  const [resumingSaleDraft, setResumingSaleDraft] = useState<Draft | null>(null);
 
   // Si venimos de "Ir a Ventas" desde Productos con un carrito ya armado, abrir el diálogo
   // de venta nueva automáticamente en vez de dejar el carrito perdido en un botón sin apretar.
+  // `clearCartOnClose: true` porque esta apertura (y la del botón "Nueva Venta" de abajo) están
+  // ligadas al carrito compartido — al cerrar sin editar, se vacía (ver use-sale-dialog.tsx).
+  // El diálogo compartido vive en AppShell y persiste al navegar — si ya está abierto (otra
+  // sesión de venta en curso desde otra pantalla), nunca se la pisa.
   useEffect(() => {
-    if (cart.lines.length > 0 && !dialogOpen && editingSale === null) {
-      setDialogOpen(true);
+    if (cart.lines.length > 0 && !isSaleDialogOpen) {
+      openCreateSale({ initialLines: cart.lines, clearCartOnClose: true });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const { data: sales = [], isError: errorSales } = useQuery<Sale[]>({ queryKey: ["/api/sales"] });
-  // Etapa I-B.8-E (F5): sin errorProducts, un fallo acá dejaba el diálogo de nueva/editar venta
-  // con el catálogo vacío en silencio, en vez de avisar que algo no cargó.
-  const { data: products = [], isError: errorProducts } = useQuery<Product[]>({ queryKey: ["/api/products"] });
   const { data: topProducts = [], isError: errorTopProducts } = useQuery<TopProductByCategory[]>({
     queryKey: ["/api/sales/top-products", "top5"],
     queryFn: async () => {
@@ -68,7 +65,9 @@ export default function Ventas() {
     },
   });
 
-  const hasLoadError = errorSales || errorTopProducts || errorProducts;
+  // "/api/products" (para la venta nueva/editar) ya no se consulta en esta página — su propio
+  // aviso de error vive en use-sale-dialog.tsx, que es quien lo consulta ahora.
+  const hasLoadError = errorSales || errorTopProducts;
 
   const filteredSales = sales.filter((s) => {
     const matchesSearch = s.clientName.toLowerCase().includes(search.toLowerCase());
@@ -93,7 +92,11 @@ export default function Ventas() {
 
   return (
     <div className="p-6 space-y-6" data-testid="page-ventas">
-      <UnfinishedDraftsSection type="sale" title="Ventas sin terminar" onResume={setResumingSaleDraft} />
+      <UnfinishedDraftsSection
+        type="sale"
+        title="Ventas sin terminar"
+        onResume={(draft) => openCreateSale({ draftToResume: draft, clearCartOnClose: true })}
+      />
 
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
@@ -104,7 +107,10 @@ export default function Ventas() {
               : `${sales.length} venta${sales.length !== 1 ? "s" : ""} registrada${sales.length !== 1 ? "s" : ""} · ${owingCount} te debe${owingCount !== 1 ? "n" : ""}`}
           </p>
         </div>
-        <Button onClick={() => setDialogOpen(true)} data-testid="button-add-sale">
+        <Button
+          onClick={() => openCreateSale({ initialLines: cart.lines, clearCartOnClose: true })}
+          data-testid="button-add-sale"
+        >
           <Plus className="h-4 w-4 mr-2" />
           Nueva Venta
         </Button>
@@ -224,32 +230,12 @@ export default function Ventas() {
         </>
       )}
 
-      <NewSaleDialog
-        open={dialogOpen || editingSale !== null || resumingSaleDraft !== null}
-        onOpenChange={(next) => {
-          if (!next) {
-            const wasEditing = editingSale !== null;
-            setDialogOpen(false);
-            setEditingSale(null);
-            setResumingSaleDraft(null);
-            // Solo se limpia el carrito compartido si esta sesión de venta arrancó (o pudo
-            // arrancar) desde el carrito de Productos — nunca al cerrar la edición de una
-            // venta ya existente, que no tiene relación con el carrito.
-            if (!wasEditing) cart.clear();
-          }
-        }}
-        products={products}
-        existingSale={editingSale}
-        initialLines={cart.lines}
-        draftToResume={resumingSaleDraft}
-      />
-
       <SaleDetailDialog
         saleId={selectedSaleId}
         onOpenChange={(next) => !next && setSelectedSaleId(null)}
         onEdit={(sale) => {
           setSelectedSaleId(null);
-          setEditingSale(sale);
+          openEditSale(sale);
         }}
       />
 

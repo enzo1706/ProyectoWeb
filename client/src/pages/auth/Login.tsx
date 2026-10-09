@@ -8,6 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Shield, Loader2 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { BrandLogo } from "@/components/BrandLogo";
+import { wasClosedByInactivity, clearSessionActivity } from "@/lib/sessionActivity";
 
 export default function Login() {
   const { login } = useAuth();
@@ -16,6 +17,14 @@ export default function Login() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // Prompt 13 — se evalúa una sola vez, al entrar a esta pantalla (no en cada render): si no
+  // fue por inactividad, nunca se inventa un motivo. Se borra enseguida — es un aviso de una
+  // sola vez, no algo que deba seguir apareciendo si se recarga esta misma pantalla después.
+  const [showInactivityNotice] = useState(() => {
+    const closedByInactivity = wasClosedByInactivity();
+    if (closedByInactivity) clearSessionActivity();
+    return closedByInactivity;
+  });
   // Guarda sincrónico: `disabled={isSubmitting}` no alcanza para bloquear un
   // doble-submit real (ver client/src/hooks/use-guarded-mutation.ts).
   const isSubmittingRef = useRef(false);
@@ -52,6 +61,15 @@ export default function Login() {
           <h1 className="text-2xl font-bold text-[hsl(220,55%,22%)]">Mary Kay Manager</h1>
           <p className="text-sm text-muted-foreground">Inicia sesión para continuar</p>
         </div>
+
+        {showInactivityNotice && (
+          <p
+            className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-center text-sm text-amber-700 dark:text-amber-400"
+            data-testid="text-inactivity-notice"
+          >
+            Por seguridad cerramos tu sesión porque pasaron más de 10 días sin entrar.
+          </p>
+        )}
 
         <Card className="border-[hsl(330,15%,90%)] shadow-lg bg-white/90 backdrop-blur-sm">
           <CardHeader className="space-y-1 pb-4">

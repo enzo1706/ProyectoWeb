@@ -845,6 +845,38 @@ Cómo verifico que quedó bien:
 - **Panel de administración** (precio de suscripción y cupones, Prompt U): si hoy tiene una
   entrada en el menú, se mantiene igual y visible solo para el rol admin — no es parte de este
   rediseño.
+- **Aviso de "cerrada por inactividad"**: en vez de un flag sí/no, se guarda en `localStorage`
+  SOLO la fecha del último uso de la app con sesión iniciada (nada identificable). En la
+  pantalla de ingreso, el aviso se muestra únicamente si esa fecha tiene más de 10 días — si la
+  sesión se perdió por otro motivo (cookies borradas, problema del servidor), nunca se inventa
+  el motivo. Al cerrar sesión a propósito, esa fecha se borra. Ver `client/src/lib/sessionActivity.ts`.
+- **Teclado virtual**: mientras un campo de texto tiene el foco (y por lo tanto, en celular, el
+  teclado está abierto), la barra inferior se oculta por completo — siendo `fixed`, el teclado
+  no la empuja y quedaría flotando arriba, tapando lo que se escribe. Ver
+  `client/src/hooks/use-virtual-keyboard-open.ts`.
+- **"Nueva venta" pasa a una sola instancia compartida**: se creó `SaleDialogProvider`
+  (`client/src/hooks/use-sale-dialog.tsx`), montado una sola vez en `AppShell` (no para admin).
+  Inicio, la ficha de la clienta, el botón "Nueva Venta" de Ventas, su auto-apertura desde el
+  carrito y "Retomar" un borrador ahora abren esa misma instancia en vez de cada uno tener su
+  propio diálogo local — el diálogo sobrevive a la navegación entre pantallas (una venta a
+  medio hacer ya no se pierde si la consultora cambia de sección). El vaciado del carrito
+  compartido al cerrar sigue atado solo a las aperturas que vienen de Ventas (`clearCartOnClose`),
+  igual que antes — Inicio y la ficha de clienta nunca tocaban el carrito y siguen sin tocarlo.
+- **"Clientes" → "Clientas"**: se revisó todo `client/src` (strings visibles) y los mensajes de
+  error del backend que se muestran al frontend, case-insensitive. El único lugar que todavía
+  decía "Clientes" era el título del ítem del menú lateral (`AppSidebar.tsx`) — ya corregido a
+  "Clientas". El resto de la app (incluyendo los mensajes de error de `server/`) ya estaba en
+  femenino de prompts anteriores. No se tocó ninguna ruta, tabla ni nombre de variable.
+- **Sesión (10 días, renovación en cada visita)**: implementado con `rolling: true` +
+  `maxAge: 10 días` en `server/session.ts` — no requiere ninguna columna, tabla ni variable de
+  Railway nueva (la tabla `session` y `trust proxy` ya existen y ya están probados en
+  producción), así que no se agregó ninguna entrada en `docs/migracion-deploy-2.md`. Un deploy
+  con este cambio desloguea sin aviso a cualquier consultora con una sesión activa en ese
+  momento (el formato de la cookie no cambia, pero `maxAge` sí) — no es grave (vuelve a loguear
+  normal), pero vale que quien haga el deploy lo sepa de antemano.
+- **Test de la cookie de sesión**: `server/tests/session-rolling.test.ts` prueba que el login
+  deja una cookie que vence en 10 días y que una request autenticada posterior (`GET
+  /api/auth/me`) renueva ese vencimiento (`Set-Cookie` en cada response, no solo en el login).
 
 ## Ingreso, registro y suscripción
 
