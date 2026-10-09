@@ -68,3 +68,37 @@ export function assertTestDatabaseAuthorized(): AuthorizedTestDatabase {
 
   return { url };
 }
+
+/**
+ * Señal independiente de la de arriba — esta no valida a qué apunta TEST_DATABASE_URL, sino
+ * si corresponde elegirla. Antes de esto, storage.ts/session.ts/app.ts decidían la base SOLO
+ * por la presencia de la variable: "producción nunca tiene TEST_DATABASE_URL" era un supuesto,
+ * no algo que el código garantizara. Si alguien la agregara por error en las variables de
+ * Railway, producción pasaría a leer/escribir en la base de test en silencio.
+ *
+ * `vitest run` fija `NODE_ENV=test` por defecto (confirmado en vivo, no es solo lo que ponen
+ * algunos archivos de server/tests a mano) — ni `npm run dev` ni Railway lo setean nunca.
+ * Combinado con el guard de arriba (loopback + "_test"), ahora hacen falta DOS señales
+ * independientes, no una, para que un entorno real use la base de test por accidente.
+ *
+ * Caso inverso, igual de real (reproducido: así terminó un usuario de test en la base de
+ * desarrollo real) — NODE_ENV=test pero TEST_DATABASE_URL ausente (por ejemplo, si alguien la
+ * sacó del .env a mano para algo puntual y se olvidó de volver a ponerla antes de correr los
+ * tests): un storage que caiga de vuelta a la base real en silencio es tan peligroso como el
+ * caso de arriba. Por eso esto tira en vez de devolver `false` — un test de Postgres que no
+ * tiene su base dedicada configurada tiene que romper fuerte, nunca escribir callado en otro
+ * lado.
+ */
+export function shouldUseTestDatabase(): boolean {
+  if (process.env.NODE_ENV !== "test") return false;
+
+  if (!process.env.TEST_DATABASE_URL) {
+    throw new Error(
+      "[test-db-guard] NODE_ENV=test pero falta TEST_DATABASE_URL. Un storage de Postgres en " +
+        "un test nunca debe caer de vuelta a la base real en silencio — configurá " +
+        "TEST_DATABASE_URL (ver docs/TESTING_POSTGRES.md) o corré este test en DATABASE_MODE=memory.",
+    );
+  }
+
+  return true;
+}

@@ -95,6 +95,7 @@ import type { z } from "zod";
 import { eq, ne, count, sql, and, gt, gte, lt, asc, desc, isNotNull, isNull, inArray, notInArray, ilike, or } from "drizzle-orm";
 import type { db as database } from "./db";
 import { resolveStorageMode } from "./storage-mode";
+import { shouldUseTestDatabase } from "./test-db-guard";
 import { slugify } from "@shared/slug";
 import bcrypt from "bcryptjs";
 import { TRIAL_DAYS, PERIOD_DAYS } from "./config/subscription";
@@ -917,11 +918,12 @@ export class DatabaseStorage implements IStorage {
   private dbPromise: Promise<Database> | undefined;
 
   private async getDb(): Promise<Database> {
-    // TEST_DATABASE_URL solo existe cuando un test la seteó explícitamente y pasó el guard
-    // de server/test-db-guard.ts (host loopback + nombre "*_test") — producción real nunca
-    // la tiene, así que este branch nunca se activa fuera de los tests de Postgres real
-    // (client-isolation/stock-concurrency/tenant-isolation-deep, ver Etapa I-B.5.1).
-    this.dbPromise ??= process.env.TEST_DATABASE_URL
+    // shouldUseTestDatabase() exige NODE_ENV=test ADEMÁS de TEST_DATABASE_URL (ver
+    // server/test-db-guard.ts) — no alcanza con que la variable esté presente. Antes de este
+    // chequeo, "producción real nunca tiene TEST_DATABASE_URL" era un supuesto, no algo que
+    // el código garantizara: si alguien la agregaba por error en las variables de Railway,
+    // producción pasaba a leer/escribir en la base de test en silencio.
+    this.dbPromise ??= shouldUseTestDatabase()
       ? import("./test-db").then((module) => module.testDb)
       : import("./db").then((module) => module.db);
     return this.dbPromise;
