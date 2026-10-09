@@ -63,6 +63,14 @@ siguiente.
   - `RESEND_API_KEY` / `EMAIL_FROM`: si se quiere probar el flujo de recuperación de
     contraseña en staging, o una clave de test de Resend si existe, o dejarlas sin setear
     (el envío de mail simplemente no va a andar, sin romper el resto de la app).
+  - **`TEST_DATABASE_URL`: NUNCA tiene que existir en ningún servicio de Railway, ni en
+    staging ni en producción.** Es exclusiva de los tests que corren en la máquina local
+    (`vitest`, que fija `NODE_ENV=test` antes de usarla). `storage.ts`/`session.ts`/`app.ts`
+    exigen `NODE_ENV=test` ADEMÁS de esta variable para elegir la base de test
+    (`shouldUseTestDatabase()`, ver `server/test-db-guard.ts`) — como `NODE_ENV` en Railway
+    siempre es `production` (ver el punto de arriba), esta segunda señal ya alcanza para que
+    agregarla ahí por error no tenga ningún efecto. Aun así, antes de cada deploy conviene
+    confirmarla ausente en el panel de variables del servicio.
 - Auto-deploy desde la rama `staging` de este mismo repo (configurable en el servicio de
   Railway, igual que ya está configurado el de producción apuntando a `main`).
 
