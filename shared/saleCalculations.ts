@@ -170,6 +170,150 @@ export function resolveLineCost(input: {
   };
 }
 
+/**
+ * Prompt 8 — al vender sin stock suficiente, `quantity - quantityPending` unidades quedan
+ * cubiertas con lo que hay ahora; el resto (`pending`) espera un pedido futuro. Nunca negativo:
+ * `available` ya viene resuelto por el caller (nunca < 0).
+ */
+export interface StockAllocation {
+  covered: number;
+  pending: number;
+}
+export function resolveStockAllocation(requestedQuantity: number, available: number): StockAllocation {
+  const covered = Math.min(requestedQuantity, Math.max(0, available));
+  return { covered, pending: requestedQuantity - covered };
+}
+
+/**
+ * Prompt 8 — costo inicial de un renglón al crearse (o al agregarse una cantidad nueva en una
+ * edición): la porción YA cubierta (`quantity - quantityPending`) toma el costo real conocido
+ * de `productStock.costPrice` si existe; si no existe, TODA la línea (cubierta + pendiente)
+ * queda estimada con el descuento habitual, igual que `resolveLineCost` hacía antes de este
+ * prompt (no hay forma de saber el costo real de algo que ni siquiera se compró todavía).
+ */
+export function resolveInitialLineCost(input: {
+  quantity: number;
+  quantityPending: number;
+  realCostPerUnitKnown: number | null;
+  publicPrice: number;
+  habitualDiscountPercent: number;
+}): { estimatedCostPerUnit: number | null; realCostAccumulated: number; realCostUnits: number } {
+  const coveredAtCreation = input.quantity - input.quantityPending;
+  if (input.realCostPerUnitKnown !== null) {
+    return {
+      estimatedCostPerUnit:
+        input.quantityPending > 0 ? computeDiscountedCost(input.publicPrice, input.habitualDiscountPercent) : null,
+      realCostAccumulated: coveredAtCreation * input.realCostPerUnitKnown,
+      realCostUnits: coveredAtCreation,
+    };
+  }
+  return {
+    estimatedCostPerUnit: computeDiscountedCost(input.publicPrice, input.habitualDiscountPercent),
+    realCostAccumulated: 0,
+    realCostUnits: 0,
+  };
+}
+
+/** Prompt 8 — costo final de un renglón (lo que usa `profit`), combinando lo ya resuelto con
+ * costo real y lo que todavía queda con el estimado congelado. `costIsEstimated` es
+ * `realCostUnits < quantity` — nunca se mezcla un promedio viejo con uno nuevo: cada pedido que
+ * llega solo le suma a `realCostAccumulated`/`realCostUnits`, nunca reaveragea lo anterior. */
+export function resolveBlendedLineCost(input: {
+  quantity: number;
+  estimatedCostPerUnit: number | null;
+  realCostAccumulated: number;
+  realCostUnits: number;
+}): ResolvedLineCost {
+  const isEstimated = input.realCostUnits < input.quantity;
+  if (!isEstimated) {
+    return { costPrice: Math.round(input.realCostAccumulated / input.quantity), isEstimated: false };
+  }
+  const estimatedUnits = input.quantity - input.realCostUnits;
+  const estimatedTotal = (input.estimatedCostPerUnit ?? 0) * estimatedUnits;
+  return { costPrice: Math.round((input.realCostAccumulated + estimatedTotal) / input.quantity), isEstimated: true };
+}
+
+/** Prompt 8 — un pedido (o cualquier otro camino que sume stock) asigna `unitsToAssign`
+ * unidades a un renglón pendiente, a `realUnitCost` (el costo real de ESE pedido). El estimado
+ * congelado de lo que siga pendiente nunca se toca. */
+export function applyRealCostToLine(
+  current: { estimatedCostPerUnit: number | null; realCostAccumulated: number; realCostUnits: number },
+  unitsToAssign: number,
+  realUnitCost: number,
+): { estimatedCostPerUnit: number | null; realCostAccumulated: number; realCostUnits: number } {
+  return {
+    estimatedCostPerUnit: current.estimatedCostPerUnit,
+    realCostAccumulated: current.realCostAccumulated + unitsToAssign * realUnitCost,
+    realCostUnits: current.realCostUnits + unitsToAssign,
+  };
+}
+
+/** Prompt 8 — costo cargado a mano desde "Editar producto" (recalculateEstimatedSalesForProduct)
+ * sobre un renglón que todavía tiene unidades pendientes: actualiza SOLO el estimado congelado
+ * (todavía no llegó ningún pedido real para esas unidades) — nunca toca lo ya resuelto. Si no
+ * queda nada pendiente, resuelve la línea entera de una, igual que antes de este prompt. */
+export function applyManualCostCorrection(
+  current: {
+    quantity: number;
+    quantityPending: number;
+    estimatedCostPerUnit: number | null;
+    realCostAccumulated: number;
+    realCostUnits: number;
+  },
+  newCostPrice: number,
+): { estimatedCostPerUnit: number | null; realCostAccumulated: number; realCostUnits: number } {
+  if (current.quantityPending > 0) {
+    return {
+      estimatedCostPerUnit: newCostPrice,
+      realCostAccumulated: current.realCostAccumulated,
+      realCostUnits: current.realCostUnits,
+    };
+  }
+  const remaining = current.quantity - current.realCostUnits;
+  return {
+    estimatedCostPerUnit: null,
+    realCostAccumulated: current.realCostAccumulated + newCostPrice * remaining,
+    realCostUnits: current.quantity,
+  };
+}
+
+export interface QuantityDecreaseResult {
+  quantityPending: number;
+  quantityDelivered: number;
+  stockToReturn: number;
+}
+
+/**
+ * Prompt 8, ajuste 5 — al bajar la cantidad de un renglón (o sacarlo entero: `decreaseAmount` =
+ * toda la cantidad vieja), el orden es primero lo pendiente (nunca tocó stock, nada que
+ * devolver), después lo que tenía en mano sin entregar todavía, y por último -si no alcanza- lo
+ * ya entregado (una devolución de la clienta). Todo lo que sale de las dos últimas bolsas
+ * vuelve al stock.
+ */
+export function resolveQuantityDecrease(
+  decreaseAmount: number,
+  oldQuantity: number,
+  quantityPending: number,
+  quantityDelivered: number,
+): QuantityDecreaseResult {
+  const fromPending = Math.min(decreaseAmount, quantityPending);
+  let remaining = decreaseAmount - fromPending;
+  const nextQuantityPending = quantityPending - fromPending;
+
+  const readyNotDelivered = oldQuantity - quantityPending - quantityDelivered;
+  const fromReady = Math.min(remaining, readyNotDelivered);
+  remaining -= fromReady;
+
+  const fromDelivered = Math.min(remaining, quantityDelivered);
+  const nextQuantityDelivered = quantityDelivered - fromDelivered;
+
+  return {
+    quantityPending: nextQuantityPending,
+    quantityDelivered: nextQuantityDelivered,
+    stockToReturn: fromReady + fromDelivered,
+  };
+}
+
 /** Monto de Ingresos Brutos de una venta: el % (en décimas de punto porcentual, mismo formato
  * que `consultants.grossIncomeTaxPercentTenths`) aplicado sobre el `total` que paga la clienta
  * (ya incluye descuento, recargo y envío cobrado — nunca sobre el subtotal). `null` cuando la

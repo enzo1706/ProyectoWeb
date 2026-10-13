@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { randomUUID } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
 import { testDb as db, testPool as pool } from "../test-db";
-import { consultants, products, productStock, clients, sales, saleItems, saleInstallments, clientPayments, paymentAllocations } from "@shared/schema";
+import { consultants, products, productStock, clients, sales, saleItems, saleInstallments, clientPayments, paymentAllocations, type Sale } from "@shared/schema";
 import { DatabaseStorage, SaleValidationError, ProductConflictError } from "../storage";
 
 /** Segunda consultora, exclusiva del test de aislamiento de tenant del batch de stock (Etapa
@@ -260,32 +260,30 @@ function idempotentSaleOf(quantity: number, clientRequestId: string) {
   };
 }
 
-describe("Condición de carrera de stock", () => {
-  it("stock=10, ventas simultáneas de 6+6 — nunca venden 12, la rechazada no deja rastro", async () => {
+describe("Condición de carrera de stock (Prompt 8: vender sin stock ya no rechaza)", () => {
+  it("stock=10, ventas simultáneas de 6+6 (12 pedidas): las DOS prosperan, nunca queda negativo, lo que no entra queda pendiente — nunca se pierde ni se duplica", async () => {
     const results = await Promise.allSettled([
       storage.createSale(testConsultantId, saleOf(6)),
       storage.createSale(testConsultantId, saleOf(6)),
     ]);
 
-    const fulfilled = results.filter((r) => r.status === "fulfilled");
-    const rejected = results.filter((r) => r.status === "rejected");
-
-    // Exactamente UNA de las dos ventas puede prosperar — la otra tiene que fallar por
-    // stock insuficiente, no las dos, y nunca las dos al mismo tiempo con éxito.
-    expect(fulfilled.length).toBe(1);
-    expect(rejected.length).toBe(1);
-    expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(SaleValidationError);
-    expect((rejected[0] as PromiseRejectedResult).reason.message).toMatch(/stock insuficiente/i);
+    const fulfilled = results.filter((r) => r.status === "fulfilled") as PromiseFulfilledResult<Sale>[];
+    expect(fulfilled.length).toBe(2); // ninguna se rechaza más — Prompt 8, Parte 1
 
     const [stockRow] = await db.select().from(productStock).where(eq(productStock.productId, testProductId));
-    expect(stockRow.unidades).toBe(4); // 10 - 6 de la que ganó, nunca negativo ni "-2"
+    expect(stockRow.unidades).toBe(0); // nunca negativo: las 10 que había se repartieron entre las dos
 
-    // La transacción rechazada hizo rollback correctamente: no quedó ninguna venta a medias
-    // (sale sin items, o con stock ya descontado dos veces) — hay exactamente 1 venta real.
     const salesForClient = await storage.getSalesByClient(testConsultantId, testClientId);
-    expect(salesForClient).toHaveLength(1);
-    expect(salesForClient[0].items).toHaveLength(1);
-    expect(salesForClient[0].items[0].quantity).toBe(6);
+    expect(salesForClient).toHaveLength(2); // ninguna de las dos se perdió ni se duplicó
+
+    // El FOR UPDATE serializa: una (la que llega primero) se cubre entera, la otra se queda
+    // con la diferencia pendiente — no importa cuál gane la carrera, lo que importa es que la
+    // suma de lo pendiente sea exactamente 2 (6+6=12, solo había 10) y nunca más de una venta
+    // quede con pendientes.
+    const details = await Promise.all(fulfilled.map((r) => storage.getSaleDetails(testConsultantId, r.value.id)));
+    const pendingByItem = details.map((d) => d!.items[0].quantityPending);
+    expect(pendingByItem.reduce((a, b) => a + b, 0)).toBe(2);
+    expect(pendingByItem.filter((p) => p > 0)).toHaveLength(1);
   });
 });
 
@@ -953,7 +951,7 @@ describe("Incremento atómico de stock (incrementProductStock) — Etapa I-B.8-B
     expect(beforeRows).toHaveLength(0);
 
     const updated = await storage.incrementProductStock(testConsultantId, incrementFreshProductId, 4, false);
-    expect(updated?.unidades).toBe(4);
+    expect(updated?.product.unidades).toBe(4);
 
     const rows = await db.select().from(productStock).where(eq(productStock.productId, incrementFreshProductId));
     expect(rows).toHaveLength(1); // una sola fila, nunca duplicada
@@ -1263,7 +1261,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
   describe("Básicos", () => {
     it("1. batch con una sola línea aplica correctamente", async () => {
       const result = await storage.incrementProductStockBatch(testConsultantId, [{ productId: productAId, delta: 2 }], false);
-      expect(result).toEqual({ updated: 1 });
+      expect(result).toEqual({ updated: 1, pendingAssignments: [] });
       const [row] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
       expect(row.unidades).toBe(12);
     });
@@ -1276,7 +1274,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
         { productId: productAId, delta: 1 },
         { productId: productBId, delta: 3 },
       ], false);
-      expect(result).toEqual({ updated: 2 });
+      expect(result).toEqual({ updated: 2, pendingAssignments: [] });
 
       const [afterA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
       const [afterB] = await db.select().from(productStock).where(eq(productStock.productId, productBId));
@@ -1404,7 +1402,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
         { productId: productBId, delta: 5 },
         { productId: productBId, delta: 3 },
       ], false);
-      expect(result).toEqual({ updated: 1 }); // un solo producto afectado, no dos líneas separadas
+      expect(result).toEqual({ updated: 1, pendingAssignments: [] }); // un solo producto afectado, no dos líneas separadas
 
       const [after] = await db.select().from(productStock).where(eq(productStock.productId, productBId));
       expect(after.unidades).toBe(before.unidades + 8); // 5+3 combinados, nunca solo uno de los dos
@@ -1432,7 +1430,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
         storage.incrementProductStockBatch(testConsultantId, [{ productId: freshProduct.id, delta: 5 }], false),
         storage.incrementProductStockBatch(testConsultantId, [{ productId: freshProduct.id, delta: 7 }], false),
       ]);
-      expect(results).toEqual([{ updated: 1 }, { updated: 1 }]);
+      expect(results).toEqual([{ updated: 1, pendingAssignments: [] }, { updated: 1, pendingAssignments: [] }]);
 
       const [after] = await db.select().from(productStock).where(eq(productStock.productId, freshProduct.id));
       expect(after.unidades).toBe(22); // 10 + 5 + 7, ninguno perdido bajo concurrencia real
@@ -1486,7 +1484,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
           { productId: orderedLow.id, delta: 4 },
         ], false),
       ]);
-      expect(results).toEqual([{ updated: 2 }, { updated: 2 }]);
+      expect(results).toEqual([{ updated: 2, pendingAssignments: [] }, { updated: 2, pendingAssignments: [] }]);
 
       const [afterLow] = await db.select().from(productStock).where(eq(productStock.productId, orderedLow.id));
       const [afterHigh] = await db.select().from(productStock).where(eq(productStock.productId, orderedHigh.id));
@@ -1533,7 +1531,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
         ], false),
         storage.incrementProductStockBatch(testConsultantId, [{ productId: p2.id, delta: 5 }], false),
       ]);
-      expect(results).toEqual([{ updated: 2 }, { updated: 1 }]);
+      expect(results).toEqual([{ updated: 2, pendingAssignments: [] }, { updated: 1, pendingAssignments: [] }]);
 
       const [afterP1] = await db.select().from(productStock).where(eq(productStock.productId, p1.id));
       const [afterP2] = await db.select().from(productStock).where(eq(productStock.productId, p2.id));

@@ -1,10 +1,13 @@
 import { useMemo, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useLocation } from "wouter";
-import { apiRequest } from "@/lib/queryClient";
+import { apiRequest, queryClient } from "@/lib/queryClient";
+import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
+import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/useAuth";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { LowStockDialog } from "@/components/LowStockDialog";
 import { ErrorBlock } from "@/components/ErrorBlock";
@@ -16,6 +19,8 @@ import { useHideMoney } from "@/hooks/use-hide-money";
 import { toDateStr, daysBetween } from "@/lib/date";
 import { isReminderActive } from "@shared/stockAlerts";
 import { getEventTypeLabel } from "@/components/AppointmentCard";
+import { setOrderReminderPreload } from "@/lib/orderReminderPreload";
+import { getArgentinaDateStr } from "@shared/argentinaTime";
 import type { Product, Appointment, Consultant } from "@shared/schema";
 import {
   Plus,
@@ -25,6 +30,7 @@ import {
   Package,
   Gift,
   Users,
+  Truck,
   type LucideIcon,
 } from "lucide-react";
 
@@ -59,6 +65,27 @@ interface SalesSummaryPoint {
   totalProfit: number;
   salesCount: number;
   avgTicket: number;
+}
+// Prompt 8, Parte 2 y 3.
+interface DeliveryReadyRow {
+  saleId: number;
+  itemId: number;
+  clientId: number | null;
+  clientName: string;
+  productName: string;
+  quantity: number;
+}
+interface OrderReminderItemRow {
+  productId: number;
+  productName: string;
+  soldInPeriod: number;
+  pendingFromBefore: number;
+  currentStock: number;
+  suggestedQuantity: number;
+}
+interface OrderReminderResponse {
+  reminder: { id: number; reminderDate: string };
+  items: OrderReminderItemRow[];
 }
 
 interface TaskItem {
@@ -217,6 +244,51 @@ export default function Dashboard() {
     },
   });
 
+  // Prompt 8, Parte 2 — "Ya podés entregarle a...".
+  const { data: deliveryReadyItems = [], isError: errorDeliveryReady } = useQuery<DeliveryReadyRow[]>({
+    queryKey: ["/api/deliveries/ready"],
+  });
+  const { toast } = useToast();
+  const markDeliveredMutation = useGuardedMutation({
+    mutationFn: async (itemId: number) => {
+      const res = await apiRequest("PATCH", `/api/sales/${deliveryReadyItems.find((i) => i.itemId === itemId)?.saleId}/items/${itemId}/deliver`);
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/deliveries/ready"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/sales"] });
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo marcar como entregado", description: err.message, variant: "destructive" });
+    },
+  });
+
+  // Prompt 8, Parte 3 — "Hoy es tu día de pedido" / "Tu día de pedido fue el...".
+  const { data: orderReminder, isError: errorOrderReminder } = useQuery<OrderReminderResponse | null>({
+    queryKey: ["/api/order-reminder"],
+  });
+  const [showAllReminderItems, setShowAllReminderItems] = useState(false);
+  const dismissReminderMutation = useGuardedMutation({
+    mutationFn: async (id: number) => {
+      const res = await apiRequest("POST", `/api/order-reminder/${id}/dismiss`);
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/order-reminder"] });
+      setShowAllReminderItems(false);
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo cerrar el recordatorio", description: err.message, variant: "destructive" });
+    },
+  });
+  const openOrderForReminder = () => {
+    if (!orderReminder) return;
+    const qtyByProduct: Record<number, number> = {};
+    for (const item of orderReminder.items) qtyByProduct[item.productId] = item.suggestedQuantity;
+    setOrderReminderPreload(qtyByProduct);
+    setLocation("/productos");
+  };
+
   const detailAppointment = upcomingAppointments.find((a) => a.id === selectedAppointmentId) ?? null;
 
   const openAppointmentDetail = (appointment: Appointment) => {
@@ -241,6 +313,23 @@ export default function Dashboard() {
     }
     return items.slice(0, SECTION_MAX_ITEMS);
   }, [pendingInstallments, format]);
+
+  // Prompt 8, Parte 2 — "Ya podés entregarle a [clienta]: [producto] x[cantidad]". Provisorio
+  // en "Alertas importantes" (como "Completá tu perfil") hasta que exista el bloque "Para
+  // hacer hoy" del Prompt 10.
+  const deliveryTasks = useMemo<TaskItem[]>(
+    () =>
+      deliveryReadyItems.slice(0, SECTION_MAX_ITEMS).map((item) => ({
+        key: `delivery-${item.itemId}`,
+        icon: Truck,
+        colorClass: "bg-green-500/10 text-green-600 dark:text-green-400",
+        title: item.clientId === null ? "Ya podés entregar (venta sin clienta)" : `Ya podés entregarle a ${item.clientName}`,
+        subtitle: `${item.productName} x${item.quantity}`,
+        actionLabel: "Marcar como entregado",
+        onAction: () => markDeliveredMutation.mutate(item.itemId),
+      })),
+    [deliveryReadyItems, markDeliveredMutation],
+  );
 
   const stockAlertProducts = useMemo(
     () => lowStockProducts.filter((p) => !isReminderActive(p.remindStockAt, today)).slice(0, SECTION_MAX_ITEMS),
@@ -286,12 +375,16 @@ export default function Dashboard() {
     errorInactive ||
     errorCurrentMonth ||
     errorPreviousMonth ||
-    errorBusinessSettings;
+    errorBusinessSettings ||
+    errorDeliveryReady ||
+    errorOrderReminder;
 
   const hasNothing =
     !isLoadingAny &&
     !hasLoadError &&
     alertTasks.length === 0 &&
+    deliveryTasks.length === 0 &&
+    !orderReminder &&
     stockAlertProducts.length === 0 &&
     upcomingEvents.length === 0 &&
     birthdaysToShow.length === 0 &&
@@ -332,8 +425,59 @@ export default function Dashboard() {
         </Card>
       )}
 
-      {!isLoadingAny && (alertTasks.length > 0 || stockAlertProducts.length > 0) && (
+      {!isLoadingAny && orderReminder && (
+        <Card data-testid="card-order-reminder">
+          <CardHeader className="pb-2">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Package className="h-4 w-4 text-muted-foreground" />
+              {orderReminder.reminder.reminderDate === getArgentinaDateStr()
+                ? "Hoy es tu día de pedido"
+                : `Tu día de pedido fue el ${new Date(orderReminder.reminder.reminderDate + "T00:00:00").toLocaleDateString("es-AR", { day: "numeric", month: "long" })}`}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-sm text-muted-foreground">Estos productos que vendiste tienen poco stock</p>
+            <div className="space-y-1.5">
+              {(showAllReminderItems ? orderReminder.items : orderReminder.items.slice(0, 5)).map((item) => (
+                <div key={item.productId} className="flex items-center justify-between text-sm" data-testid={`row-order-reminder-${item.productId}`}>
+                  <span className="truncate">{item.productName}</span>
+                  <Badge variant="outline">Sugerido: {item.suggestedQuantity}</Badge>
+                </div>
+              ))}
+            </div>
+            {!showAllReminderItems && orderReminder.items.length > 5 && (
+              <button
+                type="button"
+                className="text-sm text-muted-foreground underline"
+                onClick={() => setShowAllReminderItems(true)}
+                data-testid="button-order-reminder-view-all"
+              >
+                Ver todos
+              </button>
+            )}
+            <div className="flex flex-wrap gap-2 pt-1">
+              <Button type="button" onClick={openOrderForReminder} data-testid="button-order-reminder-build">
+                Armar pedido con estos productos
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={dismissReminderMutation.isPending}
+                onClick={() => dismissReminderMutation.mutate(orderReminder.reminder.id)}
+                data-testid="button-order-reminder-dismiss"
+              >
+                Listo, ya lo pedí
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {!isLoadingAny && (alertTasks.length > 0 || deliveryTasks.length > 0 || stockAlertProducts.length > 0) && (
         <Section title="Alertas importantes" icon={Clock} testId="section-alerts">
+          {deliveryTasks.map((task) => (
+            <TaskRow key={task.key} task={task} />
+          ))}
           {alertTasks.map((task) => (
             <TaskRow key={task.key} task={task} />
           ))}

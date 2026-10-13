@@ -31,6 +31,9 @@ interface LoadOrderDialogProps {
   products: Product[];
   /** Prompt 7 — borrador a retomar (desde "Pedidos sin terminar"). */
   draftToResume?: Draft | null;
+  /** Prompt 8, Parte 3 — "Armar pedido con estos productos" (desde el recordatorio de Inicio):
+   * cantidades sugeridas ya cargadas al abrir. Igual pasa primero por el paso del descuento. */
+  initialQtyByProduct?: Record<number, number>;
 }
 
 interface OrderLine {
@@ -237,7 +240,7 @@ function draftStateToDiscount(state: OrderDraftDiscountState): number | null | u
   return state.value;
 }
 
-export function LoadOrderDialog({ open, onOpenChange, products, draftToResume }: LoadOrderDialogProps) {
+export function LoadOrderDialog({ open, onOpenChange, products, draftToResume, initialQtyByProduct }: LoadOrderDialogProps) {
   const { toast } = useToast();
   const { format } = useHideMoney();
   const [stepIndex, setStepIndex] = useState(0);
@@ -271,7 +274,9 @@ export function LoadOrderDialog({ open, onOpenChange, products, draftToResume }:
     if (open && !draftToResume) {
       setStepIndex(0);
       setDiscount(undefined);
-      setQtyByProduct({});
+      // Prompt 8, Parte 3 — "Armar pedido con estos productos" ya trae las cantidades
+      // sugeridas; igual pasa primero por el paso del descuento, nada se confirma solo.
+      setQtyByProduct(initialQtyByProduct ?? {});
       setSearch("");
       setCategoryFilter("Todas");
       setExpandedFamilies(new Set());
@@ -280,6 +285,7 @@ export function LoadOrderDialog({ open, onOpenChange, products, draftToResume }:
       setEditingQtyProductId(null);
       setRemovingProductId(null);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, draftToResume]);
 
   const getQty = (productId: number) => qtyByProduct[productId] ?? 0;

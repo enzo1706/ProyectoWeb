@@ -43,6 +43,11 @@ export const consultants = pgTable("consultants", {
   // updateBusinessSettingsSchema, no acá).
   orderReminderDay1: integer("order_reminder_day1"),
   orderReminderDay2: integer("order_reminder_day2"),
+  // Prompt 8 — cuándo se guardaron por última vez los días de arriba (se pisa en cada PATCH de
+  // business-settings que los toque). El recordatorio del día de pedido nunca genera una fecha
+  // anterior a esta: si una consultora configura el día de pedido hoy, no le aparece de golpe un
+  // aviso "atrasado" de un ciclo que ya pasó antes de que existiera la configuración.
+  orderReminderDaysUpdatedAt: timestamp("order_reminder_days_updated_at"),
   // Prompt 1 — "Ingresos Brutos (%)", en DÉCIMAS de punto porcentual (35 = 3,5%) para seguir
   // la convención de todo el schema de nunca guardar decimales como float/numeric — mismo
   // criterio que amount/precio en pesos enteros. Nullable: no todas pagan IIBB.
@@ -241,8 +246,12 @@ export type InstallmentStatus = (typeof installmentStatuses)[number];
 export const adjustmentTypes = ["percent", "fixed"] as const;
 export type AdjustmentType = (typeof adjustmentTypes)[number];
 // Prompt 6: estado de entrega, separado del estado de pago (que ya vive en sale_installments).
-// "entregada" es el default porque hoy TODA venta se hace con stock (vender sin stock es el
-// Prompt 8, todavía no existe) — toda venta pasada fue, en los hechos, entregada al momento.
+// Prompt 8: dejó de ser un valor manual puro — ahora es un AGREGADO de sale_items.quantityDelivered
+// ("entregada" solo cuando TODOS los renglones tienen quantityDelivered === quantity), recalculado
+// en la misma transacción que toca cualquier renglón. El toggle manual sigue existiendo
+// (PATCH /api/sales/:id/delivery-status) pero ahora aplica a TODOS los renglones de la venta a
+// la vez: "entregada" los marca todos entregados (bloqueado si a alguno le queda quantityPending
+// > 0) y "pendiente_entrega" los vuelve todos a 0 entregado.
 export const deliveryStatuses = ["entregada", "pendiente_entrega"] as const;
 export type DeliveryStatus = (typeof deliveryStatuses)[number];
 
@@ -338,6 +347,25 @@ export const saleItems = pgTable("sale_items", {
   // de antes de esta columna, donde no hay forma de saberlo con certeza (ver migración de
   // datos de la Etapa correspondiente). Nunca se "completa" retroactivamente a partir de null.
   costIsEstimated: boolean("cost_is_estimated"),
+  // Prompt 8 — unidades de este renglón que todavía esperan un pedido futuro (vender sin
+  // stock). 0 = esta línea nunca tuvo o ya no tiene nada pendiente. Nunca se suma a
+  // `product_stock.unidades`: son unidades ya vendidas, no stock disponible.
+  quantityPending: integer("quantity_pending").notNull().default(0),
+  // Prompt 8 — unidades de este renglón ya entregadas físicamente a la clienta. "Lista para
+  // entregar pero todavía no entregada" = quantity - quantityPending - quantityDelivered (eso
+  // es lo que dispara el aviso "Ya podés entregarle..." en Inicio). Al crear la venta, nace en
+  // quantity - quantityPending (lo que ya tenía en mano se entrega en el momento).
+  quantityDelivered: integer("quantity_delivered").notNull().default(0),
+  // Prompt 8 — las tres columnas de abajo separan el costo YA RESUELTO (de stock que ya tenía
+  // o de pedidos que llegaron) del costo todavía ESTIMADO (de las unidades pendientes), para no
+  // mezclar un promedio viejo con uno nuevo cada vez que llega un pedido parcial. `costPrice`
+  // sigue siendo el valor final usado para profit: round((realCostAccumulated +
+  // estimatedCostPerUnit * (quantity - realCostUnits)) / quantity). `costIsEstimated` sigue
+  // siendo realCostUnits < quantity. Ver recalculateEstimatedSalesForProduct para el caso de
+  // costo cargado a mano con unidades todavía pendientes.
+  estimatedCostPerUnit: integer("estimated_cost_per_unit"),
+  realCostAccumulated: integer("real_cost_accumulated").notNull().default(0),
+  realCostUnits: integer("real_cost_units").notNull().default(0),
 }, (table) => ({
   saleIdIdx: index("sale_items_sale_id_idx").on(table.saleId),
   productIdIdx: index("sale_items_product_id_idx").on(table.productId),
@@ -363,6 +391,38 @@ export const saleInstallments = pgTable("sale_installments", {
 }, (table) => ({
   dueDateIdx: index("sale_installments_due_date_idx").on(table.dueDate),
   statusIdx: index("sale_installments_status_idx").on(table.status),
+}));
+
+/**
+ * Prompt 8 — un recordatorio del día de pedido generado y guardado por consultora y fecha, sin
+ * ninguna tarea programada: se calcula "al vuelo" la primera vez que entra después de su día de
+ * pedido (ver getOrderReminder en server/storage.ts), y esta fila es justamente lo que le
+ * permite no duplicarse si entra dos veces ni perderse si no entra el día exacto. `periodStart`/
+ * `periodEnd` quedan congelados en la fila (salen de los días configurados en el momento de
+ * generar, nunca de la última fila guardada — así un mes con la lista vacía, que no genera
+ * fila, no corre el período del siguiente ciclo). `items` congela SOLO el criterio (a)
+ * (vendido en el período): `[{ productId, soldInPeriod }]` — el criterio (b) (unidades
+ * pendientes) nunca se congela, se consulta en vivo cada vez que se muestra, porque "sin
+ * importar el período" significa que no está atado a este recordatorio puntual. `dismissedAt`
+ * nulo = sigue abierto ("Listo, ya lo pedí" lo cierra). Deja el modelo listo para que una futura
+ * tarea programada (Parte 4, todavía no implementada: sin service worker/push/VAPID) solo tenga
+ * que leer las filas sin dismissedAt del día y mandar la notificación — nada de eso corre acá.
+ */
+export const orderReminders = pgTable("order_reminders", {
+  id: serial("id").primaryKey(),
+  consultantId: integer("consultant_id").notNull().references(() => consultants.id),
+  reminderDate: text("reminder_date").notNull(),
+  periodStart: text("period_start").notNull(),
+  periodEnd: text("period_end").notNull(),
+  items: jsonb("items").notNull(),
+  dismissedAt: timestamp("dismissed_at"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (table) => ({
+  // Garantiza que nunca se duplique un recordatorio para la misma fecha, incluso si dos
+  // requests casi simultáneos intentan generarlo a la vez (defensa real, no solo el chequeo
+  // "ya existe" antes de insertar).
+  consultantReminderDateUnique: unique("order_reminders_consultant_date_unique").on(table.consultantId, table.reminderDate),
+  consultantIdx: index("order_reminders_consultant_idx").on(table.consultantId),
 }));
 
 /**
@@ -677,6 +737,13 @@ export type SaleItem = typeof saleItems.$inferSelect;
 export type InsertSaleItem = typeof saleItems.$inferInsert;
 export type SaleInstallment = typeof saleInstallments.$inferSelect;
 export type InsertSaleInstallment = typeof saleInstallments.$inferInsert;
+export type OrderReminder = typeof orderReminders.$inferSelect;
+export type InsertOrderReminder = typeof orderReminders.$inferInsert;
+// Prompt 8 — una línea congelada de order_reminders.items (criterio a: vendido en el período).
+export interface OrderReminderItemSnapshot {
+  productId: number;
+  soldInPeriod: number;
+}
 export type Payment = typeof payments.$inferSelect;
 export type InsertPayment = typeof payments.$inferInsert;
 export type Subscription = typeof subscriptions.$inferSelect;

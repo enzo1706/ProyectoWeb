@@ -68,7 +68,7 @@ describe("PATCH /api/products/stock/increment-batch", () => {
     });
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body).toEqual({ updated: 2 });
+    expect(body).toEqual({ updated: 2, pendingAssignments: [] });
 
     const catalog = await storage.getAllProducts(consultantId);
     expect(catalog.find((p) => p.id === productA.id)?.unidades).toBe(8);

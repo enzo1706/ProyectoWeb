@@ -577,6 +577,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.use("/api/appointments", requireAuth, requireConsultant);
   app.use("/api/reports", requireAuth, requireConsultant);
   app.use("/api/dashboard", requireAuth, requireConsultant);
+  // Prompt 8
+  app.use("/api/deliveries", requireAuth, requireConsultant);
+  app.use("/api/order-reminder", requireAuth, requireConsultant);
 
   // Sin requireConsultant: admin recibe 404 explícito ("no aplica"), no el 403 genérico.
   app.get("/api/business-settings", requireAuth, async (req: Request, res: Response) => {
@@ -1584,6 +1587,71 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
+  /** Prompt 8, Parte 2 — "Marcar como entregado" de un renglón puntual (botón del aviso "Ya
+   * podés entregarle a..." de Inicio). Sin body: entrega lo que esté listo en ese momento. */
+  app.patch("/api/sales/:saleId/items/:itemId/deliver", async (req: Request, res: Response) => {
+    try {
+      const saleId = parseInt(req.params.saleId, 10);
+      const itemId = parseInt(req.params.itemId, 10);
+      if (isNaN(saleId) || isNaN(itemId)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+
+      const updated = await storage.markSaleItemDelivered(req.consultantId!, saleId, itemId);
+      if (!updated) {
+        return res.status(404).json({ error: "Venta o renglón no encontrado" });
+      }
+      res.json(updated);
+    } catch (error) {
+      if (error instanceof SaleValidationError) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error(error);
+      res.status(500).json({ error: "Error al marcar el renglón como entregado" });
+    }
+  });
+
+  /** Prompt 8, Parte 2 — aviso de Inicio "Ya podés entregarle a...". */
+  app.get("/api/deliveries/ready", async (req: Request, res: Response) => {
+    try {
+      const items = await storage.getDeliveryReadyItems(req.consultantId!);
+      res.json(items);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener los renglones listos para entregar" });
+    }
+  });
+
+  /** Prompt 8, Parte 3 — "Hoy es tu día de pedido". Calculado al vuelo, sin tarea programada
+   * (ver DatabaseStorage.getOrderReminder para el mecanismo completo). */
+  app.get("/api/order-reminder", async (req: Request, res: Response) => {
+    try {
+      const result = await storage.getOrderReminder(req.consultantId!);
+      res.json(result);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener el recordatorio del día de pedido" });
+    }
+  });
+
+  /** Prompt 8, Parte 3 — "Listo, ya lo pedí". Sin body. */
+  app.post("/api/order-reminder/:id/dismiss", async (req: Request, res: Response) => {
+    try {
+      const id = parseInt(req.params.id, 10);
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "ID inválido" });
+      }
+      const updated = await storage.dismissOrderReminder(req.consultantId!, id);
+      if (!updated) {
+        return res.status(404).json({ error: "Recordatorio no encontrado" });
+      }
+      res.json(updated);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al cerrar el recordatorio" });
+    }
+  });
+
   app.patch("/api/sales/:id/client", async (req: Request, res: Response) => {
     try {
       const saleId = parseInt(req.params.id, 10);
@@ -1801,12 +1869,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
 
       const { isFreePlan } = await getConsultantAccessStatus(req.consultantId!);
-      const updated = await storage.setProductStock(req.consultantId!, id, parsed.data.unidades, isFreePlan, parsed.data.stockMinimo);
-      if (!updated) {
+      const result = await storage.setProductStock(req.consultantId!, id, parsed.data.unidades, isFreePlan, parsed.data.stockMinimo);
+      if (!result) {
         return res.status(404).json({ error: "Producto no encontrado" });
       }
 
-      res.json(updated);
+      res.json({ ...result.product, pendingAssignments: result.pendingAssignments });
     } catch (error) {
       if (error instanceof FreePlanProductLimitError) {
         return res.status(403).json({ error: error.message });
@@ -1833,12 +1901,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
 
       const { isFreePlan } = await getConsultantAccessStatus(req.consultantId!);
-      const updated = await storage.incrementProductStock(req.consultantId!, id, parsed.data.delta, isFreePlan);
-      if (!updated) {
+      const result = await storage.incrementProductStock(req.consultantId!, id, parsed.data.delta, isFreePlan);
+      if (!result) {
         return res.status(404).json({ error: "Producto no encontrado" });
       }
 
-      res.json(updated);
+      res.json({ ...result.product, pendingAssignments: result.pendingAssignments });
     } catch (error) {
       if (error instanceof SaleValidationError) {
         return res.status(400).json({ error: error.message });

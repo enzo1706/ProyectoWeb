@@ -20,6 +20,7 @@ import {
   clientPayments,
   paymentAllocations,
   paymentMethods,
+  orderReminders,
   createSaleSchema,
   updateSaleSchema,
   createAppointmentSchema,
@@ -63,6 +64,8 @@ import {
   type ClientNote,
   type ClientPayment,
   type PaymentAllocation,
+  type OrderReminder,
+  type OrderReminderItemSnapshot,
 } from "@shared/schema";
 import { normalizeEmail } from "@shared/email";
 import {
@@ -78,8 +81,16 @@ import {
   HABITUAL_DISCOUNT_WINDOW_MS,
   resolveLineCost,
   computeGrossIncomeTax,
+  resolveStockAllocation,
+  resolveInitialLineCost,
+  resolveBlendedLineCost,
+  applyRealCostToLine,
+  applyManualCostCorrection,
+  resolveQuantityDecrease,
+  computeDiscountedCost,
 } from "@shared/saleCalculations";
 import { resolveLowStockThreshold, DEFAULT_LOW_STOCK_THRESHOLD } from "@shared/stockAlerts";
+import { resolveOrderReminderPeriod } from "@shared/orderReminderSchedule";
 import {
   type ClientListFilter,
   STALE_THRESHOLD_DAYS,
@@ -89,12 +100,12 @@ import {
   birthdayDay,
   MAX_CLIENTS_PAGE_SIZE,
 } from "@shared/clientFilters";
-import { getArgentinaDateStr, getArgentinaMonth } from "@shared/argentinaTime";
+import { getArgentinaDateStr, getArgentinaMonth, toArgentinaDateStr } from "@shared/argentinaTime";
 import { type ReportPeriodKind, getComparisonPeriod } from "@shared/reportsPeriods";
 import { normalizeArgentinaPhoneForStorage, normalizeArgentinaPhoneDigits } from "@shared/phone";
 import { isKnownEventType, normalizeCustomEventTypeName, KNOWN_EVENT_TYPES } from "@shared/eventTypes";
 import type { z } from "zod";
-import { eq, ne, count, sql, and, gt, gte, lt, asc, desc, isNotNull, isNull, inArray, notInArray, ilike, or } from "drizzle-orm";
+import { eq, ne, count, sql, and, gt, gte, lt, lte, asc, desc, isNotNull, isNull, inArray, notInArray, ilike, or } from "drizzle-orm";
 import type { db as database } from "./db";
 import { resolveStorageMode } from "./storage-mode";
 import { shouldUseTestDatabase } from "./test-db-guard";
@@ -840,14 +851,16 @@ export interface IStorage {
    * Prompt 14 (P30) — `isFreePlan` igual criterio que `createProduct`: si este SET lleva el
    * producto de 0 (o inexistente) a más de 0 unidades ("reponer" cuenta como sumar uno nuevo,
    * ver docs/prompts-mejoras.md Prompt 14), y ya está en el límite, tira
-   * `FreePlanProductLimitError`. Bajar o mantener unidades nunca se bloquea. */
+   * `FreePlanProductLimitError`. Bajar o mantener unidades nunca se bloquea.
+   * Prompt 8, punto 6 — antes de nada, solo lo que SUBE respecto del valor anterior cubre
+   * ventas pendientes de este producto (bajar a mano nunca cubre pendientes). */
   setProductStock(
     consultantId: number,
     productId: number,
     unidades: number,
     isFreePlan: boolean,
     stockMinimo?: number | null,
-  ): Promise<Product | undefined>;
+  ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined>;
   /** Pospone la alerta de stock bajo de este producto hasta `remindAt` (YYYY-MM-DD), o la
    * cancela si `remindAt` es null. */
   setProductStockReminder(consultantId: number, productId: number, remindAt: string | null): Promise<Product | undefined>;
@@ -860,8 +873,14 @@ export interface IStorage {
    * reemplaza, coexisten. Tira `SaleValidationError` si el delta dejaría el stock negativo
    * (mismo error de dominio que ya usa `createSale`/`updateSale` para "stock insuficiente").
    * Prompt 14 (P30) — mismo criterio de `isFreePlan` que `setProductStock`/`createProduct`.
+   * Prompt 8, punto 6 — solo un delta POSITIVO cubre ventas pendientes primero.
    */
-  incrementProductStock(consultantId: number, productId: number, delta: number, isFreePlan: boolean): Promise<Product | undefined>;
+  incrementProductStock(
+    consultantId: number,
+    productId: number,
+    delta: number,
+    isFreePlan: boolean,
+  ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined>;
   /** Etapa 7.2 — confirmación de pedido/importación como UNA sola operación atómica (todo o
    * nada), en vez del loop de `incrementProductStock` por línea que podía dejar una
    * importación aplicada a medias si una línea intermedia fallaba (hallazgo P2, Etapa 6).
@@ -877,14 +896,18 @@ export interface IStorage {
    * de esta función. `cancelSale`/`updateSale` (el stock que "vuelve" al cancelar/editar una
    * venta, nunca una carga) escriben `productStock.unidades` directo, sin pasar por esta
    * función — por diseño nunca pueden quedar bloqueados por este límite, porque es una
-   * corrección, no una carga (ver docs/prompts-mejoras.md Prompt 14). */
+   * corrección, no una carga (ver docs/prompts-mejoras.md Prompt 14).
+   * Prompt 8 — antes de sumar nada a stock disponible, cubre las ventas con este producto
+   * pendiente (vender sin stock), de la más vieja a la más nueva — esas unidades nunca llegan
+   * a contar para el límite de arriba. `pendingAssignments` es para el mensaje al usuario
+   * ("2 unidades se asignaron a ventas pendientes: María Gómez (2)"). */
   incrementProductStockBatch(
     consultantId: number,
     lines: { productId: number; delta: number }[],
     isFreePlan: boolean,
     discountPercent?: number,
     draftId?: number,
-  ): Promise<{ updated: number }>;
+  ): Promise<{ updated: number; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] }>;
   /** Prompt 2 — corrige las líneas de venta estimadas (producto sin costo al momento de
    * vender) de un producto con el costo recién conocido, y recalcula el `profit` cacheado de
    * cada venta afectada. NO se llama desde `incrementProductStockBatch`: un pedido nunca
@@ -946,6 +969,20 @@ export interface IStorage {
   /** Prompt 6, punto 6 — cambiar a mano entre "entregada" y "pendiente_entrega" desde el
    * detalle de la venta. Independiente del pago: no toca sale_installments ni status. */
   setSaleDeliveryStatus(consultantId: number, saleId: number, deliveryStatus: "entregada" | "pendiente_entrega"): Promise<Sale | undefined>;
+  /** Prompt 8, Parte 2 — "Marcar como entregado" de un renglón puntual. */
+  markSaleItemDelivered(consultantId: number, saleId: number, itemId: number): Promise<Sale | undefined>;
+  /** Prompt 8, Parte 2 — aviso "Ya podés entregarle a...": renglones listos para entregar. */
+  getDeliveryReadyItems(
+    consultantId: number,
+  ): Promise<{ saleId: number; itemId: number; clientId: number | null; clientName: string; productName: string; quantity: number }[]>;
+  /** Prompt 8, Parte 3 — calcula/recupera el recordatorio del día de pedido, sin tarea
+   * programada (ver implementación en DatabaseStorage para el detalle del mecanismo). */
+  getOrderReminder(consultantId: number): Promise<{
+    reminder: OrderReminder;
+    items: { productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[];
+  } | null>;
+  /** Prompt 8, Parte 3 — "Listo, ya lo pedí". */
+  dismissOrderReminder(consultantId: number, reminderId: number): Promise<OrderReminder | undefined>;
   /** Prompt 6, punto 1 — asigna una clienta a una venta creada sin una ("Sin clienta"). Solo
    * de `null` a una clienta real. */
   assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined>;
@@ -1131,6 +1168,19 @@ export class DatabaseStorage implements IStorage {
 
   async updateBusinessSettings(consultantId: number, input: UpdateBusinessSettingsInput): Promise<Consultant | undefined> {
     const db = await this.getDb();
+    const newDay1 = input.orderReminderDay1 ?? null;
+    const newDay2 = input.orderReminderDay2 ?? null;
+
+    // Prompt 8, ajuste 1 — solo se pisa la fecha cuando los días de pedido REALMENTE cambian
+    // (no en cada guardado de Configuración: cambiar la moneda o el objetivo no tiene nada que
+    // ver con "cuándo configuró el día de pedido"). Comparar contra lo que había ANTES de este
+    // UPDATE, nunca contra el resultado.
+    const [existing] = await db
+      .select({ orderReminderDay1: consultants.orderReminderDay1, orderReminderDay2: consultants.orderReminderDay2 })
+      .from(consultants)
+      .where(eq(consultants.id, consultantId));
+    const daysChanged = existing !== undefined && (existing.orderReminderDay1 !== newDay1 || existing.orderReminderDay2 !== newDay2);
+
     const [updated] = await db
       .update(consultants)
       .set({
@@ -1138,8 +1188,9 @@ export class DatabaseStorage implements IStorage {
         currency: input.currency,
         monthlyGoal: input.monthlyGoal ?? null,
         defaultLowStockThreshold: input.defaultLowStockThreshold ?? null,
-        orderReminderDay1: input.orderReminderDay1 ?? null,
-        orderReminderDay2: input.orderReminderDay2 ?? null,
+        orderReminderDay1: newDay1,
+        orderReminderDay2: newDay2,
+        ...(daysChanged ? { orderReminderDaysUpdatedAt: new Date() } : {}),
         grossIncomeTaxPercentTenths: input.grossIncomeTaxPercentTenths ?? null,
       })
       .where(eq(consultants.id, consultantId))
@@ -2162,21 +2213,30 @@ export class DatabaseStorage implements IStorage {
     unidades: number,
     isFreePlan: boolean,
     stockMinimo?: number | null,
-  ): Promise<Product | undefined> {
+  ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined> {
     const db = await this.getDb();
     const product = await this.findVisibleProduct(db, consultantId, productId);
     if (!product) return undefined;
 
-    const setFields: Partial<typeof productStock.$inferInsert> = { unidades };
-    if (stockMinimo !== undefined) setFields.stockMinimo = stockMinimo;
-
-    const stock = await db.transaction(async (tx) => {
+    const { stock, pendingAssignments } = await db.transaction(async (tx) => {
       const [existing] = await tx
         .select({ unidades: productStock.unidades })
         .from(productStock)
         .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, productId)));
-      await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, existing?.unidades ?? 0, unidades);
+      const existingUnidades = existing?.unidades ?? 0;
 
+      // Prompt 8, punto 6 — "Editar producto" también cubre pendientes primero: solo lo que
+      // SUBE respecto de lo que ya había cuenta como "unidades que llegan" (bajar el número a
+      // mano es una corrección, no una carga — nunca cubre pendientes).
+      const arriving = Math.max(0, unidades - existingUnidades);
+      const { leftoverDelta, assignments } = await this.assignUnitsToPendingSales(tx, consultantId, productId, arriving, null);
+      // El campo final nunca incluye lo que se fue a pendientes: eso no es stock disponible.
+      const finalUnidades = unidades - (arriving - leftoverDelta);
+
+      await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, existingUnidades, finalUnidades);
+
+      const setFields: Partial<typeof productStock.$inferInsert> = { unidades: finalUnidades };
+      if (stockMinimo !== undefined) setFields.stockMinimo = stockMinimo;
       const [stock] = await tx
         .insert(productStock)
         .values({ consultantId, productId, ...setFields })
@@ -2185,12 +2245,17 @@ export class DatabaseStorage implements IStorage {
           set: setFields,
         })
         .returning();
-      return stock;
+      return { stock, pendingAssignments: assignments };
     });
-    return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
+    return { product: withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId)), pendingAssignments };
   }
 
-  async incrementProductStock(consultantId: number, productId: number, delta: number, isFreePlan: boolean): Promise<Product | undefined> {
+  async incrementProductStock(
+    consultantId: number,
+    productId: number,
+    delta: number,
+    isFreePlan: boolean,
+  ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined> {
     if (delta === 0) {
       throw new SaleValidationError("El delta de stock no puede ser 0");
     }
@@ -2208,26 +2273,114 @@ export class DatabaseStorage implements IStorage {
     //
     // La transacción es necesaria para poder deshacer la escritura si el resultado da negativo:
     // el UPSERT por sí solo ya habría comiteado el valor antes de que este código lo revise.
-    const stock = await db.transaction(async (tx) => {
+    const { stock, pendingAssignments } = await db.transaction(async (tx) => {
+      // Prompt 8, punto 6 — solo un delta POSITIVO (unidades que llegan) cubre pendientes
+      // primero; un decremento manual es una corrección, nunca pasa por acá.
+      const { leftoverDelta, assignments } = await this.assignUnitsToPendingSales(tx, consultantId, productId, delta, null);
+
       const [stock] = await tx
         .insert(productStock)
-        .values({ consultantId, productId, unidades: delta })
+        .values({ consultantId, productId, unidades: leftoverDelta })
         .onConflictDoUpdate({
           target: [productStock.consultantId, productStock.productId],
-          set: { unidades: sql`${productStock.unidades} + ${delta}` },
+          set: { unidades: sql`${productStock.unidades} + ${leftoverDelta}` },
         })
         .returning();
       if (stock.unidades < 0) {
         throw new SaleValidationError(`Stock insuficiente: quedarían ${stock.unidades} unidades`);
       }
-      // previousUnidades = stock.unidades - delta: el UPSERT ya aplicó +delta, así que el valor
-      // de ANTES se reconstruye sin una SELECT aparte (0 si la fila era nueva, igual que si
-      // delta se aplicó sobre una fila inexistente).
-      await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - delta, stock.unidades);
-      return stock;
+      // previousUnidades = stock.unidades - leftoverDelta: el UPSERT ya aplicó +leftoverDelta,
+      // así que el valor de ANTES se reconstruye sin una SELECT aparte.
+      await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - leftoverDelta, stock.unidades);
+      return { stock, pendingAssignments: assignments };
     });
 
-    return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
+    return { product: withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId)), pendingAssignments };
+  }
+
+  /**
+   * Prompt 8, Parte 2 y punto 6 — antes de que `delta` unidades entren a `productStock.unidades`,
+   * cubre primero las ventas que tenían este producto pendiente (sin stock), de la más vieja a
+   * la más nueva. Esas unidades NUNCA llegan a sumar stock disponible — por diseño, nunca
+   * cuentan para el límite de productos del plan gratis (Prompt 14): el caller solo valida el
+   * límite sobre `leftoverDelta`, nunca sobre `delta` crudo.
+   *
+   * `realUnitCost` es el costo real de ESTA entrada de stock (el de un pedido con descuento,
+   * `lineCost`) — si viene `null` (carga manual sin contexto de pedido, ver setProductStock/
+   * incrementProductStock), las unidades asignadas quedan físicamente "listas para entregar"
+   * igual, pero el costo de ese renglón no se toca (sigue con lo que tenía, real o estimado).
+   */
+  private async assignUnitsToPendingSales(
+    tx: Pick<Database, "select" | "update">,
+    consultantId: number,
+    productId: number,
+    delta: number,
+    realUnitCost: number | null,
+  ): Promise<{ leftoverDelta: number; assignments: { saleId: number; clientName: string; quantity: number }[] }> {
+    if (delta <= 0) return { leftoverDelta: delta, assignments: [] };
+
+    const pendingLines = await tx
+      .select({
+        id: saleItems.id,
+        saleId: saleItems.saleId,
+        quantity: saleItems.quantity,
+        quantityPending: saleItems.quantityPending,
+        estimatedCostPerUnit: saleItems.estimatedCostPerUnit,
+        realCostAccumulated: saleItems.realCostAccumulated,
+        realCostUnits: saleItems.realCostUnits,
+        clientName: sales.clientName,
+      })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .where(
+        and(
+          eq(sales.consultantId, consultantId),
+          eq(saleItems.productId, productId),
+          gt(saleItems.quantityPending, 0),
+          ne(sales.status, "cancelada"),
+        ),
+      )
+      .orderBy(asc(sales.date), asc(sales.id));
+
+    let remaining = delta;
+    const assignments: { saleId: number; clientName: string; quantity: number }[] = [];
+    const affectedSaleIds = new Set<number>();
+
+    for (const line of pendingLines) {
+      if (remaining <= 0) break;
+      const assigned = Math.min(remaining, line.quantityPending);
+      if (assigned <= 0) continue;
+      remaining -= assigned;
+
+      const costFields =
+        realUnitCost !== null
+          ? applyRealCostToLine(line, assigned, realUnitCost)
+          : { estimatedCostPerUnit: line.estimatedCostPerUnit, realCostAccumulated: line.realCostAccumulated, realCostUnits: line.realCostUnits };
+      const blended = resolveBlendedLineCost({ quantity: line.quantity, ...costFields });
+
+      await tx
+        .update(saleItems)
+        .set({ quantityPending: line.quantityPending - assigned, costPrice: blended.costPrice, costIsEstimated: blended.isEstimated, ...costFields })
+        .where(eq(saleItems.id, line.id));
+
+      assignments.push({ saleId: line.saleId, clientName: line.clientName, quantity: assigned });
+      affectedSaleIds.add(line.saleId);
+    }
+
+    for (const saleId of Array.from(affectedSaleIds)) {
+      const [sale] = await tx.select().from(sales).where(eq(sales.id, saleId));
+      if (!sale) continue;
+      const items = await tx
+        .select({ quantity: saleItems.quantity, costPrice: saleItems.costPrice })
+        .from(saleItems)
+        .where(eq(saleItems.saleId, saleId));
+      const productCost = computeHistoricalProductCost(items);
+      if (productCost === null) continue;
+      const profit = computeSaleProfit({ total: sale.total, productCost, shippingCost: sale.shippingCost, ingresosBrutos: sale.ingresosBrutos });
+      await tx.update(sales).set({ profit }).where(eq(sales.id, saleId));
+    }
+
+    return { leftoverDelta: remaining, assignments };
   }
 
   async incrementProductStockBatch(
@@ -2236,7 +2389,7 @@ export class DatabaseStorage implements IStorage {
     isFreePlan: boolean,
     discountPercent?: number,
     draftId?: number,
-  ): Promise<{ updated: number }> {
+  ): Promise<{ updated: number; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] }> {
     if (lines.length === 0) {
       throw new SaleValidationError("El lote no puede estar vacío");
     }
@@ -2290,25 +2443,37 @@ export class DatabaseStorage implements IStorage {
     // "estimadas" con su "≈". La única puerta para recalcularlas es que la consultora cargue el
     // costo a mano desde "Editar producto" (Prompt 4) — esa función ya existe y está testeada,
     // lista para engancharse ahí.
+    const pendingAssignments: { saleId: number; clientName: string; quantity: number }[] = [];
+
     await db.transaction(async (tx) => {
       for (const productId of orderedProductIds) {
         const delta = deltaByProductId.get(productId)!;
+        const lineCost =
+          discountPercent !== undefined ? Math.round(precioById.get(productId)! * (1 - discountPercent / 100)) : null;
 
-        if (discountPercent === undefined) {
+        // Prompt 8, Parte 2 y punto 6 — antes de sumar nada a productStock.unidades, cubre
+        // primero las ventas que tenían este producto pendiente. Lo asignado ahí NUNCA llega a
+        // ser stock disponible: todo lo que sigue abajo (cantidad, costo promedio, límite del
+        // plan gratis) corre sobre `leftoverDelta`, nunca sobre `delta` crudo.
+        const { leftoverDelta, assignments } = await this.assignUnitsToPendingSales(tx, consultantId, productId, delta, lineCost);
+        pendingAssignments.push(...assignments);
+        if (leftoverDelta <= 0) continue;
+
+        if (lineCost === null) {
           // Camino de siempre: solo cantidad, no toca costo (correcciones manuales de stock
           // sin contexto de pedido/costo).
           const [stock] = await tx
             .insert(productStock)
-            .values({ consultantId, productId, unidades: delta })
+            .values({ consultantId, productId, unidades: leftoverDelta })
             .onConflictDoUpdate({
               target: [productStock.consultantId, productStock.productId],
-              set: { unidades: sql`${productStock.unidades} + ${delta}` },
+              set: { unidades: sql`${productStock.unidades} + ${leftoverDelta}` },
             })
             .returning();
           if (stock.unidades < 0) {
             throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${stock.unidades} unidades`);
           }
-          await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - delta, stock.unidades);
+          await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - leftoverDelta, stock.unidades);
           continue;
         }
 
@@ -2318,18 +2483,18 @@ export class DatabaseStorage implements IStorage {
         // siempre los valores previos a este pedido, sin necesidad de FOR UPDATE explícito (el
         // propio UPSERT ya toma el lock de fila al ejecutarse). Si no había costo o el stock
         // estaba en 0 (o menos), el costo nuevo es directamente el de esta compra — nunca se
-        // promedia contra "nada".
-        const lineCost = Math.round(precioById.get(productId)! * (1 - discountPercent / 100));
+        // promedia contra "nada". Usa `leftoverDelta`, no `delta`: las unidades que se fueron a
+        // cubrir pendientes nunca se mezclan en el promedio de lo que queda disponible.
         const [stock] = await tx
           .insert(productStock)
-          .values({ consultantId, productId, unidades: delta, costPrice: lineCost, selectedDiscount: discountPercent })
+          .values({ consultantId, productId, unidades: leftoverDelta, costPrice: lineCost, selectedDiscount: discountPercent })
           .onConflictDoUpdate({
             target: [productStock.consultantId, productStock.productId],
             set: {
-              unidades: sql`${productStock.unidades} + ${delta}`,
+              unidades: sql`${productStock.unidades} + ${leftoverDelta}`,
               costPrice: sql`CASE
                 WHEN ${productStock.costPrice} IS NULL OR ${productStock.unidades} <= 0 THEN ${lineCost}
-                ELSE ROUND((${productStock.unidades} * ${productStock.costPrice} + ${delta}::integer * ${lineCost}::integer)::numeric / (${productStock.unidades} + ${delta}))
+                ELSE ROUND((${productStock.unidades} * ${productStock.costPrice} + ${leftoverDelta}::integer * ${lineCost}::integer)::numeric / (${productStock.unidades} + ${leftoverDelta}))
               END`,
               selectedDiscount: discountPercent,
             },
@@ -2338,7 +2503,7 @@ export class DatabaseStorage implements IStorage {
         if (stock.unidades < 0) {
           throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${stock.unidades} unidades`);
         }
-        await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - delta, stock.unidades);
+        await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - leftoverDelta, stock.unidades);
       }
 
       // Prompt 7, punto 2: mismo criterio que createSale.draftId — si este pedido viene de un
@@ -2348,32 +2513,45 @@ export class DatabaseStorage implements IStorage {
       }
     });
 
-    return { updated: orderedProductIds.length };
+    return { updated: orderedProductIds.length, pendingAssignments };
   }
 
+  /** Prompt 2 (manual), extendida en Prompt 8, ajuste 2 — costo cargado a mano desde "Editar
+   * producto" sobre líneas estimadas de este producto. Si una línea todavía tiene unidades
+   * pendientes (esperando un pedido real), NO se resuelve del todo: solo se actualiza el
+   * estimado congelado (`applyManualCostCorrection`), para que cuando ese pedido llegue
+   * (incrementProductStockBatch / assignUnitsToPendingSales) combine bien lo ya real con lo
+   * recién estimado, sin pisar ninguna de las dos partes. */
   async recalculateEstimatedSalesForProduct(consultantId: number, productId: number, newCostPrice: number): Promise<void> {
     const db = await this.getDb();
     await db.transaction(async (tx) => {
       const estimatedItems = await tx
-        .select({ id: saleItems.id, saleId: saleItems.saleId })
+        .select({
+          id: saleItems.id,
+          saleId: saleItems.saleId,
+          quantity: saleItems.quantity,
+          quantityPending: saleItems.quantityPending,
+          estimatedCostPerUnit: saleItems.estimatedCostPerUnit,
+          realCostAccumulated: saleItems.realCostAccumulated,
+          realCostUnits: saleItems.realCostUnits,
+        })
         .from(saleItems)
         .innerJoin(sales, eq(saleItems.saleId, sales.id))
         .where(and(eq(sales.consultantId, consultantId), eq(saleItems.productId, productId), eq(saleItems.costIsEstimated, true)));
       if (estimatedItems.length === 0) return;
 
-      await tx
-        .update(saleItems)
-        .set({ costPrice: newCostPrice, costIsEstimated: false })
-        .where(
-          inArray(
-            saleItems.id,
-            estimatedItems.map((i) => i.id),
-          ),
-        );
+      for (const item of estimatedItems) {
+        const corrected = applyManualCostCorrection(item, newCostPrice);
+        const blended = resolveBlendedLineCost({ quantity: item.quantity, ...corrected });
+        await tx
+          .update(saleItems)
+          .set({ costPrice: blended.costPrice, costIsEstimated: blended.isEstimated, ...corrected })
+          .where(eq(saleItems.id, item.id));
+      }
 
       // Una venta puede tener más de un producto — el profit se recalcula con TODAS sus
       // líneas, no solo las que se acaban de corregir.
-      const affectedSaleIds = Array.from(new Set(estimatedItems.map((i) => i.saleId)));
+      const affectedSaleIds = Array.from(new Set(estimatedItems.map((item) => item.saleId)));
       for (const saleId of affectedSaleIds) {
         const [sale] = await tx.select().from(sales).where(eq(sales.id, saleId));
         if (!sale) continue;
@@ -3815,21 +3993,28 @@ export class DatabaseStorage implements IStorage {
           throw new SaleValidationError(`"${product.producto}" está discontinuado y no está disponible para nuevas ventas`);
         }
         const available = stock?.unidades ?? 0;
-        if (available < item.quantity) {
-          throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);
-        }
-        const resolvedCost = resolveLineCost({
-          costPrice: stock?.costPrice ?? null,
+        // Prompt 8, Parte 1: vender sin stock (o sin stock suficiente) ya no se rechaza — lo
+        // que no hay queda "pendiente" en este renglón, a la espera de un pedido futuro.
+        const allocation = resolveStockAllocation(item.quantity, available);
+        const initialCost = resolveInitialLineCost({
+          quantity: item.quantity,
+          quantityPending: allocation.pending,
+          realCostPerUnitKnown: stock?.costPrice ?? null,
           publicPrice: product.precio,
           habitualDiscountPercent,
         });
+        const blendedCost = resolveBlendedLineCost({ quantity: item.quantity, ...initialCost });
         return {
           product,
           quantity: item.quantity,
           unitPrice: item.unitPrice ?? product.precio,
-          costPrice: resolvedCost.costPrice,
-          costIsEstimated: resolvedCost.isEstimated,
-          remainingAfterSale: available - item.quantity,
+          costPrice: blendedCost.costPrice,
+          costIsEstimated: blendedCost.isEstimated,
+          quantityPending: allocation.pending,
+          // Lo que ya tenía en mano se entrega en el momento, igual que toda venta antes de
+          // este prompt — solo lo pendiente (si hay) espera a un pedido futuro.
+          quantityDelivered: allocation.covered,
+          ...initialCost,
         };
       });
 
@@ -3910,7 +4095,10 @@ export class DatabaseStorage implements IStorage {
             // Prompt 6: único valor real que se escribe hoy en creación — "entregado"/"pagado"
             // quedaron retirados (ver comentario en shared/schema.ts).
             status: "pendiente",
-            deliveryStatus: "entregada",
+            // Prompt 8: "entregada" solo si TODOS los renglones quedaron con quantityDelivered
+            // === quantity (nunca basta con quantityPending === 0: puede estar "lista para
+            // entregar" sin que todavía se haya tocado "Marcar como entregado").
+            deliveryStatus: lines.every((l) => l.quantityDelivered === l.quantity) ? "entregada" : "pendiente_entrega",
             notes: input.notes ?? null,
             clientRequestId: input.clientRequestId ?? null,
           })
@@ -3935,6 +4123,11 @@ export class DatabaseStorage implements IStorage {
           // una fuente distinta para lo que se persiste vs. lo que se calculó.
           costPrice: l.costPrice,
           costIsEstimated: l.costIsEstimated,
+          quantityPending: l.quantityPending,
+          quantityDelivered: l.quantityDelivered,
+          estimatedCostPerUnit: l.estimatedCostPerUnit,
+          realCostAccumulated: l.realCostAccumulated,
+          realCostUnits: l.realCostUnits,
         })),
       );
 
@@ -3956,10 +4149,15 @@ export class DatabaseStorage implements IStorage {
         .returning();
       await this.recordInitialPaidInstallments(tx, consultantId, sale.clientId, input.paymentMethod, insertedInstallments);
 
+      // Prompt 8, punto 8: aunque el `FOR UPDATE` de arriba ya impide la carrera real (la
+      // segunda venta simultánea queda esperando y relee el valor ya descontado por la
+      // primera), el UPDATE en sí queda expresado como una resta atómica calculada por
+      // Postgres (nunca negativo) en vez de pasar un valor ya calculado en JS — mismo patrón
+      // que ya usa incrementProductStockBatch.
       for (const line of lines) {
         await tx
           .update(productStock)
-          .set({ unidades: line.remainingAfterSale })
+          .set({ unidades: sql`${productStock.unidades} - LEAST(${productStock.unidades}, ${line.quantityDelivered})` })
           .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, line.product.id)));
       }
 
@@ -4085,15 +4283,26 @@ export class DatabaseStorage implements IStorage {
         : [];
       const stockRowById = new Map(stockRows.map((s) => [s.productId, s]));
       const stockById = new Map(involvedIds.map((pid) => [pid, stockRowById.get(pid)?.unidades ?? 0]));
+      // Prompt 8 — se empareja por productId, nunca por el id del renglón: una venta nunca
+      // puede tener el mismo producto en dos renglones (NewSaleDialog.tsx fusiona cualquier
+      // producto repetido del carrito en una sola línea, sumando cantidades), así que emparejar
+      // por productId es exactamente lo mismo que emparejar por id, sin necesitar que el
+      // cliente mande ids de renglones que hoy no conoce.
+      const existingByProductId = new Map(
+        existingItems.filter((i): i is typeof i & { productId: number } => i.productId !== null).map((i) => [i.productId, i]),
+      );
 
-      // 1) Restaurar el stock que esta venta tenía reservado (como si se hubiera eliminado).
-      for (const item of existingItems) {
-        if (item.productId !== null) {
-          stockById.set(item.productId, (stockById.get(item.productId) ?? 0) + item.quantity);
+      // Renglones que desaparecen en esta edición: se tratan como una baja completa de ese
+      // renglón (misma fórmula que cancelSale) — devuelven quantity - quantityPending al stock
+      // y no vuelven a insertarse.
+      const newProductIds = new Set(input.items.map((i) => i.productId));
+      for (const old of existingItems) {
+        if (old.productId !== null && !newProductIds.has(old.productId)) {
+          const covered = old.quantity - old.quantityPending;
+          stockById.set(old.productId, (stockById.get(old.productId) ?? 0) + covered);
         }
       }
 
-      // 2) Validar y reservar stock para la nueva composición, sobre el stock ya restaurado.
       const lines = input.items.map((item) => {
         const product = productById.get(item.productId);
         if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
@@ -4102,22 +4311,150 @@ export class DatabaseStorage implements IStorage {
         if (stockRowById.get(item.productId)?.discontinued && !existingProductIds.has(item.productId)) {
           throw new SaleValidationError(`"${product.producto}" está discontinuado y no está disponible para nuevas ventas`);
         }
-        const available = stockById.get(item.productId) ?? 0;
-        if (available < item.quantity) {
-          throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);
+        const realCostPerUnitKnown = stockRowById.get(item.productId)?.costPrice ?? null;
+        const existing = existingByProductId.get(item.productId);
+
+        if (!existing) {
+          // Renglón nuevo en esta edición: misma lógica que un renglón de createSale.
+          const available = stockById.get(item.productId) ?? 0;
+          const allocation = resolveStockAllocation(item.quantity, available);
+          stockById.set(item.productId, available - allocation.covered);
+          const initialCost = resolveInitialLineCost({
+            quantity: item.quantity,
+            quantityPending: allocation.pending,
+            realCostPerUnitKnown,
+            publicPrice: product.precio,
+            habitualDiscountPercent,
+          });
+          const blended = resolveBlendedLineCost({ quantity: item.quantity, ...initialCost });
+          return {
+            product,
+            quantity: item.quantity,
+            unitPrice: item.unitPrice ?? product.precio,
+            costPrice: blended.costPrice,
+            costIsEstimated: blended.isEstimated,
+            quantityPending: allocation.pending,
+            quantityDelivered: allocation.covered,
+            ...initialCost,
+          };
         }
-        stockById.set(item.productId, available - item.quantity);
-        const resolvedCost = resolveLineCost({
-          costPrice: stockRowById.get(item.productId)?.costPrice ?? null,
+
+        if (item.quantity === existing.quantity) {
+          // Sin cambio de cantidad: nunca toca el stock ni el progreso de entrega (ya quedó
+          // "restaurado" arriba solo si desapareció, no es este caso). El costo es distinto:
+          // Prompt 2 ya establecía que CUALQUIER edición usa el costo VIGENTE de ese momento,
+          // nunca el histórico — eso sigue así cuando no queda nada pendiente (se re-resuelve
+          // entero, exactamente como un renglón nuevo). Solo cuando SÍ queda algo pendiente se
+          // preserva el acumulado real/estimado tal cual: no hay un "costo vigente" único del
+          // que recalcular sin perder la parte ya resuelta con costo real de un pedido previo.
+          if (existing.quantityPending === 0) {
+            const initialCost = resolveInitialLineCost({
+              quantity: existing.quantity,
+              quantityPending: 0,
+              realCostPerUnitKnown,
+              publicPrice: product.precio,
+              habitualDiscountPercent,
+            });
+            const blended = resolveBlendedLineCost({ quantity: existing.quantity, ...initialCost });
+            return {
+              product,
+              quantity: existing.quantity,
+              unitPrice: item.unitPrice ?? product.precio,
+              costPrice: blended.costPrice,
+              costIsEstimated: blended.isEstimated,
+              quantityPending: 0,
+              quantityDelivered: existing.quantityDelivered,
+              ...initialCost,
+            };
+          }
+          const blended = resolveBlendedLineCost({
+            quantity: existing.quantity,
+            estimatedCostPerUnit: existing.estimatedCostPerUnit,
+            realCostAccumulated: existing.realCostAccumulated,
+            realCostUnits: existing.realCostUnits,
+          });
+          return {
+            product,
+            quantity: existing.quantity,
+            unitPrice: item.unitPrice ?? product.precio,
+            costPrice: blended.costPrice,
+            costIsEstimated: blended.isEstimated,
+            quantityPending: existing.quantityPending,
+            quantityDelivered: existing.quantityDelivered,
+            estimatedCostPerUnit: existing.estimatedCostPerUnit,
+            realCostAccumulated: existing.realCostAccumulated,
+            realCostUnits: existing.realCostUnits,
+          };
+        }
+
+        if (item.quantity < existing.quantity) {
+          // Ajuste 5: primero se descuenta de lo pendiente, después de lo que tenía en mano sin
+          // entregar, y por último (una devolución de la clienta) de lo ya entregado. Todo lo
+          // que no salga de "pendiente" vuelve al stock.
+          const decrease = resolveQuantityDecrease(
+            existing.quantity - item.quantity,
+            existing.quantity,
+            existing.quantityPending,
+            existing.quantityDelivered,
+          );
+          stockById.set(item.productId, (stockById.get(item.productId) ?? 0) + decrease.stockToReturn);
+          let realCostAccumulated = existing.realCostAccumulated;
+          let realCostUnits = existing.realCostUnits;
+          if (decrease.stockToReturn > 0 && existing.realCostUnits > 0) {
+            const avgRealCost = existing.realCostAccumulated / existing.realCostUnits;
+            const unitsRemovedFromReal = Math.min(decrease.stockToReturn, existing.realCostUnits);
+            realCostAccumulated = existing.realCostAccumulated - Math.round(avgRealCost * unitsRemovedFromReal);
+            realCostUnits = existing.realCostUnits - unitsRemovedFromReal;
+          }
+          const blended = resolveBlendedLineCost({
+            quantity: item.quantity,
+            estimatedCostPerUnit: existing.estimatedCostPerUnit,
+            realCostAccumulated,
+            realCostUnits,
+          });
+          return {
+            product,
+            quantity: item.quantity,
+            unitPrice: item.unitPrice ?? product.precio,
+            costPrice: blended.costPrice,
+            costIsEstimated: blended.isEstimated,
+            quantityPending: decrease.quantityPending,
+            quantityDelivered: decrease.quantityDelivered,
+            estimatedCostPerUnit: existing.estimatedCostPerUnit,
+            realCostAccumulated,
+            realCostUnits,
+          };
+        }
+
+        // item.quantity > existing.quantity: la diferencia sigue la lógica de vender sin stock.
+        const increaseAmount = item.quantity - existing.quantity;
+        const available = stockById.get(item.productId) ?? 0;
+        const allocation = resolveStockAllocation(increaseAmount, available);
+        stockById.set(item.productId, available - allocation.covered);
+        const deltaCost = resolveInitialLineCost({
+          quantity: increaseAmount,
+          quantityPending: allocation.pending,
+          realCostPerUnitKnown,
           publicPrice: product.precio,
           habitualDiscountPercent,
         });
+        const estimatedCostPerUnit = existing.estimatedCostPerUnit ?? deltaCost.estimatedCostPerUnit;
+        const realCostAccumulated = existing.realCostAccumulated + deltaCost.realCostAccumulated;
+        const realCostUnits = existing.realCostUnits + deltaCost.realCostUnits;
+        const blended = resolveBlendedLineCost({ quantity: item.quantity, estimatedCostPerUnit, realCostAccumulated, realCostUnits });
         return {
           product,
           quantity: item.quantity,
           unitPrice: item.unitPrice ?? product.precio,
-          costPrice: resolvedCost.costPrice,
-          costIsEstimated: resolvedCost.isEstimated,
+          costPrice: blended.costPrice,
+          costIsEstimated: blended.isEstimated,
+          // Lo ya entregado nunca se toca; la porción nueva que SÍ había en stock se entrega
+          // en el momento, igual que al crear la venta.
+          quantityPending: existing.quantityPending + allocation.pending,
+          quantityDelivered: existing.quantityDelivered + allocation.covered,
+          estimatedCostPerUnit,
+          realCostAccumulated,
+          realCostUnits,
         };
       });
 
@@ -4194,11 +4531,17 @@ export class DatabaseStorage implements IStorage {
           originalPrice: l.product.precio,
           price: l.unitPrice,
           // Costo vigente al momento de esta edición (releído de productStock bajo el mismo
-          // lock, arriba) — misma fuente que computeProductCost. Una edición reemplaza la
-          // composición completa, así que el snapshot viejo de la línea anterior no se
-          // conserva (mismo criterio ya vigente para el resto de la fila).
+          // lock, arriba) — misma fuente que computeProductCost. La FILA se reemplaza por
+          // completo (delete + insert), pero el progreso de entrega/costo de un renglón sin
+          // cambios o editado (Prompt 8) sí se preserva/ajusta — ver el armado de `lines` más
+          // arriba, nunca nace de cero salvo que sea un renglón nuevo en esta edición.
           costPrice: l.costPrice,
           costIsEstimated: l.costIsEstimated,
+          quantityPending: l.quantityPending,
+          quantityDelivered: l.quantityDelivered,
+          estimatedCostPerUnit: l.estimatedCostPerUnit,
+          realCostAccumulated: l.realCostAccumulated,
+          realCostUnits: l.realCostUnits,
         })),
       );
 
@@ -4242,6 +4585,9 @@ export class DatabaseStorage implements IStorage {
           installmentsCount,
           installmentFrequency: installmentsCount > 1 ? input.installmentFrequency ?? null : null,
           notes: input.notes ?? null,
+          // Prompt 8: igual que en createSale — "entregada" solo si TODOS los renglones de la
+          // composición nueva tienen quantityDelivered === quantity.
+          deliveryStatus: lines.every((l) => l.quantityDelivered === l.quantity) ? "entregada" : "pendiente_entrega",
         })
         .where(and(eq(sales.id, id), eq(sales.consultantId, consultantId)))
         .returning();
@@ -4287,8 +4633,14 @@ export class DatabaseStorage implements IStorage {
           .for("update");
         const stockById = new Map(stockRows.map((s) => [s.productId, s.unidades]));
         for (const item of items) {
+          // Prompt 8 — solo vuelve al stock lo que REALMENTE salió de ahí (quantity -
+          // quantityPending): lo pendiente nunca tocó productStock.unidades, y lo que un
+          // pedido ya le haya asignado a este renglón (bypasseando el stock disponible) queda
+          // incluido acá igual, porque esas unidades físicas quedan libres de nuevo al
+          // cancelarse la venta que las tenía reservadas.
           if (item.productId !== null) {
-            stockById.set(item.productId, (stockById.get(item.productId) ?? 0) + item.quantity);
+            const covered = item.quantity - item.quantityPending;
+            stockById.set(item.productId, (stockById.get(item.productId) ?? 0) + covered);
           }
         }
         for (const productId of productIds) {
@@ -4297,6 +4649,8 @@ export class DatabaseStorage implements IStorage {
             .set({ unidades: stockById.get(productId)! })
             .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, productId)));
         }
+        // Una venta cancelada no puede seguir "esperando" un pedido futuro.
+        await tx.update(saleItems).set({ quantityPending: 0 }).where(eq(saleItems.saleId, id));
       }
 
       const [updated] = await tx
@@ -4361,17 +4715,321 @@ export class DatabaseStorage implements IStorage {
     });
   }
 
+  /** Prompt 8 — el toggle manual ahora aplica a TODOS los renglones de la venta a la vez:
+   * "entregada" los marca todos entregados (`quantityDelivered = quantity`), bloqueado si a
+   * alguno le queda `quantityPending > 0` (no se puede marcar como entregado lo que todavía no
+   * se tiene); "pendiente_entrega" los vuelve todos a `quantityDelivered = 0`. */
   async setSaleDeliveryStatus(consultantId: number, saleId: number, deliveryStatus: "entregada" | "pendiente_entrega"): Promise<Sale | undefined> {
     const db = await this.getDb();
-    const [sale] = await db.select().from(sales).where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)));
-    if (!sale) return undefined;
-    if (sale.status === "cancelada") {
-      throw new SaleValidationError("No se puede cambiar la entrega de una venta cancelada");
+    return db.transaction(async (tx) => {
+      const [sale] = await tx
+        .select()
+        .from(sales)
+        .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+        .for("update");
+      if (!sale) return undefined;
+      if (sale.status === "cancelada") {
+        throw new SaleValidationError("No se puede cambiar la entrega de una venta cancelada");
+      }
+
+      if (deliveryStatus === "entregada") {
+        const items = await tx.select().from(saleItems).where(eq(saleItems.saleId, saleId));
+        if (items.some((i) => i.quantityPending > 0)) {
+          throw new SaleValidationError("No se puede marcar como entregada: todavía tiene unidades pendientes de un pedido");
+        }
+        await tx.update(saleItems).set({ quantityDelivered: sql`${saleItems.quantity}` }).where(eq(saleItems.saleId, saleId));
+      } else {
+        await tx.update(saleItems).set({ quantityDelivered: 0 }).where(eq(saleItems.saleId, saleId));
+      }
+
+      const [updated] = await tx
+        .update(sales)
+        .set({ deliveryStatus })
+        .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+        .returning();
+      return updated;
+    });
+  }
+
+  /** Prompt 8, Parte 2 — "Marcar como entregado" de UN renglón puntual (botón del aviso "Ya
+   * podés entregarle..."): entrega lo que esté "listo para entregar" en ese momento (quantity -
+   * quantityPending - quantityDelivered) y recalcula sales.deliveryStatus como agregado de
+   * todos los renglones, en la misma transacción. */
+  async markSaleItemDelivered(consultantId: number, saleId: number, itemId: number): Promise<Sale | undefined> {
+    const db = await this.getDb();
+    return db.transaction(async (tx) => {
+      const [sale] = await tx
+        .select()
+        .from(sales)
+        .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+        .for("update");
+      if (!sale) return undefined;
+      if (sale.status === "cancelada") {
+        throw new SaleValidationError("No se puede entregar un renglón de una venta cancelada");
+      }
+
+      const [item] = await tx
+        .select()
+        .from(saleItems)
+        .where(and(eq(saleItems.id, itemId), eq(saleItems.saleId, saleId)))
+        .for("update");
+      if (!item) return undefined;
+
+      const readyToDeliver = item.quantity - item.quantityPending - item.quantityDelivered;
+      if (readyToDeliver <= 0) {
+        throw new SaleValidationError("Este renglón no tiene nada listo para entregar todavía");
+      }
+      await tx
+        .update(saleItems)
+        .set({ quantityDelivered: item.quantityDelivered + readyToDeliver })
+        .where(eq(saleItems.id, itemId));
+
+      const allItems = await tx.select().from(saleItems).where(eq(saleItems.saleId, saleId));
+      const allDelivered = allItems.every((i) => (i.id === itemId ? true : i.quantityDelivered === i.quantity));
+      const [updated] = await tx
+        .update(sales)
+        .set({ deliveryStatus: allDelivered ? "entregada" : "pendiente_entrega" })
+        .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+        .returning();
+      return updated;
+    });
+  }
+
+  /** Prompt 8, Parte 2 — todos los renglones "listos para entregar" (quantityPending === 0 y
+   * todavía no se tocó "Marcar como entregado") de cualquier venta no cancelada, para el aviso
+   * de Inicio "Ya podés entregarle a...". Agrupado por renglón, no por venta: cada uno con su
+   * propio botón. */
+  async getDeliveryReadyItems(
+    consultantId: number,
+  ): Promise<{ saleId: number; itemId: number; clientId: number | null; clientName: string; productName: string; quantity: number }[]> {
+    const db = await this.getDb();
+    const rows = await db
+      .select({
+        saleId: saleItems.saleId,
+        itemId: saleItems.id,
+        quantity: saleItems.quantity,
+        quantityDelivered: saleItems.quantityDelivered,
+        productName: saleItems.productName,
+        clientId: sales.clientId,
+        clientName: sales.clientName,
+      })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .where(
+        and(
+          eq(sales.consultantId, consultantId),
+          ne(sales.status, "cancelada"),
+          eq(saleItems.quantityPending, 0),
+          sql`${saleItems.quantityDelivered} < ${saleItems.quantity}`,
+        ),
+      )
+      .orderBy(asc(sales.date), asc(sales.id));
+    return rows.map((r) => ({
+      saleId: r.saleId,
+      itemId: r.itemId,
+      clientId: r.clientId,
+      clientName: r.clientName,
+      productName: r.productName,
+      quantity: r.quantity - r.quantityDelivered,
+    }));
+  }
+
+  /** Prompt 8, Parte 3 — productos vendidos entre `periodStart` y `periodEnd` (criterio a) que
+   * HOY tienen stock <= umbral efectivo. A propósito `<=`, no el `<` estricto de `isLowStock`
+   * (shared/stockAlerts.ts: ese es el criterio del aviso genérico de stock bajo, un criterio
+   * distinto). Nunca excluye por discontinuado: "Discontinuos" es una categoría de catálogo
+   * más, no un criterio de visibilidad (Prompt 6) — la cascada de umbral de siempre tampoco lo
+   * excluye (ver getLowStockProducts). */
+  private async computeOrderReminderSoldCandidates(
+    tx: Pick<Database, "select">,
+    consultantId: number,
+    periodStart: string,
+    periodEnd: string,
+  ): Promise<OrderReminderItemSnapshot[]> {
+    const soldRows = await tx
+      .select({ productId: saleItems.productId, soldInPeriod: sql<number>`coalesce(sum(${saleItems.quantity}), 0)`.mapWith(Number) })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .where(
+        and(
+          eq(sales.consultantId, consultantId),
+          ne(sales.status, "cancelada"),
+          gte(sales.date, periodStart),
+          lte(sales.date, periodEnd),
+          isNotNull(saleItems.productId),
+        ),
+      )
+      .groupBy(saleItems.productId);
+    if (soldRows.length === 0) return [];
+
+    const productIds = soldRows.map((r) => r.productId).filter((id): id is number => id !== null);
+    const [consultantRow] = await tx
+      .select({ defaultLowStockThreshold: consultants.defaultLowStockThreshold })
+      .from(consultants)
+      .where(eq(consultants.id, consultantId));
+    const defaultThreshold = consultantRow?.defaultLowStockThreshold ?? null;
+    const stockRows = await tx
+      .select({ productId: productStock.productId, unidades: productStock.unidades, stockMinimo: productStock.stockMinimo })
+      .from(productStock)
+      .where(and(eq(productStock.consultantId, consultantId), inArray(productStock.productId, productIds)));
+    const stockByProductId = new Map(stockRows.map((s) => [s.productId, s]));
+
+    const qualifying: OrderReminderItemSnapshot[] = [];
+    for (const row of soldRows) {
+      if (row.productId === null) continue;
+      const stock = stockByProductId.get(row.productId);
+      const unidades = stock?.unidades ?? 0;
+      const threshold = resolveLowStockThreshold(stock?.stockMinimo ?? null, defaultThreshold);
+      if (unidades <= threshold) {
+        qualifying.push({ productId: row.productId, soldInPeriod: row.soldInPeriod });
+      }
     }
+    return qualifying;
+  }
+
+  /** Prompt 8, Parte 3, punto 5 — unidades pendientes de ventas sin stock de ANTES de
+   * `beforeDate` (nunca "en el período": esas ya están en `soldInPeriod`, contarlas de nuevo
+   * acá las duplicaría). "Sin importar el período" (el texto original del prompt) = siempre en
+   * vivo, nunca congelado en la fila del recordatorio. */
+  private async computeOrderReminderPendingCandidates(
+    tx: Pick<Database, "select">,
+    consultantId: number,
+    beforeDate: string,
+  ): Promise<{ productId: number; pendingFromBefore: number }[]> {
+    const rows = await tx
+      .select({ productId: saleItems.productId, pendingFromBefore: sql<number>`coalesce(sum(${saleItems.quantityPending}), 0)`.mapWith(Number) })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .where(
+        and(
+          eq(sales.consultantId, consultantId),
+          ne(sales.status, "cancelada"),
+          gt(saleItems.quantityPending, 0),
+          lt(sales.date, beforeDate),
+          isNotNull(saleItems.productId),
+        ),
+      )
+      .groupBy(saleItems.productId);
+    return rows.filter((r): r is { productId: number; pendingFromBefore: number } => r.productId !== null);
+  }
+
+  /** Arma la lista final a mostrar: una sola fila por producto (nunca duplicado entre los dos
+   * criterios), cantidad sugerida = vendido en el período + pendiente de antes del período. */
+  private async buildOrderReminderDisplayItems(
+    tx: Pick<Database, "select">,
+    consultantId: number,
+    reminder: OrderReminder,
+  ): Promise<{ productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[]> {
+    const soldItems = reminder.items as OrderReminderItemSnapshot[];
+    const pendingCandidates = await this.computeOrderReminderPendingCandidates(tx, consultantId, reminder.periodStart);
+    const pendingByProductId = new Map(pendingCandidates.map((p) => [p.productId, p.pendingFromBefore]));
+    const soldByProductId = new Map(soldItems.map((s) => [s.productId, s.soldInPeriod]));
+    const productIds = Array.from(new Set([...soldItems.map((s) => s.productId), ...pendingCandidates.map((p) => p.productId)]));
+    if (productIds.length === 0) return [];
+
+    const productRows = await tx.select().from(products).where(inArray(products.id, productIds));
+    const stockRows = await tx
+      .select()
+      .from(productStock)
+      .where(and(eq(productStock.consultantId, consultantId), inArray(productStock.productId, productIds)));
+    const productById = new Map(productRows.map((p) => [p.id, p]));
+    const stockByProductId = new Map(stockRows.map((s) => [s.productId, s]));
+
+    return productIds
+      .map((productId) => {
+        const product = productById.get(productId);
+        const stock = stockByProductId.get(productId);
+        const soldInPeriod = soldByProductId.get(productId) ?? 0;
+        const pendingFromBefore = pendingByProductId.get(productId) ?? 0;
+        const variante = product?.variante;
+        return {
+          productId,
+          productName: product ? (variante && variante !== "Estándar" ? `${product.producto} - ${variante}` : product.producto) : "Producto",
+          soldInPeriod,
+          pendingFromBefore,
+          currentStock: stock?.unidades ?? 0,
+          suggestedQuantity: soldInPeriod + pendingFromBefore,
+        };
+      })
+      .sort((a, b) => b.suggestedQuantity - a.suggestedQuantity);
+  }
+
+  /** Prompt 8, Parte 3 — calcula/recupera el recordatorio del día de pedido, sin ninguna tarea
+   * programada: busca el más reciente sin cerrar (así aparece aunque no haya entrado el día
+   * exacto); si no hay ninguno y hoy ya pasó (o es) el último ciclo configurado, intenta
+   * generarlo (nunca para un ciclo anterior a `orderReminderDaysUpdatedAt` — ajuste 1). Si la
+   * lista queda vacía, no inserta nada (se vuelve a intentar la próxima vez que entre). */
+  async getOrderReminder(
+    consultantId: number,
+  ): Promise<{ reminder: OrderReminder; items: Awaited<ReturnType<DatabaseStorage["buildOrderReminderDisplayItems"]>> } | null> {
+    const db = await this.getDb();
+    return db.transaction(async (tx) => {
+      let [reminder] = await tx
+        .select()
+        .from(orderReminders)
+        .where(and(eq(orderReminders.consultantId, consultantId), isNull(orderReminders.dismissedAt)))
+        .orderBy(desc(orderReminders.reminderDate))
+        .limit(1);
+
+      if (!reminder) {
+        const [consultant] = await tx
+          .select({
+            day1: consultants.orderReminderDay1,
+            day2: consultants.orderReminderDay2,
+            configuredAt: consultants.orderReminderDaysUpdatedAt,
+          })
+          .from(consultants)
+          .where(eq(consultants.id, consultantId));
+
+        const period = consultant
+          ? resolveOrderReminderPeriod(
+              consultant.day1,
+              consultant.day2,
+              getArgentinaDateStr(),
+              consultant.configuredAt ? toArgentinaDateStr(consultant.configuredAt) : null,
+            )
+          : null;
+
+        if (period) {
+          const [alreadyGenerated] = await tx
+            .select({ id: orderReminders.id })
+            .from(orderReminders)
+            .where(and(eq(orderReminders.consultantId, consultantId), eq(orderReminders.reminderDate, period.periodEnd)));
+
+          if (!alreadyGenerated) {
+            const soldCandidates = await this.computeOrderReminderSoldCandidates(tx, consultantId, period.periodStart, period.periodEnd);
+            const pendingCandidates = await this.computeOrderReminderPendingCandidates(tx, consultantId, period.periodStart);
+            if (soldCandidates.length > 0 || pendingCandidates.length > 0) {
+              [reminder] = await tx
+                .insert(orderReminders)
+                .values({
+                  consultantId,
+                  reminderDate: period.periodEnd,
+                  periodStart: period.periodStart,
+                  periodEnd: period.periodEnd,
+                  items: soldCandidates,
+                })
+                .returning();
+            }
+          }
+          // Si `alreadyGenerated` existe, ya se generó y se cerró para este ciclo — no se
+          // vuelve a mostrar (point 1: nunca se duplica, ni reaparece algo ya resuelto).
+        }
+      }
+
+      if (!reminder) return null;
+      const items = await this.buildOrderReminderDisplayItems(tx, consultantId, reminder);
+      return { reminder, items };
+    });
+  }
+
+  /** Prompt 8, Parte 3 — "Listo, ya lo pedí". */
+  async dismissOrderReminder(consultantId: number, reminderId: number): Promise<OrderReminder | undefined> {
+    const db = await this.getDb();
     const [updated] = await db
-      .update(sales)
-      .set({ deliveryStatus })
-      .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+      .update(orderReminders)
+      .set({ dismissedAt: new Date() })
+      .where(and(eq(orderReminders.id, reminderId), eq(orderReminders.consultantId, consultantId), isNull(orderReminders.dismissedAt)))
       .returning();
     return updated;
   }
@@ -4456,6 +5114,8 @@ export class MemoryStorage implements IStorage {
   private clientNoteRecords: ClientNote[] = [];
   private clientPaymentRecords: ClientPayment[] = [];
   private paymentAllocationRecords: PaymentAllocation[] = [];
+  private orderReminderRecords: OrderReminder[] = [];
+  private nextOrderReminderId = 1;
   private nextOrderDiscountLogId = 1;
   private nextDraftId = 1;
   private nextClientNoteId = 1;
@@ -4566,6 +5226,7 @@ export class MemoryStorage implements IStorage {
         jobTitle: null,
         orderReminderDay1: null,
         orderReminderDay2: null,
+        orderReminderDaysUpdatedAt: null,
         grossIncomeTaxPercentTenths: null,
       };
       this.consultants.push(consultant);
@@ -4625,12 +5286,18 @@ export class MemoryStorage implements IStorage {
   async updateBusinessSettings(consultantId: number, input: UpdateBusinessSettingsInput): Promise<Consultant | undefined> {
     const consultant = this.consultants.find((c) => c.id === consultantId);
     if (!consultant) return undefined;
+    const newDay1 = input.orderReminderDay1 ?? null;
+    const newDay2 = input.orderReminderDay2 ?? null;
+    // Prompt 8, ajuste 1 — mismo criterio que DatabaseStorage: solo se pisa la fecha cuando los
+    // días REALMENTE cambian.
+    const daysChanged = consultant.orderReminderDay1 !== newDay1 || consultant.orderReminderDay2 !== newDay2;
     consultant.businessName = input.businessName;
     consultant.currency = input.currency;
     consultant.monthlyGoal = input.monthlyGoal ?? null;
     consultant.defaultLowStockThreshold = input.defaultLowStockThreshold ?? null;
-    consultant.orderReminderDay1 = input.orderReminderDay1 ?? null;
-    consultant.orderReminderDay2 = input.orderReminderDay2 ?? null;
+    consultant.orderReminderDay1 = newDay1;
+    consultant.orderReminderDay2 = newDay2;
+    if (daysChanged) consultant.orderReminderDaysUpdatedAt = new Date();
     consultant.grossIncomeTaxPercentTenths = input.grossIncomeTaxPercentTenths ?? null;
     return consultant;
   }
@@ -4730,6 +5397,7 @@ export class MemoryStorage implements IStorage {
       jobTitle: null,
       orderReminderDay1: null,
       orderReminderDay2: null,
+      orderReminderDaysUpdatedAt: null,
       grossIncomeTaxPercentTenths: null,
     };
     this.consultants.push(consultant);
@@ -5362,39 +6030,118 @@ export class MemoryStorage implements IStorage {
     return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
+  /** Prompt 8, Parte 2 y punto 6 — espejo de DatabaseStorage.assignUnitsToPendingSales: antes
+   * de que `delta` unidades entren a stock disponible, cubre primero las ventas que tenían
+   * este producto pendiente, de la más vieja a la más nueva. */
+  private assignUnitsToPendingSalesMem(
+    consultantId: number,
+    productId: number,
+    delta: number,
+    realUnitCost: number | null,
+  ): { leftoverDelta: number; assignments: { saleId: number; clientName: string; quantity: number }[] } {
+    if (delta <= 0) return { leftoverDelta: delta, assignments: [] };
+
+    const saleIdsByConsultant = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
+    const pendingLines = this.saleItems
+      .filter((i) => i.productId === productId && i.quantityPending > 0 && saleIdsByConsultant.get(i.saleId)?.status !== "cancelada")
+      .sort((a, b) => {
+        const saleA = saleIdsByConsultant.get(a.saleId)!;
+        const saleB = saleIdsByConsultant.get(b.saleId)!;
+        return saleA.date === saleB.date ? saleA.id - saleB.id : saleA.date.localeCompare(saleB.date);
+      });
+
+    let remaining = delta;
+    const assignments: { saleId: number; clientName: string; quantity: number }[] = [];
+    const affectedSaleIds = new Set<number>();
+
+    for (const line of pendingLines) {
+      if (remaining <= 0) break;
+      const assigned = Math.min(remaining, line.quantityPending);
+      if (assigned <= 0) continue;
+      remaining -= assigned;
+
+      if (realUnitCost !== null) {
+        const costFields = applyRealCostToLine(line, assigned, realUnitCost);
+        line.estimatedCostPerUnit = costFields.estimatedCostPerUnit;
+        line.realCostAccumulated = costFields.realCostAccumulated;
+        line.realCostUnits = costFields.realCostUnits;
+      }
+      line.quantityPending -= assigned;
+      const blended = resolveBlendedLineCost({
+        quantity: line.quantity,
+        estimatedCostPerUnit: line.estimatedCostPerUnit,
+        realCostAccumulated: line.realCostAccumulated,
+        realCostUnits: line.realCostUnits,
+      });
+      line.costPrice = blended.costPrice;
+      line.costIsEstimated = blended.isEstimated;
+
+      const sale = saleIdsByConsultant.get(line.saleId)!;
+      assignments.push({ saleId: line.saleId, clientName: sale.clientName, quantity: assigned });
+      affectedSaleIds.add(line.saleId);
+    }
+
+    for (const saleId of Array.from(affectedSaleIds)) {
+      const sale = this.sales.find((s) => s.id === saleId);
+      if (!sale) continue;
+      const items = this.saleItems.filter((i) => i.saleId === saleId);
+      const productCost = computeHistoricalProductCost(items.map((i) => ({ quantity: i.quantity, costPrice: i.costPrice })));
+      if (productCost === null) continue;
+      sale.profit = computeSaleProfit({ total: sale.total, productCost, shippingCost: sale.shippingCost, ingresosBrutos: sale.ingresosBrutos });
+    }
+
+    return { leftoverDelta: remaining, assignments };
+  }
+
   async setProductStock(
     consultantId: number,
     productId: number,
     unidades: number,
     isFreePlan: boolean,
     stockMinimo?: number | null,
-  ): Promise<Product | undefined> {
+  ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined> {
     const product = this.findVisibleProduct(consultantId, productId);
     if (!product) return undefined;
     const stock = this.getOrCreateStock(consultantId, productId);
-    this.assertFreePlanProductLimitMem(consultantId, isFreePlan, stock.unidades, unidades);
-    stock.unidades = unidades;
+    const existingUnidades = stock.unidades;
+
+    // Prompt 8, punto 6 — solo lo que SUBE cubre pendientes primero (bajar a mano es una
+    // corrección, nunca una carga).
+    const arriving = Math.max(0, unidades - existingUnidades);
+    const { leftoverDelta, assignments } = this.assignUnitsToPendingSalesMem(consultantId, productId, arriving, null);
+    const finalUnidades = unidades - (arriving - leftoverDelta);
+
+    this.assertFreePlanProductLimitMem(consultantId, isFreePlan, existingUnidades, finalUnidades);
+    stock.unidades = finalUnidades;
     if (stockMinimo !== undefined) stock.stockMinimo = stockMinimo;
-    return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
+    return { product: withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId)), pendingAssignments: assignments };
   }
 
-  async incrementProductStock(consultantId: number, productId: number, delta: number, isFreePlan: boolean): Promise<Product | undefined> {
+  async incrementProductStock(
+    consultantId: number,
+    productId: number,
+    delta: number,
+    isFreePlan: boolean,
+  ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined> {
     if (delta === 0) {
       throw new SaleValidationError("El delta de stock no puede ser 0");
     }
     const product = this.findVisibleProduct(consultantId, productId);
     if (!product) return undefined;
     const stock = this.getOrCreateStock(consultantId, productId);
-    // Misma semántica que la versión atómica de Postgres: `actual = actual + delta`, y si el
-    // resultado da negativo se rechaza SIN tocar la fila (no hay "commit parcial" que deshacer,
-    // simplemente no se asigna hasta después de validar).
-    const nextUnidades = stock.unidades + delta;
+
+    // Prompt 8, punto 6 — solo un delta positivo cubre pendientes primero.
+    const { leftoverDelta, assignments } = this.assignUnitsToPendingSalesMem(consultantId, productId, delta, null);
+
+    // Misma semántica que la versión atómica de Postgres: `actual = actual + leftoverDelta`, y
+    // si el resultado da negativo se rechaza SIN tocar la fila.
+    const nextUnidades = stock.unidades + leftoverDelta;
     if (nextUnidades < 0) {
       throw new SaleValidationError(`Stock insuficiente: quedarían ${nextUnidades} unidades`);
     }
     this.assertFreePlanProductLimitMem(consultantId, isFreePlan, stock.unidades, nextUnidades);
     stock.unidades = nextUnidades;
-    return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
+    return { product: withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId)), pendingAssignments: assignments };
   }
 
   async incrementProductStockBatch(
@@ -5403,7 +6150,7 @@ export class MemoryStorage implements IStorage {
     isFreePlan: boolean,
     discountPercent?: number,
     draftId?: number,
-  ): Promise<{ updated: number }> {
+  ): Promise<{ updated: number; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] }> {
     if (lines.length === 0) {
       throw new SaleValidationError("El lote no puede estar vacío");
     }
@@ -5417,6 +6164,32 @@ export class MemoryStorage implements IStorage {
     }
 
     const orderedProductIds = Array.from(deltaByProductId.keys()).sort((a, b) => a - b);
+
+    // Visibilidad de catálogo ANTES de mutar nada — la asignación a pendientes de abajo SÍ
+    // muta sale_items (nunca product_stock), así que tiene que quedar atrás de esta validación
+    // para no romper el "todo o nada" de esta función (si un producto no existe, nada se tocó
+    // todavía, ni siquiera un renglón pendiente).
+    const productByIdForBatch = new Map<number, ProductRow>();
+    for (const productId of orderedProductIds) {
+      const product = this.findVisibleProduct(consultantId, productId);
+      if (!product) {
+        throw new SaleValidationError(`Producto ${productId} no encontrado`);
+      }
+      productByIdForBatch.set(productId, product);
+    }
+
+    // Prompt 8 — cubre pendientes ANTES de la planificación de stock de abajo.
+    const pendingAssignments: { saleId: number; clientName: string; quantity: number }[] = [];
+    const leftoverByProductId = new Map<number, number>();
+    for (const productId of orderedProductIds) {
+      const delta = deltaByProductId.get(productId)!;
+      const lineCost =
+        discountPercent !== undefined ? Math.round(productByIdForBatch.get(productId)!.precio * (1 - discountPercent / 100)) : null;
+      const { leftoverDelta, assignments } = this.assignUnitsToPendingSalesMem(consultantId, productId, delta, lineCost);
+      leftoverByProductId.set(productId, leftoverDelta);
+      pendingAssignments.push(...assignments);
+    }
+
     // Prompt 14 (P30) — cuántas líneas de ESTE lote ya se planearon como "nuevas" (0 → positivo)
     // antes de la línea actual del loop de abajo: `this.productStock` todavía no las refleja
     // (recién se aplican en la segunda pasada), así que el chequeo de límite las cuenta aparte.
@@ -5433,12 +6206,10 @@ export class MemoryStorage implements IStorage {
     // recalcularlas es la carga manual de costo desde "Editar producto" (Prompt 4).
     const planned: { stock: ProductStock; nextUnidades: number; nextCostPrice?: number }[] = [];
     for (const productId of orderedProductIds) {
-      const product = this.findVisibleProduct(consultantId, productId);
-      if (!product) {
-        throw new SaleValidationError(`Producto ${productId} no encontrado`);
-      }
+      const product = productByIdForBatch.get(productId)!;
       const stock = this.getOrCreateStock(consultantId, productId);
-      const delta = deltaByProductId.get(productId)!;
+      const delta = leftoverByProductId.get(productId)!;
+      if (delta <= 0) continue;
       const nextUnidades = stock.unidades + delta;
       if (nextUnidades < 0) {
         throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${nextUnidades} unidades`);
@@ -5451,7 +6222,8 @@ export class MemoryStorage implements IStorage {
       }
       // Prompt 2 — mismo criterio que DatabaseStorage: promedio ponderado por unidades,
       // redondeado a pesos enteros; sin costo previo o con 0 unidades, el costo nuevo es
-      // directamente el de esta compra.
+      // directamente el de esta compra. Usa `leftoverDelta` (acá `delta`), no el delta crudo
+      // del pedido: lo que se fue a cubrir pendientes nunca se mezcla en este promedio.
       const lineCost = Math.round(product.precio * (1 - discountPercent / 100));
       const hadNoRealCost = stock.costPrice === null || stock.unidades <= 0;
       const nextCostPrice = hadNoRealCost
@@ -5473,7 +6245,7 @@ export class MemoryStorage implements IStorage {
       if (index !== -1) this.draftRecords.splice(index, 1);
     }
 
-    return { updated: orderedProductIds.length };
+    return { updated: orderedProductIds.length, pendingAssignments };
   }
 
   async recalculateEstimatedSalesForProduct(consultantId: number, productId: number, newCostPrice: number): Promise<void> {
@@ -5484,8 +6256,13 @@ export class MemoryStorage implements IStorage {
     if (estimatedItems.length === 0) return;
 
     for (const item of estimatedItems) {
-      item.costPrice = newCostPrice;
-      item.costIsEstimated = false;
+      const corrected = applyManualCostCorrection(item, newCostPrice);
+      item.estimatedCostPerUnit = corrected.estimatedCostPerUnit;
+      item.realCostAccumulated = corrected.realCostAccumulated;
+      item.realCostUnits = corrected.realCostUnits;
+      const blended = resolveBlendedLineCost({ quantity: item.quantity, ...corrected });
+      item.costPrice = blended.costPrice;
+      item.costIsEstimated = blended.isEstimated;
     }
 
     const affectedSaleIds = Array.from(new Set(estimatedItems.map((i) => i.saleId)));
@@ -6513,16 +7290,25 @@ export class MemoryStorage implements IStorage {
       if (product.discontinued) {
         throw new SaleValidationError(`"${product.producto}" está discontinuado y no está disponible para nuevas ventas`);
       }
-      if (product.unidades < item.quantity) {
-        throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${product.unidades})`);
-      }
-      const resolvedCost = resolveLineCost({ costPrice: product.costPrice, publicPrice: product.precio, habitualDiscountPercent });
+      // Prompt 8, Parte 1: vender sin stock (o sin stock suficiente) ya no se rechaza.
+      const allocation = resolveStockAllocation(item.quantity, product.unidades);
+      const initialCost = resolveInitialLineCost({
+        quantity: item.quantity,
+        quantityPending: allocation.pending,
+        realCostPerUnitKnown: product.costPrice,
+        publicPrice: product.precio,
+        habitualDiscountPercent,
+      });
+      const blendedCost = resolveBlendedLineCost({ quantity: item.quantity, ...initialCost });
       return {
         product,
         quantity: item.quantity,
         unitPrice: item.unitPrice ?? product.precio,
-        costPrice: resolvedCost.costPrice,
-        costIsEstimated: resolvedCost.isEstimated,
+        costPrice: blendedCost.costPrice,
+        costIsEstimated: blendedCost.isEstimated,
+        quantityPending: allocation.pending,
+        quantityDelivered: allocation.covered,
+        ...initialCost,
       };
     });
 
@@ -6597,7 +7383,8 @@ export class MemoryStorage implements IStorage {
       installmentsCount: input.installments.length,
       installmentFrequency: input.installments.length > 1 ? input.installmentFrequency ?? null : null,
       status: "pendiente",
-      deliveryStatus: "entregada",
+      // Prompt 8: "entregada" solo si TODOS los renglones tienen quantityDelivered === quantity.
+      deliveryStatus: lines.every((l) => l.quantityDelivered === l.quantity) ? "entregada" : "pendiente_entrega",
       notes: input.notes ?? null,
       clientRequestId: input.clientRequestId ?? null,
     };
@@ -6616,9 +7403,15 @@ export class MemoryStorage implements IStorage {
         // Misma fuente que computeProductCost más arriba.
         costPrice: line.costPrice,
         costIsEstimated: line.costIsEstimated,
+        quantityPending: line.quantityPending,
+        quantityDelivered: line.quantityDelivered,
+        estimatedCostPerUnit: line.estimatedCostPerUnit,
+        realCostAccumulated: line.realCostAccumulated,
+        realCostUnits: line.realCostUnits,
       });
+      // Prompt 8, punto 8: resta atómica (nunca negativa) — mismo criterio que DatabaseStorage.
       const stock = this.getOrCreateStock(consultantId, line.product.id);
-      stock.unidades -= line.quantity;
+      stock.unidades -= Math.min(stock.unidades, line.quantityDelivered);
     }
 
     const insertedInstallments: SaleInstallment[] = installmentPlans.map((plan, index) => ({
@@ -6677,15 +7470,21 @@ export class MemoryStorage implements IStorage {
     const productById = new Map((await this.getProductsByIds(consultantId, involvedIds)).map((p) => [p.id, p]));
     const stockById = new Map<number, number>();
     productById.forEach((p) => stockById.set(p.id, p.unidades));
+    // Prompt 8 — se empareja por productId (nunca hay dos renglones con el mismo producto en
+    // una venta, ver mismo comentario en DatabaseStorage.updateSale).
+    const existingByProductId = new Map(
+      existingItems.filter((i): i is typeof i & { productId: number } => i.productId !== null).map((i) => [i.productId, i]),
+    );
 
-    // 1) Restaurar el stock que esta venta tenía reservado (como si se hubiera eliminado).
-    for (const item of existingItems) {
-      if (item.productId !== null) {
-        stockById.set(item.productId, (stockById.get(item.productId) ?? 0) + item.quantity);
+    // Renglones que desaparecen en esta edición: baja completa (misma fórmula que cancelSale).
+    const newProductIds = new Set(input.items.map((i) => i.productId));
+    for (const old of existingItems) {
+      if (old.productId !== null && !newProductIds.has(old.productId)) {
+        const covered = old.quantity - old.quantityPending;
+        stockById.set(old.productId, (stockById.get(old.productId) ?? 0) + covered);
       }
     }
 
-    // 2) Validar y reservar stock para la nueva composición, sobre el stock ya restaurado.
     const habitualDiscountPercent = this.resolveHabitualDiscountPercentMem(consultantId);
     const lines = input.items.map((item) => {
       const product = productById.get(item.productId);
@@ -6693,18 +7492,139 @@ export class MemoryStorage implements IStorage {
       if (product.discontinued && !existingProductIds.has(item.productId)) {
         throw new SaleValidationError(`"${product.producto}" está discontinuado y no está disponible para nuevas ventas`);
       }
-      const available = stockById.get(item.productId) ?? 0;
-      if (available < item.quantity) {
-        throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);
+      const realCostPerUnitKnown = product.costPrice;
+      const existing = existingByProductId.get(item.productId);
+
+      if (!existing) {
+        const available = stockById.get(item.productId) ?? 0;
+        const allocation = resolveStockAllocation(item.quantity, available);
+        stockById.set(item.productId, available - allocation.covered);
+        const initialCost = resolveInitialLineCost({
+          quantity: item.quantity,
+          quantityPending: allocation.pending,
+          realCostPerUnitKnown,
+          publicPrice: product.precio,
+          habitualDiscountPercent,
+        });
+        const blended = resolveBlendedLineCost({ quantity: item.quantity, ...initialCost });
+        return {
+          product,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice ?? product.precio,
+          costPrice: blended.costPrice,
+          costIsEstimated: blended.isEstimated,
+          quantityPending: allocation.pending,
+          quantityDelivered: allocation.covered,
+          ...initialCost,
+        };
       }
-      stockById.set(item.productId, available - item.quantity);
-      const resolvedCost = resolveLineCost({ costPrice: product.costPrice, publicPrice: product.precio, habitualDiscountPercent });
+
+      if (item.quantity === existing.quantity) {
+        // Prompt 2: cualquier edición usa el costo VIGENTE, nunca el histórico — sigue así
+        // cuando no queda nada pendiente (se re-resuelve entero). Solo con algo pendiente se
+        // preserva el acumulado tal cual (mismo criterio que DatabaseStorage.updateSale).
+        if (existing.quantityPending === 0) {
+          const initialCost = resolveInitialLineCost({
+            quantity: existing.quantity,
+            quantityPending: 0,
+            realCostPerUnitKnown,
+            publicPrice: product.precio,
+            habitualDiscountPercent,
+          });
+          const blended = resolveBlendedLineCost({ quantity: existing.quantity, ...initialCost });
+          return {
+            product,
+            quantity: existing.quantity,
+            unitPrice: item.unitPrice ?? product.precio,
+            costPrice: blended.costPrice,
+            costIsEstimated: blended.isEstimated,
+            quantityPending: 0,
+            quantityDelivered: existing.quantityDelivered,
+            ...initialCost,
+          };
+        }
+        const blended = resolveBlendedLineCost({
+          quantity: existing.quantity,
+          estimatedCostPerUnit: existing.estimatedCostPerUnit,
+          realCostAccumulated: existing.realCostAccumulated,
+          realCostUnits: existing.realCostUnits,
+        });
+        return {
+          product,
+          quantity: existing.quantity,
+          unitPrice: item.unitPrice ?? product.precio,
+          costPrice: blended.costPrice,
+          costIsEstimated: blended.isEstimated,
+          quantityPending: existing.quantityPending,
+          quantityDelivered: existing.quantityDelivered,
+          estimatedCostPerUnit: existing.estimatedCostPerUnit,
+          realCostAccumulated: existing.realCostAccumulated,
+          realCostUnits: existing.realCostUnits,
+        };
+      }
+
+      if (item.quantity < existing.quantity) {
+        const decrease = resolveQuantityDecrease(
+          existing.quantity - item.quantity,
+          existing.quantity,
+          existing.quantityPending,
+          existing.quantityDelivered,
+        );
+        stockById.set(item.productId, (stockById.get(item.productId) ?? 0) + decrease.stockToReturn);
+        let realCostAccumulated = existing.realCostAccumulated;
+        let realCostUnits = existing.realCostUnits;
+        if (decrease.stockToReturn > 0 && existing.realCostUnits > 0) {
+          const avgRealCost = existing.realCostAccumulated / existing.realCostUnits;
+          const unitsRemovedFromReal = Math.min(decrease.stockToReturn, existing.realCostUnits);
+          realCostAccumulated = existing.realCostAccumulated - Math.round(avgRealCost * unitsRemovedFromReal);
+          realCostUnits = existing.realCostUnits - unitsRemovedFromReal;
+        }
+        const blended = resolveBlendedLineCost({
+          quantity: item.quantity,
+          estimatedCostPerUnit: existing.estimatedCostPerUnit,
+          realCostAccumulated,
+          realCostUnits,
+        });
+        return {
+          product,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice ?? product.precio,
+          costPrice: blended.costPrice,
+          costIsEstimated: blended.isEstimated,
+          quantityPending: decrease.quantityPending,
+          quantityDelivered: decrease.quantityDelivered,
+          estimatedCostPerUnit: existing.estimatedCostPerUnit,
+          realCostAccumulated,
+          realCostUnits,
+        };
+      }
+
+      const increaseAmount = item.quantity - existing.quantity;
+      const available = stockById.get(item.productId) ?? 0;
+      const allocation = resolveStockAllocation(increaseAmount, available);
+      stockById.set(item.productId, available - allocation.covered);
+      const deltaCost = resolveInitialLineCost({
+        quantity: increaseAmount,
+        quantityPending: allocation.pending,
+        realCostPerUnitKnown,
+        publicPrice: product.precio,
+        habitualDiscountPercent,
+      });
+      const estimatedCostPerUnit = existing.estimatedCostPerUnit ?? deltaCost.estimatedCostPerUnit;
+      const realCostAccumulated = existing.realCostAccumulated + deltaCost.realCostAccumulated;
+      const realCostUnits = existing.realCostUnits + deltaCost.realCostUnits;
+      const blended = resolveBlendedLineCost({ quantity: item.quantity, estimatedCostPerUnit, realCostAccumulated, realCostUnits });
       return {
         product,
         quantity: item.quantity,
         unitPrice: item.unitPrice ?? product.precio,
-        costPrice: resolvedCost.costPrice,
-        costIsEstimated: resolvedCost.isEstimated,
+        costPrice: blended.costPrice,
+        costIsEstimated: blended.isEstimated,
+        quantityPending: existing.quantityPending + allocation.pending,
+        quantityDelivered: existing.quantityDelivered + allocation.covered,
+        estimatedCostPerUnit,
+        realCostAccumulated,
+        realCostUnits,
       };
     });
 
@@ -6775,9 +7695,15 @@ export class MemoryStorage implements IStorage {
         originalPrice: line.product.precio,
         price: line.unitPrice,
         // Costo vigente al momento de esta edición — misma fuente que computeProductCost más
-        // arriba. La composición se reemplaza por completo.
+        // arriba. La FILA se reemplaza por completo, pero el progreso de entrega/costo de un
+        // renglón sin cambios o editado se preserva/ajusta (ver el armado de `lines` arriba).
         costPrice: line.costPrice,
         costIsEstimated: line.costIsEstimated,
+        quantityPending: line.quantityPending,
+        quantityDelivered: line.quantityDelivered,
+        estimatedCostPerUnit: line.estimatedCostPerUnit,
+        realCostAccumulated: line.realCostAccumulated,
+        realCostUnits: line.realCostUnits,
       });
     }
 
@@ -6810,6 +7736,9 @@ export class MemoryStorage implements IStorage {
     existingSale.installmentsCount = installmentsCount;
     existingSale.installmentFrequency = installmentsCount > 1 ? input.installmentFrequency ?? null : null;
     existingSale.notes = input.notes ?? null;
+    // Prompt 8: igual que en createSale — "entregada" solo si TODOS los renglones de la
+    // composición nueva tienen quantityDelivered === quantity.
+    existingSale.deliveryStatus = lines.every((l) => l.quantityDelivered === l.quantity) ? "entregada" : "pendiente_entrega";
 
     return existingSale;
   }
@@ -6824,8 +7753,11 @@ export class MemoryStorage implements IStorage {
     const items = this.saleItems.filter((i) => i.saleId === id);
     for (const item of items) {
       if (item.productId !== null) {
+        // Prompt 8 — solo vuelve al stock lo que REALMENTE salió de ahí (ver mismo comentario
+        // en DatabaseStorage.cancelSale).
         const stock = this.getOrCreateStock(consultantId, item.productId);
-        stock.unidades += item.quantity;
+        stock.unidades += item.quantity - item.quantityPending;
+        item.quantityPending = 0;
       }
     }
 
@@ -6864,8 +7796,182 @@ export class MemoryStorage implements IStorage {
     if (sale.status === "cancelada") {
       throw new SaleValidationError("No se puede cambiar la entrega de una venta cancelada");
     }
+    const items = this.saleItems.filter((i) => i.saleId === saleId);
+    if (deliveryStatus === "entregada") {
+      if (items.some((i) => i.quantityPending > 0)) {
+        throw new SaleValidationError("No se puede marcar como entregada: todavía tiene unidades pendientes de un pedido");
+      }
+      for (const i of items) i.quantityDelivered = i.quantity;
+    } else {
+      for (const i of items) i.quantityDelivered = 0;
+    }
     sale.deliveryStatus = deliveryStatus;
     return sale;
+  }
+
+  /** Prompt 8, Parte 2 — "Marcar como entregado" de un renglón puntual. */
+  async markSaleItemDelivered(consultantId: number, saleId: number, itemId: number): Promise<Sale | undefined> {
+    const sale = this.sales.find((s) => s.id === saleId && s.consultantId === consultantId);
+    if (!sale) return undefined;
+    if (sale.status === "cancelada") {
+      throw new SaleValidationError("No se puede entregar un renglón de una venta cancelada");
+    }
+    const item = this.saleItems.find((i) => i.id === itemId && i.saleId === saleId);
+    if (!item) return undefined;
+
+    const readyToDeliver = item.quantity - item.quantityPending - item.quantityDelivered;
+    if (readyToDeliver <= 0) {
+      throw new SaleValidationError("Este renglón no tiene nada listo para entregar todavía");
+    }
+    item.quantityDelivered += readyToDeliver;
+
+    const allItems = this.saleItems.filter((i) => i.saleId === saleId);
+    sale.deliveryStatus = allItems.every((i) => i.quantityDelivered === i.quantity) ? "entregada" : "pendiente_entrega";
+    return sale;
+  }
+
+  async getDeliveryReadyItems(
+    consultantId: number,
+  ): Promise<{ saleId: number; itemId: number; clientId: number | null; clientName: string; productName: string; quantity: number }[]> {
+    const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
+    return this.saleItems
+      .filter((i) => {
+        const sale = saleById.get(i.saleId);
+        return sale !== undefined && sale.status !== "cancelada" && i.quantityPending === 0 && i.quantityDelivered < i.quantity;
+      })
+      .sort((a, b) => {
+        const saleA = saleById.get(a.saleId)!;
+        const saleB = saleById.get(b.saleId)!;
+        return saleA.date === saleB.date ? saleA.id - saleB.id : saleA.date.localeCompare(saleB.date);
+      })
+      .map((i) => {
+        const sale = saleById.get(i.saleId)!;
+        return { saleId: i.saleId, itemId: i.id, clientId: sale.clientId, clientName: sale.clientName, productName: i.productName, quantity: i.quantity - i.quantityDelivered };
+      });
+  }
+
+  /** Espejo de DatabaseStorage.computeOrderReminderSoldCandidates. */
+  private computeOrderReminderSoldCandidatesMem(consultantId: number, periodStart: string, periodEnd: string): OrderReminderItemSnapshot[] {
+    const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
+    const soldByProductId = new Map<number, number>();
+    for (const item of this.saleItems) {
+      if (item.productId === null) continue;
+      const sale = saleById.get(item.saleId);
+      if (!sale || sale.status === "cancelada") continue;
+      if (sale.date < periodStart || sale.date > periodEnd) continue;
+      soldByProductId.set(item.productId, (soldByProductId.get(item.productId) ?? 0) + item.quantity);
+    }
+    if (soldByProductId.size === 0) return [];
+
+    const consultant = this.consultants.find((c) => c.id === consultantId);
+    const defaultThreshold = consultant?.defaultLowStockThreshold ?? null;
+    const qualifying: OrderReminderItemSnapshot[] = [];
+    for (const [productId, soldInPeriod] of Array.from(soldByProductId)) {
+      const stock = this.productStock.find((s) => s.consultantId === consultantId && s.productId === productId);
+      const unidades = stock?.unidades ?? 0;
+      const threshold = resolveLowStockThreshold(stock?.stockMinimo ?? null, defaultThreshold);
+      if (unidades <= threshold) qualifying.push({ productId, soldInPeriod });
+    }
+    return qualifying;
+  }
+
+  /** Espejo de DatabaseStorage.computeOrderReminderPendingCandidates. */
+  private computeOrderReminderPendingCandidatesMem(consultantId: number, beforeDate: string): { productId: number; pendingFromBefore: number }[] {
+    const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
+    const pendingByProductId = new Map<number, number>();
+    for (const item of this.saleItems) {
+      if (item.productId === null || item.quantityPending <= 0) continue;
+      const sale = saleById.get(item.saleId);
+      if (!sale || sale.status === "cancelada" || sale.date >= beforeDate) continue;
+      pendingByProductId.set(item.productId, (pendingByProductId.get(item.productId) ?? 0) + item.quantityPending);
+    }
+    return Array.from(pendingByProductId, ([productId, pendingFromBefore]) => ({ productId, pendingFromBefore }));
+  }
+
+  /** Espejo de DatabaseStorage.buildOrderReminderDisplayItems. */
+  private buildOrderReminderDisplayItemsMem(
+    consultantId: number,
+    reminder: OrderReminder,
+  ): { productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[] {
+    const soldItems = reminder.items as OrderReminderItemSnapshot[];
+    const pendingCandidates = this.computeOrderReminderPendingCandidatesMem(consultantId, reminder.periodStart);
+    const pendingByProductId = new Map(pendingCandidates.map((p) => [p.productId, p.pendingFromBefore]));
+    const soldByProductId = new Map(soldItems.map((s) => [s.productId, s.soldInPeriod]));
+    const productIds = Array.from(new Set([...soldItems.map((s) => s.productId), ...pendingCandidates.map((p) => p.productId)]));
+
+    return productIds
+      .map((productId) => {
+        const product = this.products.find((p) => p.id === productId);
+        const stock = this.productStock.find((s) => s.consultantId === consultantId && s.productId === productId);
+        const soldInPeriod = soldByProductId.get(productId) ?? 0;
+        const pendingFromBefore = pendingByProductId.get(productId) ?? 0;
+        const variante = product?.variante;
+        return {
+          productId,
+          productName: product ? (variante && variante !== "Estándar" ? `${product.producto} - ${variante}` : product.producto) : "Producto",
+          soldInPeriod,
+          pendingFromBefore,
+          currentStock: stock?.unidades ?? 0,
+          suggestedQuantity: soldInPeriod + pendingFromBefore,
+        };
+      })
+      .sort((a, b) => b.suggestedQuantity - a.suggestedQuantity);
+  }
+
+  async getOrderReminder(consultantId: number): Promise<{
+    reminder: OrderReminder;
+    items: { productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[];
+  } | null> {
+    let reminder = this.orderReminderRecords
+      .filter((r) => r.consultantId === consultantId && r.dismissedAt === null)
+      .sort((a, b) => b.reminderDate.localeCompare(a.reminderDate))[0];
+
+    if (!reminder) {
+      const consultant = this.consultants.find((c) => c.id === consultantId);
+      const period = consultant
+        ? resolveOrderReminderPeriod(
+            consultant.orderReminderDay1,
+            consultant.orderReminderDay2,
+            getArgentinaDateStr(),
+            consultant.orderReminderDaysUpdatedAt ? toArgentinaDateStr(consultant.orderReminderDaysUpdatedAt) : null,
+          )
+        : null;
+
+      if (period) {
+        const alreadyGenerated = this.orderReminderRecords.some(
+          (r) => r.consultantId === consultantId && r.reminderDate === period.periodEnd,
+        );
+        if (!alreadyGenerated) {
+          const soldCandidates = this.computeOrderReminderSoldCandidatesMem(consultantId, period.periodStart, period.periodEnd);
+          const pendingCandidates = this.computeOrderReminderPendingCandidatesMem(consultantId, period.periodStart);
+          if (soldCandidates.length > 0 || pendingCandidates.length > 0) {
+            reminder = {
+              id: this.nextOrderReminderId++,
+              consultantId,
+              reminderDate: period.periodEnd,
+              periodStart: period.periodStart,
+              periodEnd: period.periodEnd,
+              items: soldCandidates,
+              dismissedAt: null,
+              createdAt: new Date(),
+            };
+            this.orderReminderRecords.push(reminder);
+          }
+        }
+      }
+    }
+
+    if (!reminder) return null;
+    return { reminder, items: this.buildOrderReminderDisplayItemsMem(consultantId, reminder) };
+  }
+
+  async dismissOrderReminder(consultantId: number, reminderId: number): Promise<OrderReminder | undefined> {
+    const reminder = this.orderReminderRecords.find(
+      (r) => r.id === reminderId && r.consultantId === consultantId && r.dismissedAt === null,
+    );
+    if (!reminder) return undefined;
+    reminder.dismissedAt = new Date();
+    return reminder;
   }
 
   async assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined> {

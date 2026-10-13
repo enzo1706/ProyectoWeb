@@ -3,6 +3,16 @@ import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Package, Plus, Minus, ImagePlus, Search } from "lucide-react";
 import { apiRequest } from "@/lib/queryClient";
 import { useHideMoney } from "@/hooks/use-hide-money";
@@ -141,7 +151,11 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
     return product.unidades - ordered;
   };
 
-  const handleAddToCart = () => {
+  // Prompt 8, Parte 1 — vender sin stock: al agregar más cantidad de la que hay, se pide
+  // confirmación con uno de dos textos según falte TODO o solo una parte.
+  const [outOfStockConfirm, setOutOfStockConfirm] = useState<{ remaining: number } | null>(null);
+
+  const addToCartNow = () => {
     if (!activeProduct) return;
     const priceCents = priceInput ? Math.round(Number(priceInput) * 100) : activeProduct.precio;
     onAddLine({
@@ -157,7 +171,18 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
     });
     setSelectedProduct(null);
     setSelectedTone(null);
+    setOutOfStockConfirm(null);
     onSubViewChange("cart");
+  };
+
+  const handleAddToCart = () => {
+    if (!activeProduct) return;
+    const remaining = remainingFor(activeProduct);
+    if (quantity > remaining) {
+      setOutOfStockConfirm({ remaining: Math.max(0, remaining) });
+      return;
+    }
+    addToCartNow();
   };
 
   if (subView === "cart") {
@@ -185,9 +210,8 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
         <button
           key={product.id}
           type="button"
-          disabled={remaining <= 0}
           onClick={() => openProduct(product)}
-          className="flex w-full items-center gap-3 rounded-xl border bg-muted/40 p-3 text-left hover-elevate active-elevate-2 disabled:opacity-50 disabled:cursor-not-allowed"
+          className="flex w-full items-center gap-3 rounded-xl border bg-muted/40 p-3 text-left hover-elevate active-elevate-2"
           data-testid={`${testIdPrefix}-${product.id}`}
         >
           {product.imagen ? (
@@ -284,9 +308,8 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
               <button
                 key={product.id}
                 type="button"
-                disabled={remaining <= 0}
                 onClick={() => openProduct(product)}
-                className="flex w-full items-center gap-3 rounded-xl border bg-muted/40 p-3 text-left hover-elevate active-elevate-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="flex w-full items-center gap-3 rounded-xl border bg-muted/40 p-3 text-left hover-elevate active-elevate-2"
                 data-testid={`sale-picker-product-${product.id}`}
               >
                 {product.imagen ? (
@@ -322,9 +345,8 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
             <button
               key={sibling.id}
               type="button"
-              disabled={remainingFor(sibling) <= 0}
               onClick={() => openTone(sibling)}
-              className="flex flex-col items-center gap-1.5 disabled:opacity-40"
+              className="flex flex-col items-center gap-1.5"
               data-testid={`sale-picker-tone-${sibling.id}`}
             >
               <span
@@ -372,12 +394,12 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
             <span className="min-w-[1.5rem] text-center font-semibold tabular-nums" data-testid="text-step-qty">
               {quantity}
             </span>
+            {/* Prompt 8, Parte 1: vender sin stock — ya no tiene tope en el stock disponible. */}
             <Button
               type="button"
               variant="outline"
               size="icon"
-              onClick={() => setQuantity((q) => Math.min(Math.max(maxQty, 1), q + 1))}
-              disabled={quantity >= maxQty}
+              onClick={() => setQuantity((q) => q + 1)}
               aria-label="Aumentar cantidad"
               data-testid="button-step-qty-plus"
             >
@@ -386,7 +408,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
           </div>
         </div>
         {maxQty <= 0 ? (
-          <p className="text-sm text-destructive">Sin stock disponible para este producto.</p>
+          <p className="text-sm text-muted-foreground">No contás con stock de este producto.</p>
         ) : (
           <p className="text-sm text-muted-foreground">Stock disponible: {maxQty}</p>
         )}
@@ -402,15 +424,30 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
             data-testid="input-step-price"
           />
         </div>
-        <Button
-          type="button"
-          className="h-12 w-full"
-          onClick={handleAddToCart}
-          disabled={maxQty <= 0 || quantity > maxQty}
-          data-testid="button-step-add-to-cart"
-        >
+        <Button type="button" className="h-12 w-full" onClick={handleAddToCart} data-testid="button-step-add-to-cart">
           Agregar a la venta
         </Button>
+
+        <AlertDialog open={outOfStockConfirm !== null} onOpenChange={(o) => !o && setOutOfStockConfirm(null)}>
+          <AlertDialogContent data-testid="dialog-confirm-no-stock">
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {outOfStockConfirm?.remaining === 0 ? "No contás con stock de este producto" : "No tenés suficiente stock"}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {outOfStockConfirm?.remaining === 0
+                  ? "¿Querés continuar con la venta?"
+                  : `Tenés ${outOfStockConfirm?.remaining} unidades de este producto. Las ${quantity - (outOfStockConfirm?.remaining ?? 0)} que faltan quedan pendientes para tu próximo pedido. ¿Querés continuar con la venta?`}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel data-testid="button-no-stock-cancel">Cancelar</AlertDialogCancel>
+              <AlertDialogAction onClick={addToCartNow} data-testid="button-no-stock-continue">
+                Sí, continuar
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </div>
     );
   }

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import type { Product, Draft } from "@shared/schema";
@@ -31,6 +31,7 @@ import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { getProductCategories, toneFamilyKey } from "@/lib/productCategories";
 import { LoadOrderDialog } from "@/components/LoadOrderDialog";
+import { consumeOrderReminderPreload } from "@/lib/orderReminderPreload";
 import { UnfinishedDraftsSection } from "@/components/UnfinishedDraftsSection";
 import { AddProductDialog } from "@/components/stock/AddProductDialog";
 import { EditProductDialog } from "@/components/stock/EditProductDialog";
@@ -136,6 +137,16 @@ export default function Productos() {
   const [loadOrderOpen, setLoadOrderOpen] = useState(false);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [resumingOrderDraft, setResumingOrderDraft] = useState<Draft | null>(null);
+  // Prompt 8, Parte 3 — "Armar pedido con estos productos" desde el recordatorio de Inicio.
+  const [orderPreload, setOrderPreload] = useState<Record<number, number> | null>(null);
+
+  useEffect(() => {
+    const preload = consumeOrderReminderPreload();
+    if (preload) {
+      setOrderPreload(preload);
+      setLoadOrderOpen(true);
+    }
+  }, []);
 
   const { data: products = [], isLoading, isError, error } = useQuery<Product[]>({
     queryKey: ["/api/products"],
@@ -403,10 +414,12 @@ export default function Productos() {
           if (!next) {
             setLoadOrderOpen(false);
             setResumingOrderDraft(null);
+            setOrderPreload(null);
           }
         }}
         products={products}
         draftToResume={resumingOrderDraft}
+        initialQtyByProduct={orderPreload ?? undefined}
       />
     </div>
   );

@@ -463,9 +463,9 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
     setLines((prev) => {
       const existing = prev.find((l) => l.productId === line.productId);
       if (existing) {
-        return prev.map((l) =>
-          l.productId === line.productId ? { ...l, quantity: Math.min(l.maxQuantity, l.quantity + line.quantity) } : l,
-        );
+        // Prompt 8, Parte 1: vender sin stock — ya no se limita a `maxQuantity` (el stock al
+        // momento de agregarla), puede seguir sumando aunque falte stock.
+        return prev.map((l) => (l.productId === line.productId ? { ...l, quantity: l.quantity + line.quantity } : l));
       }
       return [...prev, line];
     });

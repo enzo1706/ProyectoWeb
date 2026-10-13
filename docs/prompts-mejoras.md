@@ -539,6 +539,64 @@ Cómo verifico que quedó bien:
 - En un Android con avisos activados, "Probar aviso" llega al centro de notificaciones.
 ```
 
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **Partes implementadas**: 1, 2 y 3 completas. La Parte 4 (notificación al celular) queda
+  deliberadamente sin implementar — se dejó listo únicamente el modelo de datos (la tabla
+  `order_reminders`, que ya es "el recordatorio generado y guardado por consultora y fecha").
+  Nada de manifest, service worker, claves VAPID ni endpoint de suscripción todavía.
+- **Modelo de unidades pendientes**: `sale_items` gana `quantityPending` (unidades que esperan
+  un pedido futuro) y `quantityDelivered` (unidades ya entregadas físicamente). "Listo para
+  entregar, todavía no entregado" = `quantity - quantityPending - quantityDelivered` — eso es
+  lo que dispara el aviso "Ya podés entregarle...". `sales.deliveryStatus` (ya existía, Prompt
+  6) deja de ser un valor puramente manual: pasa a ser el agregado de los renglones
+  ("entregada" solo cuando TODOS tienen `quantityDelivered === quantity"), recalculado en la
+  misma transacción que toca cualquier renglón. El toggle manual de la venta sigue existiendo,
+  pero ahora aplica a todos sus renglones a la vez (bloqueado a "entregada" si queda algo
+  pendiente).
+- **Costo de las unidades pendientes**: tres campos separan lo YA resuelto de lo todavía
+  estimado (`estimatedCostPerUnit`, `realCostAccumulated`, `realCostUnits`), para no mezclar un
+  promedio viejo con uno nuevo en cada pedido parcial. Cuando llega un pedido, cada unidad
+  asignada a un renglón pendiente suma su costo real a ese renglón puntual — es una excepción
+  acotada a la regla del Prompt 2 ("un pedido nunca recalcula ventas viejas"), que sigue
+  rigiendo para todo lo demás. Cargar el costo a mano desde "Editar producto"
+  (`recalculateEstimatedSalesForProduct`) también respeta esto: si la línea todavía tiene
+  unidades pendientes, solo actualiza el estimado congelado, nunca resuelve de una lo que
+  todavía espera un pedido real.
+- **Los 4 caminos que suman stock** (pedido del catálogo, borrador de pedido confirmado —
+  misma función que el pedido, con `draftId` —, carga manual de un producto nuevo, "Editar
+  producto") cubren primero las ventas pendientes de ese producto, de la más vieja a la más
+  nueva, antes de que cualquier unidad llegue a contar como stock disponible. Por diseño, esas
+  unidades nunca cuentan para el límite de 10 productos del plan gratis (Prompt 14). La carga
+  manual de un producto NUEVO (`createProduct`) es la única excepción real: un producto recién
+  creado no puede tener ninguna venta pendiente previa, así que ahí no hay nada que cubrir.
+- **Cancelar o editar una venta con unidades pendientes**: cancelar devuelve al stock
+  `quantity - quantityPending` (nunca el total) y pone `quantityPending = 0` — nunca se
+  bloquea por el límite del plan gratis, es una corrección, no una carga. Editar empareja los
+  renglones por `productId` (nunca por el `id` del renglón: una venta nunca puede tener el
+  mismo producto en dos renglones, el carrito de "Nueva venta" ya fusiona cualquier repetido).
+  Al bajar la cantidad, el orden es primero lo pendiente, después lo que tenía en mano sin
+  entregar, y por último (una devolución de la clienta) lo ya entregado — todo lo que no sale
+  de "pendiente" vuelve al stock. Al subir, la diferencia sigue la lógica de vender sin stock,
+  sin tocar nunca lo que ya estaba entregado.
+- **Recordatorio del día de pedido, sin tarea programada**: se calcula al vuelo cada vez que
+  entra a la app (nunca con un cron). El período (para el criterio de "vendido desde el
+  recordatorio anterior") sale siempre de los días configurados, nunca de la última fila
+  guardada — así un ciclo con la lista vacía (que no genera fila) no corre el período del
+  siguiente. Nunca se genera un recordatorio para un ciclo anterior a la fecha en que se
+  configuraron los días de pedido (`consultants.orderReminderDaysUpdatedAt`, se pisa solo
+  cuando esos días realmente cambian). El criterio (a) (vendido en el período con stock bajo)
+  nunca excluye productos discontinuados — la cascada de umbral de siempre tampoco lo hace, y
+  "Discontinuos" es una categoría de catálogo más desde el Prompt 6, no un criterio de
+  visibilidad. El criterio (b) (unidades pendientes) se consulta siempre en vivo, nunca
+  congelado, y solo cuenta pendientes de ANTES del inicio del período (lo de dentro del
+  período ya está sumado en "vendido en el período") — así el producto aparece una sola vez,
+  con la cantidad sugerida = vendido en el período + pendiente de antes del período.
+- **Ubicación en Inicio**: los dos avisos ("Ya podés entregarle a..." y el recordatorio del día
+  de pedido) viven por ahora en el Inicio actual, visibles, con el mismo patrón `TaskRow`/
+  `Section` que ya usa esa pantalla — igual criterio que "Completá tu perfil" del Prompt 14.
+  Cuando se implemente el Prompt 10, mover los dos al bloque "Para hacer hoy".
+
 ## Clientas
 
 ### Prompt 9 · Clientas: alta, filtros y ficha

@@ -15,12 +15,16 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { User, Calendar, FileText, AlertTriangle, Pencil, Ban, Truck, CheckCircle2 } from "lucide-react";
+import { User, Calendar, FileText, AlertTriangle, Pencil, Ban, Truck, CheckCircle2, Clock } from "lucide-react";
+import { Link } from "wouter";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { computeAdjustmentAmount, computeHistoricalProductCost, type OrderAdjustment } from "@shared/saleCalculations";
+import { resolveNextOrderDate } from "@shared/orderReminderSchedule";
+import { getArgentinaDateStr } from "@shared/argentinaTime";
 import type { SaleDetails } from "./SaleCard";
+import type { Consultant } from "@shared/schema";
 
 interface SaleDetailDialogProps {
   saleId: number | null;
@@ -56,6 +60,13 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
       const res = await apiRequest("GET", `/api/sales/${saleId}`);
       return res.json();
     },
+    enabled: saleId !== null,
+  });
+
+  // Prompt 8, Parte 1 — "Se pide el [fecha]" necesita saber los días de pedido configurados.
+  const businessSettingsQuery = useQuery<Consultant>({
+    queryKey: ["/api/business-settings"],
+    queryFn: async () => (await apiRequest("GET", "/api/business-settings")).json(),
     enabled: saleId !== null,
   });
 
@@ -112,6 +123,21 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
     },
   });
 
+  // Prompt 8, Parte 2 — "Marcar como entregado" de un renglón puntual.
+  const markItemDeliveredMutation = useGuardedMutation({
+    mutationFn: async (itemId: number) => {
+      const res = await apiRequest("PATCH", `/api/sales/${saleId}/items/${itemId}/deliver`);
+      return res.json();
+    },
+    onSuccess: () => {
+      invalidateAfterChange();
+      queryClient.invalidateQueries({ queryKey: ["/api/deliveries/ready"] });
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudo marcar como entregado", description: err.message, variant: "destructive" });
+    },
+  });
+
   const open = saleId !== null;
   const sale = saleQuery.data;
   const isCancelled = sale?.status === "cancelada";
@@ -124,6 +150,14 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
   const pendingAmount = pendingInstallments.reduce((sum, i) => sum + (i.amount - i.amountPaid), 0);
   const paymentStatus: "cobrada" | "te_debe" = pendingAmount > 0 ? "te_debe" : "cobrada";
   const isPendingDelivery = !isCancelled && sale?.deliveryStatus === "pendiente_entrega";
+  // Prompt 8, Parte 1 — "Se pide el [fecha]" / "Configurá tu día de pedido" cuando algún
+  // renglón todavía tiene unidades pendientes de un pedido futuro.
+  const hasAnyPendingUnits = sale?.items.some((i) => i.quantityPending > 0) ?? false;
+  const settings = businessSettingsQuery.data;
+  const nextOrderDate =
+    hasAnyPendingUnits && settings
+      ? resolveNextOrderDate(settings.orderReminderDay1, settings.orderReminderDay2, getArgentinaDateStr())
+      : null;
 
   // Etapa 7.7 — descuento/recargo de la orden no se guardan como monto ($) en `sales`, solo
   // como tipo+valor (`orderDiscountType`/`orderDiscountValue`) — se resuelven acá con el mismo
@@ -216,6 +250,25 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                   </div>
                 )}
 
+                {!isCancelled && hasAnyPendingUnits && (
+                  <div className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-2.5 text-sm" data-testid="banner-pending-units">
+                    <Clock className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0" />
+                    {nextOrderDate ? (
+                      <span>
+                        Se pide el{" "}
+                        {parseLocalDate(nextOrderDate).toLocaleDateString("es-AR", { day: "numeric", month: "long" })}
+                      </span>
+                    ) : (
+                      <span className="flex items-center gap-2">
+                        Configurá tu día de pedido para que te lo recordemos.
+                        <Link href="/configuracion" className="underline" onClick={() => onOpenChange(false)}>
+                          Ir a Configuración
+                        </Link>
+                      </span>
+                    )}
+                  </div>
+                )}
+
                 {!isCancelled && pendingInstallments.length > 0 && (
                   <div className="space-y-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3" data-testid="section-pending-installments">
                     <p className="text-sm font-semibold text-amber-700 dark:text-amber-400">Cuotas pendientes</p>
@@ -253,27 +306,51 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                 </div>
 
                 <div className="rounded-lg border divide-y">
-                  {sale.items.map((item) => (
-                    <div
-                      key={item.id}
-                      className="flex items-center justify-between gap-2 p-3 text-sm"
-                      data-testid={`row-sale-item-${item.id}`}
-                    >
-                      <div className="min-w-0">
-                        <p className="font-medium truncate">{item.productName}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {item.quantity} x {format(item.price)}
-                        </p>
-                        <p className="text-xs text-muted-foreground" data-testid={`text-item-cost-${item.id}`}>
-                          Costo{item.costIsEstimated ? " (estimado)" : ""}:{" "}
-                          {item.costPrice !== null
-                            ? `${item.quantity} x ${format(item.costPrice)} = ${format(item.quantity * item.costPrice)}`
-                            : "No disponible"}
-                        </p>
+                  {sale.items.map((item) => {
+                    // Prompt 8, Parte 1 y 2 — lo pendiente espera un pedido futuro; lo "listo
+                    // para entregar" (pendiente=0, todavía no se tocó "Marcar como entregado")
+                    // muestra su propio botón, por renglón.
+                    const readyToDeliver = item.quantity - item.quantityPending - item.quantityDelivered;
+                    return (
+                      <div key={item.id} className="flex items-center justify-between gap-2 p-3 text-sm" data-testid={`row-sale-item-${item.id}`}>
+                        <div className="min-w-0">
+                          <p className="font-medium truncate">{item.productName}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {item.quantity} x {format(item.price)}
+                          </p>
+                          <p className="text-xs text-muted-foreground" data-testid={`text-item-cost-${item.id}`}>
+                            Costo{item.costIsEstimated ? " (estimado)" : ""}:{" "}
+                            {item.costPrice !== null
+                              ? `${item.quantity} x ${format(item.costPrice)} = ${format(item.quantity * item.costPrice)}`
+                              : "No disponible"}
+                          </p>
+                          {item.quantityPending > 0 && (
+                            <Badge variant="outline" className="mt-1" data-testid={`badge-item-pending-${item.id}`}>
+                              {item.quantityPending} pendiente{item.quantityPending > 1 ? "s" : ""}
+                            </Badge>
+                          )}
+                          {readyToDeliver > 0 && (
+                            <div className="mt-1.5 flex items-center gap-2">
+                              <Badge className="bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
+                                Ya podés entregar {readyToDeliver}
+                              </Badge>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                disabled={markItemDeliveredMutation.isPending}
+                                onClick={() => markItemDeliveredMutation.mutate(item.id)}
+                                data-testid={`button-mark-item-delivered-${item.id}`}
+                              >
+                                Marcar como entregado
+                              </Button>
+                            </div>
+                          )}
+                        </div>
+                        <p className="font-medium tabular-nums shrink-0">{format(item.quantity * item.price)}</p>
                       </div>
-                      <p className="font-medium tabular-nums shrink-0">{format(item.quantity * item.price)}</p>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
 
                 <div className="rounded-lg border p-3 space-y-1 text-sm">

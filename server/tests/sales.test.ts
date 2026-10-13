@@ -133,16 +133,24 @@ describe("POST /api/sales — creación", () => {
     expect(sale.total).toBe(900); // 1000 - 10%
   });
 
-  it("rechaza sin persistir ni descontar stock: stock insuficiente", async () => {
+  it("Prompt 8: vender más de lo que hay en stock ya no se rechaza — el resto queda pendiente", async () => {
     const before = await (await api("GET", "/api/products")).json();
     const stockBefore = before.find((p: any) => p.id === productId).unidades;
 
     const res = await api("POST", "/api/sales", baseSale({ items: [{ productId, quantity: 999 }], installments: [{ amount: 999000 }] }));
-    expect(res.status).toBe(400);
-    expect((await res.json()).error).toMatch(/stock insuficiente/i);
+    expect(res.status).toBe(201);
+    const sale = await res.json();
+    expect(sale.deliveryStatus).toBe("pendiente_entrega");
 
     const after = await (await api("GET", "/api/products")).json();
-    expect(after.find((p: any) => p.id === productId).unidades).toBe(stockBefore);
+    expect(after.find((p: any) => p.id === productId).unidades).toBe(0); // se entregó lo que había, nunca negativo
+
+    // Se cancela de inmediato para no dejar un pendiente gigante que interfiera con el resto
+    // de los tests de este archivo (comparten el mismo productId).
+    const cancelRes = await api("POST", `/api/sales/${sale.id}/cancel`, {});
+    expect(cancelRes.status).toBe(200);
+    const restored = await (await api("GET", "/api/products")).json();
+    expect(restored.find((p: any) => p.id === productId).unidades).toBe(stockBefore);
   });
 
   it("rechaza sin persistir: producto inexistente", async () => {
