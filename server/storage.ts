@@ -4887,14 +4887,16 @@ export class DatabaseStorage implements IStorage {
     return qualifying;
   }
 
-  /** Prompt 8, Parte 3, punto 5 — unidades pendientes de ventas sin stock de ANTES de
-   * `beforeDate` (nunca "en el período": esas ya están en `soldInPeriod`, contarlas de nuevo
-   * acá las duplicaría). "Sin importar el período" (el texto original del prompt) = siempre en
-   * vivo, nunca congelado en la fila del recordatorio. */
+  /** Unidades pendientes de ventas FUERA del período [`periodStart`, `periodEnd`]: de antes
+   * (`date < periodStart`) o del propio día de pedido en adelante (`date > periodEnd`, que por
+   * construcción es `reminderDate` — ver resolveOrderReminderPeriod). Nunca de ventas DENTRO
+   * del período: esas ya están en `soldInPeriod`, contarlas de nuevo acá las duplicaría.
+   * Siempre en vivo, nunca congelado en la fila del recordatorio (ajuste del Prompt 8). */
   private async computeOrderReminderPendingCandidates(
     tx: Pick<Database, "select">,
     consultantId: number,
-    beforeDate: string,
+    periodStart: string,
+    periodEnd: string,
   ): Promise<{ productId: number; pendingFromBefore: number }[]> {
     const rows = await tx
       .select({ productId: saleItems.productId, pendingFromBefore: sql<number>`coalesce(sum(${saleItems.quantityPending}), 0)`.mapWith(Number) })
@@ -4905,7 +4907,7 @@ export class DatabaseStorage implements IStorage {
           eq(sales.consultantId, consultantId),
           ne(sales.status, "cancelada"),
           gt(saleItems.quantityPending, 0),
-          lt(sales.date, beforeDate),
+          or(lt(sales.date, periodStart), gt(sales.date, periodEnd)),
           isNotNull(saleItems.productId),
         ),
       )
@@ -4914,14 +4916,16 @@ export class DatabaseStorage implements IStorage {
   }
 
   /** Arma la lista final a mostrar: una sola fila por producto (nunca duplicado entre los dos
-   * criterios), cantidad sugerida = vendido en el período + pendiente de antes del período. */
+   * criterios), cantidad sugerida = vendido en el período + pendiente de fuera del período.
+   * Ambos criterios se recalculan en vivo a partir de las fechas congeladas en `reminder`
+   * (nunca de una lista guardada — ajuste del Prompt 8). */
   private async buildOrderReminderDisplayItems(
     tx: Pick<Database, "select">,
     consultantId: number,
     reminder: OrderReminder,
   ): Promise<{ productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[]> {
-    const soldItems = reminder.items as OrderReminderItemSnapshot[];
-    const pendingCandidates = await this.computeOrderReminderPendingCandidates(tx, consultantId, reminder.periodStart);
+    const soldItems = await this.computeOrderReminderSoldCandidates(tx, consultantId, reminder.periodStart, reminder.periodEnd);
+    const pendingCandidates = await this.computeOrderReminderPendingCandidates(tx, consultantId, reminder.periodStart, reminder.periodEnd);
     const pendingByProductId = new Map(pendingCandidates.map((p) => [p.productId, p.pendingFromBefore]));
     const soldByProductId = new Map(soldItems.map((s) => [s.productId, s.soldInPeriod]));
     const productIds = Array.from(new Set([...soldItems.map((s) => s.productId), ...pendingCandidates.map((p) => p.productId)]));
@@ -4994,20 +4998,19 @@ export class DatabaseStorage implements IStorage {
           const [alreadyGenerated] = await tx
             .select({ id: orderReminders.id })
             .from(orderReminders)
-            .where(and(eq(orderReminders.consultantId, consultantId), eq(orderReminders.reminderDate, period.periodEnd)));
+            .where(and(eq(orderReminders.consultantId, consultantId), eq(orderReminders.reminderDate, period.reminderDate)));
 
           if (!alreadyGenerated) {
             const soldCandidates = await this.computeOrderReminderSoldCandidates(tx, consultantId, period.periodStart, period.periodEnd);
-            const pendingCandidates = await this.computeOrderReminderPendingCandidates(tx, consultantId, period.periodStart);
+            const pendingCandidates = await this.computeOrderReminderPendingCandidates(tx, consultantId, period.periodStart, period.periodEnd);
             if (soldCandidates.length > 0 || pendingCandidates.length > 0) {
               [reminder] = await tx
                 .insert(orderReminders)
                 .values({
                   consultantId,
-                  reminderDate: period.periodEnd,
+                  reminderDate: period.reminderDate,
                   periodStart: period.periodStart,
                   periodEnd: period.periodEnd,
-                  items: soldCandidates,
                 })
                 .returning();
             }
@@ -7876,13 +7879,14 @@ export class MemoryStorage implements IStorage {
   }
 
   /** Espejo de DatabaseStorage.computeOrderReminderPendingCandidates. */
-  private computeOrderReminderPendingCandidatesMem(consultantId: number, beforeDate: string): { productId: number; pendingFromBefore: number }[] {
+  private computeOrderReminderPendingCandidatesMem(consultantId: number, periodStart: string, periodEnd: string): { productId: number; pendingFromBefore: number }[] {
     const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
     const pendingByProductId = new Map<number, number>();
     for (const item of this.saleItems) {
       if (item.productId === null || item.quantityPending <= 0) continue;
       const sale = saleById.get(item.saleId);
-      if (!sale || sale.status === "cancelada" || sale.date >= beforeDate) continue;
+      if (!sale || sale.status === "cancelada") continue;
+      if (!(sale.date < periodStart || sale.date > periodEnd)) continue;
       pendingByProductId.set(item.productId, (pendingByProductId.get(item.productId) ?? 0) + item.quantityPending);
     }
     return Array.from(pendingByProductId, ([productId, pendingFromBefore]) => ({ productId, pendingFromBefore }));
@@ -7893,8 +7897,8 @@ export class MemoryStorage implements IStorage {
     consultantId: number,
     reminder: OrderReminder,
   ): { productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[] {
-    const soldItems = reminder.items as OrderReminderItemSnapshot[];
-    const pendingCandidates = this.computeOrderReminderPendingCandidatesMem(consultantId, reminder.periodStart);
+    const soldItems = this.computeOrderReminderSoldCandidatesMem(consultantId, reminder.periodStart, reminder.periodEnd);
+    const pendingCandidates = this.computeOrderReminderPendingCandidatesMem(consultantId, reminder.periodStart, reminder.periodEnd);
     const pendingByProductId = new Map(pendingCandidates.map((p) => [p.productId, p.pendingFromBefore]));
     const soldByProductId = new Map(soldItems.map((s) => [s.productId, s.soldInPeriod]));
     const productIds = Array.from(new Set([...soldItems.map((s) => s.productId), ...pendingCandidates.map((p) => p.productId)]));
@@ -7939,19 +7943,18 @@ export class MemoryStorage implements IStorage {
 
       if (period) {
         const alreadyGenerated = this.orderReminderRecords.some(
-          (r) => r.consultantId === consultantId && r.reminderDate === period.periodEnd,
+          (r) => r.consultantId === consultantId && r.reminderDate === period.reminderDate,
         );
         if (!alreadyGenerated) {
           const soldCandidates = this.computeOrderReminderSoldCandidatesMem(consultantId, period.periodStart, period.periodEnd);
-          const pendingCandidates = this.computeOrderReminderPendingCandidatesMem(consultantId, period.periodStart);
+          const pendingCandidates = this.computeOrderReminderPendingCandidatesMem(consultantId, period.periodStart, period.periodEnd);
           if (soldCandidates.length > 0 || pendingCandidates.length > 0) {
             reminder = {
               id: this.nextOrderReminderId++,
               consultantId,
-              reminderDate: period.periodEnd,
+              reminderDate: period.reminderDate,
               periodStart: period.periodStart,
               periodEnd: period.periodEnd,
-              items: soldCandidates,
               dismissedAt: null,
               createdAt: new Date(),
             };

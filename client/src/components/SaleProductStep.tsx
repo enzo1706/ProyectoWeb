@@ -431,14 +431,14 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
         <AlertDialog open={outOfStockConfirm !== null} onOpenChange={(o) => !o && setOutOfStockConfirm(null)}>
           <AlertDialogContent data-testid="dialog-confirm-no-stock">
             <AlertDialogHeader>
+              {/* Texto exacto del prompt (docs/prompts-mejoras.md, Parte 1), partido en
+                  título/descripción solo por la frontera de la oración — nunca parafraseado. */}
               <AlertDialogTitle>
-                {outOfStockConfirm?.remaining === 0 ? "No contás con stock de este producto" : "No tenés suficiente stock"}
-              </AlertDialogTitle>
-              <AlertDialogDescription>
                 {outOfStockConfirm?.remaining === 0
-                  ? "¿Querés continuar con la venta?"
-                  : `Tenés ${outOfStockConfirm?.remaining} unidades de este producto. Las ${quantity - (outOfStockConfirm?.remaining ?? 0)} que faltan quedan pendientes para tu próximo pedido. ¿Querés continuar con la venta?`}
-              </AlertDialogDescription>
+                  ? "No contás con stock de este producto."
+                  : `Tenés ${outOfStockConfirm?.remaining} unidades de este producto. Las ${quantity - (outOfStockConfirm?.remaining ?? 0)} que faltan quedan pendientes para tu próximo pedido.`}
+              </AlertDialogTitle>
+              <AlertDialogDescription>¿Querés continuar con la venta?</AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
               <AlertDialogCancel data-testid="button-no-stock-cancel">Cancelar</AlertDialogCancel>

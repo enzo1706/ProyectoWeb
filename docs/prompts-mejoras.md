@@ -588,10 +588,19 @@ Cómo verifico que quedó bien:
   cuando esos días realmente cambian). El criterio (a) (vendido en el período con stock bajo)
   nunca excluye productos discontinuados — la cascada de umbral de siempre tampoco lo hace, y
   "Discontinuos" es una categoría de catálogo más desde el Prompt 6, no un criterio de
-  visibilidad. El criterio (b) (unidades pendientes) se consulta siempre en vivo, nunca
-  congelado, y solo cuenta pendientes de ANTES del inicio del período (lo de dentro del
-  período ya está sumado en "vendido en el período") — así el producto aparece una sola vez,
-  con la cantidad sugerida = vendido en el período + pendiente de antes del período.
+  visibilidad.
+  - **Período, ajuste**: `periodEnd` de un ciclo es el día ANTERIOR a `reminderDate` (nunca
+    `reminderDate` mismo) y `periodStart` es la ocurrencia configurada inmediatamente anterior
+    (incluida) — así una venta hecha el PROPIO día de pedido (por ejemplo a la tarde, después de
+    tocar "Listo, ya lo pedí" a la mañana) entra entera en el ciclo SIGUIENTE, cuyo
+    `periodStart` es justamente ese `reminderDate`: sin huecos entre un ciclo y el otro, y sin
+    que una misma venta se cuente en dos. Ni el criterio (a) ni el (b) se congelan en la fila
+    guardada (que solo tiene las 3 fechas): ambos se recalculan en vivo cada vez que se muestra
+    el recordatorio todavía abierto, a partir de esas fechas. El criterio (b) solo cuenta
+    pendientes de FUERA del período (de antes de `periodStart`, o del propio `reminderDate` en
+    adelante — lo de DENTRO del período ya está sumado en "vendido en el período") — así el
+    producto aparece una sola vez, con la cantidad sugerida = vendido en el período + pendiente
+    de fuera del período.
 - **Ubicación en Inicio**: los dos avisos ("Ya podés entregarle a..." y el recordatorio del día
   de pedido) viven por ahora en el Inicio actual, visibles, con el mismo patrón `TaskRow`/
   `Section` que ya usa esa pantalla — igual criterio que "Completá tu perfil" del Prompt 14.

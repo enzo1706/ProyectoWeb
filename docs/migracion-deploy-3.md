@@ -56,10 +56,16 @@ no se implementó, solo queda el modelo de datos listo) — también 100% aditiv
   cuándo se guardaron por última vez `order_reminder_day1`/`day2`. El recordatorio del día de
   pedido nunca genera un ciclo anterior a esta fecha.
 - 1 tabla nueva, `order_reminders`: `id`, `consultant_id` (FK a `consultants`),
-  `reminder_date`/`period_start`/`period_end` (text, `YYYY-MM-DD`), `items` (`jsonb`),
-  `dismissed_at` (`timestamp`, nullable), `created_at` (`timestamp not null default now()`),
-  con un índice único compuesto `(consultant_id, reminder_date)` y un índice simple sobre
-  `consultant_id`.
+  `reminder_date`/`period_start`/`period_end` (text, `YYYY-MM-DD`), `dismissed_at`
+  (`timestamp`, nullable), `created_at` (`timestamp not null default now()`), con un índice
+  único compuesto `(consultant_id, reminder_date)` y un índice simple sobre `consultant_id`.
+  Solo guarda las fechas del ciclo — ni el criterio (a) (vendido en el período) ni el (b)
+  (unidades pendientes) se congelan en la fila, ambos se recalculan en vivo cada vez que se
+  muestra el recordatorio abierto.
+- `period_end` de un ciclo es el día ANTERIOR a `reminder_date` (nunca `reminder_date` mismo):
+  una venta hecha el propio día de pedido entra entera en el ciclo SIGUIENTE, cuyo
+  `period_start` es justamente ese `reminder_date` — sin huecos entre un ciclo y el otro, y sin
+  que una misma venta pueda contarse en dos.
 
 **Lo que NO cambia** (Prompt 8):
 
@@ -73,10 +79,10 @@ no se implementó, solo queda el modelo de datos listo) — también 100% aditiv
 
 ## SQL (de punta a punta, en orden)
 
-Verificado contra una base descartable: `drizzle-kit push --force` con el schema actual (ambas
-ramas acumuladas) generó exactamente estas columnas, tabla e índices (`\d consultants`, `\d
-sale_items`, `\d order_reminders`), y una segunda corrida sin `--force` dio "No changes
-detected" — nada de esto quedó sin confirmar a mano.
+Verificado contra la base de dev local (`drizzle-kit push`, schema actual con ambas ramas
+acumuladas): `information_schema.columns` sobre `order_reminders` confirma exactamente estas
+columnas (sin `items`, sacada en el ajuste de período en vivo), y una segunda corrida sin
+`--force` dio "No changes detected" — nada de esto quedó sin confirmar a mano.
 
 ```sql
 -- Prompt 14 --------------------------------------------------------------
@@ -115,7 +121,6 @@ CREATE TABLE order_reminders (
   reminder_date text NOT NULL,
   period_start text NOT NULL,
   period_end text NOT NULL,
-  items jsonb NOT NULL,
   dismissed_at timestamp,
   created_at timestamp NOT NULL DEFAULT now()
 );

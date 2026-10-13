@@ -323,8 +323,11 @@ export default function Dashboard() {
         key: `delivery-${item.itemId}`,
         icon: Truck,
         colorClass: "bg-green-500/10 text-green-600 dark:text-green-400",
-        title: item.clientId === null ? "Ya podés entregar (venta sin clienta)" : `Ya podés entregarle a ${item.clientName}`,
-        subtitle: `${item.productName} x${item.quantity}`,
+        title:
+          item.clientId === null
+            ? `Ya podés entregar: ${item.productName} x${item.quantity} (venta sin clienta)`
+            : `Ya podés entregarle a ${item.clientName}`,
+        subtitle: item.clientId === null ? "" : `${item.productName} x${item.quantity}`,
         actionLabel: "Marcar como entregado",
         onAction: () => markDeliveredMutation.mutate(item.itemId),
       })),

@@ -397,13 +397,14 @@ export const saleInstallments = pgTable("sale_installments", {
  * Prompt 8 — un recordatorio del día de pedido generado y guardado por consultora y fecha, sin
  * ninguna tarea programada: se calcula "al vuelo" la primera vez que entra después de su día de
  * pedido (ver getOrderReminder en server/storage.ts), y esta fila es justamente lo que le
- * permite no duplicarse si entra dos veces ni perderse si no entra el día exacto. `periodStart`/
- * `periodEnd` quedan congelados en la fila (salen de los días configurados en el momento de
- * generar, nunca de la última fila guardada — así un mes con la lista vacía, que no genera
- * fila, no corre el período del siguiente ciclo). `items` congela SOLO el criterio (a)
- * (vendido en el período): `[{ productId, soldInPeriod }]` — el criterio (b) (unidades
- * pendientes) nunca se congela, se consulta en vivo cada vez que se muestra, porque "sin
- * importar el período" significa que no está atado a este recordatorio puntual. `dismissedAt`
+ * permite no duplicarse si entra dos veces ni perderse si no entra el día exacto. Solo las
+ * FECHAS del ciclo quedan congeladas en la fila (`reminderDate`, el día de pedido en sí;
+ * `periodStart`/`periodEnd`, el ciclo anterior a ese día — ver resolveOrderReminderPeriod en
+ * shared/orderReminderSchedule.ts, que arma el rango sin incluir `reminderDate`, para que una
+ * venta hecha el propio día de pedido entre entera en el ciclo SIGUIENTE, nunca en el que se
+ * está cerrando ni en los dos a la vez). Ni el criterio (a) (vendido en el período) ni el (b)
+ * (unidades pendientes de antes/del día de pedido) se congelan: ambos se recalculan en vivo
+ * cada vez que se muestra el recordatorio abierto, a partir de esas fechas guardadas. `dismissedAt`
  * nulo = sigue abierto ("Listo, ya lo pedí" lo cierra). Deja el modelo listo para que una futura
  * tarea programada (Parte 4, todavía no implementada: sin service worker/push/VAPID) solo tenga
  * que leer las filas sin dismissedAt del día y mandar la notificación — nada de eso corre acá.
@@ -414,7 +415,6 @@ export const orderReminders = pgTable("order_reminders", {
   reminderDate: text("reminder_date").notNull(),
   periodStart: text("period_start").notNull(),
   periodEnd: text("period_end").notNull(),
-  items: jsonb("items").notNull(),
   dismissedAt: timestamp("dismissed_at"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 }, (table) => ({

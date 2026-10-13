@@ -38,6 +38,13 @@ function monthsBefore(ymd: { year: number; month: number }, count: number): { ye
   return { year: Math.floor(totalMonths / 12), month: (totalMonths % 12) + 1 };
 }
 
+/** Suma (o resta, con `delta` negativo) días de calendario, dejando que `Date.UTC` normalice el
+ * desborde de mes/año (ej. 2026-03-01 menos 1 día = 2026-02-28). */
+function addDays(ymd: YMD, delta: number): YMD {
+  const d = new Date(Date.UTC(ymd.year, ymd.month - 1, ymd.day + delta));
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
+}
+
 /** Las ocurrencias más recientes de este día configurado, mirando hasta 3 meses atrás — más
  * que suficiente margen: si `periodEnd` termina cayendo en un mes anterior a este (porque hoy
  * todavía no llegó a la ocurrencia de este mes), `periodStart` sigue teniendo de dónde salir. */
@@ -49,6 +56,7 @@ function candidatesForDay(day: number, today: YMD): YMD[] {
 }
 
 export interface OrderReminderPeriod {
+  reminderDate: string;
   periodEnd: string;
   periodStart: string;
 }
@@ -59,6 +67,14 @@ export interface OrderReminderPeriod {
  * Devuelve `null` si no hay ninguna ocurrencia válida (sin días configurados, o la más
  * reciente es anterior a `configuredSinceStr`: no se generan recordatorios de antes de que la
  * consultora configurara sus días de pedido).
+ *
+ * `reminderDate` es el día de pedido en sí (la ocurrencia configurada más reciente <= hoy, sin
+ * cambios respecto de antes). El período [`periodStart`, `periodEnd`] es el ciclo ANTERIOR a
+ * `reminderDate`: va desde la ocurrencia previa (incluida) hasta el día antes de `reminderDate`
+ * (incluido) — nunca hasta `reminderDate` mismo. Así una venta hecha el propio día de pedido
+ * (que puede pasar después de haber cerrado el recordatorio a la mañana) entra entera en el
+ * período SIGUIENTE, cuyo `periodStart` es justamente este `reminderDate`: sin huecos entre un
+ * ciclo y el otro, y sin que una misma venta pueda contarse en dos ciclos.
  */
 export function resolveOrderReminderPeriod(
   day1: number | null,
@@ -74,18 +90,19 @@ export function resolveOrderReminderPeriod(
     .filter((ymd) => ymdValue(ymd) <= todayValue)
     .sort((a, b) => ymdValue(b) - ymdValue(a));
 
-  const periodEnd = allCandidates[0];
-  if (!periodEnd) return null;
+  const reminderDateYmd = allCandidates[0];
+  if (!reminderDateYmd) return null;
 
   if (configuredSinceStr) {
     const floorValue = ymdValue(strToYmd(configuredSinceStr));
-    if (ymdValue(periodEnd) < floorValue) return null;
+    if (ymdValue(reminderDateYmd) < floorValue) return null;
   }
 
-  const periodEndValue = ymdValue(periodEnd);
-  const periodStart = allCandidates.find((ymd) => ymdValue(ymd) < periodEndValue) ?? periodEnd;
+  const reminderDateValue = ymdValue(reminderDateYmd);
+  const periodStart = allCandidates.find((ymd) => ymdValue(ymd) < reminderDateValue) ?? reminderDateYmd;
+  const periodEnd = addDays(reminderDateYmd, -1);
 
-  return { periodEnd: ymdToStr(periodEnd), periodStart: ymdToStr(periodStart) };
+  return { reminderDate: ymdToStr(reminderDateYmd), periodEnd: ymdToStr(periodEnd), periodStart: ymdToStr(periodStart) };
 }
 
 /**

@@ -211,6 +211,63 @@ describe("Prompt 8, Parte 3 — recordatorio del día de pedido", () => {
     expect(res.items[0].soldInPeriod).toBe(5);
   });
 
+  it("venta hecha el mismo día de pedido, después de cerrar el recordatorio, aparece en el recordatorio siguiente (nunca se pierde)", async () => {
+    setArgentinaNow("2026-10-01");
+    const cookie = await createConsultant();
+    await setOrderDays(cookie, 10);
+    await createProductSold(cookie, "2026-10-05", 5, 0); // P1: el ciclo de hoy no queda vacío
+
+    setArgentinaNow("2026-10-10");
+    const first = await (await api(cookie, "GET", "/api/order-reminder")).json();
+    expect(first.reminder.reminderDate).toBe("2026-10-10");
+    await api(cookie, "POST", `/api/order-reminder/${first.reminder.id}/dismiss`, {});
+
+    // A la tarde del mismo día de pedido, después de "Listo, ya lo pedí": vende otro producto.
+    const p2 = await createProductSold(cookie, "2026-10-10", 4, 0);
+    const sameDay = await (await api(cookie, "GET", "/api/order-reminder")).json();
+    expect(sameDay).toBeNull(); // el ciclo de hoy ya se cerró, esta venta no lo reabre
+
+    for (const next of ["2026-10-19", "2026-10-28", "2026-11-06"]) {
+      setArgentinaNow(next);
+      await api(cookie, "GET", "/api/business-settings"); // mantiene viva la sesión rolling
+    }
+    setArgentinaNow("2026-11-10");
+    const second = await (await api(cookie, "GET", "/api/order-reminder")).json();
+    expect(second).not.toBeNull();
+    expect(second.reminder.periodStart).toBe("2026-10-10"); // arranca en el día de pedido anterior
+    const item = second.items.find((i: any) => i.productId === p2);
+    expect(item).toBeDefined();
+    expect(item.soldInPeriod).toBe(4);
+  });
+
+  it("ninguna venta aparece en dos recordatorios: la del día de pedido no entra en el ciclo que termina ese día", async () => {
+    setArgentinaNow("2026-10-01");
+    const cookie = await createConsultant();
+    await setOrderDays(cookie, 10);
+    const p1 = await createProductSold(cookie, "2026-10-05", 5, 0);
+
+    setArgentinaNow("2026-10-10");
+    // Vendido el PROPIO día de pedido, antes de pedir el recordatorio por primera vez.
+    const p2 = await createProductSold(cookie, "2026-10-10", 4, 0);
+
+    const first = await (await api(cookie, "GET", "/api/order-reminder")).json();
+    expect(first.reminder.reminderDate).toBe("2026-10-10");
+    const firstIds = first.items.map((i: any) => i.productId);
+    expect(firstIds).toContain(p1);
+    expect(firstIds).not.toContain(p2); // la venta de hoy queda para el ciclo siguiente
+
+    await api(cookie, "POST", `/api/order-reminder/${first.reminder.id}/dismiss`, {});
+    for (const next of ["2026-10-19", "2026-10-28", "2026-11-06"]) {
+      setArgentinaNow(next);
+      await api(cookie, "GET", "/api/business-settings");
+    }
+    setArgentinaNow("2026-11-10");
+    const second = await (await api(cookie, "GET", "/api/order-reminder")).json();
+    const secondIds = second.items.map((i: any) => i.productId);
+    expect(secondIds).toContain(p2); // ahora sí, en el ciclo siguiente
+    expect(secondIds).not.toContain(p1); // y nunca otra vez el del ciclo anterior
+  });
+
   it("no genera un recordatorio de un ciclo anterior a cuando se configuraron los días (ajuste 1)", async () => {
     setArgentinaNow("2026-10-01");
     const cookie = await createConsultant();
