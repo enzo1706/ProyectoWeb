@@ -4,12 +4,14 @@ import type { z } from "zod";
 import bcrypt from "bcryptjs";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
-import { storage, SaleValidationError, SaleRequestConflictError, ProductConflictError, ProductValidationError, AppointmentValidationError, AppointmentConflictError, isBcryptHash, DuplicateEmailError, DuplicateUsernameError } from "./storage";
+import { storage, SaleValidationError, SaleRequestConflictError, ProductConflictError, ProductValidationError, AppointmentValidationError, AppointmentConflictError, isBcryptHash, DuplicateEmailError, DuplicateUsernameError, DuplicateWhatsAppError, FreePlanProductLimitError } from "./storage";
 import { requestPasswordReset, verifyResetCode, resetPassword } from "./auth-reset";
 import { uploadProductImage, deleteProductImage, isValidImageBuffer, listProductImageFiles, extractStoragePath } from "./image-storage";
 import { findProductImageMatches } from "@shared/imageMatching";
 import { matchImportedProducts, type ImportCatalogProduct } from "@shared/importMatching";
 import { isClientListFilter } from "@shared/clientFilters";
+import { normalizeEmail } from "@shared/email";
+import { normalizeArgentinaPhoneDigits, normalizeArgentinaPhoneForStorage } from "@shared/phone";
 import { isReportPeriodKind } from "@shared/reportsPeriods";
 import { parseExcelImportRows, parseCsvImportRows, parsePdfImportRows, ImportParseError } from "./importParsers";
 import {
@@ -50,6 +52,7 @@ import {
   validateCouponSchema,
   createOrderDiscountLogSchema,
   registerConsultantSchema,
+  updateConsultantProfileSchema,
   forgotPasswordSchema,
   verifyResetCodeSchema,
   resetPasswordSchema,
@@ -61,9 +64,8 @@ import {
 } from "@shared/schema";
 import { requireAdmin } from "./middleware/requireAdmin";
 import { requireAuth } from "./middleware/requireAuth";
-import { requireActiveSubscription } from "./middleware/requireActiveSubscription";
 import { slugify } from "@shared/slug";
-import { SUBSCRIPTION_PRICE_ARS, PLAN_NAME, PERIOD_DAYS } from "./config/subscription";
+import { SUBSCRIPTION_PRICE_ARS, PLAN_NAME, PERIOD_DAYS, FREE_PLAN_PRODUCT_LIMIT } from "./config/subscription";
 import {
   getConsultantAccessStatus,
   generateExternalReference,
@@ -361,7 +363,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "Datos inválidos" });
       }
 
-      const user = await storage.getUserByUsername(parsed.data.username);
+      // Prompt 14 — el campo de ingreso acepta email, WhatsApp o un usuario viejo. Orden fijo,
+      // nunca "probar los 3 y ver cuál matchea" (eso sería más lento y más fácil de romper
+      // sin querer si alguna vez dos búsquedas distintas coincidieran): con "@" → email;
+      // si no, pero tiene forma de WhatsApp argentino válido → WhatsApp; si no → usuario (así
+      // siguen entrando las cuentas de antes de este prompt). El mismo criterio determina CUÁL
+      // búsqueda correr, nunca "si la primera no encuentra, probar la siguiente" — eso sí
+      // cambiaría el mensaje de error según cuántas búsquedas se intentaron, un vector de
+      // timing nuevo que no existía antes.
+      const identifier = parsed.data.identifier.trim();
+      const whatsappCheck = !identifier.includes("@") ? normalizeArgentinaPhoneDigits(identifier) : null;
+      const user = identifier.includes("@")
+        ? await storage.getUserByConsultantEmail(normalizeEmail(identifier))
+        : whatsappCheck?.valid
+          ? await storage.getUserByConsultantWhatsapp(whatsappCheck.digits)
+          : await storage.getUserByUsername(identifier);
       if (!user) {
         // Etapa 7.6: mismo criterio anti-timing que ya usa requestPasswordReset (server/
         // auth-reset.ts) — sin esto, "usuario inexistente" respondía casi al instante
@@ -417,34 +433,24 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
 
-      const existingUsername = await storage.getUserByUsername(parsed.data.username);
-      if (existingUsername) {
-        return res.status(409).json({ error: "Ese nombre de usuario ya está en uso" });
-      }
-
       const { user } = await storage.registerConsultant({
-        username: parsed.data.username,
+        contactName: parsed.data.contactName,
         email: parsed.data.email,
+        whatsapp: parsed.data.whatsapp,
         password: parsed.data.password,
       });
 
       req.session.userId = user.id;
       res.status(201).json(omitPassword(user));
     } catch (error) {
-      if (error instanceof DuplicateEmailError) {
-        // Etapa 7.6: antes decía "Ya existe una cuenta con ese email" — confirmaba sin
-        // ambigüedad que ese email está registrado (hallazgo P2, Etapa 6). El username sigue
-        // devolviendo un mensaje específico a propósito (es un dato público, no sensible, y la
-        // UX de elegir un usuario se rompe si no se avisa cuál campo chocó) — pero el email es
-        // exactamente el dato que no queremos confirmar. El mensaje ahora da una salida
-        // accionable sin confirmar la existencia de la cuenta en la misma frase; sigue siendo
-        // un 409 (no se fuerza a 200/201, sería mentirle a la propia usuaria sobre si su cuenta
-        // se creó) — `registerRateLimiter` ya existente sigue acotando cuántos intentos por IP
-        // son posibles. No elimina el vector por completo (ver reporte de la etapa).
+      // Etapa 7.6 / Prompt 14: ni el email ni el WhatsApp confirman sin ambigüedad que esa
+      // cuenta existe (hallazgo P2, Etapa 6) — mismo mensaje genérico y mismo 409 para los dos,
+      // nunca "Ya existe una cuenta con ese email/WhatsApp". El username ya no lo elige la
+      // usuaria (se deriva del email, Prompt 14), así que una colisión ahí (rarísima: dos
+      // emails con la misma parte antes de la @ Y el sufijo numérico también ocupado) ya no
+      // puede pasar en la práctica — igual se cubre con el mismo mensaje genérico, nunca un 500.
+      if (error instanceof DuplicateEmailError || error instanceof DuplicateWhatsAppError || error instanceof DuplicateUsernameError) {
         return res.status(409).json({ error: "No pudimos crear la cuenta con esos datos. Si ya tenés una cuenta, iniciá sesión o recuperá tu contraseña." });
-      }
-      if (error instanceof DuplicateUsernameError) {
-        return res.status(409).json({ error: "Ese nombre de usuario ya está en uso" });
       }
       console.error(error);
       res.status(500).json({ error: "No se pudo crear la cuenta. Intentá nuevamente." });
@@ -559,16 +565,18 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // acceder a los datos de negocio. Sin esto, estas rutas quedan abiertas sin login.
   // requireConsultant además exige que la sesión pertenezca a una consultora (admin
   // nunca debe poder tocar datos de negocio scopeados por tenant a través de estas rutas).
-  // requireActiveSubscription es una tercera capa aparte, no un reemplazo de las dos
-  // anteriores: sin trial vigente ni suscripción activa, 403 antes de llegar al handler —
-  // nunca se monta en /api/subscription/*, /api/auth/*, /api/health ni /api/admin/*.
-  app.use("/api/products", requireAuth, requireConsultant, requireActiveSubscription);
-  app.use("/api/clients", requireAuth, requireConsultant, requireActiveSubscription);
-  app.use("/api/sales", requireAuth, requireConsultant, requireActiveSubscription);
-  app.use("/api/drafts", requireAuth, requireConsultant, requireActiveSubscription);
-  app.use("/api/appointments", requireAuth, requireConsultant, requireActiveSubscription);
-  app.use("/api/reports", requireAuth, requireConsultant, requireActiveSubscription);
-  app.use("/api/dashboard", requireAuth, requireConsultant, requireActiveSubscription);
+  // Prompt 14 (P30): ya no hay una tercera capa de "suscripción activa" acá — una cuenta sin
+  // pago activo (plan gratis) sigue entrando a todo esto igual, sin límite de tiempo. La única
+  // restricción real del plan gratis es el límite de productos en stock, validado puntualmente
+  // en los handlers de /api/products que suman stock (ver ensureCanAddProductWithStock en
+  // storage.ts), no como un gate genérico de ruta.
+  app.use("/api/products", requireAuth, requireConsultant);
+  app.use("/api/clients", requireAuth, requireConsultant);
+  app.use("/api/sales", requireAuth, requireConsultant);
+  app.use("/api/drafts", requireAuth, requireConsultant);
+  app.use("/api/appointments", requireAuth, requireConsultant);
+  app.use("/api/reports", requireAuth, requireConsultant);
+  app.use("/api/dashboard", requireAuth, requireConsultant);
 
   // Sin requireConsultant: admin recibe 404 explícito ("no aplica"), no el 403 genérico.
   app.get("/api/business-settings", requireAuth, async (req: Request, res: Response) => {
@@ -610,8 +618,55 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }
   });
 
-  // Nunca requireActiveSubscription: una consultora bloqueada tiene que poder seguir
-  // consultando su propio estado y pagando — eso es justamente lo que la desbloquea.
+  /**
+   * Prompt 14 — Configuración → "Tus datos". Cambiar email o WhatsApp exige la contraseña
+   * actual (son los datos para entrar y recuperar la cuenta) — el chequeo vive acá, no en
+   * storage.ts, porque es el único lugar con acceso al hash guardado en `users`.
+   */
+  app.patch("/api/consultant/profile", requireAuth, async (req: Request, res: Response) => {
+    try {
+      if (req.consultantId === null || req.consultantId === undefined) {
+        return res.status(404).json({ error: "Este dato no aplica para administradores" });
+      }
+      const parsed = updateConsultantProfileSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
+      }
+
+      const consultant = await storage.getBusinessSettings(req.consultantId);
+      if (!consultant) {
+        return res.status(404).json({ error: "Configuración no encontrada" });
+      }
+
+      const newNormalizedEmail = parsed.data.email === undefined || parsed.data.email === null ? null : normalizeEmail(parsed.data.email);
+      const emailChanging = parsed.data.email !== undefined && newNormalizedEmail !== consultant.email;
+      const whatsappChanging = parsed.data.whatsapp !== undefined && parsed.data.whatsapp !== consultant.whatsapp;
+      if (emailChanging || whatsappChanging) {
+        if (!parsed.data.currentPassword) {
+          return res.status(400).json({ error: "Para cambiar el email o el WhatsApp, ingresá tu contraseña actual" });
+        }
+        const user = await storage.getUser(req.session.userId!);
+        const passwordMatches =
+          user && isBcryptHash(user.password) ? await bcrypt.compare(parsed.data.currentPassword, user.password) : false;
+        if (!passwordMatches) {
+          return res.status(403).json({ error: "La contraseña actual no es correcta" });
+        }
+      }
+
+      const updated = await storage.updateConsultantProfile(req.consultantId, parsed.data);
+      if (!updated) {
+        return res.status(404).json({ error: "Configuración no encontrada" });
+      }
+      res.json(updated);
+    } catch (error) {
+      if (error instanceof DuplicateEmailError || error instanceof DuplicateWhatsAppError) {
+        return res.status(409).json({ error: error.message });
+      }
+      console.error(error);
+      res.status(500).json({ error: "Error al actualizar tus datos" });
+    }
+  });
+
   app.get("/api/subscription/status", requireAuth, async (req: Request, res: Response) => {
     try {
       if (req.consultantId === null || req.consultantId === undefined) {
@@ -620,9 +675,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const access = await getConsultantAccessStatus(req.consultantId);
       const priceArs = await getCurrentSubscriptionPriceArs();
       const activeCoupon = await storage.getActiveCouponRedemptionForConsultant(req.consultantId);
+      // Prompt 14 — solo tiene sentido calcularlo para el plan gratis (Stock/Suscripción lo
+      // muestran ahí); para una cuenta pagando es innecesario y evita una consulta de más.
+      const productsWithStockCount = access.isFreePlan ? await storage.countProductsWithStock(req.consultantId) : null;
       res.json({
         status: access.status,
         hasAccess: access.hasAccess,
+        isFreePlan: access.isFreePlan,
+        productsWithStockCount,
+        freePlanProductLimit: FREE_PLAN_PRODUCT_LIMIT,
         trialEndAt: access.trialEndAt,
         currentPeriodStart: access.currentPeriodStart,
         currentPeriodEnd: access.currentPeriodEnd,
@@ -853,10 +914,14 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.post("/api/products/seed", async (req: Request, res: Response) => {
     try {
       // Privado de esta consultora (no global) — es un catálogo de prueba para ella sola.
-      const count = await storage.seedOwnProducts(req.consultantId!, [...SEED_PRODUCTS]);
+      const { isFreePlan } = await getConsultantAccessStatus(req.consultantId!);
+      const count = await storage.seedOwnProducts(req.consultantId!, [...SEED_PRODUCTS], isFreePlan);
       const list = await storage.getAllProducts(req.consultantId!);
       res.json({ message: "Catálogo de prueba cargado", count, products: list });
     } catch (error) {
+      if (error instanceof FreePlanProductLimitError) {
+        return res.status(403).json({ error: error.message });
+      }
       console.error(error);
       res.status(500).json({ error: "Error al cargar productos de prueba" });
     }
@@ -868,9 +933,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (!parsed.success) {
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
-      const created = await storage.createProduct(req.consultantId!, parsed.data);
+      const { isFreePlan } = await getConsultantAccessStatus(req.consultantId!);
+      const created = await storage.createProduct(req.consultantId!, parsed.data, isFreePlan);
       res.status(201).json(created);
     } catch (error) {
+      if (error instanceof FreePlanProductLimitError) {
+        return res.status(403).json({ error: error.message });
+      }
       console.error(error);
       res.status(500).json({ error: "Error al crear el producto" });
     }
@@ -1731,13 +1800,17 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
 
-      const updated = await storage.setProductStock(req.consultantId!, id, parsed.data.unidades, parsed.data.stockMinimo);
+      const { isFreePlan } = await getConsultantAccessStatus(req.consultantId!);
+      const updated = await storage.setProductStock(req.consultantId!, id, parsed.data.unidades, isFreePlan, parsed.data.stockMinimo);
       if (!updated) {
         return res.status(404).json({ error: "Producto no encontrado" });
       }
 
       res.json(updated);
     } catch (error) {
+      if (error instanceof FreePlanProductLimitError) {
+        return res.status(403).json({ error: error.message });
+      }
       console.error(error);
       res.status(500).json({ error: "Error al actualizar el stock" });
     }
@@ -1759,7 +1832,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
 
-      const updated = await storage.incrementProductStock(req.consultantId!, id, parsed.data.delta);
+      const { isFreePlan } = await getConsultantAccessStatus(req.consultantId!);
+      const updated = await storage.incrementProductStock(req.consultantId!, id, parsed.data.delta, isFreePlan);
       if (!updated) {
         return res.status(404).json({ error: "Producto no encontrado" });
       }
@@ -1768,6 +1842,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       if (error instanceof SaleValidationError) {
         return res.status(400).json({ error: error.message });
+      }
+      if (error instanceof FreePlanProductLimitError) {
+        return res.status(403).json({ error: error.message });
       }
       console.error(error);
       res.status(500).json({ error: "Error al actualizar el stock" });
@@ -1790,11 +1867,21 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "Datos inválidos", details: parsed.error.flatten() });
       }
 
-      const result = await storage.incrementProductStockBatch(req.consultantId!, parsed.data.lines, parsed.data.discountPercent, parsed.data.draftId);
+      const { isFreePlan } = await getConsultantAccessStatus(req.consultantId!);
+      const result = await storage.incrementProductStockBatch(
+        req.consultantId!,
+        parsed.data.lines,
+        isFreePlan,
+        parsed.data.discountPercent,
+        parsed.data.draftId,
+      );
       res.json(result);
     } catch (error) {
       if (error instanceof SaleValidationError) {
         return res.status(400).json({ error: error.message });
+      }
+      if (error instanceof FreePlanProductLimitError) {
+        return res.status(403).json({ error: error.message });
       }
       console.error(error);
       res.status(500).json({ error: "Error al actualizar el stock" });
@@ -2134,6 +2221,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const enriched = await Promise.all(
         rows.map(async (row) => {
           const access = await getConsultantAccessStatus(row.consultantId);
+          // Prompt 14 — solo tiene sentido para el plan gratis (ver SubscriptionManagement.tsx,
+          // que reemplaza "Prueba (trial)"/"Días restantes" por esto en esos casos).
+          const productsWithStockCount = access.isFreePlan ? await storage.countProductsWithStock(row.consultantId) : null;
           return {
             consultantId: row.consultantId,
             businessName: row.businessName,
@@ -2141,6 +2231,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             email: row.email,
             status: access.status,
             hasAccess: access.hasAccess,
+            isFreePlan: access.isFreePlan,
+            productsWithStockCount,
+            freePlanProductLimit: FREE_PLAN_PRODUCT_LIMIT,
             daysRemaining: access.daysRemaining,
             trialStartAt: row.subscription?.trialStartAt ?? null,
             trialEndAt: access.trialEndAt,

@@ -72,7 +72,7 @@ beforeAll(async () => {
   const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: user.username, password: "vitest-test-password-123" }),
+    body: JSON.stringify({ identifier: user.username, password: "vitest-test-password-123" }),
   });
   cookie = loginRes.headers.get("set-cookie")!.split(";")[0];
 
@@ -85,7 +85,7 @@ beforeAll(async () => {
   const loginResB = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: userB.username, password: "vitest-test-password-123" }),
+    body: JSON.stringify({ identifier: userB.username, password: "vitest-test-password-123" }),
   });
   cookieB = loginResB.headers.get("set-cookie")!.split(";")[0];
 

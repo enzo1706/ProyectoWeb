@@ -23,11 +23,14 @@ vi.mock("../email", () => ({
 let httpServer: Server;
 let baseUrl: string;
 
-function uniqueUsername(tag: string): string {
-  return `vitest_emailfail_${tag}_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-}
 function uniqueEmail(tag: string): string {
   return `vitest.emailfail.${tag}.${Date.now()}.${Math.floor(Math.random() * 1e6)}@example.com`;
+}
+// Prompt 14 — WhatsApp único por llamada (el registro ahora lo pide siempre).
+let nextWhatsappSuffix = 1;
+function uniqueWhatsapp(): string {
+  const suffix = String(nextWhatsappSuffix++).padStart(7, "0");
+  return `261${suffix}`;
 }
 
 beforeAll(async () => {
@@ -45,12 +48,11 @@ afterAll(async () => {
 
 describe("Fallo del proveedor de email en /api/auth/forgot-password", () => {
   it("responde el mismo mensaje genérico aunque el proveedor de email falle, y nunca expone el detalle del error", async () => {
-    const username = uniqueUsername("gen");
     const email = uniqueEmail("gen");
     await fetch(`${baseUrl}/api/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, email, password: "vitest-test-password-123" }),
+      body: JSON.stringify({ contactName: "Vitest Test", email, whatsapp: uniqueWhatsapp(), password: "vitest-test-password-123" }),
     });
 
     const res = await fetch(`${baseUrl}/api/auth/forgot-password`, {
@@ -66,12 +68,11 @@ describe("Fallo del proveedor de email en /api/auth/forgot-password", () => {
   });
 
   it("el código generado pero nunca enviado queda invalidado — no queda utilizable ni por quien lo intercepte", async () => {
-    const username = uniqueUsername("invalid");
     const email = uniqueEmail("invalid");
     await fetch(`${baseUrl}/api/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, email, password: "vitest-test-password-123" }),
+      body: JSON.stringify({ contactName: "Vitest Test", email, whatsapp: uniqueWhatsapp(), password: "vitest-test-password-123" }),
     });
 
     await fetch(`${baseUrl}/api/auth/forgot-password`, {
@@ -92,12 +93,11 @@ describe("Fallo del proveedor de email en /api/auth/forgot-password", () => {
   });
 
   it("después de un fallo de envío, la consultora puede simplemente volver a pedir el código", async () => {
-    const username = uniqueUsername("retry");
     const email = uniqueEmail("retry");
     await fetch(`${baseUrl}/api/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, email, password: "vitest-test-password-123" }),
+      body: JSON.stringify({ contactName: "Vitest Test", email, whatsapp: uniqueWhatsapp(), password: "vitest-test-password-123" }),
     });
 
     const first = await fetch(`${baseUrl}/api/auth/forgot-password`, {

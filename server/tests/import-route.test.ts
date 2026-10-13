@@ -28,7 +28,7 @@ async function createConsultant(username: string) {
   const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password: "vitest-test-password-123" }),
+    body: JSON.stringify({ identifier: username, password: "vitest-test-password-123" }),
   });
   const cookie = loginRes.headers.get("set-cookie")!.split(";")[0];
   return { consultantId: user.consultantId!, cookie };
@@ -79,7 +79,7 @@ describe("POST /api/products/import/parse", () => {
     const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: admin.username, password: "vitest-test-password-123" }),
+      body: JSON.stringify({ identifier: admin.username, password: "vitest-test-password-123" }),
     });
     const cookie = loginRes.headers.get("set-cookie")!.split(";")[0];
     const res = await fetch(`${baseUrl}/api/products/import/parse`, {
@@ -154,7 +154,7 @@ describe("POST /api/products/import/parse", () => {
       precio: 5000,
       unidades: 0,
       puntos: 0,
-    });
+    }, false);
 
     const { cookie: cookieA } = await createConsultant(`vitest_import_a_${Date.now()}`);
     const res = await fetch(`${baseUrl}/api/products/import/parse`, {

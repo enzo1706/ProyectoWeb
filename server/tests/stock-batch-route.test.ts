@@ -21,7 +21,7 @@ async function createConsultant(username: string) {
   const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password: "vitest-test-password-123" }),
+    body: JSON.stringify({ identifier: username, password: "vitest-test-password-123" }),
   });
   const cookie = loginRes.headers.get("set-cookie")!.split(";")[0];
   return { consultantId: user.consultantId!, cookie };
@@ -53,8 +53,8 @@ describe("PATCH /api/products/stock/increment-batch", () => {
 
   it("16. una sola llamada aplica todo el batch: 2 productos, 1 request, ambos quedan actualizados", async () => {
     const { consultantId, cookie } = await createConsultant(`vitest_stockbatch_ok_${Date.now()}`);
-    const productA = await storage.createProduct(consultantId, { seccion: "Test", producto: "Batch HTTP A", precio: 1000, unidades: 5, puntos: 1 });
-    const productB = await storage.createProduct(consultantId, { seccion: "Test", producto: "Batch HTTP B", precio: 1000, unidades: 2, puntos: 1 });
+    const productA = await storage.createProduct(consultantId, { seccion: "Test", producto: "Batch HTTP A", precio: 1000, unidades: 5, puntos: 1 }, false);
+    const productB = await storage.createProduct(consultantId, { seccion: "Test", producto: "Batch HTTP B", precio: 1000, unidades: 2, puntos: 1 }, false);
 
     const res = await fetch(`${baseUrl}/api/products/stock/increment-batch`, {
       method: "PATCH",
@@ -95,7 +95,7 @@ describe("PATCH /api/products/stock/increment-batch", () => {
 
   it("delta negativo o 0 en cualquier línea responde 400 (este batch es solo entrada de mercadería)", async () => {
     const { consultantId, cookie } = await createConsultant(`vitest_stockbatch_negativo_${Date.now()}`);
-    const product = await storage.createProduct(consultantId, { seccion: "Test", producto: "Batch HTTP delta inválido", precio: 1000, unidades: 5, puntos: 1 });
+    const product = await storage.createProduct(consultantId, { seccion: "Test", producto: "Batch HTTP delta inválido", precio: 1000, unidades: 5, puntos: 1 }, false);
 
     const res = await fetch(`${baseUrl}/api/products/stock/increment-batch`, {
       method: "PATCH",
@@ -111,10 +111,10 @@ describe("PATCH /api/products/stock/increment-batch", () => {
 
   it("23. tenant isolation: consultora A no puede incrementar stock de un producto MANUAL de B — rechazado, stock de A y de B intactos", async () => {
     const { consultantId: consultantBId } = await createConsultant(`vitest_stockbatch_b_${Date.now()}`);
-    const productOfB = await storage.createProduct(consultantBId, { seccion: "Test", producto: "Producto privado de B", precio: 1000, unidades: 20, puntos: 1 });
+    const productOfB = await storage.createProduct(consultantBId, { seccion: "Test", producto: "Producto privado de B", precio: 1000, unidades: 20, puntos: 1 }, false);
 
     const { consultantId: consultantAId, cookie: cookieA } = await createConsultant(`vitest_stockbatch_a_${Date.now()}`);
-    const productOfA = await storage.createProduct(consultantAId, { seccion: "Test", producto: "Producto de A", precio: 1000, unidades: 10, puntos: 1 });
+    const productOfA = await storage.createProduct(consultantAId, { seccion: "Test", producto: "Producto de A", precio: 1000, unidades: 10, puntos: 1 }, false);
 
     const res = await fetch(`${baseUrl}/api/products/stock/increment-batch`, {
       method: "PATCH",
@@ -144,7 +144,7 @@ describe("PATCH /api/products/stock/increment-batch", () => {
     // ofrece a la venta) — este test fija ese comportamiento como documentado, para que un
     // cambio futuro que lo bloquee sea una decisión explícita, no un efecto colateral accidental.
     const { consultantId, cookie } = await createConsultant(`vitest_stockbatch_disc_${Date.now()}`);
-    const product = await storage.createProduct(consultantId, { seccion: "Test", producto: "Producto discontinuado", precio: 1000, unidades: 5, puntos: 1 });
+    const product = await storage.createProduct(consultantId, { seccion: "Test", producto: "Producto discontinuado", precio: 1000, unidades: 5, puntos: 1 }, false);
     await storage.setProductDiscontinued(consultantId, product.id, true);
 
     const res = await fetch(`${baseUrl}/api/products/stock/increment-batch`, {

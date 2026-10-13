@@ -10,6 +10,7 @@ import { LowStockDialog } from "@/components/LowStockDialog";
 import { ErrorBlock } from "@/components/ErrorBlock";
 import { AppointmentDetailDialog } from "@/components/AppointmentDetailDialog";
 import { SaleDetailDialog } from "@/components/SaleDetailDialog";
+import { CompleteProfileDialog } from "@/components/CompleteProfileDialog";
 import { useSaleDialog } from "@/hooks/use-sale-dialog";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { toDateStr, daysBetween } from "@/lib/date";
@@ -162,7 +163,11 @@ export default function Dashboard() {
   const [appointmentDetailOpen, setAppointmentDetailOpen] = useState(false);
   const [selectedAppointmentId, setSelectedAppointmentId] = useState<number | null>(null);
   const [selectedSaleId, setSelectedSaleId] = useState<number | null>(null);
+  const [completeProfileOpen, setCompleteProfileOpen] = useState(false);
   const { openCreateSale } = useSaleDialog();
+  // Prompt 14 — "Completá tu perfil": ciudad, edad y cargo todavía no cargados. Provisorio
+  // acá hasta que exista el bloque "Para mejorar tu negocio" del Prompt 10.
+  const profileIncomplete = Boolean(businessSettings) && (!businessSettings!.city || !businessSettings!.age || !businessSettings!.jobTitle);
 
   const today = toDateStr(new Date());
   const { start: monthStart, end: monthEnd } = currentMonthRange();
@@ -457,6 +462,23 @@ export default function Dashboard() {
         </CardContent>
       </Card>
 
+      {profileIncomplete && (
+        <Card data-testid="card-complete-profile">
+          <CardContent className="flex items-center justify-between gap-3 py-4">
+            <p className="text-sm text-muted-foreground">Completá tu perfil para que te conozcamos mejor.</p>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setCompleteProfileOpen(true)}
+              data-testid="button-open-complete-profile"
+            >
+              Completar
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
       <button
         type="button"
         onClick={() => setLocation("/reportes")}
@@ -467,6 +489,7 @@ export default function Dashboard() {
       </button>
 
       <LowStockDialog open={lowStockOpen} onOpenChange={setLowStockOpen} products={lowStockProducts} />
+      <CompleteProfileDialog open={completeProfileOpen} onOpenChange={setCompleteProfileOpen} />
       <AppointmentDetailDialog
         open={appointmentDetailOpen}
         onOpenChange={(next) => {

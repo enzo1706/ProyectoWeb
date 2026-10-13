@@ -34,10 +34,22 @@ beforeAll(async () => {
     role: "consultant",
     status: true,
   });
+  // Prompt 14 — este archivo prueba CRUD de productos (creación, edición, stock, descuento,
+  // discontinuado, recordatorio, seed del catálogo de prueba), no el límite del plan gratis
+  // (eso tiene su propia cobertura dedicada, ver subscription.test.ts/products-free-plan-limit.
+  // test.ts). Como todos los describe blocks comparten una sola consultora, entre el catálogo
+  // de prueba (8 productos) y los productos manuales de cada test se supera largamente el
+  // cupo de 10 — se le da una suscripción activa para que esos límites no interfieran acá.
+  const now = new Date();
+  await storage.updateSubscription(user.consultantId!, {
+    status: "active",
+    currentPeriodStart: now,
+    currentPeriodEnd: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000),
+  });
   const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: user.username, password: "vitest-test-password-123" }),
+    body: JSON.stringify({ identifier: user.username, password: "vitest-test-password-123" }),
   });
   cookie = loginRes.headers.get("set-cookie")!.split(";")[0];
 });
@@ -58,7 +70,7 @@ describe("Autorización: admin no puede pegarle a /api/products/* (Etapa I-B.8-C
     const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: admin.username, password: "vitest-test-password-123" }),
+      body: JSON.stringify({ identifier: admin.username, password: "vitest-test-password-123" }),
     });
     const adminCookie = loginRes.headers.get("set-cookie")!.split(";")[0];
 

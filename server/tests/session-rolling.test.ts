@@ -51,7 +51,7 @@ describe("Sesión de 10 días con renovación (Prompt 13)", () => {
     const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: user.username, password: "vitest-test-password-123" }),
+      body: JSON.stringify({ identifier: user.username, password: "vitest-test-password-123" }),
     });
     expect(loginRes.status).toBe(200);
 
@@ -73,7 +73,7 @@ describe("Sesión de 10 días con renovación (Prompt 13)", () => {
     const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: user.username, password: "vitest-test-password-123" }),
+      body: JSON.stringify({ identifier: user.username, password: "vitest-test-password-123" }),
     });
     const cookie = loginRes.headers.get("set-cookie")!.split(";")[0];
 

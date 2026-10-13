@@ -12,11 +12,15 @@ let storage: typeof import("../storage").storage;
 
 const PASSWORD = "vitest-test-password-123";
 
-function uniqueUsername(tag: string): string {
-  return `vitest_regt_${tag}_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-}
 function uniqueEmail(tag: string): string {
   return `vitest.regt.${tag}.${Date.now()}.${Math.floor(Math.random() * 1e6)}@example.com`;
+}
+// Prompt 14 — el registro ya no pide "usuario": lo deriva el backend del email. Cada llamada
+// necesita su propio WhatsApp único (shared/phone.ts rechaza dígitos repetidos).
+let nextWhatsappSuffix = 1;
+function uniqueWhatsapp(): string {
+  const suffix = String(nextWhatsappSuffix++).padStart(7, "0");
+  return `261${suffix}`;
 }
 
 // Ver auth-register.test.ts: cada test usa su propia IP sintética (X-Forwarded-For, con
@@ -55,33 +59,32 @@ describe("POST /api/auth/register — duplicados y unicidad de email", () => {
   it("4. email duplicado responde 409, la segunda cuenta nunca se crea", async () => {
     const ip = nextTestIp();
     const email = uniqueEmail("dup");
-    const first = await register({ username: uniqueUsername("dup1"), email, password: PASSWORD }, ip);
+    const first = await register({ contactName: "Vitest Test", email, whatsapp: uniqueWhatsapp(), password: PASSWORD }, ip);
     expect(first.status).toBe(201);
 
-    const usernameSegundo = uniqueUsername("dup2");
-    const second = await register({ username: usernameSegundo, email, password: PASSWORD }, ip);
+    const second = await register({ contactName: "Vitest Test", email, whatsapp: uniqueWhatsapp(), password: PASSWORD }, ip);
     expect(second.status).toBe(409);
-    expect(await storage.getUserByUsername(usernameSegundo)).toBeUndefined();
+    expect(await storage.getUserByUsername((second.body as { username?: string })?.username ?? "")).toBeUndefined();
   });
 
   it("4b. mismo email con mayúsculas/espacios distintos también choca (normalización)", async () => {
     const ip = nextTestIp();
     const base = uniqueEmail("norm");
-    const first = await register({ username: uniqueUsername("norm1"), email: base, password: PASSWORD }, ip);
+    const first = await register({ contactName: "Vitest Test", email: base, whatsapp: uniqueWhatsapp(), password: PASSWORD }, ip);
     expect(first.status).toBe(201);
 
     const variant = `  ${base.toUpperCase()}  `;
-    const second = await register({ username: uniqueUsername("norm2"), email: variant, password: PASSWORD }, ip);
+    const second = await register({ contactName: "Vitest Test", email: variant, whatsapp: uniqueWhatsapp(), password: PASSWORD }, ip);
     expect(second.status).toBe(409);
   });
 
-  it("username duplicado responde 409", async () => {
+  it("Prompt 14: WhatsApp duplicado también responde 409 (ya no hay username elegido para duplicar)", async () => {
     const ip = nextTestIp();
-    const username = uniqueUsername("userdup");
-    const first = await register({ username, email: uniqueEmail("userdup1"), password: PASSWORD }, ip);
+    const whatsapp = uniqueWhatsapp();
+    const first = await register({ contactName: "Vitest Test", email: uniqueEmail("wadup1"), whatsapp, password: PASSWORD }, ip);
     expect(first.status).toBe(201);
 
-    const second = await register({ username, email: uniqueEmail("userdup2"), password: PASSWORD }, ip);
+    const second = await register({ contactName: "Vitest Test", email: uniqueEmail("wadup2"), whatsapp, password: PASSWORD }, ip);
     expect(second.status).toBe(409);
   });
 });
@@ -89,14 +92,15 @@ describe("POST /api/auth/register — duplicados y unicidad de email", () => {
 describe("POST /api/auth/register — no tenant injection", () => {
   it("7. un intento de consultantId ajeno en el body es ignorado — nace con su propio tenant", async () => {
     const ip = nextTestIp();
-    const victim = await register({ username: uniqueUsername("victima"), email: uniqueEmail("victima"), password: PASSWORD }, ip);
+    const victim = await register({ contactName: "Vitest Test", email: uniqueEmail("victima"), whatsapp: uniqueWhatsapp(), password: PASSWORD }, ip);
     const victimUser = await storage.getUserByUsername((victim.body as { username: string }).username);
     expect(victimUser).toBeDefined();
 
     const attacker = await register(
       {
-        username: uniqueUsername("atacante"),
+        contactName: "Vitest Test",
         email: uniqueEmail("atacante"),
+        whatsapp: uniqueWhatsapp(),
         password: PASSWORD,
         consultantId: victimUser!.consultantId,
       },
@@ -109,8 +113,8 @@ describe("POST /api/auth/register — no tenant injection", () => {
 
   it("8. cada registro crea un tenant (consultant) propio y nuevo", async () => {
     const ip = nextTestIp();
-    const a = await register({ username: uniqueUsername("tenanta"), email: uniqueEmail("tenanta"), password: PASSWORD }, ip);
-    const b = await register({ username: uniqueUsername("tenantb"), email: uniqueEmail("tenantb"), password: PASSWORD }, ip);
+    const a = await register({ contactName: "Vitest Test", email: uniqueEmail("tenanta"), whatsapp: uniqueWhatsapp(), password: PASSWORD }, ip);
+    const b = await register({ contactName: "Vitest Test", email: uniqueEmail("tenantb"), whatsapp: uniqueWhatsapp(), password: PASSWORD }, ip);
     const userA = await storage.getUserByUsername((a.body as { username: string }).username);
     const userB = await storage.getUserByUsername((b.body as { username: string }).username);
 
@@ -124,8 +128,8 @@ describe("Multi-tenancy del registro", () => {
   it("10+11. dos registros nuevos crean dos tenants distintos, y A no ve datos creados por B", async () => {
     const ipA = nextTestIp();
     const ipB = nextTestIp();
-    const a = await register({ username: uniqueUsername("iso_a"), email: uniqueEmail("iso_a"), password: PASSWORD }, ipA);
-    const b = await register({ username: uniqueUsername("iso_b"), email: uniqueEmail("iso_b"), password: PASSWORD }, ipB);
+    const a = await register({ contactName: "Vitest Test", email: uniqueEmail("iso_a"), whatsapp: uniqueWhatsapp(), password: PASSWORD }, ipA);
+    const b = await register({ contactName: "Vitest Test", email: uniqueEmail("iso_b"), whatsapp: uniqueWhatsapp(), password: PASSWORD }, ipB);
     expect(a.status).toBe(201);
     expect(b.status).toBe(201);
 

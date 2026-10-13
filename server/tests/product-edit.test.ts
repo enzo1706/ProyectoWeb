@@ -25,7 +25,7 @@ async function createConsultant(username: string) {
   const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Forwarded-For": nextTestIp() },
-    body: JSON.stringify({ username, password: "vitest-test-password-123" }),
+    body: JSON.stringify({ identifier: username, password: "vitest-test-password-123" }),
   });
   const cookie = loginRes.headers.get("set-cookie")!.split(";")[0];
   return {

@@ -3,20 +3,24 @@ import { Link, useLocation } from "wouter";
 import { useAuth } from "@/hooks/useAuth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PasswordInput } from "@/components/PasswordInput";
 import { Label } from "@/components/ui/label";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Shield, Loader2 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { BrandLogo } from "@/components/BrandLogo";
 import { wasClosedByInactivity, clearSessionActivity } from "@/lib/sessionActivity";
+import { WHATSAPP_FORMAT_HINT, looksLikeInvalidPhone } from "@/lib/phoneHint";
 
 export default function Login() {
   const { login } = useAuth();
   const [, setLocation] = useLocation();
   const { toast } = useToast();
-  const [username, setUsername] = useState("");
+  // Prompt 14 — acepta email, WhatsApp o un usuario viejo; el backend decide con cuál buscar.
+  const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const invalidPhoneHint = looksLikeInvalidPhone(identifier);
   // Prompt 13 — se evalúa una sola vez, al entrar a esta pantalla (no en cada render): si no
   // fue por inactividad, nunca se inventa un motivo. Se borra enseguida — es un aviso de una
   // sola vez, no algo que deba seguir apareciendo si se recarga esta misma pantalla después.
@@ -31,12 +35,12 @@ export default function Login() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (isSubmittingRef.current) return;
+    if (isSubmittingRef.current || invalidPhoneHint) return;
     isSubmittingRef.current = true;
     setIsSubmitting(true);
 
     try {
-      const loggedIn = await login(username, password);
+      const loggedIn = await login(identifier, password);
       setLocation(loggedIn.role === "admin" ? "/admin" : "/");
     } catch (error) {
       toast({
@@ -59,7 +63,7 @@ export default function Login() {
         <div className="text-center space-y-2">
           <BrandLogo size={56} className="mx-auto shadow-md" />
           <h1 className="text-2xl font-bold text-[hsl(220,55%,22%)]">Mary Kay Manager</h1>
-          <p className="text-sm text-muted-foreground">Inicia sesión para continuar</p>
+          <p className="text-sm text-muted-foreground">Entrá con tu email o tu WhatsApp</p>
         </div>
 
         {showInactivityNotice && (
@@ -75,31 +79,32 @@ export default function Login() {
           <CardHeader className="space-y-1 pb-4">
             <CardTitle className="text-lg text-[hsl(220,55%,22%)] flex items-center gap-2">
               <Shield className="h-5 w-5 text-primary" />
-              Iniciar Sesión
+              Iniciar sesión
             </CardTitle>
-            <CardDescription>
-              Ingresa tus credenciales de consultora o administrador
-            </CardDescription>
           </CardHeader>
           <CardContent>
             <form onSubmit={handleSubmit} className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="username">Usuario</Label>
+                <Label htmlFor="identifier">Email o WhatsApp</Label>
                 <Input
-                  id="username"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  placeholder="tu.usuario"
+                  id="identifier"
+                  value={identifier}
+                  onChange={(e) => setIdentifier(e.target.value)}
+                  placeholder="tu@email.com o 261 555 1234"
                   required
                   autoComplete="username"
-                  data-testid="input-login-username"
+                  data-testid="input-login-identifier"
                 />
+                {invalidPhoneHint && (
+                  <p className="text-sm text-destructive" data-testid="text-login-phone-hint">
+                    {WHATSAPP_FORMAT_HINT}
+                  </p>
+                )}
               </div>
               <div className="space-y-2">
                 <Label htmlFor="password">Contraseña</Label>
-                <Input
+                <PasswordInput
                   id="password"
-                  type="password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="••••••••"
@@ -111,7 +116,7 @@ export default function Login() {
               <Button
                 type="submit"
                 className="w-full"
-                disabled={isSubmitting}
+                disabled={isSubmitting || invalidPhoneHint}
                 data-testid="button-login-submit"
               >
                 {isSubmitting ? (
@@ -120,7 +125,7 @@ export default function Login() {
                     Ingresando...
                   </>
                 ) : (
-                  "Ingresar"
+                  "Iniciar sesión"
                 )}
               </Button>
               <p className="text-center">
@@ -132,16 +137,18 @@ export default function Login() {
                   ¿Olvidaste tu contraseña?
                 </Link>
               </p>
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full"
+                onClick={() => setLocation("/register")}
+                data-testid="link-go-register"
+              >
+                Crear cuenta
+              </Button>
             </form>
           </CardContent>
         </Card>
-
-        <p className="text-center text-sm text-muted-foreground">
-          ¿No tenés una cuenta?{" "}
-          <Link href="/register" className="font-medium text-primary hover:underline" data-testid="link-go-register">
-            Registrarse
-          </Link>
-        </p>
       </div>
     </div>
   );

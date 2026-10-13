@@ -33,13 +33,15 @@ const storage = new DatabaseStorage();
 let httpServer: Server;
 let baseUrl: string;
 
-const USERNAME = `vitest_sess_${Date.now()}`;
 const EMAIL = `vitest.sess.${Date.now()}@example.com`;
+const WHATSAPP = `261${String(Date.now()).slice(-7)}`;
 const PASSWORD = "vitest-test-password-123";
 const NEW_PASSWORD = "vitest-new-password-456";
+let USERNAME: string;
 
 beforeAll(async () => {
-  await storage.registerConsultant({ username: USERNAME, email: EMAIL, password: PASSWORD });
+  const { user } = await storage.registerConsultant({ contactName: "Vitest Test", email: EMAIL, whatsapp: WHATSAPP, password: PASSWORD });
+  USERNAME = user.username;
 
   const { createApp } = await import("../app");
   const result = await createApp();
@@ -58,7 +60,7 @@ describe("Invalidación de sesiones tras reset de contraseña (Postgres real)", 
     const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: USERNAME, password: PASSWORD }),
+      body: JSON.stringify({ identifier: USERNAME, password: PASSWORD }),
     });
     expect(loginRes.status).toBe(200);
     const oldCookie = loginRes.headers.get("set-cookie")!.split(";")[0];
@@ -91,7 +93,7 @@ describe("Invalidación de sesiones tras reset de contraseña (Postgres real)", 
     const newLogin = await fetch(`${baseUrl}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: USERNAME, password: NEW_PASSWORD }),
+      body: JSON.stringify({ identifier: USERNAME, password: NEW_PASSWORD }),
     });
     expect(newLogin.status).toBe(200);
   });

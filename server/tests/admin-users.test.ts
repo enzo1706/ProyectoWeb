@@ -15,7 +15,7 @@ async function login(username: string, password: string) {
   const res = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ identifier: username, password }),
   });
   return { status: res.status, cookie: res.headers.get("set-cookie")?.split(";")[0] };
 }

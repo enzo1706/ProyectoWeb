@@ -920,7 +920,7 @@ describe("Incremento atómico de stock (incrementProductStock) — Etapa I-B.8-B
     // pisarse y el resultado final quedaba por debajo de 15. El cálculo atómico en la misma
     // sentencia SQL (`unidades = unidades + delta`) es justamente lo que elimina esa carrera.
     const results = await Promise.all(
-      Array.from({ length: 5 }, () => storage.incrementProductStock(testConsultantId, incrementProductId, 1)),
+      Array.from({ length: 5 }, () => storage.incrementProductStock(testConsultantId, incrementProductId, 1, false)),
     );
     expect(results.every((r) => r !== undefined)).toBe(true);
 
@@ -931,7 +931,7 @@ describe("Incremento atómico de stock (incrementProductStock) — Etapa I-B.8-B
   it("delta=0 se rechaza con SaleValidationError, sin tocar la fila", async () => {
     const [before] = await db.select().from(productStock).where(eq(productStock.productId, incrementProductId));
 
-    await expect(storage.incrementProductStock(testConsultantId, incrementProductId, 0)).rejects.toBeInstanceOf(SaleValidationError);
+    await expect(storage.incrementProductStock(testConsultantId, incrementProductId, 0, false)).rejects.toBeInstanceOf(SaleValidationError);
 
     const [after] = await db.select().from(productStock).where(eq(productStock.productId, incrementProductId));
     expect(after.unidades).toBe(before.unidades);
@@ -940,7 +940,7 @@ describe("Incremento atómico de stock (incrementProductStock) — Etapa I-B.8-B
   it("un decremento que dejaría stock negativo se rechaza y hace rollback real: la fila queda exactamente igual", async () => {
     const [before] = await db.select().from(productStock).where(eq(productStock.productId, incrementProductId));
 
-    await expect(storage.incrementProductStock(testConsultantId, incrementProductId, -(before.unidades + 1))).rejects.toThrow(
+    await expect(storage.incrementProductStock(testConsultantId, incrementProductId, -(before.unidades + 1), false)).rejects.toThrow(
       /stock insuficiente/i,
     );
 
@@ -952,7 +952,7 @@ describe("Incremento atómico de stock (incrementProductStock) — Etapa I-B.8-B
     const beforeRows = await db.select().from(productStock).where(eq(productStock.productId, incrementFreshProductId));
     expect(beforeRows).toHaveLength(0);
 
-    const updated = await storage.incrementProductStock(testConsultantId, incrementFreshProductId, 4);
+    const updated = await storage.incrementProductStock(testConsultantId, incrementFreshProductId, 4, false);
     expect(updated?.unidades).toBe(4);
 
     const rows = await db.select().from(productStock).where(eq(productStock.productId, incrementFreshProductId));
@@ -975,14 +975,14 @@ describe("Incremento atómico de stock (incrementProductStock) — Etapa I-B.8-B
       })
       .returning();
 
-    await expect(storage.incrementProductStock(testConsultantId, freshProduct.id, -3)).rejects.toThrow(/stock insuficiente/i);
+    await expect(storage.incrementProductStock(testConsultantId, freshProduct.id, -3, false)).rejects.toThrow(/stock insuficiente/i);
 
     const rows = await db.select().from(productStock).where(eq(productStock.productId, freshProduct.id));
     expect(rows).toHaveLength(0); // el rollback deshizo también el INSERT, no queda fila en -3
   });
 
   it("producto inexistente/no visible -> undefined, sin crear ninguna fila", async () => {
-    const result = await storage.incrementProductStock(testConsultantId, 999999999, 5);
+    const result = await storage.incrementProductStock(testConsultantId, 999999999, 5, false);
     expect(result).toBeUndefined();
     const rows = await db.select().from(productStock).where(eq(productStock.productId, 999999999));
     expect(rows).toHaveLength(0);
@@ -1108,7 +1108,7 @@ describe("CRUD real de productos (updateProduct/deleteProduct) — Etapa I-B.8-C
 
     const [updateResult, incrementResult] = await Promise.allSettled([
       storage.updateProduct(testConsultantId, crudProductId, { producto: "Nombre tras incremento concurrente" }),
-      storage.incrementProductStock(testConsultantId, crudProductId, 3),
+      storage.incrementProductStock(testConsultantId, crudProductId, 3, false),
     ]);
     expect(updateResult.status).toBe("fulfilled");
     expect(incrementResult.status).toBe("fulfilled");
@@ -1262,7 +1262,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
 
   describe("Básicos", () => {
     it("1. batch con una sola línea aplica correctamente", async () => {
-      const result = await storage.incrementProductStockBatch(testConsultantId, [{ productId: productAId, delta: 2 }]);
+      const result = await storage.incrementProductStockBatch(testConsultantId, [{ productId: productAId, delta: 2 }], false);
       expect(result).toEqual({ updated: 1 });
       const [row] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
       expect(row.unidades).toBe(12);
@@ -1275,7 +1275,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
       const result = await storage.incrementProductStockBatch(testConsultantId, [
         { productId: productAId, delta: 1 },
         { productId: productBId, delta: 3 },
-      ]);
+      ], false);
       expect(result).toEqual({ updated: 2 });
 
       const [afterA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
@@ -1285,7 +1285,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
     });
 
     it("3. batch vacío se rechaza con SaleValidationError, sin tocar nada", async () => {
-      await expect(storage.incrementProductStockBatch(testConsultantId, [])).rejects.toBeInstanceOf(SaleValidationError);
+      await expect(storage.incrementProductStockBatch(testConsultantId, [], false)).rejects.toBeInstanceOf(SaleValidationError);
     });
 
     it("4. producto inexistente en el batch -> se rechaza el batch entero", async () => {
@@ -1293,13 +1293,13 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
         storage.incrementProductStockBatch(testConsultantId, [
           { productId: productAId, delta: 1 },
           { productId: 999999999, delta: 1 },
-        ]),
+        ], false),
       ).rejects.toThrow(/no encontrado/i);
     });
 
     it("5. producto MANUAL de otra consultora -> se rechaza igual que uno inexistente, nunca se filtra que existe", async () => {
       await expect(
-        storage.incrementProductStockBatch(testConsultantId, [{ productId: otherProductId, delta: 1 }]),
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: otherProductId, delta: 1 }], false),
       ).rejects.toThrow(/no encontrado/i);
 
       // El stock de la otra consultora, intacto.
@@ -1309,19 +1309,19 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
 
     it("6. delta inválido (0, negativo o no entero) se rechaza — este batch es solo entrada de mercadería", async () => {
       await expect(
-        storage.incrementProductStockBatch(testConsultantId, [{ productId: productAId, delta: 0 }]),
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: productAId, delta: 0 }], false),
       ).rejects.toBeInstanceOf(SaleValidationError);
       await expect(
-        storage.incrementProductStockBatch(testConsultantId, [{ productId: productAId, delta: -1 }]),
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: productAId, delta: -1 }], false),
       ).rejects.toBeInstanceOf(SaleValidationError);
       await expect(
-        storage.incrementProductStockBatch(testConsultantId, [{ productId: productAId, delta: 1.5 }]),
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: productAId, delta: 1.5 }], false),
       ).rejects.toBeInstanceOf(SaleValidationError);
     });
 
     it("7. stock válido: varias líneas con deltas positivos dispares aplican exactamente lo esperado", async () => {
       const [beforeC] = await db.select().from(productStock).where(eq(productStock.productId, productCId));
-      await storage.incrementProductStockBatch(testConsultantId, [{ productId: productCId, delta: 7 }]);
+      await storage.incrementProductStockBatch(testConsultantId, [{ productId: productCId, delta: 7 }], false);
       const [afterC] = await db.select().from(productStock).where(eq(productStock.productId, productCId));
       expect(afterC.unidades).toBe(beforeC.unidades + 7);
     });
@@ -1343,7 +1343,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
           { productId: productAId, delta: 5 }, // línea 1: válida
           { productId: productBId, delta: 3 }, // línea 2: válida
           { productId: 999999999, delta: 1 }, // línea 3: inválida -> todo el batch debe revertir
-        ]),
+        ], false),
       ).rejects.toThrow(/no encontrado/i);
 
       const [afterA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
@@ -1368,7 +1368,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
         storage.incrementProductStockBatch(testConsultantId, [
           { productId: productAId, delta: 1 },
           { productId: productCId, delta: -1 }, // rechazado por el schema/validación de línea, nunca por stock negativo
-        ]),
+        ], false),
       ).rejects.toBeInstanceOf(SaleValidationError);
 
       const [afterA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
@@ -1388,7 +1388,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
         storage.incrementProductStockBatch(testConsultantId, [
           { productId: 999999999, delta: 1 },
           { productId: productAId, delta: 5 },
-        ]),
+        ], false),
       ).rejects.toThrow(/no encontrado/i);
 
       const [afterA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
@@ -1403,7 +1403,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
       const result = await storage.incrementProductStockBatch(testConsultantId, [
         { productId: productBId, delta: 5 },
         { productId: productBId, delta: 3 },
-      ]);
+      ], false);
       expect(result).toEqual({ updated: 1 }); // un solo producto afectado, no dos líneas separadas
 
       const [after] = await db.select().from(productStock).where(eq(productStock.productId, productBId));
@@ -1429,8 +1429,8 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
       await db.insert(productStock).values({ consultantId: testConsultantId, productId: freshProduct.id, unidades: 10, stockMinimo: 0 });
 
       const results = await Promise.all([
-        storage.incrementProductStockBatch(testConsultantId, [{ productId: freshProduct.id, delta: 5 }]),
-        storage.incrementProductStockBatch(testConsultantId, [{ productId: freshProduct.id, delta: 7 }]),
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: freshProduct.id, delta: 5 }], false),
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: freshProduct.id, delta: 7 }], false),
       ]);
       expect(results).toEqual([{ updated: 1 }, { updated: 1 }]);
 
@@ -1480,11 +1480,11 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
         storage.incrementProductStockBatch(testConsultantId, [
           { productId: orderedLow.id, delta: 1 },
           { productId: orderedHigh.id, delta: 2 },
-        ]),
+        ], false),
         storage.incrementProductStockBatch(testConsultantId, [
           { productId: orderedHigh.id, delta: 3 },
           { productId: orderedLow.id, delta: 4 },
-        ]),
+        ], false),
       ]);
       expect(results).toEqual([{ updated: 2 }, { updated: 2 }]);
 
@@ -1530,8 +1530,8 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
         storage.incrementProductStockBatch(testConsultantId, [
           { productId: p1.id, delta: 2 },
           { productId: p2.id, delta: 2 },
-        ]),
-        storage.incrementProductStockBatch(testConsultantId, [{ productId: p2.id, delta: 5 }]),
+        ], false),
+        storage.incrementProductStockBatch(testConsultantId, [{ productId: p2.id, delta: 5 }], false),
       ]);
       expect(results).toEqual([{ updated: 2 }, { updated: 1 }]);
 

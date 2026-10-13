@@ -40,7 +40,7 @@ beforeAll(async () => {
   const adminLogin = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: admin.username, password: "vitest-test-password-123" }),
+    body: JSON.stringify({ identifier: admin.username, password: "vitest-test-password-123" }),
   });
   adminCookie = adminLogin.headers.get("set-cookie")!.split(";")[0];
 
@@ -53,7 +53,7 @@ beforeAll(async () => {
   const consultantLogin = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: consultant.username, password: "vitest-test-password-123" }),
+    body: JSON.stringify({ identifier: consultant.username, password: "vitest-test-password-123" }),
   });
   consultantCookie = consultantLogin.headers.get("set-cookie")!.split(";")[0];
 });

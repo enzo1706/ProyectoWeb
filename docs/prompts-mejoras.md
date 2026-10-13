@@ -663,6 +663,16 @@ compran", que SÍ las excluye, vía `matchesStaleFilter`) y con "Clientas para r
 Reportes (Prompt 11), que también las excluye explícitamente. **No se corrige ahora** — queda
 para cuando se implemente este Prompt 10.
 
+#### Pendiente del Prompt 14 (encontrado haciendo el Prompt 14, sin tocar acá)
+
+El aviso **"Completá tu perfil"** (nombre, ciudad, edad y cargo) que pide el Prompt 14 tiene
+que vivir en el bloque **"Para mejorar tu negocio"** de arriba — pero ese bloque todavía no
+existe (este Prompt 10 no está implementado: `client/src/pages/Dashboard.tsx` hoy no tiene
+ningún bloque con ese nombre ni nada parecido). Mientras tanto, el Prompt 14 lo ubica en otro
+lugar temporal (ver su propia sección de decisiones) — cuando se implemente este Prompt 10,
+mover "Completá tu perfil" al bloque "Para mejorar tu negocio" junto con los demás avisos de
+baja prioridad.
+
 ## Reportes
 
 ### Prompt 11 · Reportes: claro y liviano
@@ -955,6 +965,46 @@ Cómo verifico que quedó bien:
 - Con una cuenta gratis y 10 productos, al intentar sumar el 11 aparece el cartel.
 - Ya no aparece ninguna fecha de vencimiento de la prueba.
 ```
+
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **Cómo se cuentan los 10 productos**: solo cuentan los productos con `unidades > 0`. Sumar
+  unidades a un producto que YA tiene stock es libre (no cuenta como "nuevo"). Reponer un
+  producto que está en 0 SÍ cuenta como sumar uno nuevo: si ya hay 10 con stock, aparece el
+  cartel del límite. Así nunca hay más de 10 productos con stock en el plan gratis.
+- **Cuentas sin suscripción activa**: la prueba vencida, la consultora que dejó de pagar y la
+  que canceló pasan TODAS al plan gratis — una sola regla para todas, sin distinción por
+  motivo. Conservan todo y siguen usando la app. Si tienen más de 10 productos con stock,
+  pueden vender lo que tienen, pero no reponer ni sumar productos nuevos hasta bajar de 10 o
+  suscribirse.
+- **Dónde se valida el límite**: en el servidor, no solo en la pantalla, en TODOS los caminos
+  que puedan sumar stock — catálogo (pedido/reposición), carga manual, edición directa de
+  unidades, y cualquier otro camino que toque `product_stock.unidades` al alza.
+- **Excepción al límite**: cancelar o editar una venta que devuelve stock NUNCA queda bloqueado
+  por el límite, aunque la cuenta ya esté en 10 productos — es una corrección (el stock vuelve a
+  donde estaba), no una carga nueva.
+- **Textos exactos aprobados** (reemplazan a los del borrador del prompt):
+  - Stock, con menos de 10: "Prueba gratis: 8 de 10 productos."
+  - Stock, en el límite: "Prueba gratis: llegaste al límite de 10 productos. Para sumar nuevos o
+    reponer los agotados, suscribite."
+  - Suscripción, con menos de 10: "Estás usando la prueba gratis: podés tener hasta 10 productos
+    con stock. Tenés 8."
+  - Suscripción, en el límite: "Estás usando la prueba gratis y llegaste al límite de 10
+    productos. Suscribite para cargar todos los que quieras."
+  - Suscripción, cuenta que pagó y dejó de pagar (expired/canceled): ya no dice "Tu período de
+    prueba o suscripción venció" — dice "Tu suscripción no está activa. Seguís con la prueba
+    gratis: hasta 10 productos con stock."
+- **WhatsApp con "15"**: no se tocó `shared/phone.ts`. En Ingreso, Crear cuenta y Tus datos, si lo
+  escrito tiene forma de teléfono (solo dígitos/espacios/guiones/+) pero no es válido, se avisa
+  ANTES de enviar: "Escribí tu WhatsApp sin el 0 y sin el 15. Por ejemplo: 261 555 1234." — el
+  aviso depende solo del formato, nunca de si la cuenta existe (no rompe el anti-enumeración).
+- **Usuario derivado del email**: se deriva de la parte antes del "@", en minúsculas. Si coincide
+  con la forma de un WhatsApp válido (ej. un email tipo `2615551234@gmail.com`), se le agrega un
+  sufijo numérico — para que el orden de búsqueda del login nunca sea ambiguo. Orden fijo de
+  búsqueda en el login: si el texto tiene "@" → email; si no pero tiene forma de WhatsApp válido
+  → WhatsApp; si no → usuario (nunca se prueban los tres, por seguridad anti-enumeración).
+- **"Tus datos"**: cambiar el email o el WhatsApp pide la contraseña actual (son las credenciales
+  para entrar y recuperar la cuenta) — solo cuando alguno de esos dos campos realmente cambia.
 
 ## Toda la app
 

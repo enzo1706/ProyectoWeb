@@ -24,6 +24,19 @@ export const consultants = pgTable("consultants", {
   // SIEMPRE normalizado (ver shared/email.ts normalizeEmail, storage.setConsultantEmail) antes
   // de guardarse, nunca tal cual lo tipeó la consultora.
   email: text("email"),
+  // Prompt 14 — WhatsApp de la CONSULTORA misma (nunca confundir con `clients.phone`, el de
+  // sus clientas). Siempre normalizado a 10 dígitos (shared/phone.ts), igual criterio que
+  // `email`: único mientras no sea NULL, nunca se migran masivamente los datos históricos.
+  whatsapp: text("whatsapp"),
+  // Prompt 14 — "Nombre y apellido" de la consultora (dato personal, distinto de
+  // `businessName` que es el nombre DEL NEGOCIO). Se pide en "Crear cuenta" y se puede editar
+  // después en Configuración → "Tus datos".
+  contactName: text("contact_name"),
+  city: text("city"),
+  age: integer("age"),
+  // "cargo" en el texto del prompt — texto libre (ej. "Consultora", "Directora"). Nombrado
+  // jobTitle, no `role`, para no pisar `users.role` (el rol de autenticación: admin/consultant).
+  jobTitle: text("job_title"),
   // Prompt 1 — "¿Qué día del mes hacés tu pedido?". Hasta 2 días (1-31), ambos opcionales e
   // independientes entre sí — nunca un array, para no andar validando duplicados/orden adentro
   // de un tipo compuesto. day2 solo tiene sentido si day1 también está cargado (se valida en
@@ -42,6 +55,8 @@ export const consultants = pgTable("consultants", {
   // Mercado Pago) — si alguno choca en el futuro, es una situación real a revisar a mano, no
   // algo para "arreglar" con una migración silenciosa.
   emailUnique: uniqueIndex("consultants_email_unique_idx").on(table.email).where(sql`${table.email} IS NOT NULL`),
+  // Prompt 14 — mismo criterio exacto que el de arriba, para WhatsApp.
+  whatsappUnique: uniqueIndex("consultants_whatsapp_unique_idx").on(table.whatsapp).where(sql`${table.whatsapp} IS NOT NULL`),
 }));
 
 export const users = pgTable("users", {
@@ -1170,8 +1185,11 @@ export const assignProductImageMatchesSchema = z.object({
     .min(1, "No hay ninguna asignación para aplicar"),
 });
 
+// Prompt 14 — el campo de ingreso acepta email, WhatsApp o un usuario viejo (las cuentas de
+// antes de este prompt siguen pudiendo entrar con su `username`) — un solo string, el backend
+// decide con qué lo busca (ver findUserForLogin en storage.ts).
 export const loginSchema = z.object({
-  username: z.string().min(1),
+  identifier: z.string().trim().min(1, "Ingresá tu email, WhatsApp o usuario"),
   password: z.string().min(1),
 });
 
@@ -1239,12 +1257,65 @@ const usernameFieldSchema = z.string().trim().min(3, "El usuario debe tener al m
 const passwordFieldSchema = z.string().min(6, "La contraseña debe tener al menos 6 caracteres");
 const resetCodeFieldSchema = z.string().regex(/^\d{6}$/, "El código debe tener 6 dígitos");
 
+// Prompt 14 — mismo criterio que PHONE_ERROR_MESSAGE (clientas), pero propio: el de clientas
+// no menciona el "15" porque ahí casi nadie lo tipea; en el ingreso/registro de la CONSULTORA
+// sí es común que alguien escriba su propio WhatsApp con el "15" de siempre (ej.
+// "0261 15 555 1234"), formato que `normalizeArgentinaPhoneForStorage` rechaza a propósito
+// (ambiguo sin conocer la longitud exacta del código de área) — el mensaje le dice
+// explícitamente qué sacar, en vez de solo decir "formato inválido".
+export const CONSULTANT_WHATSAPP_ERROR_MESSAGE = "Escribí tu WhatsApp sin el 0 y sin el 15. Por ejemplo: 261 555 1234.";
+
+const contactNameFieldSchema = z.string().trim().min(1, "El nombre es obligatorio").max(120);
+
+const consultantWhatsappFieldSchema = z
+  .string()
+  .trim()
+  .min(1, "El WhatsApp es obligatorio")
+  .refine((val) => normalizeArgentinaPhoneForStorage(val) !== null, { message: CONSULTANT_WHATSAPP_ERROR_MESSAGE })
+  .transform((val) => normalizeArgentinaPhoneForStorage(val)!);
+
+/** Mismo campo de arriba, pero OPCIONAL (para "Tus datos": nadie está obligado a cargar el
+ * WhatsApp ahí si no lo hizo en su momento — aunque en el registro nuevo sí es obligatorio). */
+const optionalConsultantWhatsappFieldSchema = z
+  .union([z.literal(""), consultantWhatsappFieldSchema])
+  .nullable()
+  .optional()
+  .transform((val) => (val === "" || val === undefined ? null : val));
+
+const optionalProfileTextFieldSchema = (maxLength: number) =>
+  z
+    .string()
+    .trim()
+    .max(maxLength)
+    .nullable()
+    .optional()
+    .transform((val) => (val && val.trim() ? val.trim() : null));
+
 // Deliberadamente NO incluye role/consultantId/status — el backend los asigna siempre de
-// forma autoritativa (ver POST /api/auth/register), nunca los toma del body.
+// forma autoritativa (ver POST /api/auth/register), nunca los toma del body. Tampoco incluye
+// `username`: el Prompt 14 saca ese campo del registro — el backend lo deriva internamente a
+// partir del email (ver storage.registerConsultant), nunca lo pide ni lo recibe del body.
 export const registerConsultantSchema = z.object({
-  username: usernameFieldSchema,
+  contactName: contactNameFieldSchema,
   email: emailFieldSchema,
+  whatsapp: consultantWhatsappFieldSchema,
   password: passwordFieldSchema,
+});
+
+/** Prompt 14 — Configuración → "Tus datos". Cambiar `email` o `whatsapp` exige la contraseña
+ * actual (son los datos para entrar y recuperar la cuenta) — ese chequeo compara contra el
+ * valor YA guardado, así que se hace en el handler (storage/routes), no acá: este schema solo
+ * valida la FORMA de cada campo. */
+export const updateConsultantProfileSchema = z.object({
+  contactName: optionalProfileTextFieldSchema(120),
+  email: z.union([z.literal(""), emailFieldSchema]).nullable().optional().transform((val) => (val === "" || val === undefined ? null : val)),
+  whatsapp: optionalConsultantWhatsappFieldSchema,
+  city: optionalProfileTextFieldSchema(120),
+  age: z.number().int().min(14, "La edad tiene que ser mayor a 14").max(100, "Revisá la edad").nullable().optional(),
+  jobTitle: optionalProfileTextFieldSchema(120),
+  // Solo obligatoria si email o whatsapp cambian de verdad — se valida en el handler, que es
+  // el único lugar que conoce el valor ANTERIOR para comparar.
+  currentPassword: z.string().optional(),
 });
 
 export const forgotPasswordSchema = z.object({

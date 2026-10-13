@@ -39,7 +39,15 @@ function daysRemaining(now: Date, target: Date): number {
 
 export interface ConsultantAccessStatus {
   status: SubscriptionStatus;
+  // Prompt 14 — ya nadie se bloquea por su estado de suscripción (ver isFreePlan): este campo
+  // queda SIEMPRE true. Se mantiene (en vez de borrarlo) porque el frontend y el middleware ya
+  // lo leen — así ninguno de los dos necesita saber que ya no hay nada que "fallar".
   hasAccess: boolean;
+  // Prompt 14 — true para cualquier estado que no sea un período pago vigente ("trial",
+  // "expired", "canceled"). Única fuente de verdad de "esta cuenta no tiene un pago activo" —
+  // la usan el límite de productos, Stock, Suscripción y el panel de admin, nunca cada uno
+  // reimplementa su propia versión de "¿está pagando?".
+  isFreePlan: boolean;
   trialEndAt: Date | null;
   currentPeriodStart: Date | null;
   currentPeriodEnd: Date | null;
@@ -53,12 +61,26 @@ interface SubscriptionDates {
   currentPeriodEnd: Date | null;
 }
 
-/** Calcula el acceso a partir de las fechas — nunca de `status` (ver `getConsultantAccessStatus`). */
+/** Única fuente de verdad de "esta cuenta no tiene un pago activo ahora mismo" — cualquier
+ * estado que no sea "active" (trial nunca pagó, expired dejó de pagar, canceled canceló) cae
+ * en el plan gratis, con el mismo límite de productos y el mismo resto de la app abierto. */
+export function isFreePlan(status: SubscriptionStatus): boolean {
+  return status !== "active";
+}
+
+/**
+ * Calcula el estado a partir de las fechas — nunca de `status` guardado (ver
+ * `getConsultantAccessStatus`). Prompt 14: ya no existe un trial que vence por días — una
+ * consultora que nunca pagó queda en "trial" para siempre (el límite real es el de productos,
+ * no el de tiempo). `hasAccess` es siempre `true`: nadie se bloquea por el estado de la
+ * suscripción en sí.
+ */
 function computeAccess(sub: SubscriptionDates, now: Date): ConsultantAccessStatus {
   if (sub.status === "canceled") {
     return {
       status: "canceled",
-      hasAccess: false,
+      hasAccess: true,
+      isFreePlan: true,
       trialEndAt: sub.trialEndAt,
       currentPeriodStart: sub.currentPeriodStart,
       currentPeriodEnd: sub.currentPeriodEnd,
@@ -70,9 +92,11 @@ function computeAccess(sub: SubscriptionDates, now: Date): ConsultantAccessStatu
   // trialEndAt (una fecha de trial vieja nunca puede "revivir" después del primer pago).
   if (sub.currentPeriodEnd) {
     const active = now.getTime() <= sub.currentPeriodEnd.getTime();
+    const status: SubscriptionStatus = active ? "active" : "expired";
     return {
-      status: active ? "active" : "expired",
-      hasAccess: active,
+      status,
+      hasAccess: true,
+      isFreePlan: isFreePlan(status),
       trialEndAt: sub.trialEndAt,
       currentPeriodStart: sub.currentPeriodStart,
       currentPeriodEnd: sub.currentPeriodEnd,
@@ -80,22 +104,23 @@ function computeAccess(sub: SubscriptionDates, now: Date): ConsultantAccessStatu
     };
   }
 
-  const inTrial = now.getTime() <= sub.trialEndAt.getTime();
+  // Nunca pagó — "trial" para siempre, ya no vence por fecha (Prompt 14, P30).
   return {
-    status: inTrial ? "trial" : "expired",
-    hasAccess: inTrial,
+    status: "trial",
+    hasAccess: true,
+    isFreePlan: true,
     trialEndAt: sub.trialEndAt,
     currentPeriodStart: null,
     currentPeriodEnd: null,
-    daysRemaining: inTrial ? daysRemaining(now, sub.trialEndAt) : 0,
+    daysRemaining: 0,
   };
 }
 
 /**
  * Única fuente de verdad del acceso de una consultora. El acceso SIEMPRE se calcula al vuelo
  * a partir de las fechas — `subscriptions.status` es solo caché de lectura para el admin, y
- * esta función la autocorrige a "expired" cuando detecta que venció (nunca al revés: activar
- * una suscripción es exclusivamente responsabilidad del webhook de pago, no de una lectura).
+ * esta función la autocorrige cuando detecta que cambió (nunca al revés: activar una
+ * suscripción es exclusivamente responsabilidad del webhook de pago, no de una lectura).
  */
 export async function getConsultantAccessStatus(consultantId: number): Promise<ConsultantAccessStatus> {
   const sub = await storage.getSubscriptionByConsultantId(consultantId);
@@ -103,8 +128,9 @@ export async function getConsultantAccessStatus(consultantId: number): Promise<C
 
   if (!sub) {
     // No debería pasar en uso normal (toda consultora nace con su subscription) — sin fila,
-    // no hay acceso posible, nunca se inventa un trial fantasma para taparlo.
-    return { status: "expired", hasAccess: false, trialEndAt: null, currentPeriodStart: null, currentPeriodEnd: null, daysRemaining: 0 };
+    // igual queda en plan gratis (Prompt 14: nadie se bloquea por el estado), nunca se inventa
+    // un período pago fantasma.
+    return { status: "expired", hasAccess: true, isFreePlan: true, trialEndAt: null, currentPeriodStart: null, currentPeriodEnd: null, daysRemaining: 0 };
   }
 
   const computed = computeAccess({ ...sub, status: sub.status as SubscriptionStatus }, now);
@@ -123,6 +149,9 @@ export async function getConsultantAccessStatus(consultantId: number): Promise<C
   return computed;
 }
 
+/** Prompt 14 — ya no bloquea nada por sí sola (ver ConsultantAccessStatus.hasAccess): queda
+ * para quien todavía la llame, pero `requireActiveSubscription` deja de usarla para cortar
+ * requests. Lo real para saber si hay que limitar algo es `isFreePlan`. */
 export async function hasActiveAccess(consultantId: number): Promise<boolean> {
   return (await getConsultantAccessStatus(consultantId)).hasAccess;
 }

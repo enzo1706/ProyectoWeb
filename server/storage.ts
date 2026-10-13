@@ -25,6 +25,7 @@ import {
   createAppointmentSchema,
   updateAppointmentSchema,
   updateBusinessSettingsSchema,
+  updateConsultantProfileSchema,
   createProductSchema,
   updateProductSchema,
   appointmentStatuses,
@@ -90,7 +91,7 @@ import {
 } from "@shared/clientFilters";
 import { getArgentinaDateStr, getArgentinaMonth } from "@shared/argentinaTime";
 import { type ReportPeriodKind, getComparisonPeriod } from "@shared/reportsPeriods";
-import { normalizeArgentinaPhoneForStorage } from "@shared/phone";
+import { normalizeArgentinaPhoneForStorage, normalizeArgentinaPhoneDigits } from "@shared/phone";
 import { isKnownEventType, normalizeCustomEventTypeName, KNOWN_EVENT_TYPES } from "@shared/eventTypes";
 import type { z } from "zod";
 import { eq, ne, count, sql, and, gt, gte, lt, asc, desc, isNotNull, isNull, inArray, notInArray, ilike, or } from "drizzle-orm";
@@ -99,7 +100,7 @@ import { resolveStorageMode } from "./storage-mode";
 import { shouldUseTestDatabase } from "./test-db-guard";
 import { slugify } from "@shared/slug";
 import bcrypt from "bcryptjs";
-import { TRIAL_DAYS, PERIOD_DAYS } from "./config/subscription";
+import { TRIAL_DAYS, PERIOD_DAYS, FREE_PLAN_PRODUCT_LIMIT } from "./config/subscription";
 
 /** Misma fórmula que `computeDiscountEndsAt` de server/subscription.ts, duplicada acá adentro
  * (sin import) para no crear una dependencia circular storage.ts ↔ subscription.ts
@@ -136,10 +137,20 @@ export class ProductValidationError extends Error {}
 export class DuplicateEmailError extends Error {}
 /** Etapa 3 (registro): ya existe una cuenta con ese username — mapea a 409. */
 export class DuplicateUsernameError extends Error {}
+/** Prompt 14: ya existe otra cuenta con ese WhatsApp normalizado — mapea a 409, mismo
+ * criterio que DuplicateEmailError. */
+export class DuplicateWhatsAppError extends Error {}
+/** Prompt 14 (P30): el plan gratis llegó a FREE_PLAN_PRODUCT_LIMIT productos con stock y esta
+ * operación sumaría uno más — mapea a 403 (el payload es válido, lo que falta es el plan). */
+export class FreePlanProductLimitError extends Error {}
 
+/** Prompt 14 — ya no incluye `username`: el registro público deja de pedirlo, el backend lo
+ * deriva del email (ver deriveUniqueUsername). Las cuentas viejas con username propio siguen
+ * existiendo y pudiendo loguearse con él — esto solo afecta a las cuentas NUEVAS. */
 export interface RegisterConsultantInput {
-  username: string;
+  contactName: string;
   email: string;
+  whatsapp: string;
   password: string;
 }
 
@@ -256,6 +267,7 @@ export type UpdateSaleInput = z.infer<typeof updateSaleSchema>;
 export type CreateAppointmentInput = z.infer<typeof createAppointmentSchema>;
 export type UpdateAppointmentInput = z.infer<typeof updateAppointmentSchema>;
 export type UpdateBusinessSettingsInput = z.infer<typeof updateBusinessSettingsSchema>;
+export type UpdateConsultantProfileInput = z.infer<typeof updateConsultantProfileSchema>;
 export type CreateProductInput = z.infer<typeof createProductSchema>;
 export type UpdateProductInput = z.infer<typeof updateProductSchema>;
 export type SubscriptionUpdate = Partial<
@@ -669,6 +681,12 @@ export interface IStorage {
   listConsultantAccounts(): Promise<Consultant[]>;
   getBusinessSettings(consultantId: number): Promise<Consultant | undefined>;
   updateBusinessSettings(consultantId: number, input: UpdateBusinessSettingsInput): Promise<Consultant | undefined>;
+  /** Prompt 14 — Configuración → "Tus datos" (nombre, email, WhatsApp, ciudad, edad, cargo).
+   * El chequeo de "hace falta la contraseña actual para cambiar email/whatsapp" vive en el
+   * handler (routes.ts), que es quien tiene el hash de la cuenta — storage.ts solo escribe los
+   * campos ya validados. Tira `DuplicateEmailError`/`DuplicateWhatsAppError` si el nuevo valor
+   * ya lo usa otra cuenta. */
+  updateConsultantProfile(consultantId: number, input: UpdateConsultantProfileInput): Promise<Consultant | undefined>;
   /** Prompt 1/2 — una fila por pedido confirmado, para calcular el "descuento de compra
    * habitual" (ver server/orderDiscount.ts). Append-only, nunca se edita ni se borra. */
   createOrderDiscountLogEntry(consultantId: number, input: { discountPercent: number; publicValueArs: number }): Promise<OrderDiscountLogEntry>;
@@ -688,6 +706,9 @@ export interface IStorage {
   /** Recuperación de contraseña: el email vive en `consultants.email`, no en `users` — resuelve
    * el usuario consultora dueño de ese email ya normalizado. undefined si no existe ninguno. */
   getUserByConsultantEmail(normalizedEmail: string): Promise<User | undefined>;
+  /** Prompt 14 — mismo patrón que getUserByConsultantEmail, para el ingreso con WhatsApp
+   * (`consultants.whatsapp`, siempre ya normalizado a 10 dígitos). */
+  getUserByConsultantWhatsapp(normalizedWhatsapp: string): Promise<User | undefined>;
   /** Marca usados (sin poder volver a intentarse) todos los códigos de recuperación sin usar
    * de este usuario — se llama antes de crear uno nuevo (una solicitud nueva invalida
    * cualquier código anterior todavía pendiente) y también después de un reset exitoso. */
@@ -772,11 +793,17 @@ export interface IStorage {
   /** Admin-only: carga/actualiza el catálogo GLOBAL (consultantId null) — no toca stock de nadie. */
   bulkInsertProducts(items: InsertProduct[]): Promise<number>;
   /** Catálogo de prueba de una consultora (ej. botón "Cargar catálogo de prueba"): productos
-   * privados de ella, no globales — igual que bulkInsertProducts pero scopeado, con stock propio. */
-  seedOwnProducts(consultantId: number, items: CreateProductInput[]): Promise<number>;
+   * privados de ella, no globales — igual que bulkInsertProducts pero scopeado, con stock propio.
+   * Prompt 14 (P30) — mismo criterio de `isFreePlan` que el resto de los caminos que suman stock. */
+  seedOwnProducts(consultantId: number, items: CreateProductInput[], isFreePlan: boolean): Promise<number>;
   getLowStockProducts(consultantId: number): Promise<Product[]>;
   applyProductDiscount(consultantId: number, productId: number, discountPercent: number): Promise<Product | undefined>;
-  createProduct(consultantId: number, input: CreateProductInput): Promise<Product>;
+  /** Prompt 14 (P30) — `isFreePlan` lo decide SIEMPRE el caller (routes.ts, vía
+   * isFreePlan(status) de server/subscription.ts): storage.ts no puede importar ese módulo
+   * sin crear un ciclo (subscription.ts ya importa `storage` de acá). Si la consultora está
+   * en el plan gratis y este producto nace con `unidades > 0`, cuenta contra el cupo de
+   * FREE_PLAN_PRODUCT_LIMIT — tira `FreePlanProductLimitError` si ya está lleno. */
+  createProduct(consultantId: number, input: CreateProductInput, isFreePlan: boolean): Promise<Product>;
   /**
    * Etapa I-B.8-C: edita los campos CORE (nombre/precio/sección/línea/código) de un producto
    * MANUAL propio — nunca uno global (`consultantId` null), esos son catálogo compartido y no
@@ -809,11 +836,16 @@ export interface IStorage {
    * menciona el Prompt 2, a diferencia de un pedido nuevo). */
   setProductCost(consultantId: number, productId: number, costPrice: number): Promise<Product | undefined>;
   /** La consultora fija su propio stock sobre un producto (global o manual propio). `stockMinimo`
-   * es opcional: si viene, actualiza también el umbral propio del producto (null lo borra). */
+   * es opcional: si viene, actualiza también el umbral propio del producto (null lo borra).
+   * Prompt 14 (P30) — `isFreePlan` igual criterio que `createProduct`: si este SET lleva el
+   * producto de 0 (o inexistente) a más de 0 unidades ("reponer" cuenta como sumar uno nuevo,
+   * ver docs/prompts-mejoras.md Prompt 14), y ya está en el límite, tira
+   * `FreePlanProductLimitError`. Bajar o mantener unidades nunca se bloquea. */
   setProductStock(
     consultantId: number,
     productId: number,
     unidades: number,
+    isFreePlan: boolean,
     stockMinimo?: number | null,
   ): Promise<Product | undefined>;
   /** Pospone la alerta de stock bajo de este producto hasta `remindAt` (YYYY-MM-DD), o la
@@ -827,8 +859,9 @@ export interface IStorage {
    * `setProductStock`, que sigue siendo un SET ABSOLUTO para ajustes manuales — no la
    * reemplaza, coexisten. Tira `SaleValidationError` si el delta dejaría el stock negativo
    * (mismo error de dominio que ya usa `createSale`/`updateSale` para "stock insuficiente").
+   * Prompt 14 (P30) — mismo criterio de `isFreePlan` que `setProductStock`/`createProduct`.
    */
-  incrementProductStock(consultantId: number, productId: number, delta: number): Promise<Product | undefined>;
+  incrementProductStock(consultantId: number, productId: number, delta: number, isFreePlan: boolean): Promise<Product | undefined>;
   /** Etapa 7.2 — confirmación de pedido/importación como UNA sola operación atómica (todo o
    * nada), en vez del loop de `incrementProductStock` por línea que podía dejar una
    * importación aplicada a medias si una línea intermedia fallaba (hallazgo P2, Etapa 6).
@@ -836,10 +869,19 @@ export interface IStorage {
    * JS) que ya usa `incrementProductStock`, solo que ahora las líneas comparten una única
    * transacción. Si cualquier línea es inválida (producto no visible para este consultantId,
    * o el resultado quedaría negativo), tira `SaleValidationError` y NINGUNA línea queda
-   * aplicada — ni las que "ya habían pasado" antes en el loop. */
+   * aplicada — ni las que "ya habían pasado" antes en el loop.
+   * Prompt 14 (P30) — `isFreePlan`: si la consultora está en el plan gratis, cuenta cuántas
+   * líneas de este MISMO lote traen un producto de 0 (o inexistente) a positivo ("reponer"
+   * cuenta como nuevo) y, si sumadas al cupo ya ocupado superarían FREE_PLAN_PRODUCT_LIMIT,
+   * tira `FreePlanProductLimitError` ANTES de aplicar nada — todo o nada, igual que el resto
+   * de esta función. `cancelSale`/`updateSale` (el stock que "vuelve" al cancelar/editar una
+   * venta, nunca una carga) escriben `productStock.unidades` directo, sin pasar por esta
+   * función — por diseño nunca pueden quedar bloqueados por este límite, porque es una
+   * corrección, no una carga (ver docs/prompts-mejoras.md Prompt 14). */
   incrementProductStockBatch(
     consultantId: number,
     lines: { productId: number; delta: number }[],
+    isFreePlan: boolean,
     discountPercent?: number,
     draftId?: number,
   ): Promise<{ updated: number }>;
@@ -855,6 +897,10 @@ export interface IStorage {
    * del aviso en sí es otra tarea). Solo cuenta productos con unidades en stock: uno agotado y
    * sin costo no tiene ninguna urgencia de completarse. */
   countProductsWithoutCost(consultantId: number): Promise<number>;
+  /** Prompt 14 (P30) — cuántos productos tiene esta consultora con `unidades > 0` ahora mismo.
+   * Es el número real del cupo del plan gratis ("8 de 10 productos") y también la base del
+   * chequeo de límite (mismo WHERE que `countProductsWithoutCost`, sin el filtro de costo). */
+  countProductsWithStock(consultantId: number): Promise<number>;
   /** Admin-only: catálogo global completo (sin stock, eso es por consultora) para la pantalla de imágenes. */
   listGlobalProducts(): Promise<ProductRow[]>;
   /** Admin-only: solo aplica a productos globales — las imágenes de productos manuales las
@@ -1101,6 +1147,30 @@ export class DatabaseStorage implements IStorage {
     return updated;
   }
 
+  async updateConsultantProfile(consultantId: number, input: UpdateConsultantProfileInput): Promise<Consultant | undefined> {
+    const db = await this.getDb();
+    const setFields: Partial<typeof consultants.$inferInsert> = {};
+    if (input.contactName !== undefined) setFields.contactName = input.contactName;
+    if (input.email !== undefined) setFields.email = input.email === null ? null : normalizeEmail(input.email);
+    if (input.whatsapp !== undefined) setFields.whatsapp = input.whatsapp;
+    if (input.city !== undefined) setFields.city = input.city;
+    if (input.age !== undefined) setFields.age = input.age;
+    if (input.jobTitle !== undefined) setFields.jobTitle = input.jobTitle;
+
+    try {
+      const [updated] = await db.update(consultants).set(setFields).where(eq(consultants.id, consultantId)).returning();
+      return updated;
+    } catch (err) {
+      if (isUniqueViolationOn(err, "consultants_email_unique_idx")) {
+        throw new DuplicateEmailError("Ya existe otra cuenta con ese email");
+      }
+      if (isUniqueViolationOn(err, "consultants_whatsapp_unique_idx")) {
+        throw new DuplicateWhatsAppError("Ya existe otra cuenta con ese WhatsApp");
+      }
+      throw err;
+    }
+  }
+
   async createOrderDiscountLogEntry(consultantId: number, input: { discountPercent: number; publicValueArs: number }): Promise<OrderDiscountLogEntry> {
     const db = await this.getDb();
     const [entry] = await db
@@ -1142,19 +1212,52 @@ export class DatabaseStorage implements IStorage {
     return updated;
   }
 
+  /**
+   * Prompt 14 — el registro público ya no pide "usuario": se deriva de la parte del email
+   * antes del `@`. Nunca puede coincidir con la forma de un WhatsApp válido (10 dígitos
+   * argentinos tras normalizar) — si coincidiera, el orden de búsqueda del login
+   * (findUserForLogin: @ → email; si no, WhatsApp válido → WhatsApp; si no, usuario) nunca
+   * llegaría a buscarlo como usuario, porque ese string siempre se interpretaría como un
+   * WhatsApp primero. Tampoco puede repetir un username ya existente (cuentas viejas con
+   * usuario propio). En cualquiera de los dos casos, se le agrega un sufijo numérico.
+   */
+  private async deriveUniqueUsername(db: Pick<Database, "select">, email: string): Promise<string> {
+    const localPart = email.split("@")[0]?.trim().toLowerCase() || "consultora";
+    let suffix = 0;
+    while (true) {
+      const candidate = suffix === 0 ? localPart : `${localPart}${suffix}`;
+      const looksLikeWhatsapp = normalizeArgentinaPhoneDigits(candidate).valid;
+      if (!looksLikeWhatsapp) {
+        const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.username, candidate));
+        if (!existing) return candidate;
+      }
+      suffix += 1;
+    }
+  }
+
   async registerConsultant(input: RegisterConsultantInput): Promise<{ user: User; consultant: Consultant }> {
     const db = await this.getDb();
     const normalizedEmail = normalizeEmail(input.email);
+    const normalizedWhatsapp = normalizeArgentinaPhoneForStorage(input.whatsapp);
     const hashedPassword = await bcrypt.hash(input.password, BCRYPT_SALT_ROUNDS);
 
     try {
       // Mismo criterio transaccional que createUser: consultant + trial + user nacen juntos o
-      // no nace ninguno — acá además el email queda seteado desde el vamos, en la misma
-      // transacción (a diferencia del flujo de suscripción, que lo completa después).
+      // no nace ninguno — acá además el email/whatsapp quedan seteados desde el vamos, en la
+      // misma transacción (a diferencia del flujo de suscripción, que completa el email después).
       return await db.transaction(async (tx) => {
+        const username = await this.deriveUniqueUsername(tx, normalizedEmail);
+
         const [consultant] = await tx
           .insert(consultants)
-          .values({ businessName: input.username, currency: "ARS", monthlyGoal: null, email: normalizedEmail })
+          .values({
+            businessName: "",
+            currency: "ARS",
+            monthlyGoal: null,
+            email: normalizedEmail,
+            whatsapp: normalizedWhatsapp,
+            contactName: input.contactName,
+          })
           .returning();
 
         const trialStartAt = new Date();
@@ -1165,7 +1268,7 @@ export class DatabaseStorage implements IStorage {
 
         const [user] = await tx
           .insert(users)
-          .values({ username: input.username, password: hashedPassword, role: "consultant", status: true, consultantId: consultant.id })
+          .values({ username, password: hashedPassword, role: "consultant", status: true, consultantId: consultant.id })
           .returning();
 
         return { user, consultant };
@@ -1173,6 +1276,9 @@ export class DatabaseStorage implements IStorage {
     } catch (err) {
       if (isUniqueViolationOn(err, "consultants_email_unique_idx")) {
         throw new DuplicateEmailError("Ya existe una cuenta con ese email");
+      }
+      if (isUniqueViolationOn(err, "consultants_whatsapp_unique_idx")) {
+        throw new DuplicateWhatsAppError("Ya existe una cuenta con ese WhatsApp");
       }
       if (isUniqueViolationOn(err, "users_username_unique")) {
         throw new DuplicateUsernameError("Ese nombre de usuario ya está en uso");
@@ -1188,6 +1294,17 @@ export class DatabaseStorage implements IStorage {
       .from(consultants)
       .innerJoin(users, eq(users.consultantId, consultants.id))
       .where(and(eq(consultants.email, normalizedEmail), eq(users.role, "consultant")));
+    return row?.user;
+  }
+
+  /** Prompt 14 — mismo patrón que getUserByConsultantEmail, para el ingreso con WhatsApp. */
+  async getUserByConsultantWhatsapp(normalizedWhatsapp: string): Promise<User | undefined> {
+    const db = await this.getDb();
+    const [row] = await db
+      .select({ user: users })
+      .from(consultants)
+      .innerJoin(users, eq(users.consultantId, consultants.id))
+      .where(and(eq(consultants.whatsapp, normalizedWhatsapp), eq(users.role, "consultant")));
     return row?.user;
   }
 
@@ -1730,8 +1847,10 @@ export class DatabaseStorage implements IStorage {
 
   /** Mismo patrón select-then-upsert que bulkInsertProducts, pero scopeado a UNA consultora
    * (productos privados, no globales) y sembrando también su propio stock en la misma pasada —
-   * usado por el botón "Cargar catálogo de prueba". Idempotente: reintentar no duplica. */
-  async seedOwnProducts(consultantId: number, items: CreateProductInput[]): Promise<number> {
+   * usado por el botón "Cargar catálogo de prueba". Idempotente: reintentar no duplica.
+   * Prompt 14 (P30) — mismo chequeo de límite que el resto de los caminos que suman stock: sin
+   * esto, este botón sería una puerta trasera para esquivar el cupo del plan gratis. */
+  async seedOwnProducts(consultantId: number, items: CreateProductInput[], isFreePlan: boolean): Promise<number> {
     if (items.length === 0) return 0;
 
     const db = await this.getDb();
@@ -1779,6 +1898,12 @@ export class DatabaseStorage implements IStorage {
             .returning();
           productId = created.id;
         }
+
+        const [existingStock] = await tx
+          .select({ unidades: productStock.unidades })
+          .from(productStock)
+          .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, productId)));
+        await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, existingStock?.unidades ?? 0, item.unidades);
 
         await tx
           .insert(productStock)
@@ -1836,11 +1961,40 @@ export class DatabaseStorage implements IStorage {
     return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
   }
 
-  async createProduct(consultantId: number, input: CreateProductInput): Promise<Product> {
+  /**
+   * Prompt 14 (P30) — chequeo del límite del plan gratis, reusado por createProduct/
+   * setProductStock/incrementProductStock/incrementProductStockBatch/seedOwnProducts. Solo
+   * bloquea cuando el producto pasa de "sin stock" (0 o inexistente) a "con stock"
+   * (`newUnidades > 0`) — sumar a algo que ya tenía stock es libre, sin importar el plan.
+   * Cuenta DENTRO de `tx` (la misma transacción que va a escribir el cambio) para que el
+   * conteo sea consistente con lo que esta operación está a punto de aplicar — nunca lee desde
+   * afuera de la transacción que aplicaría el cambio.
+   */
+  private async assertFreePlanProductLimit(
+    tx: Pick<Database, "select">,
+    consultantId: number,
+    isFreePlan: boolean,
+    previousUnidades: number,
+    newUnidades: number,
+  ): Promise<void> {
+    if (!isFreePlan || previousUnidades > 0 || newUnidades <= 0) return;
+    const [row] = await tx
+      .select({ value: count() })
+      .from(productStock)
+      .where(and(eq(productStock.consultantId, consultantId), gt(productStock.unidades, 0)));
+    if ((row?.value ?? 0) >= FREE_PLAN_PRODUCT_LIMIT) {
+      throw new FreePlanProductLimitError(
+        `Llegaste al límite de la prueba gratis (${FREE_PLAN_PRODUCT_LIMIT} productos). Suscribite para cargar todos los que quieras.`,
+      );
+    }
+  }
+
+  async createProduct(consultantId: number, input: CreateProductInput, isFreePlan: boolean): Promise<Product> {
     const db = await this.getDb();
     const variante = input.variante ?? "Estándar";
     const codigo = input.codigo ?? slugify(`${input.seccion}-${input.linea ?? ""}-${input.producto}-${variante}-${Date.now()}`);
     const [created, stock] = await db.transaction(async (tx) => {
+      await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, 0, input.unidades);
       const [created] = await tx
         .insert(products)
         .values({
@@ -2006,6 +2160,7 @@ export class DatabaseStorage implements IStorage {
     consultantId: number,
     productId: number,
     unidades: number,
+    isFreePlan: boolean,
     stockMinimo?: number | null,
   ): Promise<Product | undefined> {
     const db = await this.getDb();
@@ -2015,18 +2170,27 @@ export class DatabaseStorage implements IStorage {
     const setFields: Partial<typeof productStock.$inferInsert> = { unidades };
     if (stockMinimo !== undefined) setFields.stockMinimo = stockMinimo;
 
-    const [stock] = await db
-      .insert(productStock)
-      .values({ consultantId, productId, ...setFields })
-      .onConflictDoUpdate({
-        target: [productStock.consultantId, productStock.productId],
-        set: setFields,
-      })
-      .returning();
+    const stock = await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select({ unidades: productStock.unidades })
+        .from(productStock)
+        .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, productId)));
+      await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, existing?.unidades ?? 0, unidades);
+
+      const [stock] = await tx
+        .insert(productStock)
+        .values({ consultantId, productId, ...setFields })
+        .onConflictDoUpdate({
+          target: [productStock.consultantId, productStock.productId],
+          set: setFields,
+        })
+        .returning();
+      return stock;
+    });
     return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
   }
 
-  async incrementProductStock(consultantId: number, productId: number, delta: number): Promise<Product | undefined> {
+  async incrementProductStock(consultantId: number, productId: number, delta: number, isFreePlan: boolean): Promise<Product | undefined> {
     if (delta === 0) {
       throw new SaleValidationError("El delta de stock no puede ser 0");
     }
@@ -2056,6 +2220,10 @@ export class DatabaseStorage implements IStorage {
       if (stock.unidades < 0) {
         throw new SaleValidationError(`Stock insuficiente: quedarían ${stock.unidades} unidades`);
       }
+      // previousUnidades = stock.unidades - delta: el UPSERT ya aplicó +delta, así que el valor
+      // de ANTES se reconstruye sin una SELECT aparte (0 si la fila era nueva, igual que si
+      // delta se aplicó sobre una fila inexistente).
+      await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - delta, stock.unidades);
       return stock;
     });
 
@@ -2065,6 +2233,7 @@ export class DatabaseStorage implements IStorage {
   async incrementProductStockBatch(
     consultantId: number,
     lines: { productId: number; delta: number }[],
+    isFreePlan: boolean,
     discountPercent?: number,
     draftId?: number,
   ): Promise<{ updated: number }> {
@@ -2139,6 +2308,7 @@ export class DatabaseStorage implements IStorage {
           if (stock.unidades < 0) {
             throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${stock.unidades} unidades`);
           }
+          await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - delta, stock.unidades);
           continue;
         }
 
@@ -2168,6 +2338,7 @@ export class DatabaseStorage implements IStorage {
         if (stock.unidades < 0) {
           throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${stock.unidades} unidades`);
         }
+        await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - delta, stock.unidades);
       }
 
       // Prompt 7, punto 2: mismo criterio que createSale.draftId — si este pedido viene de un
@@ -2232,6 +2403,15 @@ export class DatabaseStorage implements IStorage {
       .select({ value: count() })
       .from(productStock)
       .where(and(eq(productStock.consultantId, consultantId), isNull(productStock.costPrice), gt(productStock.unidades, 0)));
+    return row?.value ?? 0;
+  }
+
+  async countProductsWithStock(consultantId: number): Promise<number> {
+    const db = await this.getDb();
+    const [row] = await db
+      .select({ value: count() })
+      .from(productStock)
+      .where(and(eq(productStock.consultantId, consultantId), gt(productStock.unidades, 0)));
     return row?.value ?? 0;
   }
 
@@ -4323,6 +4503,28 @@ export class MemoryStorage implements IStorage {
     return this.products.find((p) => p.id === productId && (p.consultantId === null || p.consultantId === consultantId));
   }
 
+  /** Espejo de DatabaseStorage.assertFreePlanProductLimit. `extraAlreadyCountedThisBatch` es
+   * solo para incrementProductStockBatch (dos pasadas, sin mutar nada hasta la segunda): cuántos
+   * productos de ESTE MISMO lote ya se planearon como "nuevos" antes de esta línea, porque
+   * `this.productStock` todavía no los refleja (a diferencia de los demás métodos, que mutan
+   * de inmediato y por eso nunca necesitan este extra). */
+  private assertFreePlanProductLimitMem(
+    consultantId: number,
+    isFreePlan: boolean,
+    previousUnidades: number,
+    newUnidades: number,
+    extraAlreadyCountedThisBatch = 0,
+  ): void {
+    if (!isFreePlan || previousUnidades > 0 || newUnidades <= 0) return;
+    const currentCount =
+      this.productStock.filter((s) => s.consultantId === consultantId && s.unidades > 0).length + extraAlreadyCountedThisBatch;
+    if (currentCount >= FREE_PLAN_PRODUCT_LIMIT) {
+      throw new FreePlanProductLimitError(
+        `Llegaste al límite de la prueba gratis (${FREE_PLAN_PRODUCT_LIMIT} productos). Suscribite para cargar todos los que quieras.`,
+      );
+    }
+  }
+
   /** Espejo de DatabaseStorage.resolveHabitualDiscountPercent. */
   private resolveHabitualDiscountPercentMem(consultantId: number): number {
     const since = new Date(Date.now() - HABITUAL_DISCOUNT_WINDOW_MS);
@@ -4357,6 +4559,11 @@ export class MemoryStorage implements IStorage {
         monthlyGoal: null,
         defaultLowStockThreshold: null,
         email: null,
+        whatsapp: null,
+        contactName: null,
+        city: null,
+        age: null,
+        jobTitle: null,
         orderReminderDay1: null,
         orderReminderDay2: null,
         grossIncomeTaxPercentTenths: null,
@@ -4428,6 +4635,31 @@ export class MemoryStorage implements IStorage {
     return consultant;
   }
 
+  async updateConsultantProfile(consultantId: number, input: UpdateConsultantProfileInput): Promise<Consultant | undefined> {
+    const consultant = this.consultants.find((c) => c.id === consultantId);
+    if (!consultant) return undefined;
+
+    if (input.email !== undefined) {
+      const normalized = input.email === null ? null : normalizeEmail(input.email);
+      if (normalized !== null && this.consultants.some((c) => c.id !== consultantId && c.email === normalized)) {
+        throw new DuplicateEmailError("Ya existe otra cuenta con ese email");
+      }
+      consultant.email = normalized;
+    }
+    if (input.whatsapp !== undefined) {
+      if (input.whatsapp !== null && this.consultants.some((c) => c.id !== consultantId && c.whatsapp === input.whatsapp)) {
+        throw new DuplicateWhatsAppError("Ya existe otra cuenta con ese WhatsApp");
+      }
+      consultant.whatsapp = input.whatsapp;
+    }
+    if (input.contactName !== undefined) consultant.contactName = input.contactName;
+    if (input.city !== undefined) consultant.city = input.city;
+    if (input.age !== undefined) consultant.age = input.age;
+    if (input.jobTitle !== undefined) consultant.jobTitle = input.jobTitle;
+
+    return consultant;
+  }
+
   async createOrderDiscountLogEntry(consultantId: number, input: { discountPercent: number; publicValueArs: number }): Promise<OrderDiscountLogEntry> {
     const entry: OrderDiscountLogEntry = {
       id: this.nextOrderDiscountLogId++,
@@ -4457,24 +4689,45 @@ export class MemoryStorage implements IStorage {
     return consultant;
   }
 
+  /** Espejo de DatabaseStorage.deriveUniqueUsername. */
+  private deriveUniqueUsernameMem(email: string): string {
+    const localPart = email.split("@")[0]?.trim().toLowerCase() || "consultora";
+    let suffix = 0;
+    while (true) {
+      const candidate = suffix === 0 ? localPart : `${localPart}${suffix}`;
+      const looksLikeWhatsapp = normalizeArgentinaPhoneDigits(candidate).valid;
+      if (!looksLikeWhatsapp && !this.users.some((u) => u.username === candidate)) {
+        return candidate;
+      }
+      suffix += 1;
+    }
+  }
+
   async registerConsultant(input: RegisterConsultantInput): Promise<{ user: User; consultant: Consultant }> {
     const normalizedEmail = normalizeEmail(input.email);
-    if (this.users.some((u) => u.username === input.username)) {
-      throw new DuplicateUsernameError("Ese nombre de usuario ya está en uso");
-    }
+    const normalizedWhatsapp = normalizeArgentinaPhoneForStorage(input.whatsapp);
     if (this.consultants.some((c) => c.email === normalizedEmail)) {
       throw new DuplicateEmailError("Ya existe una cuenta con ese email");
     }
+    if (normalizedWhatsapp !== null && this.consultants.some((c) => c.whatsapp === normalizedWhatsapp)) {
+      throw new DuplicateWhatsAppError("Ya existe una cuenta con ese WhatsApp");
+    }
 
     const hashedPassword = await bcrypt.hash(input.password, BCRYPT_SALT_ROUNDS);
+    const username = this.deriveUniqueUsernameMem(normalizedEmail);
 
     const consultant: Consultant = {
       id: this.nextConsultantId++,
-      businessName: input.username,
+      businessName: "",
       currency: "ARS",
       monthlyGoal: null,
       defaultLowStockThreshold: null,
       email: normalizedEmail,
+      whatsapp: normalizedWhatsapp,
+      contactName: input.contactName,
+      city: null,
+      age: null,
+      jobTitle: null,
       orderReminderDay1: null,
       orderReminderDay2: null,
       grossIncomeTaxPercentTenths: null,
@@ -4487,7 +4740,7 @@ export class MemoryStorage implements IStorage {
 
     const user: User = {
       id: this.nextUserId++,
-      username: input.username,
+      username,
       password: hashedPassword,
       role: "consultant",
       status: true,
@@ -4500,6 +4753,12 @@ export class MemoryStorage implements IStorage {
 
   async getUserByConsultantEmail(normalizedEmail: string): Promise<User | undefined> {
     const consultant = this.consultants.find((c) => c.email === normalizedEmail);
+    if (!consultant) return undefined;
+    return this.users.find((u) => u.consultantId === consultant.id && u.role === "consultant");
+  }
+
+  async getUserByConsultantWhatsapp(normalizedWhatsapp: string): Promise<User | undefined> {
+    const consultant = this.consultants.find((c) => c.whatsapp === normalizedWhatsapp);
     if (!consultant) return undefined;
     return this.users.find((u) => u.consultantId === consultant.id && u.role === "consultant");
   }
@@ -4952,7 +5211,7 @@ export class MemoryStorage implements IStorage {
 
   /** Catálogo de prueba de UNA consultora — productos privados (no globales), con su propio
    * stock sembrado en la misma pasada. Idempotente, igual que bulkInsertProducts. */
-  async seedOwnProducts(consultantId: number, items: CreateProductInput[]): Promise<number> {
+  async seedOwnProducts(consultantId: number, items: CreateProductInput[], isFreePlan: boolean): Promise<number> {
     let changed = 0;
 
     for (const item of items) {
@@ -4988,6 +5247,7 @@ export class MemoryStorage implements IStorage {
       }
 
       const stock = this.getOrCreateStock(consultantId, product.id);
+      this.assertFreePlanProductLimitMem(consultantId, isFreePlan, stock.unidades, item.unidades);
       stock.unidades = item.unidades;
       changed++;
     }
@@ -5017,9 +5277,10 @@ export class MemoryStorage implements IStorage {
     return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
-  async createProduct(consultantId: number, input: CreateProductInput): Promise<Product> {
+  async createProduct(consultantId: number, input: CreateProductInput, isFreePlan: boolean): Promise<Product> {
     const variante = input.variante ?? "Estándar";
     const codigo = input.codigo ?? slugify(`${input.seccion}-${input.linea ?? ""}-${input.producto}-${variante}-${Date.now()}`);
+    this.assertFreePlanProductLimitMem(consultantId, isFreePlan, 0, input.unidades);
     const product: ProductRow = {
       id: this.nextProductId++,
       consultantId,
@@ -5105,17 +5366,19 @@ export class MemoryStorage implements IStorage {
     consultantId: number,
     productId: number,
     unidades: number,
+    isFreePlan: boolean,
     stockMinimo?: number | null,
   ): Promise<Product | undefined> {
     const product = this.findVisibleProduct(consultantId, productId);
     if (!product) return undefined;
     const stock = this.getOrCreateStock(consultantId, productId);
+    this.assertFreePlanProductLimitMem(consultantId, isFreePlan, stock.unidades, unidades);
     stock.unidades = unidades;
     if (stockMinimo !== undefined) stock.stockMinimo = stockMinimo;
     return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
-  async incrementProductStock(consultantId: number, productId: number, delta: number): Promise<Product | undefined> {
+  async incrementProductStock(consultantId: number, productId: number, delta: number, isFreePlan: boolean): Promise<Product | undefined> {
     if (delta === 0) {
       throw new SaleValidationError("El delta de stock no puede ser 0");
     }
@@ -5129,6 +5392,7 @@ export class MemoryStorage implements IStorage {
     if (nextUnidades < 0) {
       throw new SaleValidationError(`Stock insuficiente: quedarían ${nextUnidades} unidades`);
     }
+    this.assertFreePlanProductLimitMem(consultantId, isFreePlan, stock.unidades, nextUnidades);
     stock.unidades = nextUnidades;
     return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
@@ -5136,6 +5400,7 @@ export class MemoryStorage implements IStorage {
   async incrementProductStockBatch(
     consultantId: number,
     lines: { productId: number; delta: number }[],
+    isFreePlan: boolean,
     discountPercent?: number,
     draftId?: number,
   ): Promise<{ updated: number }> {
@@ -5152,6 +5417,10 @@ export class MemoryStorage implements IStorage {
     }
 
     const orderedProductIds = Array.from(deltaByProductId.keys()).sort((a, b) => a - b);
+    // Prompt 14 (P30) — cuántas líneas de ESTE lote ya se planearon como "nuevas" (0 → positivo)
+    // antes de la línea actual del loop de abajo: `this.productStock` todavía no las refleja
+    // (recién se aplican en la segunda pasada), así que el chequeo de límite las cuenta aparte.
+    let newProductsPlannedThisBatch = 0;
 
     // Lógicamente atómico sin transacción real (no hay DB acá): DOS pasadas. La primera valida
     // TODO (visibilidad + resultado no negativo) sin escribir nada; recién si las N líneas
@@ -5174,6 +5443,8 @@ export class MemoryStorage implements IStorage {
       if (nextUnidades < 0) {
         throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${nextUnidades} unidades`);
       }
+      this.assertFreePlanProductLimitMem(consultantId, isFreePlan, stock.unidades, nextUnidades, newProductsPlannedThisBatch);
+      if (stock.unidades <= 0 && nextUnidades > 0) newProductsPlannedThisBatch++;
       if (discountPercent === undefined) {
         planned.push({ stock, nextUnidades });
         continue;
@@ -5235,6 +5506,10 @@ export class MemoryStorage implements IStorage {
 
   async countProductsWithoutCost(consultantId: number): Promise<number> {
     return this.productStock.filter((s) => s.consultantId === consultantId && s.costPrice === null && s.unidades > 0).length;
+  }
+
+  async countProductsWithStock(consultantId: number): Promise<number> {
+    return this.productStock.filter((s) => s.consultantId === consultantId && s.unidades > 0).length;
   }
 
   async setProductStockReminder(consultantId: number, productId: number, remindAt: string | null): Promise<Product | undefined> {

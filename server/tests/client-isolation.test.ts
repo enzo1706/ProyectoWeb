@@ -65,7 +65,7 @@ async function loginAs(username: string): Promise<string> {
   const res = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password: PASSWORD }),
+    body: JSON.stringify({ identifier: username, password: PASSWORD }),
   });
   expect(res.status).toBe(200);
   const setCookie = res.headers.get("set-cookie");
