@@ -33,6 +33,7 @@ import { getProductCategories, toneFamilyKey } from "@/lib/productCategories";
 import { LoadOrderDialog } from "@/components/LoadOrderDialog";
 import { UnfinishedDraftsSection } from "@/components/UnfinishedDraftsSection";
 import { AddProductDialog } from "@/components/stock/AddProductDialog";
+import { FreePlanLimitDialog, isFreePlanLimitError } from "@/components/FreePlanLimitDialog";
 import { EditProductDialog } from "@/components/stock/EditProductDialog";
 import { ProductGroup } from "@/components/stock/ProductRow";
 import {
@@ -134,6 +135,7 @@ export default function Productos() {
   const [showPublicPrice, setShowPublicPrice] = useState(true);
   const [addProductOpen, setAddProductOpen] = useState(false);
   const [loadOrderOpen, setLoadOrderOpen] = useState(false);
+  const [freePlanLimitOpen, setFreePlanLimitOpen] = useState(false);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [resumingOrderDraft, setResumingOrderDraft] = useState<Draft | null>(null);
 
@@ -210,6 +212,10 @@ export default function Productos() {
       });
     },
     onError: (err: Error) => {
+      if (isFreePlanLimitError(err)) {
+        setFreePlanLimitOpen(true);
+        return;
+      }
       toast({
         title: "No se pudo cargar el catálogo",
         description: err.message,
@@ -425,6 +431,12 @@ export default function Productos() {
         }}
         products={products}
         draftToResume={resumingOrderDraft}
+      />
+
+      <FreePlanLimitDialog
+        open={freePlanLimitOpen}
+        onOpenChange={setFreePlanLimitOpen}
+        limit={subscriptionStatus?.freePlanProductLimit ?? 10}
       />
     </div>
   );

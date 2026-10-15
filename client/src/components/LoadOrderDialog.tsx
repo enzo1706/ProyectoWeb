@@ -25,7 +25,7 @@ import { ChevronDown, Minus, Package, Pencil, Plus, Search, Trash2, Upload } fro
 import { ImportProductsDialog, type ImportedOrderLine } from "./ImportProductsDialog";
 import { UnsavedDraftAlert } from "./UnsavedDraftAlert";
 import { useDraftAutosave } from "@/hooks/use-draft-autosave";
-import { FreePlanLimitDialog } from "@/components/FreePlanLimitDialog";
+import { FreePlanLimitDialog, isFreePlanLimitError } from "@/components/FreePlanLimitDialog";
 
 interface SubscriptionStatus {
   isFreePlan: boolean;
@@ -528,6 +528,10 @@ export function LoadOrderDialog({ open, onOpenChange, products, draftToResume }:
       // aplicó ninguna línea, así que no hace falta "reflejar un estado parcial": no lo hay.
       // El diálogo queda abierto a propósito para poder reintentar.
       queryClient.invalidateQueries({ queryKey: ["/api/products"] });
+      if (isFreePlanLimitError(err)) {
+        setFreePlanLimitOpen(true);
+        return;
+      }
       toast({ title: "Hubo un problema al cargar el pedido", description: err.message, variant: "destructive" });
     },
   });
