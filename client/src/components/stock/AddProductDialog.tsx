@@ -40,6 +40,13 @@ import { ChevronDown } from "lucide-react";
 import { getProductCategories } from "@/lib/productCategories";
 import { CategorySelect } from "./CategorySelect";
 import { CostInputBlock, EMPTY_COST_INPUT, resolveCostInputForSubmit, type CostInputValue } from "./CostInputBlock";
+import { FreePlanLimitDialog } from "@/components/FreePlanLimitDialog";
+
+interface SubscriptionStatus {
+  isFreePlan: boolean;
+  productsWithStockCount: number | null;
+  freePlanProductLimit: number;
+}
 
 const manualProductFormSchema = createProductSchema.extend({
   precio: z.string().min(1, "El precio es obligatorio"),
@@ -64,9 +71,16 @@ export function AddProductDialog({
   const [costInput, setCostInput] = useState<CostInputValue>(EMPTY_COST_INPUT);
   const [moreDataOpen, setMoreDataOpen] = useState(false);
   const [confirmNoCostOpen, setConfirmNoCostOpen] = useState(false);
+  const [freePlanLimitOpen, setFreePlanLimitOpen] = useState(false);
 
   const { data: settings } = useQuery<{ habitualDiscountPercent: number }>({
     queryKey: ["/api/business-settings"],
+    enabled: open,
+  });
+  // Prompt 14 (P30) — mismo queryKey que Subscription.tsx/Dashboard: react-query reusa el
+  // cache, no dispara una consulta de más.
+  const { data: subscriptionStatus } = useQuery<SubscriptionStatus>({
+    queryKey: ["/api/subscription/status"],
     enabled: open,
   });
   const habitualDiscountPercent = Math.round(settings?.habitualDiscountPercent ?? 35);
@@ -117,7 +131,19 @@ export function AddProductDialog({
     },
   });
 
+  // Prompt 14 (P30) — un producto manual nuevo con unidades > 0 SIEMPRE suma uno al conteo de
+  // "productos con stock" (nunca existía antes), así que alcanza con mirar el conteo actual —
+  // a diferencia del catálogo (LoadOrderDialog), donde cada producto puede ya tener stock.
+  const wouldExceedFreePlanLimit = (data: ManualProductFormData) =>
+    !!subscriptionStatus?.isFreePlan &&
+    (subscriptionStatus.productsWithStockCount ?? 0) >= subscriptionStatus.freePlanProductLimit &&
+    Number(data.unidades || 0) > 0;
+
   const submit = (data: ManualProductFormData) => {
+    if (wouldExceedFreePlanLimit(data)) {
+      setFreePlanLimitOpen(true);
+      return;
+    }
     const costPayload = resolveCostInputForSubmit(costInput);
     if (!costPayload) {
       setConfirmNoCostOpen(true);
@@ -308,6 +334,12 @@ export function AddProductDialog({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <FreePlanLimitDialog
+        open={freePlanLimitOpen}
+        onOpenChange={setFreePlanLimitOpen}
+        limit={subscriptionStatus?.freePlanProductLimit ?? 10}
+      />
     </>
   );
 }

@@ -145,6 +145,16 @@ export default function Productos() {
     queryKey: ["/api/reports/stock-valuation"],
   });
 
+  // Prompt 14 (P30) — mismo queryKey que Subscription.tsx/Dashboard: react-query reusa el
+  // cache, no dispara una consulta de más.
+  const { data: subscriptionStatus } = useQuery<{
+    isFreePlan: boolean;
+    productsWithStockCount: number | null;
+    freePlanProductLimit: number;
+  }>({
+    queryKey: ["/api/subscription/status"],
+  });
+
   const categories = useMemo(() => getProductCategories(products), [products]);
 
   const totalUnidades = useMemo(() => products.reduce((sum, p) => sum + p.unidades, 0), [products]);
@@ -255,6 +265,14 @@ export default function Productos() {
         {!isLoading && products.length > 0 && (
           <p className="text-sm text-muted-foreground" data-testid="text-catalog-summary">
             {products.length} producto{products.length !== 1 ? "s" : ""} · {totalUnidades} unidad{totalUnidades !== 1 ? "es" : ""}
+          </p>
+        )}
+        {/* Prompt 14 (P30) — línea chica del plan gratis, texto exacto aprobado. */}
+        {subscriptionStatus?.isFreePlan && (
+          <p className="text-xs text-muted-foreground" data-testid="text-free-plan-stock-status">
+            {(subscriptionStatus.productsWithStockCount ?? 0) >= subscriptionStatus.freePlanProductLimit
+              ? `Prueba gratis: llegaste al límite de ${subscriptionStatus.freePlanProductLimit} productos. Para sumar nuevos o reponer los agotados, suscribite.`
+              : `Prueba gratis: ${subscriptionStatus.productsWithStockCount ?? 0} de ${subscriptionStatus.freePlanProductLimit} productos.`}
           </p>
         )}
       </header>
