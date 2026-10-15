@@ -9,6 +9,19 @@ import {
   AlertDialogAction,
   AlertDialogCancel,
 } from "@/components/ui/alert-dialog";
+import { ApiError } from "@/lib/queryClient";
+
+/**
+ * Prompt 14 (P30), ajuste — si el servidor rechaza por el límite del plan gratis desde
+ * CUALQUIER camino (FreePlanProductLimitError, server/storage.ts → 403), el cartel tiene que
+ * ser este mismo diálogo, nunca un toast — aunque el chequeo del lado del cliente ya haya
+ * dejado pasar la acción (ej. una carga de catálogo de prueba, o una carrera entre dos
+ * pestañas/dispositivos). Detecta por status + el texto exacto aprobado, nunca solo por status
+ * (un 403 también puede ser, por ejemplo, "no tenés acceso").
+ */
+export function isFreePlanLimitError(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 403 && err.message.includes("límite de la prueba gratis");
+}
 
 /**
  * Prompt 14 (P30) — cartel al llegar al límite de productos del plan gratis. Texto exacto

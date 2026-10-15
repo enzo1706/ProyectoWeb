@@ -40,7 +40,7 @@ import { ChevronDown } from "lucide-react";
 import { getProductCategories } from "@/lib/productCategories";
 import { CategorySelect } from "./CategorySelect";
 import { CostInputBlock, EMPTY_COST_INPUT, resolveCostInputForSubmit, type CostInputValue } from "./CostInputBlock";
-import { FreePlanLimitDialog } from "@/components/FreePlanLimitDialog";
+import { FreePlanLimitDialog, isFreePlanLimitError } from "@/components/FreePlanLimitDialog";
 
 interface SubscriptionStatus {
   isFreePlan: boolean;
@@ -127,6 +127,10 @@ export function AddProductDialog({
       onOpenChange(false);
     },
     onError: (err: Error) => {
+      if (isFreePlanLimitError(err)) {
+        setFreePlanLimitOpen(true);
+        return;
+      }
       toast({ title: "No se pudo agregar el producto", description: err.message, variant: "destructive" });
     },
   });

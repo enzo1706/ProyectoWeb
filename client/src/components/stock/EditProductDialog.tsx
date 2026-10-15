@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -39,6 +40,7 @@ import { getProductCategories } from "@/lib/productCategories";
 import { Trash2 } from "lucide-react";
 import { CategorySelect } from "./CategorySelect";
 import { CostInputBlock, resolveCostInputForSubmit, type CostInputValue } from "./CostInputBlock";
+import { FreePlanLimitDialog, isFreePlanLimitError } from "@/components/FreePlanLimitDialog";
 
 const editProductFormSchema = z.object({
   seccion: z.string().trim().min(1, "La categoría es obligatoria").optional(),
@@ -90,6 +92,13 @@ export function EditProductDialog({
   const [startingCostInput, setStartingCostInput] = useState<CostInputValue>({ mode: "none", percent: null, direct: "" });
   const [useCatalogPrice, setUseCatalogPrice] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [freePlanLimitOpen, setFreePlanLimitOpen] = useState(false);
+  // Prompt 14 (P30) — mismo queryKey que Subscription.tsx/Dashboard: react-query reusa el
+  // cache, no dispara una consulta de más.
+  const { data: subscriptionStatus } = useQuery<{ freePlanProductLimit: number }>({
+    queryKey: ["/api/subscription/status"],
+    enabled: open,
+  });
 
   const form = useForm<EditProductFormData>({
     resolver: zodResolver(editProductFormSchema),
@@ -158,6 +167,10 @@ export function EditProductDialog({
       onOpenChange(false);
     },
     onError: (err: Error) => {
+      if (isFreePlanLimitError(err)) {
+        setFreePlanLimitOpen(true);
+        return;
+      }
       toast({ title: "No se pudo actualizar el producto", description: err.message, variant: "destructive" });
     },
   });
@@ -435,6 +448,12 @@ export function EditProductDialog({
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
+
+    <FreePlanLimitDialog
+      open={freePlanLimitOpen}
+      onOpenChange={setFreePlanLimitOpen}
+      limit={subscriptionStatus?.freePlanProductLimit ?? 10}
+    />
     </>
   );
 }
