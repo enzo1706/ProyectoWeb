@@ -1069,9 +1069,29 @@ Cómo verifico que quedó bien:
   con la forma de un WhatsApp válido (ej. un email tipo `2615551234@gmail.com`), se le agrega un
   sufijo numérico — para que el orden de búsqueda del login nunca sea ambiguo. Orden fijo de
   búsqueda en el login: si el texto tiene "@" → email; si no pero tiene forma de WhatsApp válido
-  → WhatsApp; si no → usuario (nunca se prueban los tres, por seguridad anti-enumeración).
+  → WhatsApp; si no → usuario.
+  - **Ajuste posterior — cuentas viejas con username con forma de WhatsApp**: una cuenta de
+    antes de este prompt puede tener como username, literalmente, un número ("2615551234") —
+    con el orden de arriba, ese string se busca siempre primero como WhatsApp, y si ninguna
+    cuenta tiene ESE WhatsApp, nunca llegaba a probarse como usuario: esa cuenta quedaba sin
+    forma de entrar. Única excepción al "nunca probar los 3": si tiene forma de WhatsApp pero
+    el WhatsApp no matcheó nada, se prueba también como usuario (`WhatsAppMatchesUsernameError`
+    en `server/storage.ts`). Para que esto no vuelva a pasar de acá en adelante, guardar un
+    WhatsApp (en Crear cuenta o en Tus datos) que coincida con el username de OTRA cuenta
+    rechaza con 409 — nunca con el propio.
 - **"Tus datos"**: cambiar el email o el WhatsApp pide la contraseña actual (son las credenciales
   para entrar y recuperar la cuenta) — solo cuando alguno de esos dos campos realmente cambia.
+  Sin test hasta este ajuste; cubierto ahora en `server/tests/consultant-profile.test.ts` (sin
+  contraseña → 400, incorrecta → 403, correcta → 200 y cambia de verdad, email/WhatsApp repetido
+  de otra cuenta → 409).
+- **Línea chica de Stock y cartel del límite**: estaban en el texto del prompt pero no se habían
+  construido. Ahora: `client/src/pages/Productos.tsx` muestra "Prueba gratis: N de 10
+  productos." (o el texto de límite alcanzado) debajo del resumen del catálogo; un
+  `FreePlanLimitDialog` nuevo (`client/src/components/FreePlanLimitDialog.tsx`, con "Ver
+  planes"/"Ahora no") se dispara ANTES de tocar el servidor — en `AddProductDialog.tsx` al
+  enviar el formulario de un producto nuevo con unidades > 0, y en `LoadOrderDialog.tsx` al
+  tocar "+" sobre un producto que hoy tiene 0 de stock y haría pasar el límite (contando los que
+  ya se eligieron en ese mismo pedido todavía sin confirmar).
 
 ## Toda la app
 

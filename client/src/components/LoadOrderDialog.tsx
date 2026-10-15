@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -24,6 +25,13 @@ import { ChevronDown, Minus, Package, Pencil, Plus, Search, Trash2, Upload } fro
 import { ImportProductsDialog, type ImportedOrderLine } from "./ImportProductsDialog";
 import { UnsavedDraftAlert } from "./UnsavedDraftAlert";
 import { useDraftAutosave } from "@/hooks/use-draft-autosave";
+import { FreePlanLimitDialog } from "@/components/FreePlanLimitDialog";
+
+interface SubscriptionStatus {
+  isFreePlan: boolean;
+  productsWithStockCount: number | null;
+  freePlanProductLimit: number;
+}
 
 interface LoadOrderDialogProps {
   open: boolean;
@@ -267,6 +275,13 @@ export function LoadOrderDialog({ open, onOpenChange, products, draftToResume, i
   // se pudo retomar" (formato viejo/incompatible).
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
   const [resumeFormatError, setResumeFormatError] = useState(false);
+  // Prompt 14 (P30) — mismo queryKey que Subscription.tsx/Dashboard: react-query reusa el
+  // cache, no dispara una consulta de más.
+  const [freePlanLimitOpen, setFreePlanLimitOpen] = useState(false);
+  const { data: subscriptionStatus } = useQuery<SubscriptionStatus>({
+    queryKey: ["/api/subscription/status"],
+    enabled: open,
+  });
 
   const categories = useMemo(() => getProductCategories(products), [products]);
 
@@ -299,7 +314,33 @@ export function LoadOrderDialog({ open, onOpenChange, products, draftToResume, i
     });
   };
 
-  const adjustQty = (productId: number, delta: number) => setQty(productId, Math.max(0, getQty(productId) + delta));
+  // Prompt 14 (P30) — productos que YA tenían stock antes de este pedido, para distinguirlos de
+  // los que este pedido convertiría en "nuevos" (stock en 0 hasta ahora).
+  const stockedProductIds = useMemo(() => new Set(products.filter((p) => p.unidades > 0).map((p) => p.id)), [products]);
+  // Cuántos productos sin stock previo YA tiene este pedido con cantidad > 0, sin contar
+  // `excludingProductId` — para saber si el próximo sería el 11.
+  const newlyStockedCount = (excludingProductId: number) =>
+    Object.entries(qtyByProduct).filter(
+      ([pid, qty]) => qty > 0 && Number(pid) !== excludingProductId && !stockedProductIds.has(Number(pid)),
+    ).length;
+
+  const adjustQty = (productId: number, delta: number) => {
+    const current = getQty(productId);
+    // Ajuste (P30) — tocar "+" en un producto SIN stock que haría pasar el límite del plan
+    // gratis se bloquea ACÁ, antes de sumarlo al pedido: nunca recién al confirmar, y nunca
+    // recién cuando el servidor lo rechaza.
+    if (
+      delta > 0 &&
+      current === 0 &&
+      !stockedProductIds.has(productId) &&
+      subscriptionStatus?.isFreePlan &&
+      (subscriptionStatus.productsWithStockCount ?? 0) + newlyStockedCount(productId) + 1 > subscriptionStatus.freePlanProductLimit
+    ) {
+      setFreePlanLimitOpen(true);
+      return;
+    }
+    setQty(productId, Math.max(0, current + delta));
+  };
 
   const toggleExpand = (key: string) => {
     setExpandedFamilies((prev) => {
@@ -922,6 +963,12 @@ export function LoadOrderDialog({ open, onOpenChange, products, draftToResume, i
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <FreePlanLimitDialog
+        open={freePlanLimitOpen}
+        onOpenChange={setFreePlanLimitOpen}
+        limit={subscriptionStatus?.freePlanProductLimit ?? 10}
+      />
     </Dialog>
   );
 }

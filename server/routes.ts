@@ -4,7 +4,7 @@ import type { z } from "zod";
 import bcrypt from "bcryptjs";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
-import { storage, SaleValidationError, SaleRequestConflictError, ProductConflictError, ProductValidationError, AppointmentValidationError, AppointmentConflictError, isBcryptHash, DuplicateEmailError, DuplicateUsernameError, DuplicateWhatsAppError, FreePlanProductLimitError } from "./storage";
+import { storage, SaleValidationError, SaleRequestConflictError, ProductConflictError, ProductValidationError, AppointmentValidationError, AppointmentConflictError, isBcryptHash, DuplicateEmailError, DuplicateUsernameError, DuplicateWhatsAppError, WhatsAppMatchesUsernameError, FreePlanProductLimitError } from "./storage";
 import { requestPasswordReset, verifyResetCode, resetPassword } from "./auth-reset";
 import { uploadProductImage, deleteProductImage, isValidImageBuffer, listProductImageFiles, extractStoragePath } from "./image-storage";
 import { findProductImageMatches } from "@shared/imageMatching";
@@ -367,17 +367,30 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // nunca "probar los 3 y ver cuál matchea" (eso sería más lento y más fácil de romper
       // sin querer si alguna vez dos búsquedas distintas coincidieran): con "@" → email;
       // si no, pero tiene forma de WhatsApp argentino válido → WhatsApp; si no → usuario (así
-      // siguen entrando las cuentas de antes de este prompt). El mismo criterio determina CUÁL
-      // búsqueda correr, nunca "si la primera no encuentra, probar la siguiente" — eso sí
-      // cambiaría el mensaje de error según cuántas búsquedas se intentaron, un vector de
-      // timing nuevo que no existía antes.
+      // siguen entrando las cuentas de antes de este prompt).
+      //
+      // Única excepción (ajuste posterior): si tiene forma de WhatsApp pero NINGUNA cuenta
+      // tiene ese WhatsApp, se prueba también como usuario — una cuenta vieja puede tener
+      // justamente ESE string como username (ver WhatsAppMatchesUsernameError, que evita que
+      // esto vuelva a pasar a partir de ahora). Es un fallback real, no el "probar las 3"
+      // genérico de arriba: solo aplica a esta forma puntual, y el timing que agrega (una
+      // segunda consulta cuando la primera no encuentra nada) es aceptable frente al costo real
+      // de dejar cuentas existentes sin forma de entrar.
       const identifier = parsed.data.identifier.trim();
       const whatsappCheck = !identifier.includes("@") ? normalizeArgentinaPhoneDigits(identifier) : null;
-      const user = identifier.includes("@")
+      let user = identifier.includes("@")
         ? await storage.getUserByConsultantEmail(normalizeEmail(identifier))
         : whatsappCheck?.valid
           ? await storage.getUserByConsultantWhatsapp(whatsappCheck.digits)
           : await storage.getUserByUsername(identifier);
+      // Ajuste — una cuenta vieja puede tener como USERNAME algo con forma de WhatsApp (ej.
+      // "2615551234"). Con el orden fijo de arriba, ese string siempre se buscaría primero como
+      // WhatsApp y, si ninguna cuenta tiene ESE WhatsApp, nunca llegaría a probarse como
+      // usuario — esa cuenta quedaría sin forma de entrar. Por eso, solo en el caso puntual de
+      // "tiene forma de WhatsApp pero no matcheó ninguno", se prueba también como usuario.
+      if (!user && whatsappCheck?.valid) {
+        user = await storage.getUserByUsername(identifier);
+      }
       if (!user) {
         // Etapa 7.6: mismo criterio anti-timing que ya usa requestPasswordReset (server/
         // auth-reset.ts) — sin esto, "usuario inexistente" respondía casi al instante
@@ -449,7 +462,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       // usuaria (se deriva del email, Prompt 14), así que una colisión ahí (rarísima: dos
       // emails con la misma parte antes de la @ Y el sufijo numérico también ocupado) ya no
       // puede pasar en la práctica — igual se cubre con el mismo mensaje genérico, nunca un 500.
-      if (error instanceof DuplicateEmailError || error instanceof DuplicateWhatsAppError || error instanceof DuplicateUsernameError) {
+      if (
+        error instanceof DuplicateEmailError ||
+        error instanceof DuplicateWhatsAppError ||
+        error instanceof DuplicateUsernameError ||
+        error instanceof WhatsAppMatchesUsernameError
+      ) {
         return res.status(409).json({ error: "No pudimos crear la cuenta con esos datos. Si ya tenés una cuenta, iniciá sesión o recuperá tu contraseña." });
       }
       console.error(error);
@@ -662,7 +680,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       res.json(updated);
     } catch (error) {
-      if (error instanceof DuplicateEmailError || error instanceof DuplicateWhatsAppError) {
+      if (error instanceof DuplicateEmailError || error instanceof DuplicateWhatsAppError || error instanceof WhatsAppMatchesUsernameError) {
         return res.status(409).json({ error: error.message });
       }
       console.error(error);

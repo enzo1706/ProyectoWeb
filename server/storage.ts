@@ -151,6 +151,12 @@ export class DuplicateUsernameError extends Error {}
 /** Prompt 14: ya existe otra cuenta con ese WhatsApp normalizado — mapea a 409, mismo
  * criterio que DuplicateEmailError. */
 export class DuplicateWhatsAppError extends Error {}
+/** Prompt 14, ajuste — el WhatsApp que se intenta guardar coincide con el USERNAME de otra
+ * cuenta (una cuenta vieja cuyo usuario es, literalmente, un número de teléfono). Si se
+ * permitiera, el login (orden fijo email → WhatsApp → usuario) nunca volvería a llegar a
+ * buscarla como usuario, porque ese string siempre matchearía primero por WhatsApp — mapea a
+ * 409, mismo criterio que DuplicateWhatsAppError. */
+export class WhatsAppMatchesUsernameError extends Error {}
 /** Prompt 14 (P30): el plan gratis llegó a FREE_PLAN_PRODUCT_LIMIT productos con stock y esta
  * operación sumaría uno más — mapea a 403 (el payload es válido, lo que falta es el plan). */
 export class FreePlanProductLimitError extends Error {}
@@ -1208,6 +1214,19 @@ export class DatabaseStorage implements IStorage {
     if (input.age !== undefined) setFields.age = input.age;
     if (input.jobTitle !== undefined) setFields.jobTitle = input.jobTitle;
 
+    // Ajuste — el WhatsApp que se guarda nunca puede coincidir con el username de OTRA cuenta
+    // (ver WhatsAppMatchesUsernameError): si coincidiera, esa otra cuenta dejaría de poder
+    // entrar con su usuario de siempre, porque el login la buscaría primero como WhatsApp.
+    if (input.whatsapp !== undefined && input.whatsapp !== null) {
+      const [usernameClash] = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(and(eq(users.username, input.whatsapp), or(isNull(users.consultantId), ne(users.consultantId, consultantId))));
+      if (usernameClash) {
+        throw new WhatsAppMatchesUsernameError("Ese WhatsApp coincide con el usuario de otra cuenta");
+      }
+    }
+
     try {
       const [updated] = await db.update(consultants).set(setFields).where(eq(consultants.id, consultantId)).returning();
       return updated;
@@ -1298,6 +1317,15 @@ export class DatabaseStorage implements IStorage {
       // misma transacción (a diferencia del flujo de suscripción, que completa el email después).
       return await db.transaction(async (tx) => {
         const username = await this.deriveUniqueUsername(tx, normalizedEmail);
+
+        // Ajuste — mismo criterio que updateConsultantProfile: el WhatsApp nunca puede coincidir
+        // con el username de una cuenta ya existente.
+        if (normalizedWhatsapp !== null) {
+          const [usernameClash] = await tx.select({ id: users.id }).from(users).where(eq(users.username, normalizedWhatsapp));
+          if (usernameClash) {
+            throw new WhatsAppMatchesUsernameError("Ese WhatsApp coincide con el usuario de otra cuenta");
+          }
+        }
 
         const [consultant] = await tx
           .insert(consultants)
@@ -5320,6 +5348,9 @@ export class MemoryStorage implements IStorage {
       if (input.whatsapp !== null && this.consultants.some((c) => c.id !== consultantId && c.whatsapp === input.whatsapp)) {
         throw new DuplicateWhatsAppError("Ya existe otra cuenta con ese WhatsApp");
       }
+      if (input.whatsapp !== null && this.users.some((u) => u.username === input.whatsapp && u.consultantId !== consultantId)) {
+        throw new WhatsAppMatchesUsernameError("Ese WhatsApp coincide con el usuario de otra cuenta");
+      }
       consultant.whatsapp = input.whatsapp;
     }
     if (input.contactName !== undefined) consultant.contactName = input.contactName;
@@ -5381,6 +5412,9 @@ export class MemoryStorage implements IStorage {
     }
     if (normalizedWhatsapp !== null && this.consultants.some((c) => c.whatsapp === normalizedWhatsapp)) {
       throw new DuplicateWhatsAppError("Ya existe una cuenta con ese WhatsApp");
+    }
+    if (normalizedWhatsapp !== null && this.users.some((u) => u.username === normalizedWhatsapp)) {
+      throw new WhatsAppMatchesUsernameError("Ese WhatsApp coincide con el usuario de otra cuenta");
     }
 
     const hashedPassword = await bcrypt.hash(input.password, BCRYPT_SALT_ROUNDS);
