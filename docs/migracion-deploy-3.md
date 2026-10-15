@@ -150,10 +150,11 @@ WHERE cost_is_estimated = true AND cost_price IS NOT NULL;
 
 -- 8. Para las consultoras que YA tienen día de pedido configurado, la fecha de referencia pasa
 -- a ser el momento de este deploy (no hace falta elegir una fecha a mano) — así nadie ve de
--- golpe un aviso de un ciclo de hace semanas apenas se despliega esto (ajuste 1).
+-- golpe un aviso de un ciclo de hace semanas apenas se despliega esto (ajuste 1). El OR cubre
+-- también a quien configuró SOLO el día 2 (day1 null, day2 no) — day1 NOT NULL solo no alcanza.
 UPDATE consultants
 SET order_reminder_days_updated_at = now()
-WHERE order_reminder_day1 IS NOT NULL;
+WHERE order_reminder_day1 IS NOT NULL OR order_reminder_day2 IS NOT NULL;
 ```
 
 ## Chequeo previo (solo lectura, correr antes de aplicar)
