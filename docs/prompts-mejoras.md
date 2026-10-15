@@ -740,6 +740,44 @@ lugar temporal (ver su propia sección de decisiones) — cuando se implemente e
 mover "Completá tu perfil" al bloque "Para mejorar tu negocio" junto con los demás avisos de
 baja prioridad.
 
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **"Cobrada" en una cuota vencida pide confirmación**: "¿[Clienta] te pagó los $ [saldo]?",
+  con "Sí, me pagó" y "Cancelar". El monto es el SALDO de esa cuota (`amount - amountPaid`,
+  nunca el monto original de la cuota). Al confirmar, se registra como un pago con la misma
+  lógica de "Registrar pago" del Prompt 9 (crea `client_payments` + `payment_allocations` en la
+  misma transacción) — nunca cambiando el estado de la cuota a mano. En la práctica esto ya es
+  así: el PATCH `/api/sales/:id/installments/:id` con `{status: "pagado"}` que ya existe
+  (`registerInstallmentPayment`/`applyPaymentToInstallments`, Prompt 9) es el único camino; lo
+  que cambia es que el botón "Cobrada" de Inicio deja de abrir el detalle completo de la venta
+  (como hace hoy) y pasa a mostrar la confirmación y pegarle directo a ese mismo endpoint.
+- **Aviso nuevo del límite del plan gratis en "Para mejorar tu negocio"**: solo para cuentas del
+  plan gratis con 10 o más productos con stock — "Llegaste al límite de la prueba gratis.
+  Suscribite para cargar todos los productos que quieras.", con el botón "Ver planes" (lleva a
+  Suscripción). Se puede ocultar 7 días, como los demás avisos de este bloque.
+- **"Ocultar" se guarda en la base, por consultora**: nunca en el navegador — tiene que valer en
+  todos sus dispositivos. No existe hoy ningún mecanismo genérico para esto (lo que hay,
+  `orderReminders.dismissedAt` y `productStock.remindStockAt`, son de un solo propósito cada
+  uno) — hace falta una tabla nueva, con una fila por `(consultantId, noticeKey)` y su
+  `dismissedAt`, donde `noticeKey` es uno de un set chico y fijo (stock bajo, clientas
+  inactivas, productos sin costo, clientas sin celular, completar perfil, límite del plan
+  gratis) — nunca una clave por aviso individual.
+- **Los números tienen que coincidir con el resto de la app**:
+  - "Vas $ X" del objetivo usa `getSalesSummary` (la misma función que ya usa "Este mes
+    vendiste" de Inicio y, por adentro, `getReportsOverview` de Reportes) — nunca un cálculo
+    paralelo.
+  - "Lo que debe cada clienta" usa `getClientsPendingBalanceDetail` (la misma función privada
+    que ya comparten Clientas y "Te deben hoy" de Reportes).
+  - "Hace más de 2 meses que no compran" NO puede reusar `getInactiveClients` tal cual: esa
+    función incluye `lastPurchase: null` (clientas que nunca compraron) y calcula el corte con
+    `Date.now()` en vez de hora Argentina — dos diferencias reales con `matchesStaleFilter`
+    (`shared/clientFilters.ts`), el criterio que sí usa el filtro de Clientas. El endpoint nuevo
+    de Inicio filtra `lastPurchase !== null` sobre el resultado y usa `getArgentinaDateStr()`
+    para el corte, en vez de tocar `getInactiveClients` (que sigue usándose en otros lados sin
+    este ajuste, para no cambiarle el comportamiento a nadie más sin querer).
+  - "Hoy", "quedan N días" y "venció el [fecha]" siempre con `getArgentinaDateStr()`, nunca
+    `new Date()` del proceso (que en Railway es UTC).
+
 ## Reportes
 
 ### Prompt 11 · Reportes: claro y liviano
