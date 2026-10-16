@@ -21,6 +21,8 @@ import {
   paymentAllocations,
   paymentMethods,
   orderReminders,
+  dashboardNoticeDismissals,
+  dashboardNoticeTypes,
   createSaleSchema,
   updateSaleSchema,
   createAppointmentSchema,
@@ -66,6 +68,8 @@ import {
   type PaymentAllocation,
   type OrderReminder,
   type OrderReminderItemSnapshot,
+  type DashboardNoticeType,
+  type DashboardNoticeDismissal,
 } from "@shared/schema";
 import { normalizeEmail } from "@shared/email";
 import {
@@ -89,7 +93,7 @@ import {
   resolveQuantityDecrease,
   computeDiscountedCost,
 } from "@shared/saleCalculations";
-import { resolveLowStockThreshold, DEFAULT_LOW_STOCK_THRESHOLD } from "@shared/stockAlerts";
+import { resolveLowStockThreshold, DEFAULT_LOW_STOCK_THRESHOLD, isReminderActive } from "@shared/stockAlerts";
 import { resolveOrderReminderPeriod } from "@shared/orderReminderSchedule";
 import {
   type ClientListFilter,
@@ -100,7 +104,7 @@ import {
   birthdayDay,
   MAX_CLIENTS_PAGE_SIZE,
 } from "@shared/clientFilters";
-import { getArgentinaDateStr, getArgentinaMonth, toArgentinaDateStr } from "@shared/argentinaTime";
+import { getArgentinaDateStr, getArgentinaMonth, toArgentinaDateStr, getArgentinaNow, getDaysInMonth } from "@shared/argentinaTime";
 import { type ReportPeriodKind, getComparisonPeriod } from "@shared/reportsPeriods";
 import { normalizeArgentinaPhoneForStorage, normalizeArgentinaPhoneDigits } from "@shared/phone";
 import { isKnownEventType, normalizeCustomEventTypeName, KNOWN_EVENT_TYPES } from "@shared/eventTypes";
@@ -569,6 +573,9 @@ export interface AppointmentsSummary {
 
 export interface PendingInstallmentRow {
   saleId: number;
+  // Prompt 10 — el id real de la fila, para poder cobrarla directo (PATCH /api/sales/:id/
+  // installments/:installmentId) sin tener que abrir el detalle completo de la venta.
+  installmentId: number;
   clientName: string;
   installmentNumber: number;
   amount: number;
@@ -640,6 +647,72 @@ export interface ReportsOverview {
   // (getClientsPendingBalanceDetail), sumada sobre TODAS las clientas — nunca una fórmula nueva.
   pendingBalanceToday: number;
   overdueBalanceToday: number;
+}
+
+/** Prompt 10 — 7 días visible otra vez después de "Ocultar", si el aviso sigue vigente. */
+const DASHBOARD_NOTICE_HIDDEN_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Prompt 10 — mes actual en hora de Argentina, con el rango [monthStart, monthEnd) que ya usa
+ * getSalesSummary (medio abierto: `lt(sales.date, monthEnd)`) y cuántos días quedan del mes
+ * DESPUÉS de hoy (hoy mismo no cuenta como "día que queda", todavía está en curso). */
+function getArgentinaCurrentMonthInfo(): { monthStart: string; monthEnd: string; daysLeftInMonth: number } {
+  const now = getArgentinaNow();
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth() + 1;
+  const day = now.getUTCDate();
+  const pad2 = (n: number) => String(n).padStart(2, "0");
+  const monthStart = `${year}-${pad2(month)}-01`;
+  const nextMonth = month === 12 ? 1 : month + 1;
+  const nextYear = month === 12 ? year + 1 : year;
+  const monthEnd = `${nextYear}-${pad2(nextMonth)}-01`;
+  const daysLeftInMonth = getDaysInMonth(year, month) - day;
+  return { monthStart, monthEnd, daysLeftInMonth };
+}
+
+/** Prompt 10 — todo lo que necesita Inicio, en una sola llamada (mismo patrón que
+ * `getReportsOverview`): reusa las funciones de storage que ya existen, nunca un cálculo
+ * paralelo — así "Vas $X" coincide con "Vendiste" de Reportes, el conteo de "hace tiempo que no
+ * compran" coincide con Clientas, etc. `isFreePlan`/`productsWithStockCount` vienen del handler
+ * (requireren `getConsultantAccessStatus`, en server/subscription.ts — que ya importa storage,
+ * así que storage.ts no puede importarlo de vuelta sin ciclo). */
+export interface DashboardOverviewAccessInfo {
+  isFreePlan: boolean;
+  productsWithStockCount: number | null;
+  freePlanProductLimit: number;
+}
+
+export interface DashboardOverview {
+  businessName: string;
+  monthlyGoal: number | null;
+  monthSales: number;
+  daysLeftInMonth: number;
+  paraHacerHoy: {
+    deliveryReady: { saleId: number; itemId: number; clientId: number | null; clientName: string; productName: string; quantity: number }[];
+    orderReminder: {
+      reminder: OrderReminder;
+      items: { productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[];
+    } | null;
+    appointmentsToday: Appointment[];
+    birthdaysToday: UpcomingBirthday[];
+  };
+  pendientes: {
+    installments: PendingInstallmentRow[];
+    unfinishedSalesCount: number;
+    unfinishedOrdersCount: number;
+    salesWithoutClientCount: number;
+  };
+  paraMejorarTuNegocio: {
+    // Siempre en este orden (ajuste del Prompt 10): límite del plan gratis primero, los 4 del
+    // prompt original después, "Completá tu perfil" al final. `null` = oculta (sin condición o
+    // tapada por "Ocultar" hace menos de 7 días) — el frontend no necesita saber cuál de las dos
+    // cosas es, solo si se muestra.
+    limitePlanGratis: boolean;
+    stockBajo: { count: number; products: Product[] } | null;
+    clientasInactivas: { count: number } | null;
+    productosSinCosto: { count: number } | null;
+    clientasSinCelular: { count: number } | null;
+    completarPerfil: boolean;
+  };
 }
 
 function getCurrentMonthRange(): { monthStart: string; monthEnd: string } {
@@ -989,6 +1062,14 @@ export interface IStorage {
   } | null>;
   /** Prompt 8, Parte 3 — "Listo, ya lo pedí". */
   dismissOrderReminder(consultantId: number, reminderId: number): Promise<OrderReminder | undefined>;
+  /** Prompt 10 — "Tenés N ventas sin clienta" (bloque "Pendientes" de Inicio). */
+  countSalesWithoutClient(consultantId: number): Promise<number>;
+  /** Prompt 10 — "Ocultar" de un aviso de "Para mejorar tu negocio" (UPSERT por consultora +
+   * tipo de aviso). */
+  dismissDashboardNotice(consultantId: number, noticeType: DashboardNoticeType): Promise<void>;
+  /** Prompt 10 — todo lo que necesita Inicio en una sola llamada (ver detalle en
+   * DatabaseStorage.getDashboardOverview). */
+  getDashboardOverview(consultantId: number, access: DashboardOverviewAccessInfo): Promise<DashboardOverview>;
   /** Prompt 6, punto 1 — asigna una clienta a una venta creada sin una ("Sin clienta"). Solo
    * de `null` a una clienta real. */
   assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined>;
@@ -3524,11 +3605,14 @@ export class DatabaseStorage implements IStorage {
 
   async getPendingInstallments(consultantId: number, limit = 20): Promise<PendingInstallmentRow[]> {
     const db = await this.getDb();
-    const today = toDateStr(new Date());
+    // Prompt 10 — "hoy" en hora de Argentina, nunca el reloj del proceso (en Railway es UTC):
+    // Inicio distingue "vence hoy" de "venció" con este mismo valor.
+    const today = getArgentinaDateStr();
 
     const rows = await db
       .select({
         saleId: saleInstallments.saleId,
+        installmentId: saleInstallments.id,
         clientName: sales.clientName,
         installmentNumber: saleInstallments.installmentNumber,
         // Prompt 9: lo que falta de verdad (amount - amountPaid) — una "pendiente" puede
@@ -5065,6 +5149,126 @@ export class DatabaseStorage implements IStorage {
     return updated;
   }
 
+  /** Prompt 10 — "Tenés N ventas sin clienta" (bloque "Pendientes" de Inicio). */
+  async countSalesWithoutClient(consultantId: number): Promise<number> {
+    const db = await this.getDb();
+    const [row] = await db
+      .select({ value: count() })
+      .from(sales)
+      .where(and(eq(sales.consultantId, consultantId), isNull(sales.clientId), ne(sales.status, "cancelada")));
+    return Number(row?.value ?? 0);
+  }
+
+  /** Prompt 10 — "Ocultar" de un aviso de "Para mejorar tu negocio": UPSERT por
+   * (consultantId, noticeType), nunca una fila nueva cada vez que se oculta el mismo aviso. */
+  async dismissDashboardNotice(consultantId: number, noticeType: DashboardNoticeType): Promise<void> {
+    const db = await this.getDb();
+    await db
+      .insert(dashboardNoticeDismissals)
+      .values({ consultantId, noticeType, dismissedAt: new Date() })
+      .onConflictDoUpdate({
+        target: [dashboardNoticeDismissals.consultantId, dashboardNoticeDismissals.noticeType],
+        set: { dismissedAt: new Date() },
+      });
+  }
+
+  /** Prompt 10 — qué avisos de "Para mejorar tu negocio" siguen tapados por "Ocultar" (menos de
+   * `DASHBOARD_NOTICE_HIDDEN_MS` desde que se ocultaron). */
+  private async getHiddenDashboardNoticeTypes(consultantId: number): Promise<Set<DashboardNoticeType>> {
+    const db = await this.getDb();
+    const rows = await db
+      .select({ noticeType: dashboardNoticeDismissals.noticeType, dismissedAt: dashboardNoticeDismissals.dismissedAt })
+      .from(dashboardNoticeDismissals)
+      .where(eq(dashboardNoticeDismissals.consultantId, consultantId));
+    const cutoff = Date.now() - DASHBOARD_NOTICE_HIDDEN_MS;
+    const hidden = new Set<DashboardNoticeType>();
+    for (const row of rows) {
+      if (row.dismissedAt.getTime() > cutoff) hidden.add(row.noticeType as DashboardNoticeType);
+    }
+    return hidden;
+  }
+
+  /** Prompt 10 — todo lo que necesita Inicio en una sola llamada. Las consultas que no dependen
+   * entre sí corren en paralelo (`Promise.all`); solo `paraMejorarTuNegocio` espera a
+   * `getHiddenDashboardNoticeTypes` para decidir qué mostrar, pero esa consulta corre en el
+   * mismo `Promise.all` que todo lo demás, nunca antes. */
+  async getDashboardOverview(consultantId: number, access: DashboardOverviewAccessInfo): Promise<DashboardOverview> {
+    const todayStr = getArgentinaDateStr();
+    const { monthStart, monthEnd, daysLeftInMonth } = getArgentinaCurrentMonthInfo();
+
+    const [
+      consultant,
+      monthPoints,
+      deliveryReady,
+      orderReminderResult,
+      appointmentsUpcoming,
+      birthdaysToday,
+      pendingInstallmentsRaw,
+      salesDrafts,
+      orderDrafts,
+      salesWithoutClientCount,
+      lowStockProductsRaw,
+      inactiveClientsResult,
+      productsWithoutCostCount,
+      clientsWithoutPhoneCount,
+      hiddenNoticeTypes,
+    ] = await Promise.all([
+      this.getBusinessSettings(consultantId),
+      this.getSalesSummary(consultantId, monthStart, monthEnd, "month"),
+      this.getDeliveryReadyItems(consultantId),
+      this.getOrderReminder(consultantId),
+      this.getUpcomingAppointments(consultantId, 50),
+      this.getUpcomingBirthdays(consultantId, 0),
+      this.getPendingInstallments(consultantId, 200),
+      this.getDrafts(consultantId, "sale"),
+      this.getDrafts(consultantId, "order"),
+      this.countSalesWithoutClient(consultantId),
+      this.getLowStockProducts(consultantId),
+      this.searchClientsPaginated(consultantId, { filter: "no_compran_hace", page: 1, pageSize: 1 }),
+      this.countProductsWithoutCost(consultantId),
+      this.countClientsWithoutPhone(consultantId),
+      this.getHiddenDashboardNoticeTypes(consultantId),
+    ]);
+
+    const monthSales = monthPoints.reduce((sum, p) => sum + p.totalSales, 0);
+    const appointmentsToday = appointmentsUpcoming.filter((a) => a.date === todayStr);
+    // "Pendientes" solo cuotas vencidas o que vencen hoy — las que todavía no vencen no son
+    // urgentes (siguen apareciendo en la ficha de la clienta, no acá).
+    const installments = pendingInstallmentsRaw.filter((i) => i.dueDate <= todayStr);
+    const stockBajoProducts = lowStockProductsRaw.filter((p) => !isReminderActive(p.remindStockAt, todayStr));
+    const profileIncomplete = !consultant?.city || !consultant?.age || !consultant?.jobTitle;
+    const freePlanAtLimit = access.isFreePlan && (access.productsWithStockCount ?? 0) >= access.freePlanProductLimit;
+
+    const hide = (type: DashboardNoticeType) => hiddenNoticeTypes.has(type);
+
+    return {
+      businessName: consultant?.businessName ?? "",
+      monthlyGoal: consultant?.monthlyGoal ?? null,
+      monthSales,
+      daysLeftInMonth,
+      paraHacerHoy: {
+        deliveryReady,
+        orderReminder: orderReminderResult,
+        appointmentsToday,
+        birthdaysToday,
+      },
+      pendientes: {
+        installments,
+        unfinishedSalesCount: salesDrafts.length,
+        unfinishedOrdersCount: orderDrafts.length,
+        salesWithoutClientCount,
+      },
+      paraMejorarTuNegocio: {
+        limitePlanGratis: freePlanAtLimit && !hide("limite_plan_gratis"),
+        stockBajo: stockBajoProducts.length > 0 && !hide("stock_bajo") ? { count: stockBajoProducts.length, products: stockBajoProducts } : null,
+        clientasInactivas: inactiveClientsResult.total > 0 && !hide("clientas_inactivas") ? { count: inactiveClientsResult.total } : null,
+        productosSinCosto: productsWithoutCostCount > 0 && !hide("productos_sin_costo") ? { count: productsWithoutCostCount } : null,
+        clientasSinCelular: clientsWithoutPhoneCount > 0 && !hide("clientas_sin_celular") ? { count: clientsWithoutPhoneCount } : null,
+        completarPerfil: profileIncomplete && !hide("completar_perfil"),
+      },
+    };
+  }
+
   /** Prompt 6, punto 1 — "Completar después": asigna una clienta a una venta que se creó sin
    * una ("Sin clienta"). Solo de `null` a una clienta real — nunca reemplaza una ya asignada
    * (para eso no hace falta este endpoint, la clienta no es editable por otra vía a propósito). */
@@ -5147,6 +5351,8 @@ export class MemoryStorage implements IStorage {
   private paymentAllocationRecords: PaymentAllocation[] = [];
   private orderReminderRecords: OrderReminder[] = [];
   private nextOrderReminderId = 1;
+  private dashboardNoticeDismissalRecords: DashboardNoticeDismissal[] = [];
+  private nextDashboardNoticeDismissalId = 1;
   private nextOrderDiscountLogId = 1;
   private nextDraftId = 1;
   private nextClientNoteId = 1;
@@ -6991,7 +7197,8 @@ export class MemoryStorage implements IStorage {
   }
 
   async getPendingInstallments(consultantId: number, limit = 20): Promise<PendingInstallmentRow[]> {
-    const today = toDateStr(new Date());
+    // Prompt 10 — mismo criterio que DatabaseStorage: hora de Argentina, nunca el reloj del proceso.
+    const today = getArgentinaDateStr();
     const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
 
     return this.saleInstallments
@@ -7000,6 +7207,7 @@ export class MemoryStorage implements IStorage {
       .slice(0, limit)
       .map((i) => ({
         saleId: i.saleId,
+        installmentId: i.id,
         clientName: saleById.get(i.saleId)?.clientName ?? "—",
         installmentNumber: i.installmentNumber,
         // Prompt 9: lo que falta de verdad (amount - amountPaid).
@@ -8009,6 +8217,96 @@ export class MemoryStorage implements IStorage {
     if (!reminder) return undefined;
     reminder.dismissedAt = new Date();
     return reminder;
+  }
+
+  /** Espejo de DatabaseStorage.countSalesWithoutClient. */
+  async countSalesWithoutClient(consultantId: number): Promise<number> {
+    return this.sales.filter((s) => s.consultantId === consultantId && s.clientId === null && s.status !== "cancelada").length;
+  }
+
+  /** Espejo de DatabaseStorage.dismissDashboardNotice. */
+  async dismissDashboardNotice(consultantId: number, noticeType: DashboardNoticeType): Promise<void> {
+    const existing = this.dashboardNoticeDismissalRecords.find((r) => r.consultantId === consultantId && r.noticeType === noticeType);
+    if (existing) {
+      existing.dismissedAt = new Date();
+      return;
+    }
+    this.dashboardNoticeDismissalRecords.push({
+      id: this.nextDashboardNoticeDismissalId++,
+      consultantId,
+      noticeType,
+      dismissedAt: new Date(),
+    });
+  }
+
+  /** Espejo de DatabaseStorage.getHiddenDashboardNoticeTypes. */
+  private getHiddenDashboardNoticeTypesMem(consultantId: number): Set<DashboardNoticeType> {
+    const cutoff = Date.now() - DASHBOARD_NOTICE_HIDDEN_MS;
+    const hidden = new Set<DashboardNoticeType>();
+    for (const row of this.dashboardNoticeDismissalRecords) {
+      if (row.consultantId === consultantId && row.dismissedAt.getTime() > cutoff) {
+        hidden.add(row.noticeType as DashboardNoticeType);
+      }
+    }
+    return hidden;
+  }
+
+  /** Espejo de DatabaseStorage.getDashboardOverview. */
+  async getDashboardOverview(consultantId: number, access: DashboardOverviewAccessInfo): Promise<DashboardOverview> {
+    const todayStr = getArgentinaDateStr();
+    const { monthStart, monthEnd, daysLeftInMonth } = getArgentinaCurrentMonthInfo();
+
+    const consultant = await this.getBusinessSettings(consultantId);
+    const monthPoints = await this.getSalesSummary(consultantId, monthStart, monthEnd, "month");
+    const deliveryReady = await this.getDeliveryReadyItems(consultantId);
+    const orderReminderResult = await this.getOrderReminder(consultantId);
+    const appointmentsUpcoming = await this.getUpcomingAppointments(consultantId, 50);
+    const birthdaysToday = await this.getUpcomingBirthdays(consultantId, 0);
+    const pendingInstallmentsRaw = await this.getPendingInstallments(consultantId, 200);
+    const salesDrafts = await this.getDrafts(consultantId, "sale");
+    const orderDrafts = await this.getDrafts(consultantId, "order");
+    const salesWithoutClientCount = await this.countSalesWithoutClient(consultantId);
+    const lowStockProductsRaw = await this.getLowStockProducts(consultantId);
+    const inactiveClientsResult = await this.searchClientsPaginated(consultantId, { filter: "no_compran_hace", page: 1, pageSize: 1 });
+    const productsWithoutCostCount = await this.countProductsWithoutCost(consultantId);
+    const clientsWithoutPhoneCount = await this.countClientsWithoutPhone(consultantId);
+    const hiddenNoticeTypes = this.getHiddenDashboardNoticeTypesMem(consultantId);
+
+    const monthSales = monthPoints.reduce((sum, p) => sum + p.totalSales, 0);
+    const appointmentsToday = appointmentsUpcoming.filter((a) => a.date === todayStr);
+    const installments = pendingInstallmentsRaw.filter((i) => i.dueDate <= todayStr);
+    const stockBajoProducts = lowStockProductsRaw.filter((p) => !isReminderActive(p.remindStockAt, todayStr));
+    const profileIncomplete = !consultant?.city || !consultant?.age || !consultant?.jobTitle;
+    const freePlanAtLimit = access.isFreePlan && (access.productsWithStockCount ?? 0) >= access.freePlanProductLimit;
+
+    const hide = (type: DashboardNoticeType) => hiddenNoticeTypes.has(type);
+
+    return {
+      businessName: consultant?.businessName ?? "",
+      monthlyGoal: consultant?.monthlyGoal ?? null,
+      monthSales,
+      daysLeftInMonth,
+      paraHacerHoy: {
+        deliveryReady,
+        orderReminder: orderReminderResult,
+        appointmentsToday,
+        birthdaysToday,
+      },
+      pendientes: {
+        installments,
+        unfinishedSalesCount: salesDrafts.length,
+        unfinishedOrdersCount: orderDrafts.length,
+        salesWithoutClientCount,
+      },
+      paraMejorarTuNegocio: {
+        limitePlanGratis: freePlanAtLimit && !hide("limite_plan_gratis"),
+        stockBajo: stockBajoProducts.length > 0 && !hide("stock_bajo") ? { count: stockBajoProducts.length, products: stockBajoProducts } : null,
+        clientasInactivas: inactiveClientsResult.total > 0 && !hide("clientas_inactivas") ? { count: inactiveClientsResult.total } : null,
+        productosSinCosto: productsWithoutCostCount > 0 && !hide("productos_sin_costo") ? { count: productsWithoutCostCount } : null,
+        clientasSinCelular: clientsWithoutPhoneCount > 0 && !hide("clientas_sin_celular") ? { count: clientsWithoutPhoneCount } : null,
+        completarPerfil: profileIncomplete && !hide("completar_perfil"),
+      },
+    };
   }
 
   async assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined> {

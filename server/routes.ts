@@ -57,6 +57,8 @@ import {
   verifyResetCodeSchema,
   resetPasswordSchema,
   paymentStatuses,
+  dashboardNoticeTypes,
+  type DashboardNoticeType,
   type InsertProduct,
   type PaymentStatus,
   type CouponDiscountType,
@@ -1667,6 +1669,42 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al cerrar el recordatorio" });
+    }
+  });
+
+  /** Prompt 10 — todo lo que necesita Inicio en una sola llamada (ver
+   * DatabaseStorage.getDashboardOverview). `isFreePlan`/`productsWithStockCount` se calculan
+   * acá (mismo criterio que /api/subscription/status) y se pasan a storage.ts, que no puede
+   * importar getConsultantAccessStatus sin crear un ciclo (subscription.ts ya importa storage). */
+  app.get("/api/dashboard/overview", async (req: Request, res: Response) => {
+    try {
+      const access = await getConsultantAccessStatus(req.consultantId!);
+      const productsWithStockCount = access.isFreePlan ? await storage.countProductsWithStock(req.consultantId!) : null;
+      const overview = await storage.getDashboardOverview(req.consultantId!, {
+        isFreePlan: access.isFreePlan,
+        productsWithStockCount,
+        freePlanProductLimit: FREE_PLAN_PRODUCT_LIMIT,
+      });
+      res.json(overview);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener Inicio" });
+    }
+  });
+
+  /** Prompt 10 — "Ocultar" un aviso de "Para mejorar tu negocio". Por consultora, en la base
+   * (nunca en el navegador) — vuelve a aparecer a los 7 días si sigue vigente. Sin body. */
+  app.post("/api/dashboard/notices/:type/dismiss", async (req: Request, res: Response) => {
+    try {
+      const { type } = req.params;
+      if (!(dashboardNoticeTypes as readonly string[]).includes(type)) {
+        return res.status(400).json({ error: "Tipo de aviso inválido" });
+      }
+      await storage.dismissDashboardNotice(req.consultantId!, type as DashboardNoticeType);
+      res.json({ ok: true });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al ocultar el aviso" });
     }
   });
 

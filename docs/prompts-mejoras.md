@@ -601,10 +601,11 @@ Cómo verifico que quedó bien:
     adelante — lo de DENTRO del período ya está sumado en "vendido en el período") — así el
     producto aparece una sola vez, con la cantidad sugerida = vendido en el período + pendiente
     de fuera del período.
-- **Ubicación en Inicio**: los dos avisos ("Ya podés entregarle a..." y el recordatorio del día
-  de pedido) viven por ahora en el Inicio actual, visibles, con el mismo patrón `TaskRow`/
-  `Section` que ya usa esa pantalla — igual criterio que "Completá tu perfil" del Prompt 14.
-  Cuando se implemente el Prompt 10, mover los dos al bloque "Para hacer hoy".
+- **Ubicación en Inicio**: ~~los dos avisos... viven por ahora en el Inicio actual... Cuando se
+  implemente el Prompt 10, mover los dos al bloque "Para hacer hoy"~~ — **resuelto en el Prompt
+  10**: "Ya podés entregarle a..." es un `TaskItem` más del bloque "Para hacer hoy"; "Hoy es tu
+  día de pedido" mantiene su tarjeta propia (lista + 2 botones, no entra en el formato
+  título/subtítulo de un aviso genérico), ubicada justo antes de ese mismo bloque.
 
 ## Clientas
 
@@ -711,72 +712,82 @@ Cómo verifico que quedó bien:
 - En un celular de 375 px no se cortan los nombres.
 ```
 
-#### Advertencia para cuando se implemente (encontrado haciendo el Prompt 11, sin tocar acá)
+#### Advertencia para cuando se implemente (encontrado haciendo el Prompt 11) — resuelto en el Prompt 10
 
-El aviso **"N clientas hace más de 2 meses que no compran"** (línea de arriba, bloque "Para
-mejorar tu negocio") tiene que armarse con cuidado: `GET /api/reports/inactive-clients`, el
-endpoint que ya existe y que este aviso va a reusar, **incluye a las clientas que NUNCA
-compraron** (`lastPurchase: null`) junto con las que sí compraron hace tiempo — confirmado
-leyendo `getInactiveClients`/`getInactiveClientsMemory` en `server/storage.ts`. El código
-ACTUAL de Inicio (antes de este Prompt 10, sección "Seguimiento de clientas" de
-`client/src/pages/Dashboard.tsx`) ya tiene este mismo problema de fondo: usa la lista cruda de
-`inactiveClients` sin filtrar, así que una clienta que nunca compró puede ocupar uno de los 5
-lugares de esa sección como si "hace tiempo que no compra" (se la distingue con el texto
-"Todavía no te compró" en vez de "Hace N días sin comprarte", pero igual cuenta para el cupo y
-para cualquier conteo "N clientas..."). Si no se filtra (`lastPurchase !== null`) al armar este
-aviso nuevo, el número "N" de "N clientas hace más de 2 meses que no compran" va a contar
-clientas que nunca compraron — inconsistente con Clientas (filtro "Hace tiempo que no
-compran", que SÍ las excluye, vía `matchesStaleFilter`) y con "Clientas para recontactar" de
-Reportes (Prompt 11), que también las excluye explícitamente. **No se corrige ahora** — queda
-para cuando se implemente este Prompt 10.
+El aviso **"N clientas hace más de 2 meses que no compran"** corría el riesgo de reusar
+`GET /api/reports/inactive-clients` (`getInactiveClients`), que **incluye a las clientas que
+NUNCA compraron** (`lastPurchase: null`) — habría contado distinto que Clientas. Se resolvió
+NO reusando ese endpoint: el conteo de Inicio llama directo a `searchClientsPaginated` con
+`filter: "no_compran_hace"` (la misma función que ya usa Clientas), así que el número es, por
+construcción, idéntico — ver decisiones del Prompt 10. `getInactiveClients` queda sin tocar,
+con el mismo comportamiento de siempre para quien ya lo use.
 
-#### Pendiente del Prompt 14 (encontrado haciendo el Prompt 14, sin tocar acá)
+#### Pendiente del Prompt 14 (encontrado haciendo el Prompt 14, sin tocar acá) — resuelto en el Prompt 10
 
-El aviso **"Completá tu perfil"** (nombre, ciudad, edad y cargo) que pide el Prompt 14 tiene
-que vivir en el bloque **"Para mejorar tu negocio"** de arriba — pero ese bloque todavía no
-existe (este Prompt 10 no está implementado: `client/src/pages/Dashboard.tsx` hoy no tiene
-ningún bloque con ese nombre ni nada parecido). Mientras tanto, el Prompt 14 lo ubica en otro
-lugar temporal (ver su propia sección de decisiones) — cuando se implemente este Prompt 10,
-mover "Completá tu perfil" al bloque "Para mejorar tu negocio" junto con los demás avisos de
-baja prioridad.
+El aviso **"Completá tu perfil"** (nombre, ciudad, edad y cargo) que pide el Prompt 14 vivía en
+un lugar temporal, fuera de cualquier bloque — ahora es el último `TaskItem` del bloque "Para
+mejorar tu negocio" (ver orden final en las decisiones de este Prompt 10), con el mismo botón
+"Completar" que ya abría `CompleteProfileDialog`.
 
 #### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
 
-- **"Cobrada" en una cuota vencida pide confirmación**: "¿[Clienta] te pagó los $ [saldo]?",
-  con "Sí, me pagó" y "Cancelar". El monto es el SALDO de esa cuota (`amount - amountPaid`,
-  nunca el monto original de la cuota). Al confirmar, se registra como un pago con la misma
-  lógica de "Registrar pago" del Prompt 9 (crea `client_payments` + `payment_allocations` en la
-  misma transacción) — nunca cambiando el estado de la cuota a mano. En la práctica esto ya es
-  así: el PATCH `/api/sales/:id/installments/:id` con `{status: "pagado"}` que ya existe
-  (`registerInstallmentPayment`/`applyPaymentToInstallments`, Prompt 9) es el único camino; lo
-  que cambia es que el botón "Cobrada" de Inicio deja de abrir el detalle completo de la venta
-  (como hace hoy) y pasa a mostrar la confirmación y pegarle directo a ese mismo endpoint.
-- **Aviso nuevo del límite del plan gratis en "Para mejorar tu negocio"**: solo para cuentas del
-  plan gratis con 10 o más productos con stock — "Llegaste al límite de la prueba gratis.
-  Suscribite para cargar todos los productos que quieras.", con el botón "Ver planes" (lleva a
-  Suscripción). Se puede ocultar 7 días, como los demás avisos de este bloque.
-- **"Ocultar" se guarda en la base, por consultora**: nunca en el navegador — tiene que valer en
-  todos sus dispositivos. No existe hoy ningún mecanismo genérico para esto (lo que hay,
-  `orderReminders.dismissedAt` y `productStock.remindStockAt`, son de un solo propósito cada
-  uno) — hace falta una tabla nueva, con una fila por `(consultantId, noticeKey)` y su
-  `dismissedAt`, donde `noticeKey` es uno de un set chico y fijo (stock bajo, clientas
-  inactivas, productos sin costo, clientas sin celular, completar perfil, límite del plan
-  gratis) — nunca una clave por aviso individual.
-- **Los números tienen que coincidir con el resto de la app**:
+- **"Cobrada" en una cuota vencida o que vence hoy pide confirmación**: "¿[Clienta] te pagó los
+  $ [saldo]?", con "Sí, me pagó" y "Cancelar". El monto es el SALDO de esa cuota
+  (`amount - amountPaid`, nunca el monto original) — la misma cuenta que ya usa Clientas/Reportes
+  (`saleInstallments.amount - saleInstallments.amountPaid`, el mismo criterio detrás de
+  `getClientsPendingBalanceDetail`). Al confirmar, se registra como un pago con la misma lógica
+  de "Registrar pago" del Prompt 9 (crea `client_payments` + `payment_allocations` en la misma
+  transacción) — nunca cambiando el estado de la cuota a mano, nunca un camino nuevo: el PATCH
+  `/api/sales/:id/installments/:id` con `{status: "pagado"}` que ya existe
+  (`registerInstallmentPayment`/`applyPaymentToInstallments`, Prompt 9) ya hace exactamente esto.
+  Lo único que cambia es que el botón "Cobrada" de Inicio deja de abrir el detalle completo de la
+  venta (como hace hoy) y pasa a mostrar la confirmación y pegarle directo a ese mismo endpoint.
+- **Cuotas que vencen hoy, separadas de las vencidas**: entran igual en "Pendientes", con
+  "[Clienta] te debe $ X (vence hoy)" — las vencidas siguen con "venció el [fecha]". Ajuste de
+  base necesario: `getPendingInstallments` calculaba "hoy" con `new Date()` del proceso (UTC en
+  Railway) en vez de `getArgentinaDateStr()` — corregido, porque ahora Inicio depende de esa
+  distinción para decidir el texto.
+- **Aviso nuevo del límite del plan gratis en "Para mejorar tu negocio", primero en el orden**:
+  solo para cuentas del plan gratis con 10 o más productos con stock — "Llegaste al límite de la
+  prueba gratis. Suscribite para cargar todos los productos que quieras.", con el botón "Ver
+  planes" (lleva a Suscripción). Orden final del bloque: límite del plan gratis, poco stock,
+  clientas inactivas, productos sin costo, clientas sin celular, Completá tu perfil (los 4 del
+  medio son los del texto original del prompt, en su mismo orden).
+- **"Ocultar" se guarda en la base, por consultora y por tipo de aviso**: nunca en el navegador —
+  tiene que valer en todos sus dispositivos. No existía ningún mecanismo genérico para esto (lo
+  que había, `orderReminders.dismissedAt` y `productStock.remindStockAt`, son de un solo
+  propósito cada uno) — tabla nueva `dashboard_notice_dismissals` (`consultantId`, `noticeType`,
+  `dismissedAt`), única por `(consultantId, noticeType)`, con `noticeType` de un set chico y fijo
+  (`limite_plan_gratis`, `stock_bajo`, `clientas_inactivas`, `productos_sin_costo`,
+  `clientas_sin_celular`, `completar_perfil`) — nunca una clave por aviso individual. Vuelve a
+  aparecer a los 7 días SI la condición que lo generó sigue vigente (se revisa de nuevo en cada
+  carga, nunca se asume).
+- **Los números tienen que coincidir con el resto de la app, literalmente la misma función**:
   - "Vas $ X" del objetivo usa `getSalesSummary` (la misma función que ya usa "Este mes
     vendiste" de Inicio y, por adentro, `getReportsOverview` de Reportes) — nunca un cálculo
     paralelo.
-  - "Lo que debe cada clienta" usa `getClientsPendingBalanceDetail` (la misma función privada
-    que ya comparten Clientas y "Te deben hoy" de Reportes).
-  - "Hace más de 2 meses que no compran" NO puede reusar `getInactiveClients` tal cual: esa
-    función incluye `lastPurchase: null` (clientas que nunca compraron) y calcula el corte con
-    `Date.now()` en vez de hora Argentina — dos diferencias reales con `matchesStaleFilter`
-    (`shared/clientFilters.ts`), el criterio que sí usa el filtro de Clientas. El endpoint nuevo
-    de Inicio filtra `lastPurchase !== null` sobre el resultado y usa `getArgentinaDateStr()`
-    para el corte, en vez de tocar `getInactiveClients` (que sigue usándose en otros lados sin
-    este ajuste, para no cambiarle el comportamiento a nadie más sin querer).
+  - "Lo que debe cada clienta" (cuotas de "Pendientes") usa la misma cuenta
+    `amount - amountPaid` que ya usa `getClientsPendingBalanceDetail` (Clientas/Reportes).
+  - "Hace más de 2 meses que no compran": en vez de ajustar `getInactiveClients` (que sigue
+    usándose en otros lados sin tocar, para no cambiarle el comportamiento a nadie más), el
+    conteo de Inicio llama directo a `searchClientsPaginated(consultantId, {filter:
+    "no_compran_hace", ...})` — LA MISMA función que usa Clientas al tocar "Hace tiempo que no
+    compran" — y toma `.total`. Así el número es, por construcción, idéntico al que muestra
+    Clientas, no una aproximación que podría desincronizarse.
+  - "N productos con poco stock" ya tenía un bug real: el badge de Inicio mostraba
+    `stockAlertProducts.length` después de un `.slice(0, 5)` (nunca más de 5, aunque hubiera más)
+    y el diálogo "Ver" mostraba la lista SIN filtrar por `remindStockAt` — dos números distintos
+    entre sí y ninguno el real. Corregido: el conteo y el diálogo usan la misma lista completa,
+    ya filtrada por `remindStockAt` (el mismo criterio que ya usa Stock).
   - "Hoy", "quedan N días" y "venció el [fecha]" siempre con `getArgentinaDateStr()`, nunca
     `new Date()` del proceso (que en Railway es UTC).
+- **Rendimiento**: `getDashboardOverview` corre en un solo `Promise.all` TODAS las consultas que
+  no dependen entre sí (son prácticamente todas — el único orden real es que "Para mejorar tu
+  negocio" necesita el resultado de `getHiddenDashboardNoticeTypes`, que corre en el mismo
+  `Promise.all`, nunca antes).
+- **Comportamiento de los bloques**: cada uno se oculta sin avisos, muestra hasta 3 con "Ver más"
+  para el resto. Si los tres bloques (y el recordatorio del día de pedido) están vacíos: "Estás
+  al día. No tenés nada pendiente." — reemplaza al "No hay nada pendiente por ahora" de antes.
 
 ## Reportes
 

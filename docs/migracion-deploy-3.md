@@ -1,11 +1,12 @@
-# Migración pendiente — Tercer deploy (Prompts 14 y 8)
+# Migración pendiente — Tercer deploy (Prompts 14, 8 y 10)
 
 Este documento es el paquete de migración para DESPUÉS del segundo deploy
-(`docs/migracion-deploy-2.md`). Asume que ese paquete ya está aplicado y publicado. Acumula dos
-prompts porque todavía ninguno de los dos se desplegó: Prompt 14 (ingreso, registro y prueba
-gratis, rama `prompt-14-ingreso`) y Prompt 8 (venta sin stock y día de pedido, rama
-`prompt-8-pedidos`, creada arriba de `prompt-14-ingreso`). Todo lo de abajo se calculó leyendo
-`shared/schema.ts` en cada rama correspondiente.
+(`docs/migracion-deploy-2.md`). Asume que ese paquete ya está aplicado y publicado. Acumula tres
+prompts porque ninguno de los tres se desplegó todavía: Prompt 14 (ingreso, registro y prueba
+gratis, rama `prompt-14-ingreso`), Prompt 8 (venta sin stock y día de pedido, rama
+`prompt-8-pedidos`, creada arriba de `prompt-14-ingreso`) y Prompt 10 (Inicio: objetivo del mes y
+avisos, rama `prompt-10-inicio`, creada arriba de `prompt-8-pedidos`). Todo lo de abajo se
+calculó leyendo `shared/schema.ts` en cada rama correspondiente.
 
 ## ⚠️ Nunca correr `drizzle-kit push` (con o sin `--force`) contra producción
 
@@ -77,12 +78,30 @@ no se implementó, solo queda el modelo de datos listo) — también 100% aditiv
   campos de costo, para que el día que se lea una venta vieja no aparezca como si tuviera algo
   pendiente o estimado que en realidad no tiene.
 
+**Prompt 10** (Inicio: objetivo del mes y avisos) — también 100% aditivo:
+
+- 1 tabla nueva, `dashboard_notice_dismissals`: `id`, `consultant_id` (FK a `consultants`),
+  `notice_type` (text), `dismissed_at` (`timestamp not null default now()`), con un índice único
+  compuesto `(consultant_id, notice_type)`. "Ocultar" un aviso del bloque "Para mejorar tu
+  negocio" hace un UPSERT ahí; vuelve a aparecer a los 7 días si la condición que lo generó
+  sigue vigente.
+- Ningún otro cambio de esquema: el objetivo del mes ya existía (`consultants.monthly_goal`,
+  desde antes de este paquete) y el resto de los avisos reusan columnas/endpoints que ya
+  existían.
+
+**Lo que NO cambia** (Prompt 10):
+
+- **`server/storage.ts`: `getPendingInstallments` corrige su cálculo de "hoy"** de
+  `new Date()` del proceso (UTC en Railway) a `getArgentinaDateStr()` — es un cambio de código,
+  no de esquema, pero vale la pena anotarlo porque cambia (corrige) cuáles cuotas aparecen como
+  "vencidas" vs. "pendientes" justo en el borde de cada día.
+
 ## SQL (de punta a punta, en orden)
 
-Verificado contra la base de dev local (`drizzle-kit push`, schema actual con ambas ramas
+Verificado contra la base de dev local (`drizzle-kit push`, schema actual con las tres ramas
 acumuladas): `information_schema.columns` sobre `order_reminders` confirma exactamente estas
-columnas (sin `items`, sacada en el ajuste de período en vivo), y una segunda corrida sin
-`--force` dio "No changes detected" — nada de esto quedó sin confirmar a mano.
+columnas (sin `items`, sacada en el ajuste de período en vivo) y sobre `dashboard_notice_dismissals`
+también — nada de esto quedó sin confirmar a mano.
 
 ```sql
 -- Prompt 14 --------------------------------------------------------------
@@ -155,6 +174,17 @@ WHERE cost_is_estimated = true AND cost_price IS NOT NULL;
 UPDATE consultants
 SET order_reminder_days_updated_at = now()
 WHERE order_reminder_day1 IS NOT NULL OR order_reminder_day2 IS NOT NULL;
+
+-- Prompt 10 ------------------------------------------------------------------
+-- 9. Tabla nueva dashboard_notice_dismissals. Sin backfill: ninguna fila vieja tiene nada
+-- "oculto" todavía, así que empieza vacía para toda consultora existente.
+CREATE TABLE dashboard_notice_dismissals (
+  id serial PRIMARY KEY,
+  consultant_id integer NOT NULL REFERENCES consultants(id),
+  notice_type text NOT NULL,
+  dismissed_at timestamp NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX dashboard_notice_dismissals_consultant_notice_unique ON dashboard_notice_dismissals (consultant_id, notice_type);
 ```
 
 ## Chequeo previo (solo lectura, correr antes de aplicar)

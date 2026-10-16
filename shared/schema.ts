@@ -425,6 +425,35 @@ export const orderReminders = pgTable("order_reminders", {
   consultantIdx: index("order_reminders_consultant_idx").on(table.consultantId),
 }));
 
+/** Prompt 10 — los 6 avisos de baja prioridad que se pueden "Ocultar" (bloque "Para mejorar tu
+ * negocio" de Inicio). Nunca en el navegador: por consultora, en la base, para que valga en
+ * todos sus dispositivos — ver getDashboardOverview en server/storage.ts. */
+export const dashboardNoticeTypes = [
+  "limite_plan_gratis",
+  "stock_bajo",
+  "clientas_inactivas",
+  "productos_sin_costo",
+  "clientas_sin_celular",
+  "completar_perfil",
+] as const;
+export type DashboardNoticeType = (typeof dashboardNoticeTypes)[number];
+
+/**
+ * Prompt 10 — "Ocultar" de un aviso de baja prioridad: una fila por `(consultantId,
+ * noticeType)`, con la fecha en que se ocultó. Vuelve a aparecer a los 7 días (ver
+ * DISMISSED_NOTICE_HIDDEN_DAYS en server/storage.ts) SI la condición que lo generó sigue
+ * vigente — "Ocultar" nunca resuelve el aviso, solo lo posterga. Ocultar de nuevo antes de que
+ * pasen los 7 días reinicia el contador (UPSERT, nunca una fila nueva).
+ */
+export const dashboardNoticeDismissals = pgTable("dashboard_notice_dismissals", {
+  id: serial("id").primaryKey(),
+  consultantId: integer("consultant_id").notNull().references(() => consultants.id),
+  noticeType: text("notice_type").notNull(),
+  dismissedAt: timestamp("dismissed_at").notNull().defaultNow(),
+}, (table) => ({
+  consultantNoticeUnique: unique("dashboard_notice_dismissals_consultant_notice_unique").on(table.consultantId, table.noticeType),
+}));
+
 /**
  * Prompt 9 — un pago real, registrado con fecha y forma de pago. Puede nacer de "Registrar
  * pago" en la ficha (puede cubrir varias cuotas de varias ventas de la misma clienta), de
@@ -739,11 +768,14 @@ export type SaleInstallment = typeof saleInstallments.$inferSelect;
 export type InsertSaleInstallment = typeof saleInstallments.$inferInsert;
 export type OrderReminder = typeof orderReminders.$inferSelect;
 export type InsertOrderReminder = typeof orderReminders.$inferInsert;
-// Prompt 8 — una línea congelada de order_reminders.items (criterio a: vendido en el período).
+// Prompt 8 — una línea del criterio (a) (vendido en el período), recalculada en vivo en
+// buildOrderReminderDisplayItems — nunca se persiste (ver ajuste de período en server/storage.ts).
 export interface OrderReminderItemSnapshot {
   productId: number;
   soldInPeriod: number;
 }
+export type DashboardNoticeDismissal = typeof dashboardNoticeDismissals.$inferSelect;
+export type InsertDashboardNoticeDismissal = typeof dashboardNoticeDismissals.$inferInsert;
 export type Payment = typeof payments.$inferSelect;
 export type InsertPayment = typeof payments.$inferInsert;
 export type Subscription = typeof subscriptions.$inferSelect;
