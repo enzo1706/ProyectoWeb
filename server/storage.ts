@@ -101,6 +101,7 @@ import {
   matchesBalanceFilter,
   matchesStaleFilter,
   matchesBirthdayMonth,
+  matchesMissingPhoneFilter,
   birthdayDay,
   MAX_CLIENTS_PAGE_SIZE,
 } from "@shared/clientFilters";
@@ -577,6 +578,9 @@ export interface PendingInstallmentRow {
   // installments/:installmentId) sin tener que abrir el detalle completo de la venta.
   installmentId: number;
   clientName: string;
+  // Prompt 10 — para el botón "WhatsApp" junto a "Cobrada" (Inicio/Agenda). `null` si la venta
+  // no tiene clienta o la clienta no tiene celular cargado — el botón simplemente no sale.
+  clientPhone: string | null;
   installmentNumber: number;
   amount: number;
   dueDate: string;
@@ -3161,6 +3165,8 @@ export class DatabaseStorage implements IStorage {
     } else if (filter === "cumplen_anios") {
       const currentMonth = getArgentinaMonth();
       withStats = withStats.filter((c) => matchesBirthdayMonth(c.birthday, currentMonth));
+    } else if (filter === "sin_celular") {
+      withStats = withStats.filter((c) => matchesMissingPhoneFilter(c.phone));
     }
 
     // Orden estable y reproducible. "Cumplen años este mes" ordena por día (punto 6); el resto
@@ -3614,6 +3620,10 @@ export class DatabaseStorage implements IStorage {
         saleId: saleInstallments.saleId,
         installmentId: saleInstallments.id,
         clientName: sales.clientName,
+        // Prompt 10 — para el botón "WhatsApp" de Inicio/Agenda. LEFT JOIN: una venta sin
+        // clienta (sales.clientId null) no puede perder su cuota por un INNER JOIN que no
+        // encuentra fila en clients — queda con clientPhone null, el botón simplemente no sale.
+        clientPhone: clients.phone,
         installmentNumber: saleInstallments.installmentNumber,
         // Prompt 9: lo que falta de verdad (amount - amountPaid) — una "pendiente" puede
         // tener un pago parcial.
@@ -3622,6 +3632,7 @@ export class DatabaseStorage implements IStorage {
       })
       .from(saleInstallments)
       .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
+      .leftJoin(clients, eq(sales.clientId, clients.id))
       .where(and(eq(sales.consultantId, consultantId), eq(saleInstallments.status, "pendiente"), ne(sales.status, "cancelada")))
       .orderBy(asc(saleInstallments.dueDate))
       .limit(limit);
@@ -5210,7 +5221,7 @@ export class DatabaseStorage implements IStorage {
       lowStockProductsRaw,
       inactiveClientsResult,
       productsWithoutCostCount,
-      clientsWithoutPhoneCount,
+      clientsWithoutPhoneResult,
       hiddenNoticeTypes,
     ] = await Promise.all([
       this.getBusinessSettings(consultantId),
@@ -5226,7 +5237,10 @@ export class DatabaseStorage implements IStorage {
       this.getLowStockProducts(consultantId),
       this.searchClientsPaginated(consultantId, { filter: "no_compran_hace", page: 1, pageSize: 1 }),
       this.countProductsWithoutCost(consultantId),
-      this.countClientsWithoutPhone(consultantId),
+      // Prompt 10, ajuste — misma función que usa Clientas con "Completar" (filtro
+      // sin_celular), nunca countClientsWithoutPhone: el número del aviso tiene que coincidir
+      // por construcción con la lista filtrada que abre ese botón, no con un cálculo aparte.
+      this.searchClientsPaginated(consultantId, { filter: "sin_celular", page: 1, pageSize: 1 }),
       this.getHiddenDashboardNoticeTypes(consultantId),
     ]);
 
@@ -5263,7 +5277,8 @@ export class DatabaseStorage implements IStorage {
         stockBajo: stockBajoProducts.length > 0 && !hide("stock_bajo") ? { count: stockBajoProducts.length, products: stockBajoProducts } : null,
         clientasInactivas: inactiveClientsResult.total > 0 && !hide("clientas_inactivas") ? { count: inactiveClientsResult.total } : null,
         productosSinCosto: productsWithoutCostCount > 0 && !hide("productos_sin_costo") ? { count: productsWithoutCostCount } : null,
-        clientasSinCelular: clientsWithoutPhoneCount > 0 && !hide("clientas_sin_celular") ? { count: clientsWithoutPhoneCount } : null,
+        clientasSinCelular:
+          clientsWithoutPhoneResult.total > 0 && !hide("clientas_sin_celular") ? { count: clientsWithoutPhoneResult.total } : null,
         completarPerfil: profileIncomplete && !hide("completar_perfil"),
       },
     };
@@ -6833,6 +6848,8 @@ export class MemoryStorage implements IStorage {
     } else if (filter === "cumplen_anios") {
       const currentMonth = getArgentinaMonth();
       withStats = withStats.filter((c) => matchesBirthdayMonth(c.birthday, currentMonth));
+    } else if (filter === "sin_celular") {
+      withStats = withStats.filter((c) => matchesMissingPhoneFilter(c.phone));
     }
 
     if (filter === "cumplen_anios") {
@@ -7205,16 +7222,21 @@ export class MemoryStorage implements IStorage {
       .filter((i) => i.status === "pendiente" && saleById.get(i.saleId) !== undefined && saleById.get(i.saleId)?.status !== "cancelada")
       .sort((a, b) => a.dueDate.localeCompare(b.dueDate))
       .slice(0, limit)
-      .map((i) => ({
-        saleId: i.saleId,
-        installmentId: i.id,
-        clientName: saleById.get(i.saleId)?.clientName ?? "—",
-        installmentNumber: i.installmentNumber,
-        // Prompt 9: lo que falta de verdad (amount - amountPaid).
-        amount: i.amount - i.amountPaid,
-        dueDate: i.dueDate,
-        isOverdue: i.dueDate < today,
-      }));
+      .map((i) => {
+        const sale = saleById.get(i.saleId);
+        const client = sale?.clientId !== null && sale?.clientId !== undefined ? this.clients.find((c) => c.id === sale.clientId) : undefined;
+        return {
+          saleId: i.saleId,
+          installmentId: i.id,
+          clientName: sale?.clientName ?? "—",
+          clientPhone: client?.phone ?? null,
+          installmentNumber: i.installmentNumber,
+          // Prompt 9: lo que falta de verdad (amount - amountPaid).
+          amount: i.amount - i.amountPaid,
+          dueDate: i.dueDate,
+          isOverdue: i.dueDate < today,
+        };
+      });
   }
 
   /** Espejo de DatabaseStorage.getProductCostSummary. */
@@ -8269,7 +8291,7 @@ export class MemoryStorage implements IStorage {
     const lowStockProductsRaw = await this.getLowStockProducts(consultantId);
     const inactiveClientsResult = await this.searchClientsPaginated(consultantId, { filter: "no_compran_hace", page: 1, pageSize: 1 });
     const productsWithoutCostCount = await this.countProductsWithoutCost(consultantId);
-    const clientsWithoutPhoneCount = await this.countClientsWithoutPhone(consultantId);
+    const clientsWithoutPhoneResult = await this.searchClientsPaginated(consultantId, { filter: "sin_celular", page: 1, pageSize: 1 });
     const hiddenNoticeTypes = this.getHiddenDashboardNoticeTypesMem(consultantId);
 
     const monthSales = monthPoints.reduce((sum, p) => sum + p.totalSales, 0);
@@ -8303,7 +8325,8 @@ export class MemoryStorage implements IStorage {
         stockBajo: stockBajoProducts.length > 0 && !hide("stock_bajo") ? { count: stockBajoProducts.length, products: stockBajoProducts } : null,
         clientasInactivas: inactiveClientsResult.total > 0 && !hide("clientas_inactivas") ? { count: inactiveClientsResult.total } : null,
         productosSinCosto: productsWithoutCostCount > 0 && !hide("productos_sin_costo") ? { count: productsWithoutCostCount } : null,
-        clientasSinCelular: clientsWithoutPhoneCount > 0 && !hide("clientas_sin_celular") ? { count: clientsWithoutPhoneCount } : null,
+        clientasSinCelular:
+          clientsWithoutPhoneResult.total > 0 && !hide("clientas_sin_celular") ? { count: clientsWithoutPhoneResult.total } : null,
         completarPerfil: profileIncomplete && !hide("completar_perfil"),
       },
     };

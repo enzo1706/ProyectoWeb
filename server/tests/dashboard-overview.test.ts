@@ -19,13 +19,22 @@ async function api(cookie: string, method: string, path: string, body?: unknown)
   });
 }
 
+// loginRateLimiter cuenta por IP — con ~12 tests llamando a createConsultant() cada uno, todos
+// compartiendo la misma IP de loopback, se pisa el balde del rate limiter (mismo criterio ya
+// documentado en auth-register.test.ts). Cada test usa su propia IP sintética.
+let ipCounter = 1;
+function nextTestIp(): string {
+  ipCounter += 1;
+  return `10.79.${(ipCounter >> 8) & 0xff}.${ipCounter & 0xff}`;
+}
+
 let nextTag = 1;
 async function createConsultant(): Promise<string> {
   const username = `vitest_dashboard_${nextTag++}_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
   await storage.createUser({ username, password: "vitest-test-password-123", role: "consultant", status: true });
   const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Forwarded-For": nextTestIp() },
     body: JSON.stringify({ identifier: username, password: "vitest-test-password-123" }),
   });
   return loginRes.headers.get("set-cookie")!.split(";")[0];
@@ -294,5 +303,86 @@ describe("GET /api/dashboard/overview — Prompt 10", () => {
     }
     const overview = await (await api(cookie, "GET", "/api/dashboard/overview")).json();
     expect(overview.paraMejorarTuNegocio.limitePlanGratis).toBe(false);
+  });
+
+  it("'Cobrada' trae el teléfono de la clienta para el botón de WhatsApp; una venta sin clienta no rompe nada", async () => {
+    const cookie = await createConsultant();
+    const client = await createClient(cookie, { phone: "2615550001" });
+    const product = await createProduct(cookie, { unidades: 5 });
+    const withClientSale = await (
+      await api(cookie, "POST", "/api/sales", {
+        clientId: client.id,
+        date: "2026-10-01",
+        items: [{ productId: product.id, quantity: 1 }],
+        orderDiscount: null,
+        orderSurcharge: null,
+        paymentMethod: "efectivo",
+        paidNow: false,
+        firstDueDate: "2026-10-01",
+        installments: [{ amount: 1000 }],
+      })
+    ).json();
+    // Nota: una venta SIN clienta nunca puede tener una cuota pendiente de verdad (el servidor
+    // rechaza "sin clienta" + "pendiente de cobro", ver createSaleSchema) — el LEFT JOIN de
+    // clientPhone queda cubierto igual (nunca rompe la consulta), solo que no hay forma de
+    // armar ese caso puntual con una venta real.
+    const overview = await (await api(cookie, "GET", "/api/dashboard/overview")).json();
+    const withPhone = overview.pendientes.installments.find((i: any) => i.saleId === withClientSale.id);
+    expect(withPhone.clientPhone).toBe("2615550001");
+  });
+
+  it("'Tenés N ventas sin clienta' coincide con la lista de /api/sales filtrada por ese mismo criterio", async () => {
+    const cookie = await createConsultant();
+    const client = await createClient(cookie);
+    const product = await createProduct(cookie, { unidades: 5 });
+    // Una con clienta (no cuenta) y dos sin clienta (sí cuentan) — "sin clienta" se manda
+    // OMITIENDO clientId, nunca clientId: null (createSaleSchema solo acepta `.optional()`).
+    for (const clientId of [client.id, undefined, undefined]) {
+      await api(cookie, "POST", "/api/sales", {
+        ...(clientId !== undefined ? { clientId } : {}),
+        date: "2026-10-01",
+        items: [{ productId: product.id, quantity: 1 }],
+        orderDiscount: null,
+        orderSurcharge: null,
+        paymentMethod: "efectivo",
+        paidNow: true,
+        installments: [{ amount: 1000 }],
+      });
+    }
+
+    const overview = await (await api(cookie, "GET", "/api/dashboard/overview")).json();
+    const allSales = await (await api(cookie, "GET", "/api/sales")).json();
+    const filteredCount = allSales.filter((s: any) => s.status !== "cancelada" && s.clientId === null).length;
+
+    expect(overview.pendientes.salesWithoutClientCount).toBe(2);
+    expect(overview.pendientes.salesWithoutClientCount).toBe(filteredCount);
+  });
+
+  it("'Tenés N productos sin costo cargado' coincide con la lista de /api/products filtrada por ese mismo criterio", async () => {
+    const cookie = await createConsultant();
+    await createProduct(cookie, { unidades: 3 }); // sin costo, con stock — cuenta
+    const costPayload = await createProduct(cookie, { unidades: 3 });
+    await api(cookie, "PATCH", `/api/products/${costPayload.id}/cost`, { costPrice: 500 }); // con costo — no cuenta
+    await createProduct(cookie, { unidades: 0 }); // sin costo pero sin stock — no cuenta
+
+    const overview = await (await api(cookie, "GET", "/api/dashboard/overview")).json();
+    const allProducts = await (await api(cookie, "GET", "/api/products")).json();
+    const filteredCount = allProducts.filter((p: any) => p.costPrice === null && p.unidades > 0).length;
+
+    expect(overview.paraMejorarTuNegocio.productosSinCosto.count).toBe(1);
+    expect(overview.paraMejorarTuNegocio.productosSinCosto.count).toBe(filteredCount);
+  });
+
+  it("'Tenés N clientas sin celular cargado' coincide EXACTO con GET /api/clients?filter=sin_celular", async () => {
+    const cookie = await createConsultant();
+    await createClient(cookie, { phone: null }); // sin celular — cuenta
+    await createClient(cookie, { phone: "2615550002" }); // con celular — no cuenta
+
+    const overview = await (await api(cookie, "GET", "/api/dashboard/overview")).json();
+    const clientasRes = await api(cookie, "GET", "/api/clients?filter=sin_celular&page=1&pageSize=1");
+    const clientasBody = await clientasRes.json();
+
+    expect(overview.paraMejorarTuNegocio.clientasSinCelular.count).toBe(1);
+    expect(overview.paraMejorarTuNegocio.clientasSinCelular.count).toBe(clientasBody.total);
   });
 });

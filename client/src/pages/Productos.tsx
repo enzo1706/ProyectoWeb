@@ -46,6 +46,7 @@ import {
   SearchX,
   Plus,
   PackagePlus,
+  X,
 } from "lucide-react";
 
 const MANUAL_FILTER = "__manual";
@@ -132,6 +133,9 @@ export default function Productos() {
   const [categoryFilter, setCategoryFilter] = useState<string>(ALL_FILTER);
   // Por defecto solo se ven productos con stock > 0 — el checkbox habilita ver también los de 0.
   const [showOutOfStock, setShowOutOfStock] = useState(false);
+  // Prompt 10 — "?filter=sin_costo" en la URL (desde el aviso de Inicio "Tenés N productos sin
+  // costo cargado") deja la lista mostrando solo esos, mismo patrón que Clientas (Prompt 11).
+  const [missingCostOnly, setMissingCostOnly] = useState(() => new URLSearchParams(window.location.search).get("filter") === "sin_costo");
   // Prompt 4: alternar entre ver el precio de venta al público o el costo de cada producto.
   const [showPublicPrice, setShowPublicPrice] = useState(true);
   const [addProductOpen, setAddProductOpen] = useState(false);
@@ -186,10 +190,13 @@ export default function Productos() {
       else if (categoryFilter !== ALL_FILTER) matchesCategory = p.seccion === categoryFilter;
 
       const matchesStock = showOutOfStock || p.unidades > 0;
+      // Prompt 10 — mismo criterio que storage.countProductsWithoutCost (el número del aviso
+      // de Inicio tiene que coincidir con esta lista filtrada).
+      const matchesCost = !missingCostOnly || (p.costPrice === null && p.unidades > 0);
 
-      return matchesSearch && matchesCategory && matchesStock;
+      return matchesSearch && matchesCategory && matchesStock && matchesCost;
     });
-  }, [products, search, categoryFilter, showOutOfStock]);
+  }, [products, search, categoryFilter, showOutOfStock, missingCostOnly]);
 
   // Agrupa por familia (sección+línea+nombre) para que los tonos de un mismo producto
   // aparezcan como una sola fila expandible en vez de una fila por variante.
@@ -293,6 +300,20 @@ export default function Productos() {
           </p>
         )}
       </header>
+
+      {missingCostOnly && (
+        <div>
+          <button
+            type="button"
+            onClick={() => setMissingCostOnly(false)}
+            className="inline-flex items-center gap-1.5 rounded-full border bg-muted/50 px-3 py-1.5 text-sm font-medium hover-elevate active-elevate-2"
+            data-testid="chip-active-filter"
+          >
+            Sin costo cargado
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
 
       {!isLoading && !isError && products.length > 0 && (
         <Card data-testid="card-stock-value">

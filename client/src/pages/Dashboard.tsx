@@ -59,6 +59,7 @@ interface PendingInstallmentRow {
   saleId: number;
   installmentId: number;
   clientName: string;
+  clientPhone: string | null;
   installmentNumber: number;
   amount: number;
   dueDate: string;
@@ -358,15 +359,18 @@ export default function Dashboard() {
         title: `${inst.clientName} te debe ${format(inst.amount)} (${inst.isOverdue ? `venció el ${formatDateDisplay(inst.dueDate)}` : "vence hoy"})`,
         subtitle: "",
         actions: (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => setConfirmPayInstallment(inst)}
-            data-testid={`button-task-action-installment-${inst.installmentId}`}
-          >
-            Cobrada
-          </Button>
+          <>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setConfirmPayInstallment(inst)}
+              data-testid={`button-task-action-installment-${inst.installmentId}`}
+            >
+              Cobrada
+            </Button>
+            <WhatsAppButton phone={inst.clientPhone} variant="icon" />
+          </>
         ),
       });
     }
@@ -409,7 +413,13 @@ export default function Dashboard() {
         title: `Tenés ${n} venta${n !== 1 ? "s" : ""} sin clienta`,
         subtitle: "",
         actions: (
-          <Button type="button" variant="outline" size="sm" onClick={() => setLocation("/ventas")} data-testid="button-task-action-sales-without-client">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setLocation("/ventas?filter=sin_clienta")}
+            data-testid="button-task-action-sales-without-client"
+          >
             Asignar clienta
           </Button>
         ),
@@ -490,7 +500,13 @@ export default function Dashboard() {
         subtitle: "",
         actions: (
           <>
-            <Button type="button" variant="outline" size="sm" onClick={() => setLocation("/productos")} data-testid="button-task-action-productos-sin-costo">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setLocation("/productos?filter=sin_costo")}
+              data-testid="button-task-action-productos-sin-costo"
+            >
               Completarlos
             </Button>
             <DismissButton noticeType="productos_sin_costo" onDismiss={handleDismissNotice} />
@@ -507,7 +523,13 @@ export default function Dashboard() {
         subtitle: "",
         actions: (
           <>
-            <Button type="button" variant="outline" size="sm" onClick={() => setLocation("/clientas")} data-testid="button-task-action-clientas-sin-celular">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setLocation("/clientas?filter=sin_celular")}
+              data-testid="button-task-action-clientas-sin-celular"
+            >
               Completar
             </Button>
             <DismissButton noticeType="clientas_sin_celular" onDismiss={handleDismissNotice} />

@@ -32,6 +32,11 @@ const statusFilters = [
   { value: "pendientes_entrega", label: "Pendientes de entrega" },
   { value: "cobradas", label: "Cobradas" },
   { value: "canceladas", label: "Canceladas" },
+  // Prompt 10 — se llega normalmente por link desde el aviso de Inicio "Tenés N ventas sin
+  // clienta" (?filter=sin_clienta en la URL, igual patrón que Clientas en el Prompt 11), pero
+  // sin la restricción de "tres opciones" que tiene el selector de Clientas — queda disponible
+  // también a mano en este mismo Select, sin nada especial que mantener aparte.
+  { value: "sin_clienta", label: "Sin clienta" },
 ];
 
 export default function Ventas() {
@@ -39,7 +44,12 @@ export default function Ventas() {
   const cart = useSaleCart();
   const { isOpen: isSaleDialogOpen, openCreateSale, openEditSale } = useSaleDialog();
   const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState("todas");
+  // Prompt 10 — mismo patrón que Clientas: si se entra con "?filter=..." en la URL, arranca ya
+  // filtrado (ej. desde el aviso de Inicio "Tenés N ventas sin clienta").
+  const [statusFilter, setStatusFilter] = useState(() => {
+    const fromUrl = new URLSearchParams(window.location.search).get("filter");
+    return statusFilters.some((f) => f.value === fromUrl) ? fromUrl! : "todas";
+  });
   const [selectedSaleId, setSelectedSaleId] = useState<number | null>(null);
   const [assigningClientSale, setAssigningClientSale] = useState<Sale | null>(null);
 
@@ -76,6 +86,9 @@ export default function Ventas() {
     else if (statusFilter === "te_deben") matchesStatus = s.status !== "cancelada" && s.paymentStatus === "te_debe";
     else if (statusFilter === "cobradas") matchesStatus = s.status !== "cancelada" && s.paymentStatus === "cobrada";
     else if (statusFilter === "pendientes_entrega") matchesStatus = s.status !== "cancelada" && s.deliveryStatus === "pendiente_entrega";
+    // Prompt 10 — mismo criterio que storage.countSalesWithoutClient (el número del aviso de
+    // Inicio tiene que coincidir con esta lista filtrada).
+    else if (statusFilter === "sin_clienta") matchesStatus = s.status !== "cancelada" && s.clientId === null;
     return matchesSearch && matchesStatus;
   });
 

@@ -788,6 +788,24 @@ mejorar tu negocio" (ver orden final en las decisiones de este Prompt 10), con e
 - **Comportamiento de los bloques**: cada uno se oculta sin avisos, muestra hasta 3 con "Ver más"
   para el resto. Si los tres bloques (y el recordatorio del día de pedido) están vacíos: "Estás
   al día. No tenés nada pendiente." — reemplaza al "No hay nada pendiente por ahora" de antes.
+- **Cierre de dos huecos que el texto del prompt sí pedía** (encontrados recién al terminar la
+  primera pasada, no son opcionales):
+  - **WhatsApp en cuotas de "Pendientes"**: `getPendingInstallments` ahora trae `clientPhone`
+    (LEFT JOIN a `clients` sobre `sales.clientId` — nunca rompe una venta sin clienta, que de
+    todas formas nunca puede tener una cuota pendiente de verdad: `createSaleSchema` rechaza
+    "sin clienta" + "pendiente de cobro"). El botón `WhatsAppButton` ya se auto-oculta sin
+    teléfono, así que no hizo falta ninguna condición extra en Inicio.
+  - **Los 3 botones de "Para mejorar tu negocio"/"Pendientes" navegan ya filtrados, con el
+    filtro en la URL** (mismo patrón que Clientas/Reportes del Prompt 11): "Asignar clienta" →
+    `/ventas?filter=sin_clienta` (nuevo valor en el `Select` de Ventas, mismo criterio que
+    `countSalesWithoutClient`); "Completarlos" (sin costo) → `/productos?filter=sin_costo`
+    (chip nuevo con "✕" para sacarlo, mismo criterio que `countProductsWithoutCost`);
+    "Completar" (sin celular) → `/clientas?filter=sin_celular` (valor nuevo en
+    `ClientListFilter`, **a propósito NO** una de las "tres opciones grandes" del selector de
+    Filtros — se llega solo por link, el diseño del Prompt 9 queda intacto). El conteo de
+    "clientas sin celular" del aviso dejó de usar `countClientsWithoutPhone` y pasa a llamar
+    `searchClientsPaginated` con ese filtro — mismo criterio que "hace tiempo que no compran":
+    coincide por construcción, nunca por casualidad.
 
 ## Reportes
 
