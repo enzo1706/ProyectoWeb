@@ -939,6 +939,27 @@ Cómo verifico que quedó bien:
 - El botón de WhatsApp abre el chat de la clienta.
 ```
 
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **Evento "Cobro"**: botones "WhatsApp" y "Cobrada". "Cobrada" es el mismo flujo que ya usa
+  Inicio (Prompt 10) — misma confirmación ("¿[Clienta] te pagó los $ [saldo]?") y mismo PATCH
+  `/api/sales/:id/installments/:id` con `{status:"pagado"}`, nunca un camino nuevo. El monto es
+  el saldo (`amount - amountPaid`), la misma cuenta que usa Clientas. Una cuota vencida se ve en
+  su fecha ORIGINAL de vencimiento (nunca se mueve a "hoy"), solo con una marca visual de
+  "vencida".
+- **"Día de pedido"**: la lista de productos para pedir solo se muestra en el próximo día de
+  pedido, o en el actual si el recordatorio sigue abierto — es el MISMO recordatorio del Prompt
+  8 (`getOrderReminder`), calculado en vivo, nunca una copia. Los demás días de pedido del
+  calendario (pasados, o de meses futuros) se marcan igual en la grilla, pero sin lista: tocarlos
+  no abre nada especial.
+- **Cumpleaños 29 de febrero**: en años no bisiestos se muestran el 28 — mismo criterio que ya
+  usa `resolveOrderDayForMonth` para el día de pedido (`Math.min(día, días del mes)`), aplicado
+  ahora también a cumpleaños.
+- **Todo en hora de Argentina**: incluye corregir dos funciones que hoy usan el reloj del
+  proceso en vez de `getArgentinaDateStr()`/`getArgentinaNow()` — `getUpcomingBirthdays` y
+  `getUpcomingAppointments` (esta última la sigue usando Inicio para "hoy"/"citas de hoy", así
+  que el fix la beneficia también a ella, no solo a Agenda).
+
 ## Menú y navegación
 
 ### Prompt 13 · Menú, navegación y sesión
