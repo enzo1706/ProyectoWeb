@@ -94,7 +94,7 @@ import {
   computeDiscountedCost,
 } from "@shared/saleCalculations";
 import { resolveLowStockThreshold, DEFAULT_LOW_STOCK_THRESHOLD, isReminderActive } from "@shared/stockAlerts";
-import { resolveOrderReminderPeriod } from "@shared/orderReminderSchedule";
+import { resolveOrderReminderPeriod, resolveNextOrderDate, ymdToStr } from "@shared/orderReminderSchedule";
 import {
   type ClientListFilter,
   STALE_THRESHOLD_DAYS,
@@ -105,12 +105,12 @@ import {
   birthdayDay,
   MAX_CLIENTS_PAGE_SIZE,
 } from "@shared/clientFilters";
-import { getArgentinaDateStr, getArgentinaMonth, toArgentinaDateStr, getArgentinaNow, getDaysInMonth } from "@shared/argentinaTime";
+import { getArgentinaDateStr, getArgentinaMonth, toArgentinaDateStr, getArgentinaNow, getDaysInMonth, getArgentinaTimeStr, resolveOrderDayForMonth } from "@shared/argentinaTime";
 import { type ReportPeriodKind, getComparisonPeriod } from "@shared/reportsPeriods";
 import { normalizeArgentinaPhoneForStorage, normalizeArgentinaPhoneDigits } from "@shared/phone";
 import { isKnownEventType, normalizeCustomEventTypeName, KNOWN_EVENT_TYPES } from "@shared/eventTypes";
 import type { z } from "zod";
-import { eq, ne, count, sql, and, gt, gte, lt, lte, asc, desc, isNotNull, isNull, inArray, notInArray, ilike, or } from "drizzle-orm";
+import { eq, ne, count, sql, and, gt, gte, lt, lte, asc, desc, isNotNull, isNull, inArray, notInArray, ilike, or, getTableColumns } from "drizzle-orm";
 import type { db as database } from "./db";
 import { resolveStorageMode } from "./storage-mode";
 import { shouldUseTestDatabase } from "./test-db-guard";
@@ -557,6 +557,13 @@ export interface InactiveClient {
   totalPurchased: number;
 }
 
+/** Prompt 12 — `clientPhone` vía LEFT JOIN a `clients` (nunca rompe una cita sin clienta, que
+ * ahora es posible: ver Prompt 12, clienta opcional) — para el botón "WhatsApp" en citas,
+ * reusado por Inicio ("Citas de hoy") y Agenda. */
+export interface AppointmentWithPhone extends Appointment {
+  clientPhone: string | null;
+}
+
 export interface UpcomingBirthday {
   clientId: number;
   name: string | null;
@@ -719,6 +726,28 @@ export interface DashboardOverview {
   };
 }
 
+/** Prompt 12 — un día de pedido dentro del mes mostrado en Agenda. "real" = el recordatorio
+ * abierto de verdad (Prompt 8), con `reminderId` para poder cerrarlo ("Listo, ya lo pedí").
+ * "preview" = el próximo día de pedido SIN recordatorio abierto todavía: la misma lógica del
+ * Prompt 8 calculada en vivo (lo vendido desde el último día de pedido hasta hoy, más lo
+ * pendiente), sin guardar ninguna fila — nunca se puede cerrar. "marker" = cualquier otro día
+ * de pedido del mes (pasado, o de más adelante): solo la fecha, sin lista. */
+export interface AgendaOrderDay {
+  date: string;
+  kind: "real" | "preview" | "marker";
+  reminderId?: number;
+  items?: { productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[];
+}
+
+/** Prompt 12 — todo lo que necesita Agenda para un mes, en una sola llamada (mismo patrón que
+ * `getDashboardOverview`): citas cargadas a mano + los 3 tipos de evento automático. */
+export interface AgendaMonth {
+  appointments: AppointmentWithPhone[];
+  cobros: PendingInstallmentRow[];
+  cumpleanos: { clientId: number; name: string | null; phone: string | null; day: number }[];
+  diasDePedido: AgendaOrderDay[];
+}
+
 function getCurrentMonthRange(): { monthStart: string; monthEnd: string } {
   const now = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -747,17 +776,25 @@ function daysBetween(from: Date, to: Date): number {
   return Math.round((toMidnight.getTime() - fromMidnight.getTime()) / 86400000);
 }
 
-/** Días hasta el próximo cumpleaños, resolviendo el cruce de año (ej. hoy en diciembre, cumpleaños en enero). */
-function daysUntilNextBirthday(birthday: string, today: Date): number {
+/** Días hasta el próximo cumpleaños, resolviendo el cruce de año (ej. hoy en diciembre,
+ * cumpleaños en enero) y el 29 de febrero en años no bisiestos (Prompt 12: se muestra el 28 —
+ * mismo criterio que `resolveOrderDayForMonth`). `todayStr` tiene que venir siempre de
+ * `getArgentinaDateStr()` — aritmética en `Date.UTC` puro, nunca getters locales (`getDate()`,
+ * `getMonth()`, etc. dependen de la zona del PROCESO, no de Argentina: mismo criterio que ya
+ * documenta shared/argentinaTime.ts). */
+function daysUntilNextBirthday(birthday: string, todayStr: string): number {
   const [, month, day] = birthday.split("-").map(Number);
-  const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const [todayYear, todayMonth, todayDay] = todayStr.split("-").map(Number);
+  const todayValue = Date.UTC(todayYear, todayMonth - 1, todayDay);
 
-  let next = new Date(today.getFullYear(), month - 1, day);
-  if (next.getTime() < todayMidnight.getTime()) {
-    next = new Date(today.getFullYear() + 1, month - 1, day);
+  let year = todayYear;
+  let nextValue = Date.UTC(year, month - 1, resolveOrderDayForMonth(day, year, month));
+  if (nextValue < todayValue) {
+    year += 1;
+    nextValue = Date.UTC(year, month - 1, resolveOrderDayForMonth(day, year, month));
   }
 
-  return Math.round((next.getTime() - todayMidnight.getTime()) / 86400000);
+  return Math.round((nextValue - todayValue) / 86400000);
 }
 
 export interface IStorage {
@@ -1012,8 +1049,8 @@ export interface IStorage {
   /** Admin-only: solo aplica a productos globales — las imágenes de productos manuales las
    * gestiona cada consultora dueña, no el admin. */
   setProductImage(productId: number, imagen: string | null): Promise<SetProductImageResult>;
-  getUpcomingAppointments(consultantId: number, limit?: number): Promise<Appointment[]>;
-  getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<Appointment[]>;
+  getUpcomingAppointments(consultantId: number, limit?: number): Promise<AppointmentWithPhone[]>;
+  getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<AppointmentWithPhone[]>;
   /** Tipos de evento personalizados (no fijos/legacy) que la consultora ya usó alguna vez, para
    * ofrecerlos de nuevo al crear una cita y para el filtro "Todos los eventos" de la Agenda. */
   getAppointmentCustomTypes(consultantId: number): Promise<string[]>;
@@ -1115,8 +1152,16 @@ export interface IStorage {
   getStockValuation(consultantId: number): Promise<StockValuation>;
   getInactiveClients(consultantId: number, days: number): Promise<InactiveClient[]>;
   getUpcomingBirthdays(consultantId: number, days: number): Promise<UpcomingBirthday[]>;
+  /** Prompt 12 — cumpleaños del mes mostrado en Agenda (nunca "próximos N días desde hoy"). */
+  getBirthdaysInMonth(consultantId: number, year: number, month: number): Promise<{ clientId: number; name: string | null; phone: string | null; day: number }[]>;
   getAppointmentsSummary(consultantId: number, start: string, end: string): Promise<AppointmentsSummary>;
   getPendingInstallments(consultantId: number, limit?: number): Promise<PendingInstallmentRow[]>;
+  /** Prompt 12 — "Cobro" de Agenda: mismo criterio que getPendingInstallments, con rango de
+   * fechas en vez de `limit`. */
+  getInstallmentsInRange(consultantId: number, start: string, end: string): Promise<PendingInstallmentRow[]>;
+  /** Prompt 12 — todo lo que necesita Agenda para un mes (ver detalle en
+   * DatabaseStorage.getAgendaMonth). */
+  getAgendaMonth(consultantId: number, start: string, end: string): Promise<AgendaMonth>;
   getProductCostSummary(consultantId: number, start?: string, end?: string): Promise<ProductCostSummary>;
   getCollectedPayments(consultantId: number): Promise<CollectedPayments>;
   getPendingInstallmentsTotals(consultantId: number): Promise<PendingInstallmentsTotals>;
@@ -2753,15 +2798,17 @@ export class DatabaseStorage implements IStorage {
     });
   }
 
-  async getUpcomingAppointments(consultantId: number, limit = 10): Promise<Appointment[]> {
+  async getUpcomingAppointments(consultantId: number, limit = 10): Promise<AppointmentWithPhone[]> {
     const db = await this.getDb();
-    const now = new Date();
-    const nowDate = toDateStr(now);
-    const nowTime = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+    // Prompt 12 — hora de Argentina, nunca el reloj del proceso (en Railway es UTC): "próximas"
+    // tiene que coincidir con lo que Inicio considera "hoy".
+    const nowDate = getArgentinaDateStr();
+    const nowTime = getArgentinaTimeStr();
 
     return db
-      .select()
+      .select({ ...getTableColumns(appointments), clientPhone: clients.phone })
       .from(appointments)
+      .leftJoin(clients, eq(appointments.clientId, clients.id))
       .where(
         and(
           eq(appointments.consultantId, consultantId),
@@ -2773,11 +2820,12 @@ export class DatabaseStorage implements IStorage {
       .limit(limit);
   }
 
-  async getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<Appointment[]> {
+  async getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<AppointmentWithPhone[]> {
     const db = await this.getDb();
     return db
-      .select()
+      .select({ ...getTableColumns(appointments), clientPhone: clients.phone })
       .from(appointments)
+      .leftJoin(clients, eq(appointments.clientId, clients.id))
       .where(and(eq(appointments.consultantId, consultantId), gte(appointments.date, start), lt(appointments.date, end)))
       .orderBy(asc(appointments.date), asc(appointments.time));
   }
@@ -2831,12 +2879,20 @@ export class DatabaseStorage implements IStorage {
 
   async createAppointment(consultantId: number, input: CreateAppointmentInput): Promise<Appointment | undefined> {
     const db = await this.getDb();
-    const [client] = await db
-      .select()
-      .from(clients)
-      .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
-    if (!client) return undefined;
-    const clientName = client.name ?? client.phone ?? "Sin nombre";
+    // Prompt 12 — la clienta es opcional en todos los tipos ("Crear evento" nunca tuvo una
+    // forma natural de elegirla). Sin clientId: clientId null y clientName "" — nunca se lee
+    // clientName para decidir nada, siempre clientId (mismo criterio que "venta sin clienta").
+    let clientId: number | null = null;
+    let clientName = "";
+    if (input.clientId !== undefined) {
+      const [client] = await db
+        .select()
+        .from(clients)
+        .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
+      if (!client) return undefined;
+      clientId = client.id;
+      clientName = client.name ?? client.phone ?? "Sin nombre";
+    }
     const type = await this.resolveEventType(consultantId, input.type);
 
     if (await this.findConflictingAppointment(db, consultantId, input.date, input.time)) {
@@ -2848,7 +2904,7 @@ export class DatabaseStorage implements IStorage {
         .insert(appointments)
         .values({
           consultantId,
-          clientId: client.id,
+          clientId,
           clientName,
           date: input.date,
           time: input.time,
@@ -2877,12 +2933,18 @@ export class DatabaseStorage implements IStorage {
       .where(and(eq(appointments.id, id), eq(appointments.consultantId, consultantId)));
     if (!existing) return undefined;
 
-    const [client] = await db
-      .select()
-      .from(clients)
-      .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
-    if (!client) throw new AppointmentValidationError("Clienta no encontrada");
-    const clientName = client.name ?? client.phone ?? "Sin nombre";
+    // Prompt 12 — mismo criterio que createAppointment: sin clientId, queda sin clienta.
+    let clientId: number | null = null;
+    let clientName = "";
+    if (input.clientId !== undefined) {
+      const [client] = await db
+        .select()
+        .from(clients)
+        .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
+      if (!client) throw new AppointmentValidationError("Clienta no encontrada");
+      clientId = client.id;
+      clientName = client.name ?? client.phone ?? "Sin nombre";
+    }
     const type = input.type === existing.type ? existing.type : await this.resolveEventType(consultantId, input.type);
 
     if (await this.findConflictingAppointment(db, consultantId, input.date, input.time, id)) {
@@ -2893,7 +2955,7 @@ export class DatabaseStorage implements IStorage {
       const [updated] = await db
         .update(appointments)
         .set({
-          clientId: client.id,
+          clientId,
           clientName,
           date: input.date,
           time: input.time,
@@ -3579,7 +3641,8 @@ export class DatabaseStorage implements IStorage {
       .from(clients)
       .where(and(eq(clients.consultantId, consultantId), isNotNull(clients.birthday)));
 
-    const today = new Date();
+    // Prompt 12 — hora de Argentina, nunca el reloj del proceso (en Railway es UTC).
+    const today = getArgentinaDateStr();
     return rows
       .map((row) => ({
         clientId: row.id,
@@ -3590,6 +3653,29 @@ export class DatabaseStorage implements IStorage {
       }))
       .filter((r) => r.daysUntil <= days)
       .sort((a, b) => a.daysUntil - b.daysUntil);
+  }
+
+  /** Prompt 12 — cumpleaños del mes mostrado en Agenda (nunca "próximos N días desde hoy":
+   * tiene que poder mostrar meses pasados o futuros igual). `day` ya viene clampeado (29 de
+   * febrero en año no bisiesto → 28, mismo criterio que `resolveOrderDayForMonth`). */
+  async getBirthdaysInMonth(
+    consultantId: number,
+    year: number,
+    month: number,
+  ): Promise<{ clientId: number; name: string | null; phone: string | null; day: number }[]> {
+    const db = await this.getDb();
+    const rows = await db
+      .select({ id: clients.id, name: clients.name, phone: clients.phone, birthday: clients.birthday })
+      .from(clients)
+      .where(and(eq(clients.consultantId, consultantId), isNotNull(clients.birthday)));
+
+    const results: { clientId: number; name: string | null; phone: string | null; day: number }[] = [];
+    for (const row of rows) {
+      const [, bMonth, bDay] = (row.birthday as string).split("-").map(Number);
+      if (bMonth !== month) continue;
+      results.push({ clientId: row.id, name: row.name, phone: row.phone, day: resolveOrderDayForMonth(bDay, year, month) });
+    }
+    return results.sort((a, b) => a.day - b.day);
   }
 
   async getAppointmentsSummary(consultantId: number, start: string, end: string): Promise<AppointmentsSummary> {
@@ -3636,6 +3722,41 @@ export class DatabaseStorage implements IStorage {
       .where(and(eq(sales.consultantId, consultantId), eq(saleInstallments.status, "pendiente"), ne(sales.status, "cancelada")))
       .orderBy(asc(saleInstallments.dueDate))
       .limit(limit);
+
+    return rows.map((row) => ({ ...row, isOverdue: row.dueDate < today }));
+  }
+
+  /** Prompt 12 — "Cobro" en la Agenda: cuotas pendientes (saldo > 0, venta no cancelada) cuyo
+   * `dueDate` cae en el mes mostrado, en su fecha ORIGINAL (una vencida nunca se mueve a hoy,
+   * solo se marca `isOverdue`). Mismo criterio y mismo join que `getPendingInstallments`, con
+   * rango de fechas en vez de `limit`. */
+  async getInstallmentsInRange(consultantId: number, start: string, end: string): Promise<PendingInstallmentRow[]> {
+    const db = await this.getDb();
+    const today = getArgentinaDateStr();
+
+    const rows = await db
+      .select({
+        saleId: saleInstallments.saleId,
+        installmentId: saleInstallments.id,
+        clientName: sales.clientName,
+        clientPhone: clients.phone,
+        installmentNumber: saleInstallments.installmentNumber,
+        amount: sql<number>`${saleInstallments.amount} - ${saleInstallments.amountPaid}`,
+        dueDate: saleInstallments.dueDate,
+      })
+      .from(saleInstallments)
+      .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
+      .leftJoin(clients, eq(sales.clientId, clients.id))
+      .where(
+        and(
+          eq(sales.consultantId, consultantId),
+          eq(saleInstallments.status, "pendiente"),
+          ne(sales.status, "cancelada"),
+          gte(saleInstallments.dueDate, start),
+          lt(saleInstallments.dueDate, end),
+        ),
+      )
+      .orderBy(asc(saleInstallments.dueDate));
 
     return rows.map((row) => ({ ...row, isOverdue: row.dueDate < today }));
   }
@@ -5284,6 +5405,57 @@ export class DatabaseStorage implements IStorage {
     };
   }
 
+  /** Prompt 12 — todo lo que necesita Agenda para el mes [start, end), en una sola llamada. Las
+   * 5 consultas independientes corren en paralelo; el día de pedido se resuelve después, en
+   * JS puro, sin ninguna consulta extra (ya tiene lo que necesita: los días configurados, el
+   * recordatorio abierto si hay, y el período para la vista previa). */
+  async getAgendaMonth(consultantId: number, start: string, end: string): Promise<AgendaMonth> {
+    const db = await this.getDb();
+    const todayStr = getArgentinaDateStr();
+    const [year, month] = start.split("-").map(Number);
+
+    const [appointmentsList, cobros, cumpleanos, consultant, orderReminderResult] = await Promise.all([
+      this.getAppointmentsInRange(consultantId, start, end),
+      this.getInstallmentsInRange(consultantId, start, end),
+      this.getBirthdaysInMonth(consultantId, year, month),
+      this.getBusinessSettings(consultantId),
+      this.getOrderReminder(consultantId),
+    ]);
+
+    const day1 = consultant?.orderReminderDay1 ?? null;
+    const day2 = consultant?.orderReminderDay2 ?? null;
+    const configuredSinceStr = consultant?.orderReminderDaysUpdatedAt ? toArgentinaDateStr(consultant.orderReminderDaysUpdatedAt) : null;
+
+    const orderDayDates = new Set<string>();
+    if (day1 !== null) orderDayDates.add(ymdToStr({ year, month, day: resolveOrderDayForMonth(day1, year, month) }));
+    if (day2 !== null) orderDayDates.add(ymdToStr({ year, month, day: resolveOrderDayForMonth(day2, year, month) }));
+
+    const realReminderDate = orderReminderResult?.reminder.reminderDate ?? null;
+    const nextOrderDate = resolveNextOrderDate(day1, day2, todayStr);
+    // Prompt 12, ajuste — sin recordatorio abierto, el PRÓXIMO día de pedido igual muestra una
+    // lista en vivo: lo vendido desde el último día de pedido hasta HOY, más lo pendiente de
+    // afuera de ese período — misma función del Prompt 8 (`buildOrderReminderDisplayItems`),
+    // nunca una copia, solo que con un período armado al vuelo en vez de leído de una fila.
+    const lastOrderDay = resolveOrderReminderPeriod(day1, day2, todayStr, configuredSinceStr)?.reminderDate ?? null;
+
+    const diasDePedido: AgendaOrderDay[] = [];
+    for (const date of Array.from(orderDayDates)) {
+      if (date === realReminderDate) {
+        diasDePedido.push({ date, kind: "real", reminderId: orderReminderResult!.reminder.id, items: orderReminderResult!.items });
+      } else if (date === nextOrderDate && lastOrderDay !== null) {
+        const previewItems = await this.buildOrderReminderDisplayItems(db, consultantId, {
+          periodStart: lastOrderDay,
+          periodEnd: todayStr,
+        } as OrderReminder);
+        diasDePedido.push({ date, kind: "preview", items: previewItems });
+      } else {
+        diasDePedido.push({ date, kind: "marker" });
+      }
+    }
+
+    return { appointments: appointmentsList, cobros, cumpleanos, diasDePedido };
+  }
+
   /** Prompt 6, punto 1 — "Completar después": asigna una clienta a una venta que se creó sin
    * una ("Sin clienta"). Solo de `null` a una clienta real — nunca reemplaza una ya asignada
    * (para eso no hace falta este endpoint, la clienta no es editable por otra vía a propósito). */
@@ -6573,10 +6745,16 @@ export class MemoryStorage implements IStorage {
     return { product, previousImage };
   }
 
-  async getUpcomingAppointments(consultantId: number, limit = 10): Promise<Appointment[]> {
-    const now = new Date();
-    const nowDate = toDateStr(now);
-    const nowTime = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  /** Espejo de DatabaseStorage: agrega `clientPhone` (null si no tiene clienta o no tiene celular). */
+  private withClientPhone(a: Appointment): AppointmentWithPhone {
+    const client = a.clientId !== null ? this.clients.find((c) => c.id === a.clientId) : undefined;
+    return { ...a, clientPhone: client?.phone ?? null };
+  }
+
+  async getUpcomingAppointments(consultantId: number, limit = 10): Promise<AppointmentWithPhone[]> {
+    // Prompt 12 — mismo criterio que DatabaseStorage: hora de Argentina, nunca el reloj del proceso.
+    const nowDate = getArgentinaDateStr();
+    const nowTime = getArgentinaTimeStr();
 
     return this.appointments
       .filter(
@@ -6586,13 +6764,15 @@ export class MemoryStorage implements IStorage {
           UPCOMING_APPOINTMENT_STATUSES.includes(a.status as AppointmentStatus),
       )
       .sort((a, b) => (a.date === b.date ? a.time.localeCompare(b.time) : a.date.localeCompare(b.date)))
-      .slice(0, limit);
+      .slice(0, limit)
+      .map((a) => this.withClientPhone(a));
   }
 
-  async getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<Appointment[]> {
+  async getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<AppointmentWithPhone[]> {
     return this.appointments
       .filter((a) => a.consultantId === consultantId && a.date >= start && a.date < end)
-      .sort((a, b) => (a.date === b.date ? a.time.localeCompare(b.time) : a.date.localeCompare(b.date)));
+      .sort((a, b) => (a.date === b.date ? a.time.localeCompare(b.time) : a.date.localeCompare(b.date)))
+      .map((a) => this.withClientPhone(a));
   }
 
   async getAppointmentCustomTypes(consultantId: number): Promise<string[]> {
@@ -6626,9 +6806,15 @@ export class MemoryStorage implements IStorage {
   }
 
   async createAppointment(consultantId: number, input: CreateAppointmentInput): Promise<Appointment | undefined> {
-    const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
-    if (!client) return undefined;
-    const clientName = client.name ?? client.phone ?? "Sin nombre";
+    // Prompt 12 — espejo de DatabaseStorage: sin clientId, queda sin clienta.
+    let clientId: number | null = null;
+    let clientName = "";
+    if (input.clientId !== undefined) {
+      const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
+      if (!client) return undefined;
+      clientId = client.id;
+      clientName = client.name ?? client.phone ?? "Sin nombre";
+    }
     const type = await this.resolveEventType(consultantId, input.type);
 
     if (this.hasConflictingAppointment(consultantId, input.date, input.time)) {
@@ -6638,7 +6824,7 @@ export class MemoryStorage implements IStorage {
     const appointment: Appointment = {
       id: this.nextAppointmentId++,
       consultantId,
-      clientId: client.id,
+      clientId,
       clientName,
       date: input.date,
       time: input.time,
@@ -6655,16 +6841,21 @@ export class MemoryStorage implements IStorage {
     const existing = this.appointments.find((a) => a.id === id && a.consultantId === consultantId);
     if (!existing) return undefined;
 
-    const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
-    if (!client) throw new AppointmentValidationError("Clienta no encontrada");
-    const clientName = client.name ?? client.phone ?? "Sin nombre";
+    let clientId: number | null = null;
+    let clientName = "";
+    if (input.clientId !== undefined) {
+      const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
+      if (!client) throw new AppointmentValidationError("Clienta no encontrada");
+      clientId = client.id;
+      clientName = client.name ?? client.phone ?? "Sin nombre";
+    }
     const type = input.type === existing.type ? existing.type : await this.resolveEventType(consultantId, input.type);
 
     if (this.hasConflictingAppointment(consultantId, input.date, input.time, id)) {
       throw new AppointmentConflictError("Ya existe un turno en ese horario");
     }
 
-    existing.clientId = client.id;
+    existing.clientId = clientId;
     existing.clientName = clientName;
     existing.date = input.date;
     existing.time = input.time;
@@ -7188,7 +7379,8 @@ export class MemoryStorage implements IStorage {
   }
 
   async getUpcomingBirthdays(consultantId: number, days: number): Promise<UpcomingBirthday[]> {
-    const today = new Date();
+    // Prompt 12 — mismo criterio que DatabaseStorage: hora de Argentina, nunca el reloj del proceso.
+    const today = getArgentinaDateStr();
     return this.clients
       .filter((c): c is Client & { birthday: string } => c.consultantId === consultantId && !!c.birthday)
       .map((c) => ({
@@ -7200,6 +7392,22 @@ export class MemoryStorage implements IStorage {
       }))
       .filter((r) => r.daysUntil <= days)
       .sort((a, b) => a.daysUntil - b.daysUntil);
+  }
+
+  /** Espejo de DatabaseStorage.getBirthdaysInMonth. */
+  async getBirthdaysInMonth(
+    consultantId: number,
+    year: number,
+    month: number,
+  ): Promise<{ clientId: number; name: string | null; phone: string | null; day: number }[]> {
+    const results: { clientId: number; name: string | null; phone: string | null; day: number }[] = [];
+    for (const c of this.clients) {
+      if (c.consultantId !== consultantId || !c.birthday) continue;
+      const [, bMonth, bDay] = c.birthday.split("-").map(Number);
+      if (bMonth !== month) continue;
+      results.push({ clientId: c.id, name: c.name, phone: c.phone, day: resolveOrderDayForMonth(bDay, year, month) });
+    }
+    return results.sort((a, b) => a.day - b.day);
   }
 
   async getAppointmentsSummary(consultantId: number, start: string, end: string): Promise<AppointmentsSummary> {
@@ -7237,6 +7445,74 @@ export class MemoryStorage implements IStorage {
           isOverdue: i.dueDate < today,
         };
       });
+  }
+
+  /** Espejo de DatabaseStorage.getInstallmentsInRange. */
+  async getInstallmentsInRange(consultantId: number, start: string, end: string): Promise<PendingInstallmentRow[]> {
+    const today = getArgentinaDateStr();
+    const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
+
+    return this.saleInstallments
+      .filter((i) => {
+        const sale = saleById.get(i.saleId);
+        return i.status === "pendiente" && sale !== undefined && sale.status !== "cancelada" && i.dueDate >= start && i.dueDate < end;
+      })
+      .sort((a, b) => a.dueDate.localeCompare(b.dueDate))
+      .map((i) => {
+        const sale = saleById.get(i.saleId);
+        const client = sale?.clientId !== null && sale?.clientId !== undefined ? this.clients.find((c) => c.id === sale.clientId) : undefined;
+        return {
+          saleId: i.saleId,
+          installmentId: i.id,
+          clientName: sale?.clientName ?? "—",
+          clientPhone: client?.phone ?? null,
+          installmentNumber: i.installmentNumber,
+          amount: i.amount - i.amountPaid,
+          dueDate: i.dueDate,
+          isOverdue: i.dueDate < today,
+        };
+      });
+  }
+
+  /** Espejo de DatabaseStorage.getAgendaMonth. */
+  async getAgendaMonth(consultantId: number, start: string, end: string): Promise<AgendaMonth> {
+    const todayStr = getArgentinaDateStr();
+    const [year, month] = start.split("-").map(Number);
+
+    const appointmentsList = await this.getAppointmentsInRange(consultantId, start, end);
+    const cobros = await this.getInstallmentsInRange(consultantId, start, end);
+    const cumpleanos = await this.getBirthdaysInMonth(consultantId, year, month);
+    const consultant = this.consultants.find((c) => c.id === consultantId);
+    const orderReminderResult = await this.getOrderReminder(consultantId);
+
+    const day1 = consultant?.orderReminderDay1 ?? null;
+    const day2 = consultant?.orderReminderDay2 ?? null;
+    const configuredSinceStr = consultant?.orderReminderDaysUpdatedAt ? toArgentinaDateStr(consultant.orderReminderDaysUpdatedAt) : null;
+
+    const orderDayDates = new Set<string>();
+    if (day1 !== null) orderDayDates.add(ymdToStr({ year, month, day: resolveOrderDayForMonth(day1, year, month) }));
+    if (day2 !== null) orderDayDates.add(ymdToStr({ year, month, day: resolveOrderDayForMonth(day2, year, month) }));
+
+    const realReminderDate = orderReminderResult?.reminder.reminderDate ?? null;
+    const nextOrderDate = resolveNextOrderDate(day1, day2, todayStr);
+    const lastOrderDay = resolveOrderReminderPeriod(day1, day2, todayStr, configuredSinceStr)?.reminderDate ?? null;
+
+    const diasDePedido: AgendaOrderDay[] = [];
+    for (const date of Array.from(orderDayDates)) {
+      if (date === realReminderDate) {
+        diasDePedido.push({ date, kind: "real", reminderId: orderReminderResult!.reminder.id, items: orderReminderResult!.items });
+      } else if (date === nextOrderDate && lastOrderDay !== null) {
+        const previewItems = this.buildOrderReminderDisplayItemsMem(consultantId, {
+          periodStart: lastOrderDay,
+          periodEnd: todayStr,
+        } as OrderReminder);
+        diasDePedido.push({ date, kind: "preview", items: previewItems });
+      } else {
+        diasDePedido.push({ date, kind: "marker" });
+      }
+    }
+
+    return { appointments: appointmentsList, cobros, cumpleanos, diasDePedido };
   }
 
   /** Espejo de DatabaseStorage.getProductCostSummary. */

@@ -34,6 +34,12 @@ export function toArgentinaDateStr(instant: Date): string {
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
 }
 
+/** Prompt 12 — "HH:MM" de ahora en Argentina, mismo formato que `appointments.time`. */
+export function getArgentinaTimeStr(): string {
+  const d = getArgentinaNow();
+  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+
 /** Mes actual en Argentina, 1-12. */
 export function getArgentinaMonth(): number {
   return getArgentinaNow().getUTCMonth() + 1;

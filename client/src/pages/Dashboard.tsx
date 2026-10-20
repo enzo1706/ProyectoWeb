@@ -7,19 +7,8 @@ import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/hooks/useAuth";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Progress } from "@/components/ui/progress";
-import {
-  AlertDialog,
-  AlertDialogContent,
-  AlertDialogHeader,
-  AlertDialogFooter,
-  AlertDialogTitle,
-  AlertDialogDescription,
-  AlertDialogAction,
-  AlertDialogCancel,
-} from "@/components/ui/alert-dialog";
 import { LowStockDialog } from "@/components/LowStockDialog";
 import { ErrorBlock } from "@/components/ErrorBlock";
 import { AppointmentDetailDialog } from "@/components/AppointmentDetailDialog";
@@ -29,10 +18,12 @@ import { WhatsAppButton } from "@/components/WhatsAppButton";
 import { useSaleDialog } from "@/hooks/use-sale-dialog";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { isReminderActive } from "@shared/stockAlerts";
-import { getEventTypeLabel } from "@/components/AppointmentCard";
+import { getEventTypeLabel, type AppointmentWithPhone } from "@/components/AppointmentCard";
+import { PayInstallmentConfirmDialog, type PayableInstallment } from "@/components/PayInstallmentConfirmDialog";
+import { OrderReminderCard, type OrderReminderItemRow } from "@/components/OrderReminderCard";
 import { setOrderReminderPreload } from "@/lib/orderReminderPreload";
 import { getArgentinaDateStr } from "@shared/argentinaTime";
-import type { Product, Appointment, DashboardNoticeType } from "@shared/schema";
+import type { Product, DashboardNoticeType } from "@shared/schema";
 import {
   Plus,
   Clock,
@@ -65,14 +56,6 @@ interface PendingInstallmentRow {
   dueDate: string;
   isOverdue: boolean;
 }
-interface OrderReminderItemRow {
-  productId: number;
-  productName: string;
-  soldInPeriod: number;
-  pendingFromBefore: number;
-  currentStock: number;
-  suggestedQuantity: number;
-}
 interface DeliveryReadyRow {
   saleId: number;
   itemId: number;
@@ -89,7 +72,7 @@ interface DashboardOverview {
   paraHacerHoy: {
     deliveryReady: DeliveryReadyRow[];
     orderReminder: { reminder: { id: number; reminderDate: string }; items: OrderReminderItemRow[] } | null;
-    appointmentsToday: Appointment[];
+    appointmentsToday: AppointmentWithPhone[];
     birthdaysToday: { clientId: number; name: string | null; phone: string | null }[];
   };
   pendientes: {
@@ -208,8 +191,7 @@ export default function Dashboard() {
   const [selectedAppointmentId, setSelectedAppointmentId] = useState<number | null>(null);
   const [selectedSaleId, setSelectedSaleId] = useState<number | null>(null);
   const [completeProfileOpen, setCompleteProfileOpen] = useState(false);
-  const [confirmPayInstallment, setConfirmPayInstallment] = useState<PendingInstallmentRow | null>(null);
-  const [showAllReminderItems, setShowAllReminderItems] = useState(false);
+  const [confirmPayInstallment, setConfirmPayInstallment] = useState<PayableInstallment | null>(null);
 
   const invalidateOverview = () => queryClient.invalidateQueries({ queryKey: ["/api/dashboard/overview"] });
 
@@ -235,34 +217,9 @@ export default function Dashboard() {
     },
     onSuccess: () => {
       invalidateOverview();
-      setShowAllReminderItems(false);
     },
     onError: (err: Error) => {
       toast({ title: "No se pudo cerrar el recordatorio", description: err.message, variant: "destructive" });
-    },
-  });
-
-  // Prompt 10, punto 1 — "Cobrada" registra un pago por el SALDO de esa cuota, con la misma
-  // lógica de "Registrar pago" del Prompt 9 (client_payments + payment_allocations en la misma
-  // transacción, PATCH /api/sales/:id/installments/:installmentId → registerInstallmentPayment
-  // → applyPaymentToInstallments) — nunca cambia el estado a mano por otro camino.
-  const payInstallmentMutation = useGuardedMutation({
-    mutationFn: async (inst: PendingInstallmentRow) => {
-      const res = await apiRequest("PATCH", `/api/sales/${inst.saleId}/installments/${inst.installmentId}`, { status: "pagado" });
-      return res.json();
-    },
-    onSuccess: () => {
-      invalidateOverview();
-      queryClient.invalidateQueries({ queryKey: ["/api/sales"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
-      queryClient.invalidateQueries({
-        predicate: (query) => typeof query.queryKey[0] === "string" && query.queryKey[0].startsWith("/api/reports"),
-      });
-      setConfirmPayInstallment(null);
-    },
-    onError: (err: Error) => {
-      toast({ title: "No se pudo registrar el cobro", description: err.message, variant: "destructive" });
-      setConfirmPayInstallment(null);
     },
   });
 
@@ -287,7 +244,7 @@ export default function Dashboard() {
   };
 
   const detailAppointment = overview?.paraHacerHoy.appointmentsToday.find((a) => a.id === selectedAppointmentId) ?? null;
-  const openAppointmentDetail = (appointment: Appointment) => {
+  const openAppointmentDetail = (appointment: AppointmentWithPhone) => {
     setSelectedAppointmentId(appointment.id);
     setAppointmentDetailOpen(true);
   };
@@ -325,12 +282,20 @@ export default function Dashboard() {
         key: `event-${apt.id}`,
         icon: Calendar,
         colorClass: "bg-blue-500/10 text-blue-600 dark:text-blue-400",
-        title: `Hoy a las ${apt.time} hs: ${getEventTypeLabel(apt.type)} con ${apt.clientName}`,
+        // Prompt 12 — clienta opcional: sin clienta, el nombre del tipo/evento ya dice de qué
+        // se trata, nunca "con [clienta]" vacío.
+        title:
+          apt.clientId !== null
+            ? `Hoy a las ${apt.time} hs: ${getEventTypeLabel(apt.type)} con ${apt.clientName}`
+            : `Hoy a las ${apt.time} hs: ${getEventTypeLabel(apt.type)}`,
         subtitle: "",
         actions: (
-          <Button type="button" variant="outline" size="sm" onClick={() => openAppointmentDetail(apt)} data-testid={`button-task-action-event-${apt.id}`}>
-            Ver
-          </Button>
+          <>
+            <Button type="button" variant="outline" size="sm" onClick={() => openAppointmentDetail(apt)} data-testid={`button-task-action-event-${apt.id}`}>
+              Ver
+            </Button>
+            <WhatsAppButton phone={apt.clientPhone} variant="icon" />
+          </>
         ),
       });
     }
@@ -595,51 +560,17 @@ export default function Dashboard() {
       )}
 
       {!isLoading && overview?.paraHacerHoy.orderReminder && (
-        <Card data-testid="card-order-reminder">
-          <CardHeader className="pb-2">
-            <CardTitle className="flex items-center gap-2 text-base">
-              <Package className="h-4 w-4 text-muted-foreground" />
-              {overview.paraHacerHoy.orderReminder.reminder.reminderDate === getArgentinaDateStr()
-                ? "Hoy es tu día de pedido"
-                : `Tu día de pedido fue el ${formatDateDisplay(overview.paraHacerHoy.orderReminder.reminder.reminderDate)}`}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <p className="text-sm text-muted-foreground">Estos productos que vendiste tienen poco stock</p>
-            <div className="space-y-1.5">
-              {(showAllReminderItems ? overview.paraHacerHoy.orderReminder.items : overview.paraHacerHoy.orderReminder.items.slice(0, 5)).map((item) => (
-                <div key={item.productId} className="flex items-center justify-between text-sm" data-testid={`row-order-reminder-${item.productId}`}>
-                  <span className="break-words">{item.productName}</span>
-                  <Badge variant="outline">Sugerido: {item.suggestedQuantity}</Badge>
-                </div>
-              ))}
-            </div>
-            {!showAllReminderItems && overview.paraHacerHoy.orderReminder.items.length > 5 && (
-              <button
-                type="button"
-                className="text-sm text-muted-foreground underline"
-                onClick={() => setShowAllReminderItems(true)}
-                data-testid="button-order-reminder-view-all"
-              >
-                Ver todos
-              </button>
-            )}
-            <div className="flex flex-wrap gap-2 pt-1">
-              <Button type="button" onClick={openOrderForReminder} data-testid="button-order-reminder-build">
-                Armar pedido con estos productos
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                disabled={dismissReminderMutation.isPending}
-                onClick={() => dismissReminderMutation.mutate(overview.paraHacerHoy.orderReminder!.reminder.id)}
-                data-testid="button-order-reminder-dismiss"
-              >
-                Listo, ya lo pedí
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
+        <OrderReminderCard
+          title={
+            overview.paraHacerHoy.orderReminder.reminder.reminderDate === getArgentinaDateStr()
+              ? "Hoy es tu día de pedido"
+              : `Tu día de pedido fue el ${formatDateDisplay(overview.paraHacerHoy.orderReminder.reminder.reminderDate)}`
+          }
+          items={overview.paraHacerHoy.orderReminder.items}
+          onBuildOrder={openOrderForReminder}
+          onDismiss={() => dismissReminderMutation.mutate(overview.paraHacerHoy.orderReminder!.reminder.id)}
+          isDismissing={dismissReminderMutation.isPending}
+        />
       )}
 
       {!isLoading && <NoticeBlock title="Para hacer hoy" icon={Clock} testId="section-para-hacer-hoy" items={paraHacerHoyItems} />}
@@ -743,26 +674,7 @@ export default function Dashboard() {
         }}
       />
 
-      <AlertDialog open={confirmPayInstallment !== null} onOpenChange={(open) => !open && setConfirmPayInstallment(null)}>
-        <AlertDialogContent data-testid="dialog-confirm-pay-installment">
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              ¿{confirmPayInstallment?.clientName} te pagó los {confirmPayInstallment ? format(confirmPayInstallment.amount) : ""}?
-            </AlertDialogTitle>
-            <AlertDialogDescription>Se va a registrar como un pago, igual que "Registrar pago" en la ficha de la clienta.</AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel data-testid="button-cancel-pay-installment">Cancelar</AlertDialogCancel>
-            <AlertDialogAction
-              disabled={payInstallmentMutation.isPending}
-              onClick={() => confirmPayInstallment && payInstallmentMutation.mutate(confirmPayInstallment)}
-              data-testid="button-confirm-pay-installment"
-            >
-              Sí, me pagó
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <PayInstallmentConfirmDialog installment={confirmPayInstallment} onOpenChange={(open) => !open && setConfirmPayInstallment(null)} />
     </div>
   );
 }

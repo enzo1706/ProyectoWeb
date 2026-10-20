@@ -17,9 +17,18 @@ import {
 import type { Appointment } from "@shared/schema";
 import { getEventTypeLabel, getEventTypeColorClass } from "@shared/eventTypes";
 import { onActivationKeyDown } from "@/lib/utils";
+import { WhatsAppButton } from "./WhatsAppButton";
+
+// Prompt 12 — `clientPhone` no vive en la tabla `appointments` (se resuelve con un LEFT JOIN a
+// `clients` al leer, igual criterio que `PendingInstallmentRow`), así que no es parte del tipo
+// `Appointment` compartido — se agrega acá, opcional, para los lugares que sí lo traen
+// (Agenda, "Citas de hoy" de Inicio). Sin el campo, simplemente no se muestra el botón.
+export interface AppointmentWithPhone extends Appointment {
+  clientPhone?: string | null;
+}
 
 interface AppointmentCardProps {
-  appointment: Appointment;
+  appointment: AppointmentWithPhone;
   onClick?: (appointment: Appointment) => void;
 }
 
@@ -60,10 +69,13 @@ export function AppointmentCard({ appointment, onClick }: AppointmentCardProps) 
       <CardContent className="py-3">
         <div className="flex items-start justify-between gap-2">
           <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2">
-              <User className="h-4 w-4 text-muted-foreground" />
-              <span className="font-medium truncate">{appointment.clientName}</span>
-            </div>
+            {appointment.clientId !== null && (
+              <div className="flex items-center gap-2">
+                <User className="h-4 w-4 text-muted-foreground" />
+                <span className="font-medium truncate">{appointment.clientName}</span>
+                <WhatsAppButton phone={appointment.clientPhone} variant="icon" className="h-7 w-7" />
+              </div>
+            )}
             <div className="flex items-center gap-2 mt-1 text-sm text-muted-foreground">
               <Clock className="h-3 w-3" />
               <span>{appointment.time}</span>

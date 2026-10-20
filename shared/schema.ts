@@ -842,7 +842,9 @@ export const registerClientPaymentSchema = z.object({
 export const insertAppointmentSchema = createInsertSchema(appointments).omit({ id: true });
 
 export const createAppointmentSchema = z.object({
-  clientId: z.number().int().positive(),
+  // Prompt 12 — la clienta es opcional en todos los tipos (antes era obligatoria). Sin
+  // clientId, queda sin clienta — nunca se manda `null` (el campo se omite directo).
+  clientId: z.number().int().positive().optional(),
   date: z.string().min(1),
   time: z.string().min(1),
   type: appointmentTypeSchema,
@@ -853,7 +855,7 @@ export const createAppointmentSchema = z.object({
 // Deliberadamente separado de createAppointmentSchema: crear y editar son operaciones
 // distintas y pueden divergir con el tiempo (ej. qué campos se permiten tocar en cada caso).
 export const updateAppointmentSchema = z.object({
-  clientId: z.number().int().positive(),
+  clientId: z.number().int().positive().optional(),
   date: z.string().min(1),
   time: z.string().min(1),
   type: appointmentTypeSchema,

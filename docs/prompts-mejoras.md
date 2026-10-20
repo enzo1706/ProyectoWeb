@@ -959,6 +959,43 @@ Cómo verifico que quedó bien:
   proceso en vez de `getArgentinaDateStr()`/`getArgentinaNow()` — `getUpcomingBirthdays` y
   `getUpcomingAppointments` (esta última la sigue usando Inicio para "hoy"/"citas de hoy", así
   que el fix la beneficia también a ella, no solo a Agenda).
+- **Colores de los puntitos del calendario**: NO un color por cada uno de los 9 tipos (ámbar se
+  confunde con naranja, fucsia con rosa —y con el rosa de la marca—, celeste con azul). En
+  cambio, 4 colores, uno por GRUPO: Citas (todas las cargadas a mano, color principal de la
+  app), Cobros (verde; vencidas, en rojo), Cumpleaños (amarillo) y Días de pedido (azul, el 4º
+  color sin parecido con los otros tres). Máximo 1 punto por grupo por día → nunca más de 4
+  puntos, elimina de raíz el problema de "+N" por desborde. La referencia de abajo del calendario
+  tiene exactamente esas 4 entradas, cada una con su ícono (Citas: calendario; Cobros: billetera;
+  Cumpleaños: torta; Días de pedido: caja, el mismo ícono que ya usa Inicio/Stock para este
+  concepto). En la tarjeta de la lista del día, además del color cada tipo automático lleva su
+  ícono, para no depender solo del color. Las citas individuales (no automáticas) siguen
+  mostrando su propio color de tipo en su tarjeta, sin cambios — el color de grupo es solo para
+  el punto del calendario.
+- **Clienta opcional, revisado en todas las pantallas**: `AppointmentCard` (tarjeta de Agenda),
+  `AppointmentDetailDialog` (detalle) y "Citas de hoy" de Inicio ocultan la fila/el "con
+  [clienta]" cuando `clientId === null`, en vez de mostrar un hueco vacío — ej. "Hoy a las 15:00:
+  Reunión de unidad". El botón de WhatsApp en la tarjeta de cita solo aparece si hay clienta Y
+  tiene celular cargado.
+- **WhatsApp**: botón en toda cita con clienta-con-celular y en los eventos automáticos "Cobro" y
+  "Cumpleaños" — nunca en "Día de pedido" (no hay una clienta puntual a quien escribirle). Abre
+  el chat sin ningún mensaje precargado, mismo componente `WhatsAppButton` que ya usa el resto de
+  la app.
+- **Contador de arriba**: cuenta siempre `appointments.length` (la lista de citas cargadas a
+  mano que devuelve `/api/agenda/month`), nunca cobros/cumpleaños/días de pedido ni se ve
+  afectado por el filtro elegido.
+- **Componentes compartidos con Inicio (Prompt 10)**: `PayInstallmentConfirmDialog.tsx` (el
+  flujo de "Cobrada") y `OrderReminderCard.tsx` (la tarjeta del día de pedido) — un solo archivo
+  cada uno, usado por Dashboard.tsx y Agenda.tsx, para que ambas pantallas peguen siempre al
+  mismo camino.
+- **Orden del filtro**: "Todos los eventos", después "Cobros"/"Cumpleaños"/"Días de pedido",
+  después los 6 tipos fijos (en el orden del punto 1), al final los tipos personalizados que la
+  consultora ya haya creado.
+- **Tests agregados** (`server/tests/agenda-month.test.ts`): cobros del mes con cuota vencida/con
+  pago parcial (monto = saldo)/pagada (no aparece); cuota de una venta cancelada excluida;
+  cumpleaños del 29 de febrero se muestra el 28 en un año no bisiesto; el próximo día de pedido
+  sin recordatorio abierto todavía trae una lista en vivo sin guardar ninguna fila; una cita sin
+  clienta se crea y se lee con `clientId: null`; el contador no se mezcla con cobros/cumpleaños/
+  días de pedido (viven en listas separadas de la respuesta).
 
 ## Menú y navegación
 

@@ -597,6 +597,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   app.use("/api/appointments", requireAuth, requireConsultant);
   app.use("/api/reports", requireAuth, requireConsultant);
   app.use("/api/dashboard", requireAuth, requireConsultant);
+  app.use("/api/agenda", requireAuth, requireConsultant); // Prompt 12
   // Prompt 8
   app.use("/api/deliveries", requireAuth, requireConsultant);
   app.use("/api/order-reminder", requireAuth, requireConsultant);
@@ -1082,6 +1083,27 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al obtener citas" });
+    }
+  });
+
+  /** Prompt 12 — todo lo que necesita Agenda para un mes, en una sola llamada: citas cargadas a
+   * mano + los 3 eventos automáticos (cobros, cumpleaños, día de pedido). Ver
+   * DatabaseStorage.getAgendaMonth. */
+  app.get("/api/agenda/month", async (req: Request, res: Response) => {
+    try {
+      const start = typeof req.query.start === "string" ? req.query.start : "";
+      const end = typeof req.query.end === "string" ? req.query.end : "";
+      if (!start || !end) {
+        return res.status(400).json({ error: "Los parámetros start y end son requeridos" });
+      }
+      if (end <= start) {
+        return res.status(400).json({ error: "El parámetro end debe ser posterior a start" });
+      }
+      const month = await storage.getAgendaMonth(req.consultantId!, start, end);
+      res.json(month);
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Error al obtener la agenda del mes" });
     }
   });
 

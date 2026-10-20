@@ -31,13 +31,14 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { ToastAction } from "@/components/ui/toast";
 import { appointmentStatuses, type Appointment, type AppointmentStatus } from "@shared/schema";
-import { getEventTypeColorClass, getEventTypeLabel, getEventTypeIcon } from "./AppointmentCard";
+import { getEventTypeColorClass, getEventTypeLabel, getEventTypeIcon, type AppointmentWithPhone } from "./AppointmentCard";
+import { WhatsAppButton } from "./WhatsAppButton";
 import { parseLocalDate } from "@/lib/date";
 
 interface AppointmentDetailDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  appointment: Appointment | null;
+  appointment: AppointmentWithPhone | null;
   /** Opcional: si no se pasa (ej. desde el Dashboard, que no tiene diálogo de edición propio),
    * no se muestra el botón "Editar" — cambiar estado y eliminar siguen disponibles igual. */
   onEdit?: (appointment: Appointment) => void;
@@ -91,7 +92,9 @@ export function AppointmentDetailDialog({ open, onOpenChange, appointment, onEdi
   const undoDeleteMutation = useGuardedMutation({
     mutationFn: async (snapshot: Appointment) => {
       const res = await apiRequest("POST", "/api/appointments", {
-        clientId: snapshot.clientId,
+        // Prompt 12 — clienta opcional: el schema acepta `.optional()` (campo omitido), nunca
+        // `clientId: null` explícito.
+        clientId: snapshot.clientId ?? undefined,
         date: snapshot.date,
         time: snapshot.time,
         type: snapshot.type,
@@ -176,10 +179,13 @@ export function AppointmentDetailDialog({ open, onOpenChange, appointment, onEdi
                   </Badge>
                 </div>
 
-                <div className="flex items-center gap-3 text-sm">
-                  <User className="h-4 w-4 text-muted-foreground shrink-0" />
-                  <span>{appointment.clientName}</span>
-                </div>
+                {appointment.clientId !== null && (
+                  <div className="flex items-center gap-3 text-sm">
+                    <User className="h-4 w-4 text-muted-foreground shrink-0" />
+                    <span>{appointment.clientName}</span>
+                    <WhatsAppButton phone={appointment.clientPhone} variant="icon" className="h-7 w-7" />
+                  </div>
+                )}
 
                 {appointment.location && (
                   <div className="flex items-center gap-3 text-sm">
@@ -245,8 +251,10 @@ export function AppointmentDetailDialog({ open, onOpenChange, appointment, onEdi
               <AlertDialogHeader>
                 <AlertDialogTitle>¿Eliminar esta cita?</AlertDialogTitle>
                 <AlertDialogDescription>
-                  La cita con {appointment.clientName} del {fullDate} se va a eliminar. Vas a poder deshacerlo
-                  justo después, desde el mensaje de confirmación.
+                  {appointment.clientId !== null
+                    ? `La cita con ${appointment.clientName} del ${fullDate} se va a eliminar.`
+                    : `La cita del ${fullDate} se va a eliminar.`}{" "}
+                  Vas a poder deshacerlo justo después, desde el mensaje de confirmación.
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
