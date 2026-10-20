@@ -1,12 +1,29 @@
-# Migración pendiente — Tercer deploy (Prompts 14, 8 y 10)
+# Migración pendiente — Tercer deploy (Prompts 11, 13, 14, 8, 10, 12, 15 y 16)
 
 Este documento es el paquete de migración para DESPUÉS del segundo deploy
-(`docs/migracion-deploy-2.md`). Asume que ese paquete ya está aplicado y publicado. Acumula tres
-prompts porque ninguno de los tres se desplegó todavía: Prompt 14 (ingreso, registro y prueba
-gratis, rama `prompt-14-ingreso`), Prompt 8 (venta sin stock y día de pedido, rama
-`prompt-8-pedidos`, creada arriba de `prompt-14-ingreso`) y Prompt 10 (Inicio: objetivo del mes y
-avisos, rama `prompt-10-inicio`, creada arriba de `prompt-8-pedidos`). Todo lo de abajo se
-calculó leyendo `shared/schema.ts` en cada rama correspondiente.
+(`docs/migracion-deploy-2.md`). Asume que ese paquete ya está aplicado y publicado.
+
+## Qué entra en el tercer deploy (cadena completa)
+
+Es una sola cadena de ramas, cada una creada arriba de la anterior, ninguna desplegada todavía:
+`staging` → `prompt-11-reportes` → `prompt-13-menu` → `prompt-14-ingreso` → `prompt-8-pedidos` →
+`prompt-10-inicio` → `prompt-12-agenda` → `prompt-15-textos` → `prompt-16-...` (la punta de la
+cadena, lo que efectivamente se publica, es siempre la última rama terminada — hoy
+`prompt-12-agenda`; esta tabla se actualiza a medida que 15 y 16 se van cerrando).
+
+| # | Prompt | Rama | Migración |
+|---|--------|------|-----------|
+| 11 | Reportes claro y liviano | `prompt-11-reportes` | **Sin migración** (confirmado por diff de `shared/schema.ts` contra `staging`: 0 diferencias) |
+| 13 | Menú, navegación y sesión | `prompt-13-menu` | **Sin migración** (diff contra `prompt-11-reportes`: 0 diferencias) |
+| 14 | Ingreso, registro y prueba gratis | `prompt-14-ingreso` | **Con migración** — 5 columnas nuevas en `consultants` + 1 índice único parcial (ver detalle abajo) |
+| 8 | Venta sin stock y día de pedido (Partes 1 a 3) | `prompt-8-pedidos` | **Con migración** — 5 columnas en `sale_items`, 1 columna en `consultants`, 1 tabla nueva `order_reminders` (ver detalle abajo) |
+| 10 | Inicio: objetivo del mes y avisos | `prompt-10-inicio` | **Con migración** — 1 tabla nueva `dashboard_notice_dismissals` (ver detalle abajo) |
+| 12 | Agenda: tipos, eventos automáticos y WhatsApp | `prompt-12-agenda` | **Sin migración** — `appointments.client_id` ya era nullable desde antes; solo cambió la validación Zod (`.optional()`) para permitirlo también al crear/editar, confirmado por diff de `shared/schema.ts` contra `prompt-10-inicio`: 0 diferencias de tabla |
+| 15 | Textos y formatos | `prompt-15-textos` | Por confirmar — en investigación, se actualiza esta fila cuando cierre |
+| 16 | — | `prompt-16-...` | Todavía no arrancado |
+
+Todo lo de "con migración" de abajo se calculó leyendo `shared/schema.ts` en cada rama
+correspondiente, nunca de memoria.
 
 ## ⚠️ Nunca correr `drizzle-kit push` (con o sin `--force`) contra producción
 
