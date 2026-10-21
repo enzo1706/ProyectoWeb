@@ -151,7 +151,10 @@ export const productStock = pgTable("product_stock", {
 }));
 
 export const PHONE_REGEX = /^\d{10}$/;
-export const PHONE_ERROR_MESSAGE = "El teléfono debe tener exactamente 10 dígitos, sin espacios, guiones ni código de país (ej: 2616570560)";
+// Prompt 15 — alineado al formato de ejemplo que ya usa CONSULTANT_WHATSAPP_ERROR_MESSAGE
+// (Prompt 9/14): un número sin agrupar como ejemplo contradice la vidriera "261 555 1234" que
+// se muestra en el resto de la app, y el normalizador ya tolera espacios/guiones igual.
+export const PHONE_ERROR_MESSAGE = "Escribí el teléfono sin el 0 y sin el 15. Por ejemplo: 261 555 1234.";
 
 export const clients = pgTable("clients", {
   id: serial("id").primaryKey(),

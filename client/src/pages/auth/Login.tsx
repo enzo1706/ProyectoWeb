@@ -45,7 +45,7 @@ export default function Login() {
     } catch (error) {
       toast({
         title: "Error de acceso",
-        description: error instanceof Error ? error.message : "Credenciales inválidas",
+        description: error instanceof Error ? error.message : "Email, WhatsApp o contraseña incorrectos.",
         variant: "destructive",
       });
     } finally {

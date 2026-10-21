@@ -1,5 +1,5 @@
 import { Label } from "@/components/ui/label";
-import { Input } from "@/components/ui/input";
+import { MoneyInput } from "@/components/MoneyInput";
 import {
   Select,
   SelectContent,
@@ -58,11 +58,10 @@ export function SaleInstallmentsEditor({
           {amounts.map((amount, index) => (
             <div key={index} className="flex items-center gap-2">
               <span className="text-sm text-muted-foreground w-16 shrink-0">Cuota {index + 1}</span>
-              <Input
-                type="number"
-                min={0}
-                value={amount / 100}
-                onChange={(e) => onAmountChange(index, Math.round((Number(e.target.value) || 0) * 100))}
+              <MoneyInput
+                unit="cents"
+                value={amount}
+                onChange={(cents) => onAmountChange(index, cents ?? 0)}
                 data-testid={`input-installment-${index}`}
               />
             </div>

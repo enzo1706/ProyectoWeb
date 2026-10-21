@@ -156,7 +156,7 @@ describe("POST /api/sales — creación", () => {
   it("rechaza sin persistir: producto inexistente", async () => {
     const res = await api("POST", "/api/sales", baseSale({ items: [{ productId: 999999, quantity: 1 }], installments: [{ amount: 1000 }] }));
     expect(res.status).toBe(400);
-    expect((await res.json()).error).toMatch(/no encontrado/i);
+    expect((await res.json()).error).toMatch(/no encontramos uno de los productos/i);
   });
 
   it("rechaza sin persistir: cliente inexistente", async () => {

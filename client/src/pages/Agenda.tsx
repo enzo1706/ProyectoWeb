@@ -352,7 +352,7 @@ export default function Agenda() {
           </DropdownMenu>
           <Button onClick={handleNewAppointmentClick} data-testid="button-add-appointment">
             <Plus className="h-4 w-4 mr-2" />
-            Nueva Cita
+            Nueva cita
           </Button>
         </div>
       </div>
@@ -448,7 +448,7 @@ export default function Agenda() {
           <CardHeader>
             <CardTitle className="text-lg flex items-center justify-between gap-2">
               <span>
-                {parseLocalDate(selectedDate).toLocaleDateString("es-MX", { weekday: "long", day: "numeric", month: "long" })}
+                {parseLocalDate(selectedDate).toLocaleDateString("es-AR", { weekday: "long", day: "numeric", month: "long" })}
               </span>
             </CardTitle>
           </CardHeader>

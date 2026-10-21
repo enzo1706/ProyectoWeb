@@ -8,6 +8,8 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
+import { MoneyInput } from "@/components/MoneyInput";
+import { PercentInput } from "@/components/PercentInput";
 import { Button } from "@/components/ui/button";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { useHideMoney } from "@/hooks/use-hide-money";
@@ -25,19 +27,18 @@ export function EditSaleItemDialog({ open, onOpenChange, line, onSave }: EditSal
   const { format } = useHideMoney();
   const [quantity, setQuantity] = useState(1);
   const [mode, setMode] = useState<ItemAdjustmentMode>("none");
-  const [adjustmentInput, setAdjustmentInput] = useState("");
+  const [adjustmentValue, setAdjustmentValue] = useState<number | null>(null);
 
   useEffect(() => {
     if (line) {
       setQuantity(line.quantity);
       setMode(line.mode);
-      setAdjustmentInput(line.adjustmentValue !== null ? String(line.adjustmentValue) : "");
+      setAdjustmentValue(line.adjustmentValue);
     }
   }, [line]);
 
   if (!line) return null;
 
-  const adjustmentValue = adjustmentInput ? Number(adjustmentInput) : null;
   const finalPrice = computeItemFinalPrice(line.originalPrice, mode, adjustmentValue);
   const subtotal = finalPrice * quantity;
 
@@ -91,15 +92,11 @@ export function EditSaleItemDialog({ open, onOpenChange, line, onSave }: EditSal
                 <Label htmlFor="mode-manual" className="flex-1 py-2 cursor-pointer font-normal">Precio manual</Label>
               </div>
             </RadioGroup>
-            {mode !== "none" && (
-              <Input
-                type="number"
-                min={0}
-                placeholder={mode === "manualPrice" ? "Precio final" : "Porcentaje"}
-                value={adjustmentInput}
-                onChange={(e) => setAdjustmentInput(e.target.value)}
-                data-testid="input-edit-item-adjustment"
-              />
+            {mode === "manualPrice" && (
+              <MoneyInput unit="cents" value={adjustmentValue} onChange={setAdjustmentValue} data-testid="input-edit-item-adjustment" />
+            )}
+            {(mode === "discountPercent" || mode === "surchargePercent") && (
+              <PercentInput value={adjustmentValue} onChange={setAdjustmentValue} data-testid="input-edit-item-adjustment" />
             )}
           </div>
 

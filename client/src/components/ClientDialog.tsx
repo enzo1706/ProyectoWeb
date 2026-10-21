@@ -214,7 +214,7 @@ export function ClientDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md" data-testid="dialog-client">
         <DialogHeader>
-          <DialogTitle>{client ? "Editar Clienta" : "Nueva Clienta"}</DialogTitle>
+          <DialogTitle>{client ? "Editar clienta" : "Nueva clienta"}</DialogTitle>
         </DialogHeader>
         {!client && canImportContact && (
           <Button

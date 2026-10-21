@@ -19,7 +19,7 @@ cadena, lo que efectivamente se publica, es siempre la última rama terminada �
 | 8 | Venta sin stock y día de pedido (Partes 1 a 3) | `prompt-8-pedidos` | **Con migración** — 5 columnas en `sale_items`, 1 columna en `consultants`, 1 tabla nueva `order_reminders` (ver detalle abajo) |
 | 10 | Inicio: objetivo del mes y avisos | `prompt-10-inicio` | **Con migración** — 1 tabla nueva `dashboard_notice_dismissals` (ver detalle abajo) |
 | 12 | Agenda: tipos, eventos automáticos y WhatsApp | `prompt-12-agenda` | **Sin migración** — `appointments.client_id` ya era nullable desde antes; solo cambió la validación Zod (`.optional()`) para permitirlo también al crear/editar, confirmado por diff de `shared/schema.ts` contra `prompt-10-inicio`: 0 diferencias de tabla |
-| 15 | Textos y formatos | `prompt-15-textos` | Por confirmar — en investigación, se actualiza esta fila cuando cierre |
+| 15 | Textos y formatos | `prompt-15-textos` | **Sin migración** — confirmado por diff de `shared/schema.ts` contra `prompt-12-agenda`: la única línea que cambia es el texto de `PHONE_ERROR_MESSAGE` (un mensaje de error, no una columna) |
 | 16 | — | `prompt-16-...` | Todavía no arrancado |
 
 Todo lo de "con migración" de abajo se calculó leyendo `shared/schema.ts` en cada rama

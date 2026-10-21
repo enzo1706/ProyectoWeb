@@ -7,6 +7,7 @@ import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import type { Product } from "@shared/schema";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { MoneyInput } from "@/components/MoneyInput";
 import {
   Dialog,
   DialogContent,
@@ -49,7 +50,6 @@ const editProductFormSchema = z.object({
   variante: z.string().optional(),
   puntos: z.string().optional(),
   codigo: z.string().optional(),
-  precio: z.string().min(1, "El precio es obligatorio"),
   unidades: z.string().min(1, "Las unidades son obligatorias"),
   stockMinimo: z.string().optional(),
 });
@@ -60,12 +60,12 @@ type EditProductFormData = z.infer<typeof editProductFormSchema>;
  * cargó directo en pesos; si no tiene nada, está "sin costo". */
 function initialCostInput(product: Product): CostInputValue {
   if (product.selectedDiscount !== null) {
-    return { mode: "percent", percent: product.selectedDiscount, direct: "" };
+    return { mode: "percent", percent: product.selectedDiscount, direct: null };
   }
   if (product.costPrice !== null) {
-    return { mode: "direct", percent: null, direct: String(product.costPrice / 100) };
+    return { mode: "direct", percent: null, direct: product.costPrice };
   }
-  return { mode: "none", percent: null, direct: "" };
+  return { mode: "none", percent: null, direct: null };
 }
 
 function costInputEquals(a: CostInputValue, b: CostInputValue): boolean {
@@ -88,8 +88,9 @@ export function EditProductDialog({
   const isCatalog = product !== null && product.source !== "manual";
   const categories = getProductCategories(products);
 
-  const [costInput, setCostInput] = useState<CostInputValue>({ mode: "none", percent: null, direct: "" });
-  const [startingCostInput, setStartingCostInput] = useState<CostInputValue>({ mode: "none", percent: null, direct: "" });
+  const [costInput, setCostInput] = useState<CostInputValue>({ mode: "none", percent: null, direct: null });
+  const [startingCostInput, setStartingCostInput] = useState<CostInputValue>({ mode: "none", percent: null, direct: null });
+  const [precioCentavos, setPrecioCentavos] = useState<number | null>(null);
   const [useCatalogPrice, setUseCatalogPrice] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [freePlanLimitOpen, setFreePlanLimitOpen] = useState(false);
@@ -102,7 +103,7 @@ export function EditProductDialog({
 
   const form = useForm<EditProductFormData>({
     resolver: zodResolver(editProductFormSchema),
-    defaultValues: { seccion: "", linea: "", producto: "", variante: "", puntos: "", codigo: "", precio: "", unidades: "", stockMinimo: "" },
+    defaultValues: { seccion: "", linea: "", producto: "", variante: "", puntos: "", codigo: "", unidades: "", stockMinimo: "" },
   });
 
   useEffect(() => {
@@ -114,10 +115,10 @@ export function EditProductDialog({
         variante: product.variante,
         puntos: String(product.puntos),
         codigo: product.codigo,
-        precio: String(product.effectivePrecio / 100),
         unidades: String(product.unidades),
         stockMinimo: product.stockMinimo !== null ? String(product.stockMinimo) : "",
       });
+      setPrecioCentavos(product.effectivePrecio);
       const initial = initialCostInput(product);
       setCostInput(initial);
       setStartingCostInput(initial);
@@ -128,9 +129,12 @@ export function EditProductDialog({
   const updateMutation = useGuardedMutation({
     mutationFn: async (data: EditProductFormData) => {
       if (!product) throw new Error("Producto no seleccionado");
+      if (precioCentavos === null || precioCentavos <= 0) {
+        throw new Error("El precio es obligatorio");
+      }
 
       if (isCatalog) {
-        const priceOverride = useCatalogPrice ? null : Math.round(Number(data.precio) * 100);
+        const priceOverride = useCatalogPrice ? null : precioCentavos;
         await apiRequest("PATCH", `/api/products/${product.id}/price-override`, { priceOverride });
       } else {
         await apiRequest("PATCH", `/api/products/${product.id}`, {
@@ -139,7 +143,7 @@ export function EditProductDialog({
           producto: data.producto,
           variante: data.variante || undefined,
           puntos: data.puntos ? Number(data.puntos) : 0,
-          precio: Math.round(Number(data.precio) * 100),
+          precio: precioCentavos,
           codigo: data.codigo || undefined,
         });
       }
@@ -214,10 +218,7 @@ export function EditProductDialog({
                 <p className="text-muted-foreground">
                   {product.linea ? `${product.seccion} · ${product.linea}` : product.seccion}
                 </p>
-                <p className="text-muted-foreground">
-                  {product.puntos > 0 && `${product.puntos} pts · `}
-                  Código: {product.codigo}
-                </p>
+                {product.puntos > 0 && <p className="text-muted-foreground">{product.puntos} pts</p>}
               </div>
             ) : (
               <>
@@ -281,54 +282,41 @@ export function EditProductDialog({
               </>
             )}
 
-            <FormField
-              control={form.control}
-              name="precio"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Precio de venta</FormLabel>
-                  <FormControl>
-                    <Input
-                      {...field}
-                      type="number"
-                      min={0}
-                      step="0.01"
-                      disabled={useCatalogPrice}
-                      onChange={(e) => {
-                        setUseCatalogPrice(false);
-                        field.onChange(e);
-                      }}
-                      data-testid="input-edit-precio"
-                    />
-                  </FormControl>
-                  {isCatalog && (
-                    <FormDescription className="flex items-center justify-between gap-2">
-                      <span>Precio del catálogo: {format(product.precio)}</span>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-auto p-0 text-xs underline"
-                        onClick={() => {
-                          setUseCatalogPrice(true);
-                          form.setValue("precio", String(product.precio / 100));
-                        }}
-                        data-testid="button-use-catalog-price"
-                      >
-                        Usar el precio del catálogo
-                      </Button>
-                    </FormDescription>
-                  )}
-                  <FormMessage />
-                </FormItem>
+            <FormItem>
+              <FormLabel>Precio de venta</FormLabel>
+              <FormControl>
+                <MoneyInput
+                  unit="cents"
+                  value={precioCentavos}
+                  disabled={useCatalogPrice}
+                  onChange={(cents) => {
+                    setUseCatalogPrice(false);
+                    setPrecioCentavos(cents);
+                  }}
+                  data-testid="input-edit-precio"
+                />
+              </FormControl>
+              {isCatalog && (
+                <FormDescription className="flex items-center justify-between gap-2">
+                  <span>Precio del catálogo: {format(product.precio)}</span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-auto p-0 text-xs underline"
+                    onClick={() => {
+                      setUseCatalogPrice(true);
+                      setPrecioCentavos(product.precio);
+                    }}
+                    data-testid="button-use-catalog-price"
+                  >
+                    Usar el precio del catálogo
+                  </Button>
+                </FormDescription>
               )}
-            />
+            </FormItem>
 
-            <CostInputBlock
-              precioCentavos={Math.round(Number(form.watch("precio") || 0) * 100)}
-              value={costInput}
-              onChange={setCostInput}
-            />
+            <CostInputBlock precioCentavos={precioCentavos ?? 0} value={costInput} onChange={setCostInput} />
 
             <div className="grid grid-cols-2 gap-4">
               <FormField

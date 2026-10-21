@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { User, Calendar, Package } from "lucide-react";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { onActivationKeyDown } from "@/lib/utils";
+import { formatDateList } from "@/lib/date";
 import type { Sale as BaseSale, SaleItem, SaleInstallment } from "@shared/schema";
 
 export type { SaleItem, SaleInstallment };
@@ -43,8 +44,7 @@ const paymentColors: Record<"cobrada" | "te_debe", string> = {
 const cancelledColor = "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200";
 
 function formatSaleDate(date: string): string {
-  const [year, month, day] = date.split("-").map(Number);
-  return new Date(year, month - 1, day).toLocaleDateString("es-MX", { day: "numeric", month: "short", year: "numeric" });
+  return formatDateList(date);
 }
 
 export function SaleCard({ sale, onClick, onAssignClient }: SaleCardProps) {

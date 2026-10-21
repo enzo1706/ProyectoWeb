@@ -26,6 +26,8 @@ import {
   FormDescription,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { MoneyInput } from "@/components/MoneyInput";
+import { PercentInput } from "@/components/PercentInput";
 import { PasswordInput } from "@/components/PasswordInput";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
@@ -192,11 +194,9 @@ interface BusinessSettingsResponse extends Consultant {
 const formSchema = z
   .object({
     businessName: z.string().trim().min(1, "El nombre del negocio no puede estar vacío").max(120),
-    monthlyGoal: z.string().optional(),
     orderReminderDay1: z.string().optional(),
     orderReminderDay2: z.string().optional(),
     defaultLowStockThreshold: z.string().optional(),
-    grossIncomeTaxPercent: z.string().optional(),
   })
   .refine((v) => !v.orderReminderDay2 || v.orderReminderDay1, {
     message: "Para elegir un segundo día, primero elegí el primero",
@@ -218,37 +218,36 @@ export default function Configuracion() {
     queryKey: ["/api/business-settings"],
   });
 
+  const [monthlyGoalCents, setMonthlyGoalCents] = useState<number | null>(null);
+  const [grossIncomeTaxPercent, setGrossIncomeTaxPercent] = useState<number | null>(null);
+
   const form = useForm<FormData>({
     resolver: zodResolver(formSchema),
-    defaultValues: { businessName: "", monthlyGoal: "", orderReminderDay1: "", orderReminderDay2: "", defaultLowStockThreshold: "", grossIncomeTaxPercent: "" },
+    defaultValues: { businessName: "", orderReminderDay1: "", orderReminderDay2: "", defaultLowStockThreshold: "" },
   });
 
   useEffect(() => {
     if (settings) {
       form.reset({
         businessName: settings.businessName,
-        monthlyGoal: settings.monthlyGoal !== null ? String(settings.monthlyGoal / 100) : "",
         orderReminderDay1: settings.orderReminderDay1 !== null ? String(settings.orderReminderDay1) : "",
         orderReminderDay2: settings.orderReminderDay2 !== null ? String(settings.orderReminderDay2) : "",
         defaultLowStockThreshold:
           settings.defaultLowStockThreshold !== null ? String(settings.defaultLowStockThreshold) : "",
-        grossIncomeTaxPercent:
-          settings.grossIncomeTaxPercentTenths !== null ? String(settings.grossIncomeTaxPercentTenths / 10) : "",
       });
+      setMonthlyGoalCents(settings.monthlyGoal);
+      setGrossIncomeTaxPercent(settings.grossIncomeTaxPercentTenths !== null ? settings.grossIncomeTaxPercentTenths / 10 : null);
       setShowSecondDay(settings.orderReminderDay2 !== null);
     }
   }, [settings, form]);
 
   const saveMutation = useGuardedMutation({
     mutationFn: async (data: FormData) => {
-      // Décimas de punto porcentual: acepta coma o punto (3,5 o 3.5).
-      const grossIncomeTaxPercentTenths = data.grossIncomeTaxPercent
-        ? Math.round(Number(data.grossIncomeTaxPercent.replace(",", ".")) * 10)
-        : null;
+      const grossIncomeTaxPercentTenths = grossIncomeTaxPercent !== null ? Math.round(grossIncomeTaxPercent * 10) : null;
       const res = await apiRequest("PATCH", "/api/business-settings", {
         businessName: data.businessName,
         currency: "ARS",
-        monthlyGoal: data.monthlyGoal ? Math.round(Number(data.monthlyGoal) * 100) : null,
+        monthlyGoal: monthlyGoalCents,
         orderReminderDay1: data.orderReminderDay1 ? Number(data.orderReminderDay1) : null,
         orderReminderDay2: data.orderReminderDay2 ? Number(data.orderReminderDay2) : null,
         defaultLowStockThreshold: data.defaultLowStockThreshold ? Math.round(Number(data.defaultLowStockThreshold)) : null,
@@ -310,20 +309,19 @@ export default function Configuracion() {
                   )}
                 />
 
-                <FormField
-                  control={form.control}
-                  name="monthlyGoal"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Objetivo de ventas del mes</FormLabel>
-                      <FormControl>
-                        <Input {...field} type="number" min={0} step="1" placeholder="Sin definir" data-testid="input-monthly-goal" />
-                      </FormControl>
-                      <FormDescription>Opcional. Se ve en Inicio.</FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
+                <FormItem>
+                  <FormLabel>Objetivo de ventas del mes</FormLabel>
+                  <FormControl>
+                    <MoneyInput
+                      unit="cents"
+                      value={monthlyGoalCents}
+                      onChange={setMonthlyGoalCents}
+                      placeholder="Sin definir"
+                      data-testid="input-monthly-goal"
+                    />
+                  </FormControl>
+                  <FormDescription>Opcional. Se ve en Inicio.</FormDescription>
+                </FormItem>
               </CardContent>
             </Card>
 
@@ -451,23 +449,21 @@ export default function Configuracion() {
                 <CardTitle className="text-lg">Impuestos</CardTitle>
               </CardHeader>
               <CardContent>
-                <FormField
-                  control={form.control}
-                  name="grossIncomeTaxPercent"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Ingresos Brutos (%)</FormLabel>
-                      <FormControl>
-                        <Input {...field} placeholder="Sin cargar" data-testid="input-gross-income-tax" />
-                      </FormControl>
-                      <FormDescription>
-                        Si pagás Ingresos Brutos, poné el porcentaje y lo descontamos de tu ganancia (acepta decimales
-                        con coma o punto, ej. 3,5). Si no pagás, dejalo vacío.
-                      </FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
+                <FormItem>
+                  <FormLabel>Ingresos brutos (%)</FormLabel>
+                  <FormControl>
+                    <PercentInput
+                      value={grossIncomeTaxPercent}
+                      onChange={setGrossIncomeTaxPercent}
+                      placeholder="Sin cargar"
+                      data-testid="input-gross-income-tax"
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    Si pagás Ingresos Brutos, poné el porcentaje y lo descontamos de tu ganancia (acepta decimales
+                    con coma o punto, ej. 3,5). Si no pagás, dejalo vacío.
+                  </FormDescription>
+                </FormItem>
               </CardContent>
             </Card>
 

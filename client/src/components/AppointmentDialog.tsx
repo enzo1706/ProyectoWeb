@@ -189,7 +189,7 @@ export function AppointmentDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md" data-testid="dialog-appointment">
         <DialogHeader>
-          <DialogTitle>{isEditMode ? "Editar Cita" : "Nueva Cita"}</DialogTitle>
+          <DialogTitle>{isEditMode ? "Editar cita" : "Nueva cita"}</DialogTitle>
         </DialogHeader>
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="flex flex-1 flex-col min-h-0">

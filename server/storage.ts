@@ -115,6 +115,8 @@ import type { db as database } from "./db";
 import { resolveStorageMode } from "./storage-mode";
 import { shouldUseTestDatabase } from "./test-db-guard";
 import { slugify } from "@shared/slug";
+import { pluralize } from "@shared/text";
+import { formatMoney } from "@shared/money";
 import bcrypt from "bcryptjs";
 import { TRIAL_DAYS, PERIOD_DAYS, FREE_PLAN_PRODUCT_LIMIT } from "./config/subscription";
 
@@ -2415,7 +2417,7 @@ export class DatabaseStorage implements IStorage {
     isFreePlan: boolean,
   ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined> {
     if (delta === 0) {
-      throw new SaleValidationError("El delta de stock no puede ser 0");
+      throw new SaleValidationError("La cantidad no puede ser 0");
     }
     const db = await this.getDb();
     const product = await this.findVisibleProduct(db, consultantId, productId);
@@ -2445,7 +2447,7 @@ export class DatabaseStorage implements IStorage {
         })
         .returning();
       if (stock.unidades < 0) {
-        throw new SaleValidationError(`Stock insuficiente: quedarían ${stock.unidades} unidades`);
+        throw new SaleValidationError(`Stock insuficiente de ${product.producto}: quedarían ${pluralize(stock.unidades, "unidad", "unidades")}`);
       }
       // previousUnidades = stock.unidades - leftoverDelta: el UPSERT ya aplicó +leftoverDelta,
       // así que el valor de ANTES se reconstruye sin una SELECT aparte.
@@ -2552,13 +2554,35 @@ export class DatabaseStorage implements IStorage {
       throw new SaleValidationError("El lote no puede estar vacío");
     }
 
+    const db = await this.getDb();
+
+    // Prompt 15 — se busca el nombre ANTES de validar nada de cada línea, para que los
+    // mensajes de error de abajo nombren el producto por su nombre, nunca por su id. Visible
+    // ANTES de abrir la transacción — igual criterio que createSale: el catálogo no lo
+    // modifica ninguna venta/import concurrente, no hace falta bloquearlo. Un producto de OTRO
+    // consultantId (privado, no global) da exactamente el mismo error que uno inexistente —
+    // nunca se distingue, para no filtrar si existe. Prompt 2: también trae `precio`,
+    // necesario para el costo de esta compra cuando viene discountPercent.
+    const rawProductIds = Array.from(new Set(lines.map((l) => l.productId))).sort((a, b) => a - b);
+    const catalogRows = await db
+      .select({ id: products.id, precio: products.precio, producto: products.producto })
+      .from(products)
+      .where(and(inArray(products.id, rawProductIds), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
+    const precioById = new Map(catalogRows.map((p) => [p.id, p.precio]));
+    const nombreById = new Map(catalogRows.map((p) => [p.id, p.producto]));
+    for (const productId of rawProductIds) {
+      if (!precioById.has(productId)) {
+        throw new SaleValidationError("No encontramos uno de los productos del pedido");
+      }
+    }
+
     // Duplicados: se combinan (nunca dos escrituras separadas para el mismo producto) — mismo
     // criterio pedido en Etapa 7.2, sección 8. Este es el punto de verdad, no confía en que
     // LoadOrderDialog ya haya fusionado antes de enviar.
     const deltaByProductId = new Map<number, number>();
     for (const line of lines) {
       if (!Number.isInteger(line.delta) || line.delta <= 0) {
-        throw new SaleValidationError(`Delta inválido para el producto ${line.productId}: tiene que ser un entero positivo`);
+        throw new SaleValidationError(`La cantidad de ${nombreById.get(line.productId)} tiene que ser un entero positivo`);
       }
       deltaByProductId.set(line.productId, (deltaByProductId.get(line.productId) ?? 0) + line.delta);
     }
@@ -2570,25 +2594,6 @@ export class DatabaseStorage implements IStorage {
     // como en createSale: cada UPSERT de abajo ya toma su propio lock de fila al ejecutarse,
     // así que basta con procesarlas siempre en el mismo orden dentro de la transacción.
     const orderedProductIds = Array.from(deltaByProductId.keys()).sort((a, b) => a - b);
-
-    const db = await this.getDb();
-
-    // Visibilidad de catálogo (global o propio) ANTES de abrir la transacción — igual criterio
-    // que createSale: el catálogo no lo modifica ninguna venta/import concurrente, no hace
-    // falta bloquearlo. Un producto de OTRO consultantId (privado, no global) da exactamente
-    // el mismo error que uno inexistente — nunca se distingue, para no filtrar si existe.
-    // Prompt 2: también trae `precio`, necesario para el costo de esta compra cuando viene
-    // discountPercent.
-    const catalogRows = await db
-      .select({ id: products.id, precio: products.precio })
-      .from(products)
-      .where(and(inArray(products.id, orderedProductIds), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
-    const precioById = new Map(catalogRows.map((p) => [p.id, p.precio]));
-    for (const productId of orderedProductIds) {
-      if (!precioById.has(productId)) {
-        throw new SaleValidationError(`Producto ${productId} no encontrado`);
-      }
-    }
 
     // TODO o NADA: las N líneas comparten una única transacción. Si cualquiera tira
     // SaleValidationError (stock insuficiente), Postgres revierte TODAS las escrituras ya
@@ -2629,7 +2634,7 @@ export class DatabaseStorage implements IStorage {
             })
             .returning();
           if (stock.unidades < 0) {
-            throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${stock.unidades} unidades`);
+            throw new SaleValidationError(`Stock insuficiente de ${nombreById.get(productId)}: quedarían ${pluralize(stock.unidades, "unidad", "unidades")}`);
           }
           await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - leftoverDelta, stock.unidades);
           continue;
@@ -2659,7 +2664,7 @@ export class DatabaseStorage implements IStorage {
           })
           .returning({ unidades: productStock.unidades });
         if (stock.unidades < 0) {
-          throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${stock.unidades} unidades`);
+          throw new SaleValidationError(`Stock insuficiente de ${nombreById.get(productId)}: quedarían ${pluralize(stock.unidades, "unidad", "unidades")}`);
         }
         await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - leftoverDelta, stock.unidades);
       }
@@ -4227,7 +4232,7 @@ export class DatabaseStorage implements IStorage {
 
       const lines = input.items.map((item) => {
         const product = catalogById.get(item.productId);
-        if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
+        if (!product) throw new SaleValidationError("No encontramos uno de los productos de la venta");
         const stock = stockByProductId.get(item.productId);
         // Etapa 7.4: un producto discontinuado no es vendible en una venta NUEVA — se
         // comprueba con el mismo `stock` ya releído bajo el `FOR UPDATE` de arriba, nunca con
@@ -4549,7 +4554,7 @@ export class DatabaseStorage implements IStorage {
 
       const lines = input.items.map((item) => {
         const product = productById.get(item.productId);
-        if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
+        if (!product) throw new SaleValidationError("No encontramos uno de los productos de la venta");
         // Solo se rechaza si es un producto NUEVO en esta edición — uno que ya era parte de
         // la venta sigue siendo histórico válido aunque hoy esté discontinuado (sección 14).
         if (stockRowById.get(item.productId)?.discontinued && !existingProductIds.has(item.productId)) {
@@ -4716,7 +4721,7 @@ export class DatabaseStorage implements IStorage {
       const installmentAmounts = input.installments.map((i) => i.amount);
       const remainingTotal = totals.total - alreadyPaidAmount;
       if (remainingTotal < 0) {
-        throw new SaleValidationError(`El nuevo total no puede ser menor que lo que ya se cobró (${alreadyPaidAmount})`);
+        throw new SaleValidationError(`El nuevo total no puede ser menor que lo que ya se cobró (${formatMoney(alreadyPaidAmount / 100)})`);
       }
       if (!installmentsSumMatches(installmentAmounts, remainingTotal)) {
         throw new SaleValidationError("La suma de las cuotas no coincide con el saldo pendiente de la venta");
@@ -6554,7 +6559,7 @@ export class MemoryStorage implements IStorage {
     isFreePlan: boolean,
   ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined> {
     if (delta === 0) {
-      throw new SaleValidationError("El delta de stock no puede ser 0");
+      throw new SaleValidationError("La cantidad no puede ser 0");
     }
     const product = this.findVisibleProduct(consultantId, productId);
     if (!product) return undefined;
@@ -6567,7 +6572,7 @@ export class MemoryStorage implements IStorage {
     // si el resultado da negativo se rechaza SIN tocar la fila.
     const nextUnidades = stock.unidades + leftoverDelta;
     if (nextUnidades < 0) {
-      throw new SaleValidationError(`Stock insuficiente: quedarían ${nextUnidades} unidades`);
+      throw new SaleValidationError(`Stock insuficiente de ${product.producto}: quedarían ${pluralize(nextUnidades, "unidad", "unidades")}`);
     }
     this.assertFreePlanProductLimitMem(consultantId, isFreePlan, stock.unidades, nextUnidades);
     stock.unidades = nextUnidades;
@@ -6585,28 +6590,31 @@ export class MemoryStorage implements IStorage {
       throw new SaleValidationError("El lote no puede estar vacío");
     }
 
+    // Prompt 15 — se busca el nombre ANTES de validar nada de cada línea, para que los
+    // mensajes de abajo nombren el producto por su nombre, nunca por su id. Visibilidad de
+    // catálogo ANTES de mutar nada — la asignación a pendientes de más abajo SÍ muta
+    // sale_items (nunca product_stock), así que tiene que quedar atrás de esta validación
+    // para no romper el "todo o nada" de esta función (si un producto no existe, nada se tocó
+    // todavía, ni siquiera un renglón pendiente).
+    const rawProductIds = Array.from(new Set(lines.map((l) => l.productId))).sort((a, b) => a - b);
+    const productByIdForBatch = new Map<number, ProductRow>();
+    for (const productId of rawProductIds) {
+      const product = this.findVisibleProduct(consultantId, productId);
+      if (!product) {
+        throw new SaleValidationError("No encontramos uno de los productos del pedido");
+      }
+      productByIdForBatch.set(productId, product);
+    }
+
     const deltaByProductId = new Map<number, number>();
     for (const line of lines) {
       if (!Number.isInteger(line.delta) || line.delta <= 0) {
-        throw new SaleValidationError(`Delta inválido para el producto ${line.productId}: tiene que ser un entero positivo`);
+        throw new SaleValidationError(`La cantidad de ${productByIdForBatch.get(line.productId)!.producto} tiene que ser un entero positivo`);
       }
       deltaByProductId.set(line.productId, (deltaByProductId.get(line.productId) ?? 0) + line.delta);
     }
 
     const orderedProductIds = Array.from(deltaByProductId.keys()).sort((a, b) => a - b);
-
-    // Visibilidad de catálogo ANTES de mutar nada — la asignación a pendientes de abajo SÍ
-    // muta sale_items (nunca product_stock), así que tiene que quedar atrás de esta validación
-    // para no romper el "todo o nada" de esta función (si un producto no existe, nada se tocó
-    // todavía, ni siquiera un renglón pendiente).
-    const productByIdForBatch = new Map<number, ProductRow>();
-    for (const productId of orderedProductIds) {
-      const product = this.findVisibleProduct(consultantId, productId);
-      if (!product) {
-        throw new SaleValidationError(`Producto ${productId} no encontrado`);
-      }
-      productByIdForBatch.set(productId, product);
-    }
 
     // Prompt 8 — cubre pendientes ANTES de la planificación de stock de abajo.
     const pendingAssignments: { saleId: number; clientName: string; quantity: number }[] = [];
@@ -6642,7 +6650,7 @@ export class MemoryStorage implements IStorage {
       if (delta <= 0) continue;
       const nextUnidades = stock.unidades + delta;
       if (nextUnidades < 0) {
-        throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${nextUnidades} unidades`);
+        throw new SaleValidationError(`Stock insuficiente de ${product.producto}: quedarían ${pluralize(nextUnidades, "unidad", "unidades")}`);
       }
       this.assertFreePlanProductLimitMem(consultantId, isFreePlan, stock.unidades, nextUnidades, newProductsPlannedThisBatch);
       if (stock.unidades <= 0 && nextUnidades > 0) newProductsPlannedThisBatch++;
@@ -7827,7 +7835,7 @@ export class MemoryStorage implements IStorage {
 
     const lines = input.items.map((item) => {
       const product = productById.get(item.productId);
-      if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
+      if (!product) throw new SaleValidationError("No encontramos uno de los productos de la venta");
       // Etapa 7.4: mismo criterio que DatabaseStorage — un producto discontinuado no es
       // vendible en una venta nueva.
       if (product.discontinued) {
@@ -8031,7 +8039,7 @@ export class MemoryStorage implements IStorage {
     const habitualDiscountPercent = this.resolveHabitualDiscountPercentMem(consultantId);
     const lines = input.items.map((item) => {
       const product = productById.get(item.productId);
-      if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
+      if (!product) throw new SaleValidationError("No encontramos uno de los productos de la venta");
       if (product.discontinued && !existingProductIds.has(item.productId)) {
         throw new SaleValidationError(`"${product.producto}" está discontinuado y no está disponible para nuevas ventas`);
       }
@@ -8184,7 +8192,7 @@ export class MemoryStorage implements IStorage {
     const installmentAmounts = input.installments.map((i) => i.amount);
     const remainingTotal = totals.total - alreadyPaidAmount;
     if (remainingTotal < 0) {
-      throw new SaleValidationError(`El nuevo total no puede ser menor que lo que ya se cobró (${alreadyPaidAmount})`);
+      throw new SaleValidationError(`El nuevo total no puede ser menor que lo que ya se cobró (${formatMoney(alreadyPaidAmount / 100)})`);
     }
     if (!installmentsSumMatches(installmentAmounts, remainingTotal)) {
       throw new SaleValidationError("La suma de las cuotas no coincide con el saldo pendiente de la venta");

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import type { Product, Draft } from "@shared/schema";
+import { pluralize } from "@shared/text";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -92,7 +93,7 @@ function EmptyCatalog({ onSeed, isSeeding }: { onSeed: () => void; isSeeding: bo
       </h2>
       <p className="mt-2 max-w-md text-sm text-muted-foreground">
         Cuando el administrador cargue productos aparecerán aquí. Mientras tanto,
-        puedes cargar 6 productos de demostración con temática Mary Kay.
+        podés cargar 6 productos de demostración con temática Mary Kay.
       </p>
       <Button
         size="lg"
@@ -226,7 +227,7 @@ export default function Productos() {
       queryClient.invalidateQueries({ queryKey: ["/api/admin/stats"] });
       toast({
         title: "Catálogo listo",
-        description: `${data.count} productos de prueba cargados correctamente.`,
+        description: `${pluralize(data.count, "producto de prueba cargado", "productos de prueba cargados")} correctamente.`,
       });
     },
     onError: (err: Error) => {

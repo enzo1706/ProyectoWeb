@@ -402,7 +402,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         // es un hash bcrypt válido cualquiera (nunca corresponde a ninguna cuenta real) — el
         // costo de compare() depende del factor de costo embebido en el hash, no de su valor.
         await bcrypt.compare(parsed.data.password, DUMMY_BCRYPT_HASH);
-        return res.status(401).json({ error: "Credenciales inválidas" });
+        return res.status(401).json({ error: "Email, WhatsApp o contraseña incorrectos." });
       }
 
       let passwordMatches: boolean;
@@ -419,7 +419,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
 
       if (!passwordMatches) {
-        return res.status(401).json({ error: "Credenciales inválidas" });
+        return res.status(401).json({ error: "Email, WhatsApp o contraseña incorrectos." });
       }
 
       if (!user.status) {

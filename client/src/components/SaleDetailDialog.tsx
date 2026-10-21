@@ -23,6 +23,7 @@ import { useHideMoney } from "@/hooks/use-hide-money";
 import { computeAdjustmentAmount, computeHistoricalProductCost, type OrderAdjustment } from "@shared/saleCalculations";
 import { resolveNextOrderDate } from "@shared/orderReminderSchedule";
 import { getArgentinaDateStr } from "@shared/argentinaTime";
+import { formatDateDisplay, formatDateShort } from "@/lib/date";
 import type { SaleDetails } from "./SaleCard";
 import type { Consultant } from "@shared/schema";
 
@@ -277,7 +278,7 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                         <span>
                           Cuota {inst.installmentNumber} · {format(inst.amount - inst.amountPaid)}
                           {inst.amountPaid > 0 ? ` de ${format(inst.amount)} (pago parcial)` : ""} · vence{" "}
-                          {parseLocalDate(inst.dueDate).toLocaleDateString("es-MX", { day: "numeric", month: "short" })}
+                          {formatDateShort(inst.dueDate)}
                         </span>
                         <Button
                           type="button"
@@ -301,7 +302,7 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                 <div className="flex items-center gap-3 text-sm">
                   <Calendar className="h-4 w-4 text-muted-foreground shrink-0" />
                   <span>
-                    {parseLocalDate(sale.date).toLocaleDateString("es-MX", { day: "numeric", month: "long", year: "numeric" })}
+                    {formatDateDisplay(sale.date)}
                   </span>
                 </div>
 
@@ -394,7 +395,7 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                   )}
                   {sale.ingresosBrutos !== null && sale.ingresosBrutos !== undefined && (
                     <div className="flex justify-between text-muted-foreground">
-                      <span>Ingresos Brutos</span>
+                      <span>Ingresos brutos</span>
                       <span>{format(sale.ingresosBrutos)}</span>
                     </div>
                   )}
@@ -426,7 +427,7 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
                           Cuota {inst.installmentNumber} · {format(inst.amount)}
                         </p>
                         <p className="text-xs text-muted-foreground">
-                          Vence {parseLocalDate(inst.dueDate).toLocaleDateString("es-MX", { day: "numeric", month: "short" })}
+                          Vence {formatDateShort(inst.dueDate)}
                           {inst.status === "pendiente" && inst.amountPaid > 0 && ` · Pagado parcial: ${format(inst.amountPaid)}`}
                         </p>
                       </div>

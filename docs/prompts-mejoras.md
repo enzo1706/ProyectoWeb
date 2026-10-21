@@ -1270,6 +1270,46 @@ Cómo verifico que quedó bien:
 - Al escribir un precio, se va viendo con formato de pesos.
 ```
 
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **Alcance**: incluye los mensajes de error del servidor que ve la consultora, los toasts, los
+  emails (ej. el de recuperar contraseña) y el panel de admin — no solo las pantallas de
+  consultora. Los textos ya decididos en prompts anteriores (Clientas, Agregar a la venta,
+  Aviso de poco stock, Compra promedio en Reportes, Crear cuenta, el voseo de Login) no se
+  tocaron — se verificaron primero y se dejaron igual.
+- **Fechas futuras** (agrega al punto 6, que solo daba ejemplos de pasado): "mañana", "en 3
+  días" (hasta 7 días) y después "15 de nov." — simétrico al pasado.
+- **`unit: "cents" | "pesos"` obligatorio** en `MoneyInput`: la mayoría de los montos de la app
+  se guardan en centavos, pero el precio y los cupones de suscripción del admin se guardan en
+  pesos enteros (unidad distinta, no un descuido) — el prop evita que alguien mezcle las dos
+  sin que se note en el código.
+- **Parser de montos (`parseMoneyInput`)**: "," siempre es el decimal. "." es separador de
+  miles SOLO si el último grupo tiene exactamente 3 dígitos — si tiene 1 o 2 ("20.5",
+  "1250.50"), es decimal. Así nadie que tipea con punto decimal termina guardando mil veces
+  más. Los montos se muestran sin decimales salvo que tengan centavos de verdad.
+- **Mensaje de login**: "Email, WhatsApp o contraseña incorrectos." — mismo texto para una
+  cuenta inexistente y para una contraseña incorrecta (anti-enumeración, sin cambios de
+  comportamiento ni de timing).
+- **Mayúscula solo en la primera letra**: la regla se extiende a encabezados y etiquetas, no
+  solo botones — excepto nombres propios (Mary Kay, Mercado Pago, WhatsApp, Impulsa).
+- **Infinitivo/sustantivo vs. voseo**: títulos, botones y etiquetas van en infinitivo o con
+  sustantivo ("Iniciar sesión", "Crear cuenta", "Nueva venta"). Las frases que le hablan
+  directamente a la consultora van en voseo ("Entrá con tu email o tu WhatsApp", "Elegí una
+  clienta").
+- **Códigos internos**: se sacan el código de catálogo que puede ser un slug autogenerado
+  (`EditProductDialog` en modo catálogo, `LowStockDialog`) y el id crudo en los errores del
+  servidor (ahora nombran el producto, o dicen "uno de los productos" si no se pudo resolver
+  ninguno). Se queda el campo "Código (opcional)" de un producto manual (lo escribe la propia
+  consultora) y los ids en el panel de admin (sirven para soporte: Mercado Pago, productos del
+  catálogo).
+- **Cupón del admin**: un solo componente con un switch interno entre `MoneyInput`
+  (unit="pesos") y `PercentInput` según el tipo de descuento elegido.
+- **Jerga técnica**: ninguna palabra técnica en lo que ve la consultora, esté o no en la lista
+  del prompt (ej. "delta" → "cantidad").
+- **`PHONE_ERROR_MESSAGE`** (clientas, `shared/schema.ts`) se alineó al mismo formato de
+  ejemplo agrupado que ya usa `CONSULTANT_WHATSAPP_ERROR_MESSAGE` desde el Prompt 9/14 — era un
+  texto viejo que había quedado afuera de esa decisión, no una decisión nueva.
+
 ### Prompt 16 · Velocidad de carga
 
 _Punto: P28 · Conviene hacerlo al final, para medir con todo lo nuevo._

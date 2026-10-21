@@ -1292,13 +1292,13 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
           { productId: productAId, delta: 1 },
           { productId: 999999999, delta: 1 },
         ], false),
-      ).rejects.toThrow(/no encontrado/i);
+      ).rejects.toThrow(/no encontramos uno de los productos/i);
     });
 
     it("5. producto MANUAL de otra consultora -> se rechaza igual que uno inexistente, nunca se filtra que existe", async () => {
       await expect(
         storage.incrementProductStockBatch(testConsultantId, [{ productId: otherProductId, delta: 1 }], false),
-      ).rejects.toThrow(/no encontrado/i);
+      ).rejects.toThrow(/no encontramos uno de los productos/i);
 
       // El stock de la otra consultora, intacto.
       const [row] = await db.select().from(productStock).where(eq(productStock.productId, otherProductId));
@@ -1342,7 +1342,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
           { productId: productBId, delta: 3 }, // línea 2: válida
           { productId: 999999999, delta: 1 }, // línea 3: inválida -> todo el batch debe revertir
         ], false),
-      ).rejects.toThrow(/no encontrado/i);
+      ).rejects.toThrow(/no encontramos uno de los productos/i);
 
       const [afterA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
       const [afterB] = await db.select().from(productStock).where(eq(productStock.productId, productBId));
@@ -1387,7 +1387,7 @@ describe("Batch atómico de confirmación de pedido (incrementProductStockBatch)
           { productId: 999999999, delta: 1 },
           { productId: productAId, delta: 5 },
         ], false),
-      ).rejects.toThrow(/no encontrado/i);
+      ).rejects.toThrow(/no encontramos uno de los productos/i);
 
       const [afterA] = await db.select().from(productStock).where(eq(productStock.productId, productAId));
       expect(afterA.unidades).toBe(beforeA.unidades);

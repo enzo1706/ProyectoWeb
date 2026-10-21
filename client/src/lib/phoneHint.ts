@@ -9,7 +9,8 @@ export const WHATSAPP_FORMAT_HINT = "Escribí tu WhatsApp sin el 0 y sin el 15. 
  * Prompt 14, ajuste 4 — en el ingreso (campo único email/WhatsApp/usuario), si lo que se
  * tipeó tiene FORMA de teléfono (solo números, espacios, guiones o +) pero no es un WhatsApp
  * argentino válido tras normalizar, hay que avisar el formato ANTES de enviar — si no, se
- * busca como usuario, no existe, y la consultora recibe "Credenciales inválidas" sin saber
+ * busca como usuario, no existe, y la consultora recibe "Email, WhatsApp o contraseña
+ * incorrectos." sin saber
  * que el problema era el "0"/"15" de su WhatsApp. Depende SOLO del formato de lo tipeado,
  * nunca de si la cuenta existe — no rompe la anti-enumeración.
  */

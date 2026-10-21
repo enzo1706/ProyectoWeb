@@ -685,10 +685,10 @@ export default function ProductManagement() {
       <div>
         <h1 className="text-3xl font-bold text-foreground flex items-center gap-2">
           <Package className="h-7 w-7 text-primary" />
-          Carga Masiva de Productos
+          Carga masiva de productos
         </h1>
         <p className="text-muted-foreground mt-1">
-          Sube el catálogo global de productos — queda visible para todas las consultoras
+          Subí el catálogo global de productos — queda visible para todas las consultoras
         </p>
       </div>
 
@@ -698,7 +698,7 @@ export default function ProductManagement() {
         <Card className="lg:col-span-2 shadow-sm">
           <CardHeader>
             <CardTitle className="text-lg text-foreground">
-              Zona de Carga
+              Zona de carga
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -854,10 +854,10 @@ export default function ProductManagement() {
                     </div>
                     <div className="text-center space-y-1">
                       <p className="text-sm font-medium text-foreground">
-                        Arrastra tu archivo aquí
+                        Arrastrá tu archivo aquí
                       </p>
                       <p className="text-xs text-muted-foreground">
-                        o haz clic para seleccionar (.csv, .xlsx)
+                        o hacé clic para seleccionar (.csv, .xlsx)
                       </p>
                     </div>
                     <label>
@@ -871,7 +871,7 @@ export default function ProductManagement() {
                       <Button asChild variant="default" className="cursor-pointer">
                         <span>
                           <FileSpreadsheet className="h-4 w-4 mr-2 inline" />
-                          Seleccionar Archivo
+                          Seleccionar archivo
                         </span>
                       </Button>
                     </label>
@@ -885,7 +885,7 @@ export default function ProductManagement() {
         <Card className="shadow-sm">
           <CardHeader>
             <CardTitle className="text-lg text-foreground">
-              Formato Esperado
+              Formato esperado
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4 text-sm">

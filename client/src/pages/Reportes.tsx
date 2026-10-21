@@ -13,6 +13,7 @@ import { WhatsAppButton } from "@/components/WhatsAppButton";
 import { ClientDetailSheet } from "@/components/ClientDetailSheet";
 import type { Client } from "@/components/ClientCard";
 import { apiRequest } from "@/lib/queryClient";
+import { formatArgentinaPhoneDisplay } from "@shared/phone";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { toDateStr, parseLocalDate } from "@/lib/date";
 import { REPORT_PERIOD_KINDS, type ReportPeriodKind } from "@shared/reportsPeriods";
@@ -107,14 +108,14 @@ function formatRangeLabel(start: string, endExclusive: string): string {
   const endInclusive = parseLocalDate(toDateStr(new Date(parseLocalDate(endExclusive).getTime() - 86400000)));
   const sameMonth = startDate.getMonth() === endInclusive.getMonth() && startDate.getFullYear() === endInclusive.getFullYear();
   if (sameMonth) {
-    return `${startDate.getDate()} al ${endInclusive.toLocaleDateString("es-MX", { day: "numeric", month: "long", year: "numeric" })}`;
+    return `${startDate.getDate()} al ${endInclusive.toLocaleDateString("es-AR", { day: "numeric", month: "long", year: "numeric" })}`;
   }
-  return `${startDate.toLocaleDateString("es-MX", { day: "numeric", month: "short" })} al ${endInclusive.toLocaleDateString("es-MX", { day: "numeric", month: "short", year: "numeric" })}`;
+  return `${startDate.toLocaleDateString("es-AR", { day: "numeric", month: "short" })} al ${endInclusive.toLocaleDateString("es-AR", { day: "numeric", month: "short", year: "numeric" })}`;
 }
 
 /** Texto de la línea de comparación — ver docs/prompts-mejoras.md (Prompt 11, decisiones). */
 function comparisonLabel(kind: ReportPeriodKind, comparisonPeriod: { start: string }): string {
-  const monthName = parseLocalDate(comparisonPeriod.start).toLocaleDateString("es-MX", { month: "long" });
+  const monthName = parseLocalDate(comparisonPeriod.start).toLocaleDateString("es-AR", { month: "long" });
   switch (kind) {
     case "this_month":
       return `mismos días de ${monthName}`;
@@ -470,7 +471,7 @@ export default function Reportes() {
                     {clientsToRecontact.map((client) => (
                       <div key={client.clientId} className="flex items-center gap-3" data-testid={`row-recontact-${client.clientId}`}>
                         <div className="flex-1 min-w-0">
-                          <p className="font-medium truncate">{client.name ?? client.phone ?? "Sin nombre"}</p>
+                          <p className="font-medium truncate">{client.name ?? formatArgentinaPhoneDisplay(client.phone) ?? "Sin nombre"}</p>
                           <p className="text-sm text-muted-foreground">Última compra: hace {client.daysSinceLastPurchase} días</p>
                         </div>
                         <WhatsAppButton phone={client.phone} variant="icon" />

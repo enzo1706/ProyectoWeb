@@ -2,6 +2,7 @@ import { forwardRef, useImperativeHandle, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { MoneyInput } from "@/components/MoneyInput";
 import { Label } from "@/components/ui/label";
 import {
   AlertDialog,
@@ -58,7 +59,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
   const [selectedTone, setSelectedTone] = useState<Product | null>(null);
   const [quantity, setQuantity] = useState(1);
-  const [priceInput, setPriceInput] = useState("");
+  const [priceInput, setPriceInput] = useState<number | null>(null);
   // Prompt 6, punto 2 — buscador por nombre o tono, en el punto de entrada de este paso.
   const [productSearch, setProductSearch] = useState("");
 
@@ -134,7 +135,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
     setSelectedProduct(product);
     setSelectedTone(null);
     setQuantity(1);
-    setPriceInput(String(product.precio / 100));
+    setPriceInput(product.precio);
     const siblings = getToneSiblings(product, sellableProducts);
     onSubViewChange(siblings.length > 1 ? "tone" : "qty");
   };
@@ -142,7 +143,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
   const openTone = (tone: Product) => {
     setSelectedTone(tone);
     setQuantity(1);
-    setPriceInput(String(tone.precio / 100));
+    setPriceInput(tone.precio);
     onSubViewChange("qty");
   };
 
@@ -157,7 +158,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
 
   const addToCartNow = () => {
     if (!activeProduct) return;
-    const priceCents = priceInput ? Math.round(Number(priceInput) * 100) : activeProduct.precio;
+    const priceCents = priceInput !== null && priceInput > 0 ? priceInput : activeProduct.precio;
     onAddLine({
       productId: activeProduct.id,
       productName: activeProduct.producto,
@@ -414,15 +415,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
         )}
         <div className="space-y-1.5">
           <Label htmlFor="step-price">Precio de venta</Label>
-          <Input
-            id="step-price"
-            type="number"
-            min={0}
-            step="0.01"
-            value={priceInput}
-            onChange={(e) => setPriceInput(e.target.value)}
-            data-testid="input-step-price"
-          />
+          <MoneyInput id="step-price" unit="cents" value={priceInput} onChange={setPriceInput} data-testid="input-step-price" />
         </div>
         <Button type="button" className="h-12 w-full" onClick={handleAddToCart} data-testid="button-step-add-to-cart">
           Agregar a la venta

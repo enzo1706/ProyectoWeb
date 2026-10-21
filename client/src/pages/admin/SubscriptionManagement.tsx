@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { formatPesos } from "@/lib/currency";
 import {
   Table,
   TableBody,
@@ -107,8 +108,12 @@ function formatDate(iso: string | null): string {
   return new Date(iso).toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit", year: "numeric" });
 }
 
+// Prompt 15 — mismo caso que SubscriptionPricing.tsx: estos montos (pagos de Mercado Pago)
+// están en PESOS ENTEROS, no en centavos, así que usan `formatPesos` (nunca la `formatPrice`
+// global, que asume centavos) — antes esta pantalla tenía su propio formateador ad-hoc, con
+// un estilo distinto al de la otra pantalla de admin que también maneja plata en pesos enteros.
 function formatMoney(amount: number, currency: string): string {
-  return `$${amount.toLocaleString("es-AR")} ${currency}`;
+  return formatPesos(amount, currency);
 }
 
 function StatusBadge({ status }: { status: SubscriptionStatus }) {
@@ -391,7 +396,7 @@ function PaymentsTab() {
           </Card>
           <Card data-testid="summary-approved-revenue">
             <CardContent className="p-4">
-              <p className="text-2xl font-bold">${data.summary.approvedRevenue.toLocaleString("es-AR")}</p>
+              <p className="text-2xl font-bold">{formatPesos(data.summary.approvedRevenue)}</p>
               <p className="text-xs text-muted-foreground mt-1">Ingresos aprobados (ARS)</p>
             </CardContent>
           </Card>

@@ -125,7 +125,7 @@ export default function Ventas() {
           data-testid="button-add-sale"
         >
           <Plus className="h-4 w-4 mr-2" />
-          Nueva Venta
+          Nueva venta
         </Button>
       </div>
 

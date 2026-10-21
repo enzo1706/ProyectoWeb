@@ -133,22 +133,22 @@ describe("Anti-enumeración — timing de forgot-password (Etapa 7.6)", () => {
 });
 
 describe("Anti-enumeración — login (Etapa 7.6, Prompt 14: identifier acepta email/WhatsApp/usuario)", () => {
-  it("1. identifier inexistente (con forma de usuario viejo): 401 'Credenciales inválidas'", async () => {
+  it("1. identifier inexistente (con forma de usuario viejo): 401 'Email, WhatsApp o contraseña incorrectos.'", async () => {
     const { status, body } = await login(uniqueUsername("noexiste-login"), "cualquier-password", nextTestIp());
     expect(status).toBe(401);
-    expect(body.error).toBe("Credenciales inválidas");
+    expect(body.error).toBe("Email, WhatsApp o contraseña incorrectos.");
   });
 
   it("1b. identifier inexistente con forma de email: mismo 401 y mismo mensaje", async () => {
     const { status, body } = await login(uniqueEmail("noexiste-email"), "cualquier-password", nextTestIp());
     expect(status).toBe(401);
-    expect(body.error).toBe("Credenciales inválidas");
+    expect(body.error).toBe("Email, WhatsApp o contraseña incorrectos.");
   });
 
   it("1c. identifier inexistente con forma de WhatsApp válido: mismo 401 y mismo mensaje", async () => {
     const { status, body } = await login(uniqueWhatsapp(), "cualquier-password", nextTestIp());
     expect(status).toBe(401);
-    expect(body.error).toBe("Credenciales inválidas");
+    expect(body.error).toBe("Email, WhatsApp o contraseña incorrectos.");
   });
 
   it("2. cuenta existente + password incorrecta: MISMO status y MISMO mensaje que identifier inexistente (probado con las 3 formas: username, email y WhatsApp)", async () => {
@@ -163,7 +163,7 @@ describe("Anti-enumeración — login (Etapa 7.6, Prompt 14: identifier acepta e
       const wrongPass = await login(identifier, "password-incorrecta-123", nextTestIp());
       expect(wrongPass.status).toBe(noUser.status);
       expect(wrongPass.body.error).toBe(noUser.body.error);
-      expect(wrongPass.body.error).toBe("Credenciales inválidas");
+      expect(wrongPass.body.error).toBe("Email, WhatsApp o contraseña incorrectos.");
     }
   });
 

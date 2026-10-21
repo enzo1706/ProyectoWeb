@@ -144,7 +144,7 @@ export function AppointmentDetailDialog({ open, onOpenChange, appointment, onEdi
   const currentStatus = (appointment?.status as AppointmentStatus) ?? "pendiente";
 
   const fullDate = appointment
-    ? parseLocalDate(appointment.date).toLocaleDateString("es-MX", {
+    ? parseLocalDate(appointment.date).toLocaleDateString("es-AR", {
         weekday: "long",
         day: "numeric",
         month: "long",

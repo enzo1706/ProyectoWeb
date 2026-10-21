@@ -154,7 +154,7 @@ export default function Clientas() {
         </div>
         <Button onClick={handleNewClient} data-testid="button-add-client">
           <Plus className="h-4 w-4 mr-2" />
-          Nueva Clienta
+          Nueva clienta
         </Button>
       </div>
 

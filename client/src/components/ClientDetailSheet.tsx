@@ -14,6 +14,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { MoneyInput } from "@/components/MoneyInput";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import {
@@ -56,6 +57,7 @@ import {
   Plus,
 } from "lucide-react";
 import { apiRequest, queryClient, ApiError } from "@/lib/queryClient";
+import { formatDateList } from "@/lib/date";
 import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { formatArgentinaPhoneDisplay } from "@shared/phone";
@@ -102,10 +104,6 @@ function parseLocalDate(dateStr: string): Date {
   return new Date(year, month - 1, day);
 }
 
-function formatShortDate(dateStr: string): string {
-  return parseLocalDate(dateStr).toLocaleDateString("es-MX", { day: "numeric", month: "short", year: "numeric" });
-}
-
 function toDateInputValue(date: Date): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
@@ -116,7 +114,7 @@ function toDateInputValue(date: Date): string {
 // parsea como UTC y en Argentina, UTC-3, puede mostrar el día anterior) evita ese corrimiento.
 function formatBirthday(date?: string | null): string | null {
   if (!date) return null;
-  return parseLocalDate(date).toLocaleDateString("es-MX", { day: "numeric", month: "long" });
+  return parseLocalDate(date).toLocaleDateString("es-AR", { day: "numeric", month: "long" });
 }
 
 type HistoryEntry =
@@ -149,7 +147,7 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
   const { format } = useHideMoney();
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [payDialogOpen, setPayDialogOpen] = useState(false);
-  const [payAmount, setPayAmount] = useState("");
+  const [payAmountCents, setPayAmountCents] = useState<number | null>(null);
   const [payDate, setPayDate] = useState(() => toDateInputValue(new Date()));
   const [payMethod, setPayMethod] = useState<PaymentMethod>("efectivo");
   const [newNoteText, setNewNoteText] = useState("");
@@ -206,9 +204,8 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
   // de la más vieja a la más nueva, en una sola transacción del lado del servidor.
   const registerPaymentMutation = useGuardedMutation({
     mutationFn: async () => {
-      const amountArs = Number(payAmount.replace(",", "."));
       const res = await apiRequest("POST", `/api/clients/${client!.id}/payments`, {
-        amount: Math.round(amountArs * 100),
+        amount: payAmountCents,
         date: payDate,
         paymentMethod: payMethod,
       });
@@ -218,7 +215,7 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
       invalidateAfterMoneyChange();
       toast({ title: "Pago registrado" });
       setPayDialogOpen(false);
-      setPayAmount("");
+      setPayAmountCents(null);
     },
     onError: (err: Error) => {
       toast({ title: "No se pudo registrar el pago", description: err.message, variant: "destructive" });
@@ -328,14 +325,13 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
   const owesMoney = pendingBalance > 0;
 
   const openPayDialog = () => {
-    setPayAmount((pendingBalance / 100).toFixed(2).replace(".", ","));
+    setPayAmountCents(pendingBalance);
     setPayDate(toDateInputValue(new Date()));
     setPayMethod("efectivo");
     setPayDialogOpen(true);
   };
 
-  const payAmountCents = Math.round(Number(payAmount.replace(",", ".")) * 100) || 0;
-  const payAmountValid = payAmountCents > 0 && payAmountCents <= pendingBalance;
+  const payAmountValid = payAmountCents !== null && payAmountCents > 0 && payAmountCents <= pendingBalance;
 
   return (
     <>
@@ -416,7 +412,7 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
               <Card>
                 <CardContent className="pt-4 pb-3 text-center">
                   <p className="text-lg font-bold tabular-nums" data-testid="text-summary-total">{format(summary.totalPurchased)}</p>
-                  <p className="text-xs text-muted-foreground">Total Comprado</p>
+                  <p className="text-xs text-muted-foreground">Total comprado</p>
                 </CardContent>
               </Card>
               <Card>
@@ -428,19 +424,19 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
               <Card>
                 <CardContent className="pt-4 pb-3 text-center">
                   <p className="text-lg font-bold tabular-nums">{format(summary.avgTicket)}</p>
-                  <p className="text-xs text-muted-foreground">Ticket Promedio</p>
+                  <p className="text-xs text-muted-foreground">Compra promedio</p>
                 </CardContent>
               </Card>
               <Card>
                 <CardContent className="pt-4 pb-3 text-center">
-                  <p className="text-lg font-bold">{summary.lastPurchase ? formatShortDate(summary.lastPurchase) : "-"}</p>
-                  <p className="text-xs text-muted-foreground">Última Compra</p>
+                  <p className="text-lg font-bold">{summary.lastPurchase ? formatDateList(summary.lastPurchase) : "-"}</p>
+                  <p className="text-xs text-muted-foreground">Última compra</p>
                 </CardContent>
               </Card>
               <Card>
                 <CardContent className="pt-4 pb-3 text-center">
-                  <p className="text-lg font-bold">{summary.firstPurchase ? formatShortDate(summary.firstPurchase) : "-"}</p>
-                  <p className="text-xs text-muted-foreground">Primera Compra</p>
+                  <p className="text-lg font-bold">{summary.firstPurchase ? formatDateList(summary.firstPurchase) : "-"}</p>
+                  <p className="text-xs text-muted-foreground">Primera compra</p>
                 </CardContent>
               </Card>
               <Card>
@@ -457,7 +453,7 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
           <div className="mt-6 flex flex-wrap gap-2">
             <Button className="flex-1 min-w-[140px]" onClick={() => onNewSale(client)} data-testid="button-new-sale-client">
               <ShoppingCart className="h-4 w-4 mr-2" />
-              Nueva Venta
+              Nueva venta
             </Button>
             <Button
               variant="outline"
@@ -504,7 +500,7 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
                         <div className="flex items-center justify-between gap-2 flex-wrap">
                           <div className="flex items-center gap-2 text-sm text-muted-foreground">
                             <Calendar className="h-3.5 w-3.5" />
-                            <span>{formatShortDate(entry.sale.date)}</span>
+                            <span>{formatDateList(entry.sale.date)}</span>
                             <span className="text-xs">#{entry.sale.id}</span>
                           </div>
                           <Badge className={saleStatusColors[entry.sale.status] ?? saleStatusColors.pendiente}>
@@ -536,7 +532,7 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
                           <div className="flex items-center gap-2 text-sm">
                             <CircleDollarSign className="h-3.5 w-3.5 text-green-600 dark:text-green-400" />
                             <span className="font-medium">Pago recibido</span>
-                            <span className="text-xs text-muted-foreground">{formatShortDate(entry.payment.date)} · {paymentMethodLabels[entry.payment.paymentMethod as PaymentMethod] ?? entry.payment.paymentMethod}</span>
+                            <span className="text-xs text-muted-foreground">{formatDateList(entry.payment.date)} · {paymentMethodLabels[entry.payment.paymentMethod as PaymentMethod] ?? entry.payment.paymentMethod}</span>
                           </div>
                           <span className="font-medium tabular-nums text-green-600 dark:text-green-400">+{format(entry.payment.amount)}</span>
                         </div>
@@ -563,7 +559,7 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
                       <div className="flex items-center justify-between gap-2">
                         <div className="flex items-center gap-2 text-sm text-muted-foreground">
                           <Clock className="h-3.5 w-3.5" />
-                          <span>{formatShortDate(apt.date)} · {apt.time}</span>
+                          <span>{formatDateList(apt.date)} · {apt.time}</span>
                         </div>
                         <Badge className={getEventTypeColorClass(apt.type)}>{getEventTypeLabel(apt.type)}</Badge>
                       </div>
@@ -629,7 +625,7 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
                       <div className="flex-1 min-w-0">
                         <p className="text-sm whitespace-pre-wrap">{note.text}</p>
                         <p className="text-xs text-muted-foreground mt-1">
-                          {note.createdAt ? formatShortDate(toDateInputValue(new Date(note.createdAt))) : "Nota anterior"}
+                          {note.createdAt ? formatDateList(toDateInputValue(new Date(note.createdAt))) : "Nota anterior"}
                         </p>
                       </div>
                       <Button
@@ -706,14 +702,8 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
           <div className="space-y-3">
             <div className="space-y-1.5">
               <Label htmlFor="pay-amount">Monto</Label>
-              <Input
-                id="pay-amount"
-                inputMode="decimal"
-                value={payAmount}
-                onChange={(e) => setPayAmount(e.target.value)}
-                data-testid="input-pay-amount"
-              />
-              {!payAmountValid && payAmount && (
+              <MoneyInput id="pay-amount" unit="cents" value={payAmountCents} onChange={setPayAmountCents} data-testid="input-pay-amount" />
+              {!payAmountValid && payAmountCents !== null && (
                 <p className="text-xs text-destructive">
                   Tiene que ser mayor a 0 y no puede superar lo que debe ({format(pendingBalance)}).
                 </p>

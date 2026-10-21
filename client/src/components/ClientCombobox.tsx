@@ -18,6 +18,7 @@ import {
 import { ChevronsUpDown, Plus } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { ClientDialog } from "./ClientDialog";
+import { formatArgentinaPhoneDisplay } from "@shared/phone";
 import type { Client } from "./ClientCard";
 
 interface ClientComboboxProps {
@@ -60,7 +61,7 @@ export function ClientCombobox({ value, onSelect, id }: ClientComboboxProps) {
     },
   });
 
-  const displayLabel = value ? value.name?.trim() || value.phone : "Buscar clienta...";
+  const displayLabel = value ? value.name?.trim() || formatArgentinaPhoneDisplay(value.phone) : "Buscar clienta...";
 
   return (
     <>
@@ -120,8 +121,8 @@ export function ClientCombobox({ value, onSelect, id }: ClientComboboxProps) {
                       data-testid={`client-option-${client.id}`}
                     >
                       <div className="min-w-0">
-                        <p className="truncate">{client.name?.trim() || client.phone}</p>
-                        <p className="text-xs text-muted-foreground">{client.phone}</p>
+                        <p className="truncate">{client.name?.trim() || formatArgentinaPhoneDisplay(client.phone)}</p>
+                        <p className="text-xs text-muted-foreground">{formatArgentinaPhoneDisplay(client.phone)}</p>
                       </div>
                     </CommandItem>
                   ))}

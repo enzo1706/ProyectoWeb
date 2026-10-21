@@ -8,6 +8,7 @@ import type { Product } from "@shared/schema";
 import { createProductSchema } from "@shared/schema";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { MoneyInput } from "@/components/MoneyInput";
 import {
   Dialog,
   DialogContent,
@@ -48,8 +49,7 @@ interface SubscriptionStatus {
   freePlanProductLimit: number;
 }
 
-const manualProductFormSchema = createProductSchema.extend({
-  precio: z.string().min(1, "El precio es obligatorio"),
+const manualProductFormSchema = createProductSchema.omit({ precio: true }).extend({
   unidades: z.string().optional(),
   puntos: z.string().optional(),
   variante: z.string().optional(),
@@ -69,6 +69,7 @@ export function AddProductDialog({
   const { toast } = useToast();
   const categories = getProductCategories(products);
   const [costInput, setCostInput] = useState<CostInputValue>(EMPTY_COST_INPUT);
+  const [precioCentavos, setPrecioCentavos] = useState<number | null>(null);
   const [moreDataOpen, setMoreDataOpen] = useState(false);
   const [confirmNoCostOpen, setConfirmNoCostOpen] = useState(false);
   const [freePlanLimitOpen, setFreePlanLimitOpen] = useState(false);
@@ -87,23 +88,27 @@ export function AddProductDialog({
 
   const form = useForm<ManualProductFormData>({
     resolver: zodResolver(manualProductFormSchema),
-    defaultValues: { seccion: "", linea: "", producto: "", variante: "", precio: "", unidades: "0", puntos: "0", codigo: "" },
+    defaultValues: { seccion: "", linea: "", producto: "", variante: "", unidades: "0", puntos: "0", codigo: "" },
   });
 
   const resetAll = () => {
     form.reset();
     setCostInput(EMPTY_COST_INPUT);
+    setPrecioCentavos(null);
     setMoreDataOpen(false);
   };
 
   const createMutation = useGuardedMutation({
     mutationFn: async (data: ManualProductFormData) => {
+      if (precioCentavos === null || precioCentavos <= 0) {
+        throw new Error("El precio es obligatorio");
+      }
       const res = await apiRequest("POST", "/api/products", {
         seccion: data.seccion,
         linea: data.linea || undefined,
         producto: data.producto,
         variante: data.variante || undefined,
-        precio: Math.round(Number(data.precio) * 100),
+        precio: precioCentavos,
         unidades: data.unidades ? Number(data.unidades) : 0,
         puntos: data.puntos ? Number(data.puntos) : 0,
         codigo: data.codigo || undefined,
@@ -144,6 +149,10 @@ export function AddProductDialog({
     Number(data.unidades || 0) > 0;
 
   const submit = (data: ManualProductFormData) => {
+    if (precioCentavos === null || precioCentavos <= 0) {
+      toast({ title: "El precio es obligatorio", variant: "destructive" });
+      return;
+    }
     if (wouldExceedFreePlanLimit(data)) {
       setFreePlanLimitOpen(true);
       return;
@@ -199,19 +208,12 @@ export function AddProductDialog({
                   </FormItem>
                 )}
               />
-              <FormField
-                control={form.control}
-                name="precio"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Precio de venta</FormLabel>
-                    <FormControl>
-                      <Input {...field} type="number" min={0} step="0.01" data-testid="input-manual-precio" />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+              <FormItem>
+                <FormLabel>Precio de venta</FormLabel>
+                <FormControl>
+                  <MoneyInput unit="cents" value={precioCentavos} onChange={setPrecioCentavos} data-testid="input-manual-precio" />
+                </FormControl>
+              </FormItem>
               <FormField
                 control={form.control}
                 name="unidades"
@@ -226,11 +228,7 @@ export function AddProductDialog({
                 )}
               />
 
-              <CostInputBlock
-                precioCentavos={Math.round(Number(form.watch("precio") || 0) * 100)}
-                value={costInput}
-                onChange={setCostInput}
-              />
+              <CostInputBlock precioCentavos={precioCentavos ?? 0} value={costInput} onChange={setCostInput} />
 
               <Collapsible open={moreDataOpen} onOpenChange={setMoreDataOpen}>
                 <CollapsibleTrigger asChild>

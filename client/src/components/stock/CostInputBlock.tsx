@@ -1,6 +1,6 @@
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { FormLabel } from "@/components/ui/form";
+import { MoneyInput } from "@/components/MoneyInput";
 import { discountOptions } from "@shared/schema";
 import { computeDiscountedCost } from "@shared/saleCalculations";
 import { useHideMoney } from "@/hooks/use-hide-money";
@@ -11,23 +11,22 @@ export type CostInputMode = "none" | "percent" | "direct";
 export interface CostInputValue {
   mode: CostInputMode;
   percent: number | null;
-  direct: string;
+  /** En centavos — ya resuelto por `MoneyInput`, nunca un texto a parsear a mano. */
+  direct: number | null;
 }
 
-export const EMPTY_COST_INPUT: CostInputValue = { mode: "none", percent: null, direct: "" };
+export const EMPTY_COST_INPUT: CostInputValue = { mode: "none", percent: null, direct: null };
 
 /** Resuelve qué llamada hacer al guardar: un % (POST/PATCH .../discount) o un costo directo en
- * pesos ya convertido a centavos (PATCH .../cost) — o `null` si no se completó ninguno de los
- * dos (el caller decide qué hacer: el formulario manual muestra el aviso de "sin costo", Editar
- * producto simplemente no toca el costo existente). */
+ * centavos (PATCH .../cost) — o `null` si no se completó ninguno de los dos (el caller decide
+ * qué hacer: el formulario manual muestra el aviso de "sin costo", Editar producto simplemente
+ * no toca el costo existente). */
 export function resolveCostInputForSubmit(value: CostInputValue): { discountPercent: number } | { costPrice: number } | null {
   if (value.mode === "percent" && value.percent !== null) {
     return { discountPercent: value.percent };
   }
-  if (value.mode === "direct" && value.direct.trim() !== "") {
-    const centavos = Math.round(Number(value.direct) * 100);
-    if (!Number.isFinite(centavos) || centavos <= 0) return null;
-    return { costPrice: centavos };
+  if (value.mode === "direct" && value.direct !== null && value.direct > 0) {
+    return { costPrice: value.direct };
   }
   return null;
 }
@@ -62,7 +61,7 @@ export function CostInputBlock({
               variant={value.mode === "percent" && value.percent === pct ? "default" : "outline"}
               size="sm"
               className={cn("flex-1")}
-              onClick={() => onChange({ mode: "percent", percent: pct, direct: "" })}
+              onClick={() => onChange({ mode: "percent", percent: pct, direct: null })}
               data-testid={`button-cost-percent-${pct}`}
             >
               {pct}%
@@ -78,13 +77,10 @@ export function CostInputBlock({
 
       <div className="space-y-1.5">
         <p className="text-xs text-muted-foreground">O escribí el costo en pesos</p>
-        <Input
-          type="number"
-          min={0}
-          step="0.01"
-          placeholder="$"
-          value={value.mode === "direct" ? value.direct : ""}
-          onChange={(e) => onChange({ mode: "direct", percent: null, direct: e.target.value })}
+        <MoneyInput
+          unit="cents"
+          value={value.mode === "direct" ? value.direct : null}
+          onChange={(direct) => onChange({ mode: "direct", percent: null, direct })}
           data-testid="input-cost-direct"
         />
       </div>
