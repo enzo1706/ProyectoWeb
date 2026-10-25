@@ -523,6 +523,12 @@ export function LoadOrderDialog({ open, onOpenChange, products, draftToResume, i
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/products"] });
       queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
+      // Prompt 16 — faltaban: un pedido cargado puede resolver "Ya podés entregarle" de
+      // Inicio (unidades pendientes cubiertas) y cambia el stock valorizado de Reportes.
+      queryClient.invalidateQueries({ queryKey: ["/api/dashboard/overview"] });
+      queryClient.invalidateQueries({
+        predicate: (query) => typeof query.queryKey[0] === "string" && query.queryKey[0].startsWith("/api/reports"),
+      });
       // Prompt 7, punto 2: el servidor ya borró el borrador (si había uno) en la misma
       // transacción — esto solo refresca "Pedidos sin terminar".
       queryClient.invalidateQueries({ queryKey: ["/api/drafts", "order"] });

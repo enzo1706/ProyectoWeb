@@ -94,6 +94,13 @@ export const products = pgTable("products", {
   puntos: integer("puntos").notNull().default(0),
   precio: integer("precio").notNull(),
   imagen: text("imagen"),
+  // Prompt 16, punto 3 — miniatura generada en el servidor al subir (no depende del plan de
+  // Supabase, a diferencia del transform de imágenes que requiere Pro). Nullable: toda
+  // imagen de antes de este prompt queda sin miniatura hasta que el backfill opcional la
+  // genere (script/backfill-thumbnails.ts) — nunca se inventa una URL. La lista de Stock usa
+  // esta columna (con `imagen` como respaldo si todavía no tiene); el detalle sigue usando
+  // `imagen`, la original.
+  imagenMiniatura: text("imagen_miniatura"),
   // "import": catálogo global cargado por el admin (consultantId siempre null acá).
   // "manual": la consultora lo cargó ella misma (consultantId siempre el suyo).
   source: text("source").notNull().default("import"),

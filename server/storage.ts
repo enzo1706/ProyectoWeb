@@ -420,6 +420,7 @@ type StockFields = Pick<
 export interface SetProductImageResult {
   product: ProductRow | undefined;
   previousImage: string | null;
+  previousThumbnail: string | null;
 }
 
 /** Combina un producto de catálogo con la fila de stock de la consultora que lo está mirando
@@ -921,7 +922,11 @@ export interface IStorage {
   listAdminSubscriptions(): Promise<AdminSubscriptionRow[]>;
   /** Admin-only: ledger completo de payments de todas las consultoras, con filtros opcionales. */
   listAllPayments(filters?: AdminPaymentFilters): Promise<AdminPaymentRow[]>;
-  getAllProducts(consultantId: number): Promise<Product[]>;
+  /** Prompt 16, punto 2 — `onlyMine` (default false, mantiene el comportamiento de siempre)
+   * trae solo lo que la consultora YA tiene en stock (manual o de catálogo con unidades > 0)
+   * en vez del catálogo global completo — lo usa Stock por default; "Ver productos sin
+   * stock"/"Cargar pedido" siguen pidiendo el catálogo entero con `onlyMine: false`. */
+  getAllProducts(consultantId: number, onlyMine?: boolean): Promise<Product[]>;
   getProductsByIds(consultantId: number, ids: number[]): Promise<Product[]>;
   /** Admin-only: carga/actualiza el catálogo GLOBAL (consultantId null) — no toca stock de nadie. */
   bulkInsertProducts(items: InsertProduct[]): Promise<number>;
@@ -1050,7 +1055,10 @@ export interface IStorage {
   listGlobalProducts(): Promise<ProductRow[]>;
   /** Admin-only: solo aplica a productos globales — las imágenes de productos manuales las
    * gestiona cada consultora dueña, no el admin. */
-  setProductImage(productId: number, imagen: string | null): Promise<SetProductImageResult>;
+  /** Las dos columnas se escriben siempre juntas — nunca una imagen principal nueva/borrada
+   * sin que la miniatura siga el mismo destino (las dos null al borrar, las dos con URL al
+   * subir), para que nunca quede una miniatura vieja apuntando a un archivo que ya no existe. */
+  setProductImage(productId: number, imagen: string | null, imagenMiniatura: string | null): Promise<SetProductImageResult>;
   getUpcomingAppointments(consultantId: number, limit?: number): Promise<AppointmentWithPhone[]>;
   getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<AppointmentWithPhone[]>;
   /** Tipos de evento personalizados (no fijos/legacy) que la consultora ya usó alguna vez, para
@@ -1974,14 +1982,20 @@ export class DatabaseStorage implements IStorage {
 
   /** Catálogo visible para la consultora: lo global (consultantId null) + lo manual propio,
    * con su stock resuelto (o defaults si todavía no cargó stock para ese producto). */
-  async getAllProducts(consultantId: number): Promise<Product[]> {
+  async getAllProducts(consultantId: number, onlyMine = false): Promise<Product[]> {
     const db = await this.getDb();
+    // Prompt 16, punto 2 — `onlyMine` agrega `productStock.unidades > 0` sobre el mismo LEFT
+    // JOIN de siempre: un producto de catálogo sin fila de stock (unidades NULL) o con
+    // unidades = 0 queda afuera, sin necesidad de un INNER JOIN ni una segunda consulta. Es
+    // el default nuevo de Stock — el catálogo global completo (comportamiento de siempre)
+    // sigue a un click de distancia ("Ver productos sin stock"/"Cargar pedido").
+    const baseCondition = or(isNull(products.consultantId), eq(products.consultantId, consultantId));
     const [rows, defaultThreshold] = await Promise.all([
       db
         .select({ product: products, stock: productStock })
         .from(products)
         .leftJoin(productStock, and(eq(productStock.productId, products.id), eq(productStock.consultantId, consultantId)))
-        .where(or(isNull(products.consultantId), eq(products.consultantId, consultantId)))
+        .where(onlyMine ? and(baseCondition, sql`${productStock.unidades} > 0`) : baseCondition)
         .orderBy(products.seccion, products.linea, products.producto),
       this.getDefaultThreshold(db, consultantId),
     ]);
@@ -2781,25 +2795,25 @@ export class DatabaseStorage implements IStorage {
       .orderBy(products.seccion, products.linea, products.producto);
   }
 
-  async setProductImage(productId: number, imagen: string | null): Promise<SetProductImageResult> {
+  async setProductImage(productId: number, imagen: string | null, imagenMiniatura: string | null): Promise<SetProductImageResult> {
     const db = await this.getDb();
     return db.transaction(async (tx) => {
       // FOR UPDATE: si dos requests tocan la imagen del mismo producto a la vez (dos filas
       // de una carga masiva apuntando al mismo id, o un reemplazo superpuesto con un borrado),
       // el segundo espera acá y lee el valor que dejó el primero — nunca una foto stale.
       const [current] = await tx
-        .select({ imagen: products.imagen })
+        .select({ imagen: products.imagen, imagenMiniatura: products.imagenMiniatura })
         .from(products)
         .where(and(eq(products.id, productId), isNull(products.consultantId)))
         .for("update");
-      if (!current) return { product: undefined, previousImage: null };
+      if (!current) return { product: undefined, previousImage: null, previousThumbnail: null };
 
       const [updated] = await tx
         .update(products)
-        .set({ imagen })
+        .set({ imagen, imagenMiniatura })
         .where(and(eq(products.id, productId), isNull(products.consultantId)))
         .returning();
-      return { product: updated, previousImage: current.imagen };
+      return { product: updated, previousImage: current.imagen, previousThumbnail: current.imagenMiniatura };
     });
   }
 
@@ -3116,19 +3130,23 @@ export class DatabaseStorage implements IStorage {
       return { statsByClient: new Map(), balanceByClient: new Map() };
     }
 
-    const statsRows = await db
-      .select({
-        clientId: sales.clientId,
-        totalAmount: sql<number>`coalesce(sum(${sales.total}), 0)`,
-        lastDate: sql<string | null>`max(${sales.date})`,
-      })
-      .from(sales)
-      .where(and(eq(sales.consultantId, consultantId), inArray(sales.clientId, clientIds), ne(sales.status, "cancelada")))
-      .groupBy(sales.clientId);
+    // Prompt 16 — las dos consultas no dependen entre sí (una agrega sales, la otra
+    // sale_installments), así que corren en paralelo en vez de una detrás de la otra: un
+    // round trip menos contra Supabase en cada llamada a searchClientsPaginated/searchClients.
+    const [statsRows, balanceDetailByClient] = await Promise.all([
+      db
+        .select({
+          clientId: sales.clientId,
+          totalAmount: sql<number>`coalesce(sum(${sales.total}), 0)`,
+          lastDate: sql<string | null>`max(${sales.date})`,
+        })
+        .from(sales)
+        .where(and(eq(sales.consultantId, consultantId), inArray(sales.clientId, clientIds), ne(sales.status, "cancelada")))
+        .groupBy(sales.clientId),
+      this.getClientsPendingBalanceDetail(consultantId, getArgentinaDateStr(), clientIds),
+    ]);
 
     const statsByClient = new Map(statsRows.map((s) => [s.clientId, s]));
-
-    const balanceDetailByClient = await this.getClientsPendingBalanceDetail(consultantId, getArgentinaDateStr(), clientIds);
     const balanceByClient = new Map(Array.from(balanceDetailByClient.entries()).map(([clientId, detail]) => [clientId, detail.balance]));
 
     return { statsByClient, balanceByClient };
@@ -3864,49 +3882,58 @@ export class DatabaseStorage implements IStorage {
     const db = await this.getDb();
     const { start, end, period } = params;
 
-    // "Vendiste"/"Ganaste" — misma función que usa Inicio (getSalesSummary), nunca un cálculo
-    // paralelo, para que los dos números coincidan siempre.
-    const currentPoints = await this.getSalesSummary(consultantId, start, end, "day");
-    const totalSales = currentPoints.reduce((sum, p) => sum + p.totalSales, 0);
-    const totalProfit = currentPoints.reduce((sum, p) => sum + p.totalProfit, 0);
-
     // "hoy" siempre en hora de Argentina — nunca el reloj del proceso (en Railway es UTC),
     // tanto para el período de comparación como para "Te deben hoy"/"vencido" más abajo.
     const todayStr = getArgentinaDateStr();
     const comparisonPeriod = getComparisonPeriod(period, start, end, todayStr);
-    const previousPoints = await this.getSalesSummary(consultantId, comparisonPeriod.start, comparisonPeriod.end, "day");
+
+    // Prompt 16 — las 5 consultas de abajo no dependen entre sí (ninguna necesita el resultado
+    // de otra), así que corren en paralelo en vez de una detrás de la otra: antes este endpoint
+    // era el único de los "combinadores" (Inicio/Agenda ya usan Promise.all) que encadenaba
+    // todo en serie.
+    const [currentPoints, previousPoints, { hasIncompleteCostData }, [clientAgg], balanceDetail] = await Promise.all([
+      // "Vendiste"/"Ganaste" — misma función que usa Inicio (getSalesSummary), nunca un
+      // cálculo paralelo, para que los dos números coincidan siempre.
+      this.getSalesSummary(consultantId, start, end, "day"),
+      this.getSalesSummary(consultantId, comparisonPeriod.start, comparisonPeriod.end, "day"),
+      this.getProductCostSummary(consultantId, start, end),
+      // "Compra promedio por clienta": ventas CON clienta ÷ clientas distintas — las ventas
+      // "Sin clienta" no entran ni al numerador ni al denominador (mismo criterio que
+      // getTopClients).
+      db
+        .select({
+          distinctClientCount: sql<number>`coalesce(count(distinct ${sales.clientId}), 0)`,
+          totalSalesToClients: sql<number>`coalesce(sum(${sales.total}), 0)`,
+        })
+        .from(sales)
+        .where(
+          and(
+            eq(sales.consultantId, consultantId),
+            isNotNull(sales.clientId),
+            gte(sales.date, start),
+            lt(sales.date, end),
+            ne(sales.status, "cancelada"),
+          ),
+        ),
+      // "Te deben hoy" / "de eso, $X ya venció" — no depende del período elegido. Misma
+      // función que ya usa el filtro "Pendiente de pago" de Clientas, sumada sobre TODAS las
+      // clientas.
+      this.getClientsPendingBalanceDetail(consultantId, todayStr),
+    ]);
+
+    const totalSales = currentPoints.reduce((sum, p) => sum + p.totalSales, 0);
+    const totalProfit = currentPoints.reduce((sum, p) => sum + p.totalProfit, 0);
+
     const previousSalesCount = previousPoints.reduce((sum, p) => sum + p.salesCount, 0);
     // Si el período anterior no tuvo ninguna venta, no se compara (nunca se divide por cero,
     // y la línea de comparación directamente no se muestra).
     const previousTotalSales = previousSalesCount > 0 ? previousPoints.reduce((sum, p) => sum + p.totalSales, 0) : null;
     const previousTotalProfit = previousSalesCount > 0 ? previousPoints.reduce((sum, p) => sum + p.totalProfit, 0) : null;
 
-    const { hasIncompleteCostData } = await this.getProductCostSummary(consultantId, start, end);
-
-    // "Compra promedio por clienta": ventas CON clienta ÷ clientas distintas — las ventas "Sin
-    // clienta" no entran ni al numerador ni al denominador (mismo criterio que getTopClients).
-    const [clientAgg] = await db
-      .select({
-        distinctClientCount: sql<number>`coalesce(count(distinct ${sales.clientId}), 0)`,
-        totalSalesToClients: sql<number>`coalesce(sum(${sales.total}), 0)`,
-      })
-      .from(sales)
-      .where(
-        and(
-          eq(sales.consultantId, consultantId),
-          isNotNull(sales.clientId),
-          gte(sales.date, start),
-          lt(sales.date, end),
-          ne(sales.status, "cancelada"),
-        ),
-      );
     const distinctClientCount = Number(clientAgg?.distinctClientCount ?? 0);
     const totalSalesToClients = Number(clientAgg?.totalSalesToClients ?? 0);
     const averagePurchasePerClient = distinctClientCount > 0 ? Math.round(totalSalesToClients / distinctClientCount) : null;
 
-    // "Te deben hoy" / "de eso, $X ya venció" — no depende del período elegido. Misma función
-    // que ya usa el filtro "Pendiente de pago" de Clientas, sumada sobre TODAS las clientas.
-    const balanceDetail = await this.getClientsPendingBalanceDetail(consultantId, todayStr);
     let pendingBalanceToday = 0;
     let overdueBalanceToday = 0;
     for (const detail of Array.from(balanceDetail.values())) {
@@ -3935,32 +3962,35 @@ export class DatabaseStorage implements IStorage {
     if (salesRows.length === 0) return [];
 
     const saleIds = salesRows.map((s) => s.id);
-    const counts = await db
-      .select({
-        saleId: saleItems.saleId,
-        itemCount: sql<number>`coalesce(sum(${saleItems.quantity}), 0)`,
-        // Prompt 2: "≈" en la lista cuando alguna línea es estimada, o cuando es tan vieja que
-        // ni siquiera tiene costPrice (misma incertidumbre, mismo símbolo).
-        hasEstimatedCost: sql<boolean>`coalesce(bool_or(${saleItems.costIsEstimated} = true or ${saleItems.costPrice} is null), false)`,
-      })
-      .from(saleItems)
-      .where(inArray(saleItems.saleId, saleIds))
-      .groupBy(saleItems.saleId);
+    // Prompt 16 — las dos consultas de abajo son independientes entre sí (ambas solo
+    // necesitan `saleIds`), así que corren en paralelo en vez de una detrás de la otra.
+    const [counts, pendingAgg] = await Promise.all([
+      db
+        .select({
+          saleId: saleItems.saleId,
+          itemCount: sql<number>`coalesce(sum(${saleItems.quantity}), 0)`,
+          // Prompt 2: "≈" en la lista cuando alguna línea es estimada, o cuando es tan vieja
+          // que ni siquiera tiene costPrice (misma incertidumbre, mismo símbolo).
+          hasEstimatedCost: sql<boolean>`coalesce(bool_or(${saleItems.costIsEstimated} = true or ${saleItems.costPrice} is null), false)`,
+        })
+        .from(saleItems)
+        .where(inArray(saleItems.saleId, saleIds))
+        .groupBy(saleItems.saleId),
+      // Prompt 6: agregado de cuotas pendientes — mismo patrón que arriba (un solo query
+      // extra, nunca un fetch por venta).
+      db
+        .select({
+          saleId: saleInstallments.saleId,
+          // Prompt 9: el saldo real es amount - amountPaid — una "pendiente" puede tener un
+          // pago parcial.
+          pendingAmount: sql<number>`coalesce(sum(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.amount} - ${saleInstallments.amountPaid} else 0 end), 0)`,
+          nextDueDate: sql<string | null>`min(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.dueDate} end)`,
+        })
+        .from(saleInstallments)
+        .where(inArray(saleInstallments.saleId, saleIds))
+        .groupBy(saleInstallments.saleId),
+    ]);
     const countsBySale = new Map(counts.map((c) => [c.saleId, c]));
-
-    // Prompt 6: agregado de cuotas pendientes — mismo patrón que arriba (un solo query extra,
-    // nunca un fetch por venta).
-    const pendingAgg = await db
-      .select({
-        saleId: saleInstallments.saleId,
-        // Prompt 9: el saldo real es amount - amountPaid — una "pendiente" puede tener un
-        // pago parcial.
-        pendingAmount: sql<number>`coalesce(sum(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.amount} - ${saleInstallments.amountPaid} else 0 end), 0)`,
-        nextDueDate: sql<string | null>`min(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.dueDate} end)`,
-      })
-      .from(saleInstallments)
-      .where(inArray(saleInstallments.saleId, saleIds))
-      .groupBy(saleInstallments.saleId);
     const pendingBySale = new Map(pendingAgg.map((p) => [p.saleId, p]));
 
     return salesRows.map((s) => {
@@ -6254,18 +6284,19 @@ export class MemoryStorage implements IStorage {
     return this.consultants.find((c) => c.id === consultantId)?.defaultLowStockThreshold ?? null;
   }
 
-  async getAllProducts(consultantId: number): Promise<Product[]> {
+  async getAllProducts(consultantId: number, onlyMine = false): Promise<Product[]> {
     const defaultThreshold = this.getDefaultThresholdMem(consultantId);
     return this.products
       .filter((p) => p.consultantId === null || p.consultantId === consultantId)
+      .map((p) => ({ p, stock: this.productStock.find((s) => s.consultantId === consultantId && s.productId === p.id) }))
+      // Mismo criterio que DatabaseStorage: sin fila de stock o con 0 unidades, afuera.
+      .filter(({ stock }) => !onlyMine || (stock && stock.unidades > 0))
       .sort((a, b) =>
-        [a.seccion, a.linea ?? "", a.producto].join(" ").localeCompare(
-          [b.seccion, b.linea ?? "", b.producto].join(" "),
+        [a.p.seccion, a.p.linea ?? "", a.p.producto].join(" ").localeCompare(
+          [b.p.seccion, b.p.linea ?? "", b.p.producto].join(" "),
         ),
       )
-      .map((p) =>
-        withStockDefaults(p, this.productStock.find((s) => s.consultantId === consultantId && s.productId === p.id), defaultThreshold),
-      );
+      .map(({ p, stock }) => withStockDefaults(p, stock, defaultThreshold));
   }
 
   async getProductsByIds(consultantId: number, ids: number[]): Promise<Product[]> {
@@ -6303,6 +6334,7 @@ export class MemoryStorage implements IStorage {
           puntos: item.puntos ?? 0,
           precio: item.precio,
           imagen: item.imagen ?? null,
+          imagenMiniatura: null,
           source: "import",
         });
       }
@@ -6344,6 +6376,7 @@ export class MemoryStorage implements IStorage {
           puntos: item.puntos,
           precio: item.precio,
           imagen: item.imagen ?? null,
+          imagenMiniatura: null,
           source: "manual",
         };
         this.products.push(product);
@@ -6395,6 +6428,7 @@ export class MemoryStorage implements IStorage {
       puntos: input.puntos,
       precio: input.precio,
       imagen: input.imagen ?? null,
+      imagenMiniatura: null,
       source: "manual",
     };
     this.products.push(product);
@@ -6745,12 +6779,14 @@ export class MemoryStorage implements IStorage {
       );
   }
 
-  async setProductImage(productId: number, imagen: string | null): Promise<SetProductImageResult> {
+  async setProductImage(productId: number, imagen: string | null, imagenMiniatura: string | null): Promise<SetProductImageResult> {
     const product = this.products.find((p) => p.id === productId && p.consultantId === null);
-    if (!product) return { product: undefined, previousImage: null };
+    if (!product) return { product: undefined, previousImage: null, previousThumbnail: null };
     const previousImage = product.imagen;
+    const previousThumbnail = product.imagenMiniatura;
     product.imagen = imagen;
-    return { product, previousImage };
+    product.imagenMiniatura = imagenMiniatura;
+    return { product, previousImage, previousThumbnail };
   }
 
   /** Espejo de DatabaseStorage: agrega `clientPhone` (null si no tiene clienta o no tiene celular). */

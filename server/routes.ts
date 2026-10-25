@@ -696,9 +696,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       if (req.consultantId === null || req.consultantId === undefined) {
         return res.status(404).json({ error: "El estado de suscripción no aplica para administradores" });
       }
-      const access = await getConsultantAccessStatus(req.consultantId);
-      const priceArs = await getCurrentSubscriptionPriceArs();
-      const activeCoupon = await storage.getActiveCouponRedemptionForConsultant(req.consultantId);
+      // Prompt 16 — las 3 de abajo no dependen entre sí, corren en paralelo. La 4ta
+      // (productsWithStockCount) sí depende de `access.isFreePlan`, así que va después.
+      const [access, priceArs, activeCoupon] = await Promise.all([
+        getConsultantAccessStatus(req.consultantId),
+        getCurrentSubscriptionPriceArs(),
+        storage.getActiveCouponRedemptionForConsultant(req.consultantId),
+      ]);
       // Prompt 14 — solo tiene sentido calcularlo para el plan gratis (Stock/Suscripción lo
       // muestran ahí); para una cuenta pagando es innecesario y evita una consulta de más.
       const productsWithStockCount = access.isFreePlan ? await storage.countProductsWithStock(req.consultantId) : null;
@@ -927,7 +931,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
 
   app.get("/api/products", async (req: Request, res: Response) => {
     try {
-      const list = await storage.getAllProducts(req.consultantId!);
+      // Prompt 16, punto 2 — por default sigue siendo el catálogo completo (global + propio),
+      // igual que siempre, para no romper a ningún consumidor existente (la venta nueva
+      // necesita poder vender un producto sin stock, "Cargar pedido" necesita descubrir
+      // productos nuevos). `?scope=mine` es el que pide Stock por default: solo lo que la
+      // consultora ya tiene en stock.
+      const onlyMine = req.query.scope === "mine";
+      const list = await storage.getAllProducts(req.consultantId!, onlyMine);
       res.json(list);
     } catch (error) {
       console.error(error);
@@ -2547,16 +2557,20 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
 
       const extension = ALLOWED_IMAGE_TYPES[req.file.mimetype];
-      const url = await uploadProductImage(id, req.file.buffer, req.file.mimetype, extension);
+      const { url, thumbnailUrl } = await uploadProductImage(id, req.file.buffer, req.file.mimetype, extension);
 
       let result;
       try {
-        result = await storage.setProductImage(id, url);
+        // Prompt 16, punto 3 — si no se pudo generar la miniatura, se guarda la original en
+        // las dos columnas: nunca peor que antes de este prompt (la lista de Stock cae a
+        // mostrar la original tal cual), nunca una URL inventada.
+        result = await storage.setProductImage(id, url, thumbnailUrl ?? url);
       } catch (dbError) {
         // La imagen nueva ya se subió a Storage pero Postgres falló después — la borramos
         // para no dejarla huérfana (nadie la referencia todavía) y devolvemos el error.
         console.error("Fallo al guardar la imagen en la base, revirtiendo la subida:", dbError);
         await deleteProductImage(url);
+        if (thumbnailUrl) await deleteProductImage(thumbnailUrl);
         throw dbError;
       }
 
@@ -2564,11 +2578,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         // El producto no existe (o no es global) — la imagen recién subida queda huérfana
         // si no la borramos, porque nunca se llegó a referenciar desde ningún lado.
         await deleteProductImage(url);
+        if (thumbnailUrl) await deleteProductImage(thumbnailUrl);
         return res.status(404).json({ error: "Producto global no encontrado" });
       }
 
       if (result.previousImage) {
         await deleteProductImage(result.previousImage);
+      }
+      if (result.previousThumbnail && result.previousThumbnail !== result.previousImage) {
+        await deleteProductImage(result.previousThumbnail);
       }
 
       res.json(result.product);
@@ -2585,12 +2603,15 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         return res.status(400).json({ error: "ID inválido" });
       }
 
-      const result = await storage.setProductImage(id, null);
+      const result = await storage.setProductImage(id, null, null);
       if (!result.product) {
         return res.status(404).json({ error: "Producto global no encontrado" });
       }
       if (result.previousImage) {
         await deleteProductImage(result.previousImage);
+      }
+      if (result.previousThumbnail && result.previousThumbnail !== result.previousImage) {
+        await deleteProductImage(result.previousThumbnail);
       }
       res.json(result.product);
     } catch (error) {
@@ -2669,7 +2690,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         } else if (referencedPaths.has(filePath) || claimedInThisBatch.has(filePath)) {
           results.push({ productId, status: "omitida", reason: "Imagen utilizada por otro producto" });
         } else {
-          const result = await storage.setProductImage(productId, fileUrl);
+          // Prompt 16, punto 3 — esto asigna un archivo YA existente en Storage (nunca sube
+          // nada nuevo), así que no hay un buffer a mano para generar una miniatura acá sin
+          // descargar el archivo de vuelta. Queda sin miniatura (la lista de Stock cae a
+          // mostrar la original) hasta que corra el backfill — mismo camino que cualquier
+          // imagen de antes de este prompt.
+          const result = await storage.setProductImage(productId, fileUrl, null);
           if (!result.product) {
             results.push({ productId, status: "omitida", reason: "Producto no encontrado" });
           } else {

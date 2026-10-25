@@ -77,6 +77,10 @@ export function SaleDetailDialog({ saleId, onOpenChange, onEdit }: SaleDetailDia
     queryClient.invalidateQueries({ queryKey: ["/api/products"] });
     queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
     queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
+    // Prompt 16 — faltaban: cancelar/editar una venta cambia "Vendiste este mes"/cuotas de
+    // Inicio y los cobros/el día de pedido de Agenda.
+    queryClient.invalidateQueries({ queryKey: ["/api/dashboard/overview"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/agenda/month"] });
     queryClient.invalidateQueries({
       predicate: (query) => typeof query.queryKey[0] === "string" && query.queryKey[0].startsWith("/api/reports"),
     });

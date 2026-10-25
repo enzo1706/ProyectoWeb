@@ -66,6 +66,12 @@ export async function createApp(): Promise<{ app: Express; httpServer: Server }>
       } catch {
         responseSize = undefined;
       }
+      // Prompt 16 — mismo número que ya se logueaba, visible además en las DevTools del
+      // navegador (pestaña Network → Timing) sin tener que ir al log del servidor. Se fija
+      // ACÁ (antes de escribir el body) porque después de eso los headers ya se mandaron.
+      if (!res.headersSent) {
+        res.set("Server-Timing", `app;dur=${Date.now() - start}`);
+      }
       return originalResJson.apply(res, [bodyJson, ...args]);
     };
 

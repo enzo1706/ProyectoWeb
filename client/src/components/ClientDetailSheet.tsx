@@ -195,6 +195,11 @@ export function ClientDetailSheet({ open, onOpenChange, client, onEdit, onNewSal
     queryClient.invalidateQueries({ queryKey: ["/api/clients", client?.id, "sales"] });
     queryClient.invalidateQueries({ queryKey: ["/api/clients", client?.id, "payments"] });
     queryClient.invalidateQueries({ queryKey: ["/api/sales"] });
+    // Prompt 16 — un pago nuevo resuelve cuotas pendientes: Inicio ("pendientes") y los
+    // cobros de Agenda tienen que verlo también, igual que ya pasa desde
+    // PayInstallmentConfirmDialog.
+    queryClient.invalidateQueries({ queryKey: ["/api/dashboard/overview"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/agenda/month"] });
     queryClient.invalidateQueries({
       predicate: (query) => typeof query.queryKey[0] === "string" && query.queryKey[0].startsWith("/api/reports"),
     });

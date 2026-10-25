@@ -1,5 +1,11 @@
 # Migración pendiente — Tercer deploy (Prompts 11, 13, 14, 8, 10, 12, 15 y 16)
 
+> ⚠️ Los `CREATE INDEX CONCURRENTLY` del Prompt 16 (ver más abajo) **no se pueden ejecutar
+> dentro de una transacción** — a diferencia de las otras migraciones de este documento (que sí
+> van todas juntas en una sola transacción), esas dos líneas se corren SUELTAS, cada una por su
+> cuenta, fuera de cualquier `BEGIN`/`COMMIT`. Postgres lo exige así para que `CONCURRENTLY`
+> pueda construir el índice sin bloquear escrituras en la tabla mientras dura.
+
 Este documento es el paquete de migración para DESPUÉS del segundo deploy
 (`docs/migracion-deploy-2.md`). Asume que ese paquete ya está aplicado y publicado.
 
@@ -20,7 +26,7 @@ cadena, lo que efectivamente se publica, es siempre la última rama terminada �
 | 10 | Inicio: objetivo del mes y avisos | `prompt-10-inicio` | **Con migración** — 1 tabla nueva `dashboard_notice_dismissals` (ver detalle abajo) |
 | 12 | Agenda: tipos, eventos automáticos y WhatsApp | `prompt-12-agenda` | **Sin migración** — `appointments.client_id` ya era nullable desde antes; solo cambió la validación Zod (`.optional()`) para permitirlo también al crear/editar, confirmado por diff de `shared/schema.ts` contra `prompt-10-inicio`: 0 diferencias de tabla |
 | 15 | Textos y formatos | `prompt-15-textos` | **Sin migración** — confirmado por diff de `shared/schema.ts` contra `prompt-12-agenda`: la única línea que cambia es el texto de `PHONE_ERROR_MESSAGE` (un mensaje de error, no una columna) |
-| 16 | — | `prompt-16-...` | Todavía no arrancado |
+| 16 | Velocidad de carga | `prompt-16-velocidad` | **Con migración** — 2 índices nuevos en `sale_installments` (`CREATE INDEX CONCURRENTLY`) + 1 columna nueva `products.imagen_miniatura` (ver detalle abajo) |
 
 Todo lo de "con migración" de abajo se calculó leyendo `shared/schema.ts` en cada rama
 correspondiente, nunca de memoria.
@@ -113,6 +119,16 @@ no se implementó, solo queda el modelo de datos listo) — también 100% aditiv
   no de esquema, pero vale la pena anotarlo porque cambia (corrige) cuáles cuotas aparecen como
   "vencidas" vs. "pendientes" justo en el borde de cada día.
 
+**Prompt 16** (Velocidad de carga):
+
+- 2 índices nuevos sobre `sale_installments`, con `CREATE INDEX CONCURRENTLY`, **fuera** de la
+  transacción del bloque de abajo — ver la sección propia después del bloque SQL principal.
+- 1 columna nueva, `products.imagen_miniatura` (nullable, sin default) — va en el bloque
+  principal de abajo, es un `ALTER TABLE` común. Ninguna fila existente tiene valor ahí hasta
+  que se corra el backfill opcional (`script/backfill-thumbnails.ts`, ver la sección de
+  índices más abajo) — Stock muestra la imagen original como respaldo mientras tanto, nunca
+  rompe por esto.
+
 ## SQL (de punta a punta, en orden)
 
 Verificado contra la base de dev local (`drizzle-kit push`, schema actual con las tres ramas
@@ -202,7 +218,61 @@ CREATE TABLE dashboard_notice_dismissals (
   dismissed_at timestamp NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX dashboard_notice_dismissals_consultant_notice_unique ON dashboard_notice_dismissals (consultant_id, notice_type);
+
+-- Prompt 16 ------------------------------------------------------------------
+-- 10. Columna nueva en products (nullable, sin default). Sin backfill en esta transacción a
+-- propósito: generar la miniatura necesita bajar la imagen y subir un archivo nuevo a
+-- Supabase Storage, no es algo que un ALTER TABLE pueda hacer — ver el backfill OPCIONAL
+-- (script/backfill-thumbnails.ts) en la sección de índices más abajo.
+ALTER TABLE products ADD COLUMN imagen_miniatura text;
 ```
+
+## Prompt 16 — índices nuevos y backfill opcional de miniaturas
+
+`sale_installments` se une a `sales` por `sale_id` en varios caminos calientes (Inicio, Agenda,
+Clientas, Reportes) y hoy no tiene ningún índice sobre esa columna — solo sobre `due_date` y
+`status` por separado. Las dos consultas de abajo se corren una por una, cada una en su propia
+conexión/sesión (`psql` normal alcanza, cada `CREATE INDEX CONCURRENTLY` es su propia
+transacción implícita — por eso no puede ir adentro del `BEGIN`/`COMMIT` del bloque anterior):
+
+```sql
+-- 1. Falta por completo: las consultas que unen sale_installments con sales por sale_id
+-- (getPendingInstallments, getInstallmentsInRange, getClientsPendingBalanceDetail, el cobro
+-- de Agenda) dependían solo de los índices de sales y de la PK de sale_installments.
+CREATE INDEX CONCURRENTLY sale_installments_sale_id_idx ON sale_installments (sale_id);
+
+-- 2. Compuesto: reemplaza mejor el patrón real de consulta ("pendientes que vencen antes de
+-- X") que los dos índices sueltos que ya existían (sale_installments_due_date_idx,
+-- sale_installments_status_idx) — Postgres puede usarlos juntos con un Bitmap AND, pero el
+-- compuesto es más directo. Los dos índices sueltos NO se borran (siguen sirviendo a
+-- consultas que filtran por una sola de las dos columnas).
+CREATE INDEX CONCURRENTLY sale_installments_status_due_date_idx ON sale_installments (status, due_date);
+```
+
+Si cualquiera de las dos falla a mitad de camino (ej. se corta la conexión), Postgres puede
+dejar un índice marcado `INVALID` — nunca rompe la tabla, pero hay que confirmarlo y, si pasó,
+`DROP INDEX` ese índice inválido y volver a correr la misma línea.
+
+### Backfill opcional de miniaturas (`script/backfill-thumbnails.ts`)
+
+Genera la miniatura para los productos del catálogo global que ya tenían `imagen` ANTES de
+este prompt (`imagen_miniatura` todavía null). **Opcional**: Stock ya cae a mostrar la imagen
+original como respaldo si la miniatura no existe, así que la app funciona igual sin correr
+esto — solo deja de aprovechar el ahorro de transferencia hasta que se corra.
+
+- `npx tsx script/backfill-thumbnails.ts` — modo de prueba (default): solo LISTA qué productos
+  le faltaría la miniatura, con su id, nombre y URL de la imagen original. No descarga nada,
+  no sube nada, no escribe nada en la base.
+- `npx tsx script/backfill-thumbnails.ts --apply` — recién ahí descarga cada imagen original,
+  genera la miniatura (200×200, recortada) y la sube a Supabase Storage, y actualiza
+  `products.imagen_miniatura` fila por fila. Si una imagen puntual falla (ej. la URL ya no
+  responde), se loguea y se sigue con las demás — queda pendiente para la próxima corrida, sin
+  interrumpir el resto del lote.
+- Necesita `SUPABASE_URL` y `SUPABASE_SERVICE_ROLE_KEY` configuradas (las mismas que ya usa la
+  subida normal de imágenes) para el modo `--apply`; el modo de prueba solo lee la base
+  (`DATABASE_URL`), nunca toca Supabase Storage.
+- **No se corrió todavía contra producción ni contra el Storage real** — queda para cuando el
+  usuario decida correrlo a mano, el mismo criterio que `seed-staging.ts`.
 
 ## Chequeo previo (solo lectura, correr antes de aplicar)
 

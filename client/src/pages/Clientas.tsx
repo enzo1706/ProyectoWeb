@@ -4,6 +4,8 @@ import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Card, CardContent } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 import { ClientCard, type Client } from "@/components/ClientCard";
 import { ClientDialog } from "@/components/ClientDialog";
 import { ClientDetailSheet } from "@/components/ClientDetailSheet";
@@ -29,6 +31,27 @@ interface PaginatedClientsResponse {
   pageSize: number;
   totalPages: number;
   totalRevenue: number;
+}
+
+// Prompt 16, punto 1 — misma forma que ClientCard (avatar + nombre + 2 líneas), para que la
+// pantalla no "salte" cuando llegan los datos reales.
+function ClientCardSkeleton() {
+  return (
+    <Card>
+      <CardContent className="pt-4">
+        <div className="flex items-start gap-3">
+          <Skeleton className="h-12 w-12 rounded-full shrink-0" />
+          <div className="flex-1 space-y-2">
+            <Skeleton className="h-4 w-32" />
+            <Skeleton className="h-3 w-24" />
+          </div>
+        </div>
+        <div className="mt-4 pt-3 border-t">
+          <Skeleton className="h-3 w-20" />
+        </div>
+      </CardContent>
+    </Card>
+  );
 }
 
 export default function Clientas() {
@@ -199,7 +222,11 @@ export default function Clientas() {
       )}
 
       {isLoading ? (
-        <div className="text-center py-12 text-muted-foreground">Cargando clientas...</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <ClientCardSkeleton key={i} />
+          ))}
+        </div>
       ) : isError ? (
         <ErrorBlock message="No pudimos cargar tus clientas. Tus datos siguen intactos — probá recargar la página." />
       ) : (

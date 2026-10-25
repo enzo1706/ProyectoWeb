@@ -155,9 +155,29 @@ export default function Productos() {
     }
   }, []);
 
-  const { data: products = [], isLoading, isError, error } = useQuery<Product[]>({
-    queryKey: ["/api/products"],
+  // Prompt 16, punto 2 — por default Stock solo pide lo que la consultora YA tiene en stock
+  // (mucho más liviano que el catálogo global completo). El catálogo entero ("Ver productos
+  // sin stock" / "Cargar pedido") se pide aparte, recién cuando hace falta — una vez pedido,
+  // se sigue usando para el resto de esta visita a la pantalla (es un superset, el filtro de
+  // "sin stock" de más abajo ya lo recorta igual si el checkbox está apagado).
+  const myProductsQuery = useQuery<Product[]>({
+    queryKey: ["/api/products", "mine"],
+    queryFn: async () => (await apiRequest("GET", "/api/products?scope=mine")).json(),
   });
+  // Además del toggle y "Cargar pedido": Agregar/Editar producto también usan `products` para
+  // sugerir categorías ya existentes del catálogo completo, no solo las que la consultora ya
+  // tiene en stock.
+  const needsFullCatalog =
+    showOutOfStock || loadOrderOpen || resumingOrderDraft !== null || addProductOpen || editingProduct !== null;
+  const fullCatalogQuery = useQuery<Product[]>({
+    queryKey: ["/api/products", "all"],
+    queryFn: async () => (await apiRequest("GET", "/api/products?scope=all")).json(),
+    enabled: needsFullCatalog,
+  });
+  const products = fullCatalogQuery.data ?? myProductsQuery.data ?? [];
+  const isLoading = needsFullCatalog ? fullCatalogQuery.isLoading : myProductsQuery.isLoading;
+  const isError = needsFullCatalog ? fullCatalogQuery.isError : myProductsQuery.isError;
+  const error = needsFullCatalog ? fullCatalogQuery.error : myProductsQuery.error;
 
   const stockValuationQuery = useQuery<StockValuationData>({
     queryKey: ["/api/reports/stock-valuation"],

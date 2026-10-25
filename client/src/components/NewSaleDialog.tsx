@@ -533,6 +533,11 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
     queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
     queryClient.invalidateQueries({ queryKey: ["/api/sales/top-products"] });
     queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
+    // Prompt 16 — faltaban: una venta nueva cambia "Vendiste este mes"/cuotas pendientes de
+    // Inicio y los cobros/el día de pedido de Agenda, igual que ya se invalida para un pago o
+    // un pedido (PayInstallmentConfirmDialog/LoadOrderDialog).
+    queryClient.invalidateQueries({ queryKey: ["/api/dashboard/overview"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/agenda/month"] });
     queryClient.invalidateQueries({
       predicate: (query) => typeof query.queryKey[0] === "string" && query.queryKey[0].startsWith("/api/reports"),
     });
