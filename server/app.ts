@@ -1,4 +1,5 @@
 import express, { type Express, type Request, Response, NextFunction } from "express";
+import compression from "compression";
 import { createServer, type Server } from "http";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
@@ -37,6 +38,12 @@ export async function createApp(): Promise<{ app: Express; httpServer: Server }>
   // del proxy. Si el hosting cambia a uno con otra cantidad de hops, este valor hay que
   // revisarlo.
   app.set("trust proxy", 1);
+
+  // Prompt 16, punto 1 — gzip para TODO lo que sale de acá: las respuestas JSON de la API
+  // (un catálogo de 181 productos pasa de 78 KB a ~2,4 KB) y los archivos estáticos del
+  // frontend que sirve `serveStatic` más abajo (JS/CSS del primer ingreso). Antes de
+  // `express.json` a propósito — comprime la RESPUESTA, no depende de nada del body parser.
+  app.use(compression());
 
   app.use(
     express.json({

@@ -232,6 +232,16 @@ que el script lo haga también — es un click, y así se prueba ese botón de p
 
 ## Checklist antes de promover staging → main
 
+- [ ] Si el Prompt agrega o actualiza un módulo nativo (ej. `sharp`, Prompt 16): verificado que
+      `npm ci`, el build y una operación real del módulo (generar una miniatura, en el caso de
+      `sharp`) funcionan en un contenedor Linux limpio con la misma versión de Node que usa
+      Railway (`node:22-slim` — confirmado así el 2026-10-25: `npm ci` instala el binario nativo
+      correcto solo, el build de Vite/esbuild no tiene nada específico de plataforma, y el
+      pipeline completo de `sharp` —decodificar, redimensionar, codificar— generó una miniatura
+      válida). Un `package-lock.json` generado en Windows alcanza porque npm resuelve el binario
+      por plataforma de DESTINO al instalar, no por la plataforma donde se generó el lockfile —
+      pero esta verificación es la que lo confirma en la práctica, no solo en teoría. Repetir
+      este chequeo si se agrega otro módulo nativo más adelante.
 - [ ] El Prompt correspondiente pasó su checklist de pruebas (`docs/pruebas-prompt-*.md`)
       contra staging, no solo contra `localhost`.
 - [ ] Si el Prompt toca notificaciones push: probado con HTTPS real y un teléfono físico.
