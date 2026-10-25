@@ -10,6 +10,13 @@ Reescrito el 2026-10-25, al cerrar el Prompt 16 y ensayar el camino completo de 
 comparado con `drizzle-kit push` contra `prompt-16-velocidad`) dio **"No changes detected"** —
 confirma que los deploys 2 y 3 se pueden aplicar juntos, en una sola ventana.
 
+**Sobre el flake de `auth-anti-enumeration.test.ts`** (el `beforeAll`/`createApp()` que a veces
+tarda de más): corrida la suite completa (`npm test`, las 785 pruebas) dentro de un contenedor
+Linux limpio (`node:22-slim`, Postgres aparte en otro contenedor, sin nada más corriendo ahí) —
+**66/66 archivos y 785/785 pruebas verdes, incluido ese archivo**, en 278s. Confirma que el
+flake es de esta máquina de desarrollo cargada (muchos procesos de Docker/build corridos en la
+misma sesión), no un problema real ni portable — no bloquea nada del deploy.
+
 ## 1. Resend — arreglar "Recuperar contraseña" (independiente de todo lo demás)
 
 - **Seguir**: la sección "Arreglar Recuperar contraseña" de
