@@ -1,9 +1,13 @@
-# Pruebas: Prompts 12 a 16
+# Pruebas: Prompts 8 (Partes 1 a 3), 10 y 12 a 16
 
-Rama `prompt-16-velocidad` (acumula, en orden, los Prompts 10, 11, 12, 13, 14, 15 y 16 sobre
-`staging`). El Prompt 11 ya tiene su propio checklist (`docs/pruebas-prompt-11.md`) — este
-documento cubre del 12 al 16, pensado para correrse junto con ese, contra staging (nunca
-`localhost`), como parte de la Ronda 2 del plan de deploy (`docs/LEEME-proximos-pasos.md`).
+Rama `prompt-16-velocidad` (acumula, en orden, los Prompts 8, 9, 10, 11, 12, 13, 14, 15 y 16
+sobre `staging`). El Prompt 11 ya tiene su propio checklist (`docs/pruebas-prompt-11.md`) —
+este documento cubre el resto del tramo, pensado para correrse junto con ese, contra staging
+(nunca `localhost`), como parte de la Ronda 2 del plan de deploy
+(`docs/LEEME-proximos-pasos.md`).
+
+La Parte 4 del Prompt 8 (notificaciones push) NO está acá — todavía no está implementada, queda
+para cuando staging esté levantado (ver el paso 6 del LEEME).
 
 ## Cómo levantarlo
 
@@ -11,6 +15,57 @@ documento cubre del 12 al 16, pensado para correrse junto con ese, contra stagin
 2. `npm run dev`, o contra el dominio de staging si ya está arriba.
 3. Entrar con una consultora con clientas, ventas, cuotas y citas cargadas — o la cuenta de
    demo de esta revisión.
+
+## Prompt 8 (Partes 1 a 3) — Venta sin stock y día de pedido
+
+- **Vender sin stock**: en "Nueva venta", elegir un producto con 0 unidades — aparece "No
+  contás con stock de este producto. ¿Querés continuar con la venta?" ("Sí, continuar" /
+  "Cancelar"). Elegir más unidades de las que hay (ej. tiene 2, vender 5) — aparece "Tenés 2
+  unidades de este producto. Las 3 que faltan quedan pendientes para tu próximo pedido..." —
+  confirmar la venta: el stock queda en 0 (nunca negativo), y la venta queda "Pendiente de
+  entrega" con "Se pide el [próximo día de pedido]" (o, sin día configurado, el link a
+  Configuración). El pago sigue siendo independiente de la entrega (puede quedar cobrada y
+  pendiente de entregar, o al revés).
+- **Cuando llega el pedido**: confirmar un pedido desde el catálogo que trae ese producto — las
+  unidades nuevas se asignan solas a la venta pendiente más vieja primero (no se suman al stock
+  disponible, ya están vendidas). En Inicio aparece "Ya podés entregarle a [clienta]: [producto]
+  x[cantidad]" con el botón "Marcar como entregado" — al tocarlo, ese renglón queda entregado y,
+  cuando todos los de la venta lo están, la venta pasa a "Entregada" y el aviso desaparece.
+- **Recordatorio del día de pedido**: con un día de pedido configurado para hoy (Configuración),
+  entrar a Inicio y ver la tarjeta "Hoy es tu día de pedido" con la lista de productos (los
+  vendidos en el período con poco stock, más las unidades pendientes de ventas sin stock de
+  cualquier período) y los botones "Armar pedido con estos productos" y "Listo, ya lo pedí".
+  "Armar pedido con estos productos" abre "Cargar desde el catálogo" con esos productos y
+  cantidades ya cargados (pasando igual por el paso de descuento). "Listo, ya lo pedí" cierra la
+  tarjeta. Si la lista de productos queda vacía, la tarjeta no aparece.
+- Cancelar o editar una venta con unidades pendientes nunca queda bloqueado por el límite de 10
+  productos del plan gratis (Prompt 14) — es una corrección de stock, no una carga nueva.
+
+## Prompt 10 — Inicio: objetivo del mes y avisos
+
+- **Objetivo del mes**: con un objetivo cargado en Configuración y ventas parciales, Inicio
+  muestra "Vas $ X de $ Y", la barra de progreso con el porcentaje y "Te faltan $ Z · quedan N
+  días". Al llegar o superar el objetivo: "¡Llegaste a tu objetivo del mes! 🎉". Sin objetivo
+  cargado: "Este mes vendiste $ X" y el botón "Definir mi objetivo" (lleva a Configuración).
+- **Tres bloques de avisos**, cada uno oculto si no tiene nada, hasta 3 ítems con "Ver más" para
+  el resto, textos completos sin cortar con "…" (probar en un celular de 375 px):
+  - **"Para hacer hoy"**: "Ya podés entregarle a…" (Prompt 8), "Hoy es tu día de pedido" (Prompt
+    8), citas de hoy ("Hoy a las [hora]: [tipo] con [clienta]" → "Ver"), cumpleaños de hoy
+    ("Hoy cumple [clienta] 🎂" → "WhatsApp", solo con celular cargado).
+  - **"Pendientes"**: cuotas vencidas o que vencen hoy ("[Clienta] te debe $ X (venció el
+    [fecha])" / "(vence hoy)") con botones "Cobrada" (pide confirmación "¿[Clienta] te pagó los
+    $ [saldo]?") y "WhatsApp"; "Tenés N ventas/pedidos sin terminar" → "Retomar"; "Tenés N
+    ventas sin clienta" → "Asignar clienta" (lleva a Ventas ya filtrado).
+  - **"Para mejorar tu negocio"**: límite del plan gratis (solo cuentas gratis con 10+ productos
+    con stock), poco stock, clientas inactivas (hace más de 2 meses que no compran), productos
+    sin costo, clientas sin celular, "Completá tu perfil" (Prompt 14) — en ese orden. Cada ítem
+    tiene "Ocultar"; probar que vuelve a aparecer a los 7 días si la condición sigue vigente (o
+    confiar en el test automatizado si no se puede esperar una semana de verdad).
+- Si los tres bloques y el recordatorio del día de pedido están vacíos: "Estás al día. No tenés
+  nada pendiente." (nunca el texto viejo "No hay nada pendiente por ahora").
+- Los números de cada aviso coinciden con los que muestran Clientas/Stock/Reportes para lo
+  mismo (ej. "clientas inactivas" cuenta igual que el filtro de Clientas) — no debería verse un
+  número distinto entre Inicio y la pantalla de destino al tocar el aviso.
 
 ## Prompt 12 — Agenda: tipos, eventos automáticos y WhatsApp
 
@@ -135,15 +190,19 @@ documento cubre del 12 al 16, pensado para correrse junto con ese, contra stagin
 
 ## Si corrés `npm test` y falla algo de timing
 
-`server/tests/auth-anti-enumeration.test.ts` mide milisegundos reales — con la máquina cargada
-puede fallar por unos milisegundos de margen, sin ser una regresión real. Si falla justo ahí:
-volvé a correr ese archivo solo antes de preocuparte.
+`server/tests/auth-anti-enumeration.test.ts` mide milisegundos reales, y su `beforeAll` corre
+`createApp()` por primera vez en el proceso — con la máquina cargada puede fallar por un
+timeout de arranque o por unos milisegundos de margen en el timing, sin ser una regresión real
+(confirmado corriendo la suite completa en un contenedor Linux limpio — ver
+`docs/LEEME-proximos-pasos.md`). Si falla justo ahí: volvé a correr ese archivo solo antes de
+preocuparte.
 
 ## En un celular de 375 px
 
 - La barra inferior (Prompt 13), las tarjetas de carga (Prompt 16) y los formularios de Ingreso/
   Crear cuenta (Prompt 14) se ven completos, sin texto cortado ni botones superpuestos.
 - El calendario de Agenda (Prompt 12) se desplaza sin romper el layout.
+- Los avisos de Inicio (Prompt 10) y la tarjeta del día de pedido (Prompt 8) se leen completos.
 
 ## Qué avisar si algo falla
 
