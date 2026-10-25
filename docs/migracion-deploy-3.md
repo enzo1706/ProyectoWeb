@@ -166,17 +166,24 @@ ALTER TABLE sale_items ADD COLUMN estimated_cost_per_unit integer;
 ALTER TABLE sale_items ADD COLUMN real_cost_accumulated integer NOT NULL DEFAULT 0;
 ALTER TABLE sale_items ADD COLUMN real_cost_units integer NOT NULL DEFAULT 0;
 
--- 5. Tabla nueva order_reminders.
+-- 5. Tabla nueva order_reminders. Nombres de constraint puestos a mano, IGUAL a como los
+-- nombra Drizzle (no el default de Postgres) — mismo criterio ya aplicado en
+-- migracion-produccion-pendiente.md y migracion-deploy-2.md. Detectado en el ensayo completo
+-- del 2026-10-25 (base con el esquema de 20c8d83 + los 3 paquetes, comparada con
+-- `drizzle-kit push` contra el código actual): sin esto, salía "order_reminders_consultant_id_
+-- fkey" (default de Postgres) en vez de "order_reminders_consultant_id_consultants_id_fk"
+-- (Drizzle), y el UNIQUE quedaba como índice suelto en vez de constraint de tabla.
 CREATE TABLE order_reminders (
   id serial PRIMARY KEY,
-  consultant_id integer NOT NULL REFERENCES consultants(id),
+  consultant_id integer NOT NULL,
   reminder_date text NOT NULL,
   period_start text NOT NULL,
   period_end text NOT NULL,
   dismissed_at timestamp,
-  created_at timestamp NOT NULL DEFAULT now()
+  created_at timestamp NOT NULL DEFAULT now(),
+  CONSTRAINT order_reminders_consultant_id_consultants_id_fk FOREIGN KEY (consultant_id) REFERENCES consultants(id),
+  CONSTRAINT order_reminders_consultant_date_unique UNIQUE (consultant_id, reminder_date)
 );
-CREATE UNIQUE INDEX order_reminders_consultant_date_unique ON order_reminders (consultant_id, reminder_date);
 CREATE INDEX order_reminders_consultant_idx ON order_reminders (consultant_id);
 
 -- 6. Backfill de las filas de sale_items que ya existen (Prompt 8, ajuste 3): el valor que
@@ -210,14 +217,17 @@ WHERE order_reminder_day1 IS NOT NULL OR order_reminder_day2 IS NOT NULL;
 
 -- Prompt 10 ------------------------------------------------------------------
 -- 9. Tabla nueva dashboard_notice_dismissals. Sin backfill: ninguna fila vieja tiene nada
--- "oculto" todavía, así que empieza vacía para toda consultora existente.
+-- "oculto" todavía, así que empieza vacía para toda consultora existente. Nombres de
+-- constraint a mano, mismo motivo y mismo hallazgo del ensayo del 2026-10-25 que order_reminders
+-- arriba.
 CREATE TABLE dashboard_notice_dismissals (
   id serial PRIMARY KEY,
-  consultant_id integer NOT NULL REFERENCES consultants(id),
+  consultant_id integer NOT NULL,
   notice_type text NOT NULL,
-  dismissed_at timestamp NOT NULL DEFAULT now()
+  dismissed_at timestamp NOT NULL DEFAULT now(),
+  CONSTRAINT dashboard_notice_dismissals_consultant_id_consultants_id_fk FOREIGN KEY (consultant_id) REFERENCES consultants(id),
+  CONSTRAINT dashboard_notice_dismissals_consultant_notice_unique UNIQUE (consultant_id, notice_type)
 );
-CREATE UNIQUE INDEX dashboard_notice_dismissals_consultant_notice_unique ON dashboard_notice_dismissals (consultant_id, notice_type);
 
 -- Prompt 16 ------------------------------------------------------------------
 -- 10. Columna nueva en products (nullable, sin default). Sin backfill en esta transacción a
@@ -252,6 +262,13 @@ CREATE INDEX CONCURRENTLY sale_installments_status_due_date_idx ON sale_installm
 Si cualquiera de las dos falla a mitad de camino (ej. se corta la conexión), Postgres puede
 dejar un índice marcado `INVALID` — nunca rompe la tabla, pero hay que confirmarlo y, si pasó,
 `DROP INDEX` ese índice inválido y volver a correr la misma línea.
+
+**Los dos índices están declarados en `shared/schema.ts`** (en `saleInstallments`), aunque se
+creen a mano con `CONCURRENTLY` y nunca con `drizzle-kit push` — detectado en el ensayo del
+2026-10-25: sin declararlos ahí, cualquier `drizzle-kit push` posterior contra una base que ya
+los tuviera (staging, o cualquier entorno de desarrollo) los veía como "sobrantes" y proponía
+BORRARLOS. Mismo problema de fondo que ya resuelven `tablesFilter: ["!session"]` y el schema
+`ops` del marcador de staging, aplicado acá a nivel índice en vez de tabla.
 
 ### Backfill opcional de miniaturas (`script/backfill-thumbnails.ts`)
 

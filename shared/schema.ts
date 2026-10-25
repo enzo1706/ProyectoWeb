@@ -401,6 +401,12 @@ export const saleInstallments = pgTable("sale_installments", {
 }, (table) => ({
   dueDateIdx: index("sale_installments_due_date_idx").on(table.dueDate),
   statusIdx: index("sale_installments_status_idx").on(table.status),
+  // Prompt 16 — declarados acá aunque se creen con CREATE INDEX CONCURRENTLY (ver
+  // docs/migracion-deploy-3.md), nunca con drizzle-kit push, para que push los reconozca como
+  // ya aplicados. Sin esto, cualquier `drizzle-kit push` futuro contra una base que ya los
+  // tenga los proponía BORRAR — detectado en el ensayo completo de deploy del 2026-10-25.
+  saleIdIdx: index("sale_installments_sale_id_idx").on(table.saleId),
+  statusDueDateIdx: index("sale_installments_status_due_date_idx").on(table.status, table.dueDate),
 }));
 
 /**
