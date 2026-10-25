@@ -13,10 +13,10 @@ let httpServer: Server;
 let baseUrl: string;
 let storage: typeof import("../storage").storage;
 
-// Un único login real compartido por casi todos los casos — el gate solo depende del estado
-// de `subscriptions` en el momento del request, no de nada guardado en la sesión, así que
-// alcanza con mutar la fila entre tests. Loguear una consultora nueva por caso pegaría contra
-// el rate limiter real de /api/auth/login (10 intentos / 15 min) sin necesidad.
+// Un único login real compartido por casi todos los casos — ya no hay ningún gate que
+// dependa de nada guardado en la sesión, así que alcanza con mutar la fila de subscriptions
+// entre tests. Loguear una consultora nueva por caso pegaría contra el rate limiter real de
+// /api/auth/login (10 intentos / 15 min) sin necesidad.
 let sharedConsultantId: number;
 let sharedCookie: string;
 
@@ -31,7 +31,7 @@ async function createLoggedInConsultant(usernamePrefix: string) {
   const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password: "vitest-test-password-123" }),
+    body: JSON.stringify({ identifier: username, password: "vitest-test-password-123" }),
   });
   const cookie = loginRes.headers.get("set-cookie")!;
   return { consultantId: user.consultantId!, username, cookie };
@@ -55,10 +55,10 @@ afterAll(async () => {
   await new Promise<void>((resolve) => httpServer.close(() => resolve()));
 });
 
-/** Endpoint de negocio representativo de los 6 prefijos que ahora exigen suscripción activa
- * — GET /api/products, sin efectos secundarios, misma cadena requireAuth+requireConsultant+
- * requireActiveSubscription que /api/clients, /api/sales, /api/appointments, /api/reports,
- * /api/dashboard (los 6 se montan con exactamente la misma cadena de middleware). */
+/** Endpoint de negocio representativo de los 6 prefijos que ANTES del Prompt 14 exigían
+ * suscripción activa — GET /api/products, sin efectos secundarios. Desde el Prompt 14 (P30)
+ * estos 6 prefijos (products/clients/sales/appointments/reports/dashboard) ya NO tienen
+ * ningún gate de suscripción — solo requireAuth+requireConsultant. */
 async function getProtectedRoute(cookie: string) {
   return fetch(`${baseUrl}/api/products`, { headers: { Cookie: cookie } });
 }
@@ -71,8 +71,8 @@ async function subRow(consultantId: number) {
   return sub as any;
 }
 
-describe("requireActiveSubscription — gate de acceso por suscripción", () => {
-  it("1. trial vigente → acceso permitido a rutas de negocio", async () => {
+describe("Prompt 14 (P30) — ya no hay gate de suscripción, el plan gratis tiene acceso a todo", () => {
+  it("1. trial vigente → acceso permitido", async () => {
     const sub = await subRow(sharedConsultantId);
     sub.status = "trial";
     sub.trialEndAt = new Date(Date.now() + 5 * DAY_MS);
@@ -84,15 +84,14 @@ describe("requireActiveSubscription — gate de acceso por suscripción", () => 
     expect(res.status).toBe(200);
   });
 
-  it("2. trial vencido → endpoint protegido responde 403 subscription_required", async () => {
+  it("2. trial con trialEndAt en el pasado → acceso IGUAL permitido (ya no vence por fecha, Prompt 14)", async () => {
     const sub = await subRow(sharedConsultantId);
+    sub.status = "trial";
     sub.trialEndAt = new Date(Date.now() - 1 * DAY_MS);
     sub.currentPeriodEnd = null;
 
     const res = await getProtectedRoute(sharedCookie);
-    expect(res.status).toBe(403);
-    const body = await res.json();
-    expect(body.error).toBe("subscription_required");
+    expect(res.status).toBe(200);
   });
 
   it("3. active con currentPeriodEnd vigente → acceso permitido", async () => {
@@ -105,17 +104,17 @@ describe("requireActiveSubscription — gate de acceso por suscripción", () => 
     expect(res.status).toBe(200);
   });
 
-  it("4. active vencida (currentPeriodEnd pasado) → bloqueo", async () => {
+  it("4. active vencida (currentPeriodEnd pasado) → acceso permitido igual, pasa al plan gratis", async () => {
     const sub = await subRow(sharedConsultantId);
     sub.status = "active";
     sub.currentPeriodStart = new Date(Date.now() - 31 * DAY_MS);
     sub.currentPeriodEnd = new Date(Date.now() - 1 * DAY_MS);
 
     const res = await getProtectedRoute(sharedCookie);
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
   });
 
-  it("5. preapproval autorizado en Mercado Pago pero sin payment aprobado → nunca otorga acceso pago (currentPeriodEnd sigue null)", async () => {
+  it("5. preapproval autorizado en Mercado Pago pero sin payment aprobado (currentPeriodEnd sigue null) → acceso permitido igual (plan gratis)", async () => {
     const sub = await subRow(sharedConsultantId);
     // Simula lo que deja el webhook de subscription_preapproval: solo guarda el
     // mpPreapprovalId, nunca toca status/currentPeriodEnd — ver handleApprovedPaymentTopic,
@@ -123,13 +122,13 @@ describe("requireActiveSubscription — gate de acceso por suscripción", () => 
     sub.status = "trial";
     sub.mpPreapprovalId = "PA-authorized-sin-pago";
     sub.currentPeriodEnd = null;
-    sub.trialEndAt = new Date(Date.now() - 1 * DAY_MS); // trial ya vencido — "authorized" no la salva
+    sub.trialEndAt = new Date(Date.now() - 1 * DAY_MS);
 
     const res = await getProtectedRoute(sharedCookie);
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
   });
 
-  it("6. canceled con currentPeriodEnd todavía vigente → bloqueada (regla actual: canceled siempre bloquea, no se inventa una excepción)", async () => {
+  it("6. canceled con currentPeriodEnd todavía vigente → acceso permitido igual (Prompt 14: canceled nunca bloquea, cae en plan gratis como cualquier otro estado sin pago activo)", async () => {
     const sub = await subRow(sharedConsultantId);
     sub.status = "canceled";
     sub.currentPeriodStart = new Date();
@@ -137,20 +136,20 @@ describe("requireActiveSubscription — gate de acceso por suscripción", () => 
     sub.canceledAt = new Date();
 
     const res = await getProtectedRoute(sharedCookie);
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
   });
 
-  it("7. canceled sin período vigente → bloqueada", async () => {
+  it("7. canceled sin período vigente → acceso permitido igual", async () => {
     const sub = await subRow(sharedConsultantId);
     sub.status = "canceled";
     sub.currentPeriodEnd = null;
     sub.canceledAt = new Date();
 
     const res = await getProtectedRoute(sharedCookie);
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
   });
 
-  it("8. /api/subscription/status sigue accesible con la suscripción vencida", async () => {
+  it("8. /api/subscription/status sigue accesible y reporta isFreePlan true para una suscripción 'vencida'", async () => {
     const sub = await subRow(sharedConsultantId);
     sub.status = "trial";
     sub.canceledAt = null;
@@ -160,17 +159,18 @@ describe("requireActiveSubscription — gate de acceso por suscripción", () => 
     const res = await fetch(`${baseUrl}/api/subscription/status`, { headers: { Cookie: sharedCookie } });
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.hasAccess).toBe(false);
+    expect(body.hasAccess).toBe(true);
+    expect(body.isFreePlan).toBe(true);
   });
 
-  it("9. /api/subscription/start sigue accesible con la suscripción vencida (nunca 403 por el gate, aunque falle después por otra razón)", async () => {
+  it("9. /api/subscription/start sigue accesible con la suscripción vencida (nunca 403, aunque falle después por otra razón)", async () => {
     const res = await fetch(`${baseUrl}/api/subscription/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Cookie: sharedCookie },
       body: JSON.stringify({ email: "bloqueada@example.com" }),
     });
     // Puede fallar más adelante por otra razón (acá, Mercado Pago no configurado en test →
-    // 500), pero nunca por el gate — eso es justo lo que se está probando.
+    // 500), pero nunca por un gate de suscripción — eso es justo lo que se está probando.
     expect(res.status).not.toBe(403);
   });
 
@@ -179,7 +179,7 @@ describe("requireActiveSubscription — gate de acceso por suscripción", () => 
     expect(res.status).toBe(200);
   });
 
-  it("10. login sigue funcionando para una consultora con la suscripción vencida", async () => {
+  it("10. login sigue funcionando para una consultora con la suscripción 'vencida'", async () => {
     const { consultantId, cookie } = await createLoggedInConsultant("vitest_gate_login_ok");
     const sub = await subRow(consultantId);
     sub.trialEndAt = new Date(Date.now() - 1 * DAY_MS);
@@ -190,17 +190,20 @@ describe("requireActiveSubscription — gate de acceso por suscripción", () => 
     expect(me.status).toBe(200);
   });
 
-  it("13. una consultora con la suscripción vencida no puede sortear el bloqueo pegándole directo a los 6 endpoints protegidos, sin pasar por el frontend", async () => {
+  it("13. una consultora con la suscripción vencida/cancelada accede a los 6 endpoints que antes bloqueaba el gate, pegándoles directo sin pasar por el frontend", async () => {
     const sub = await subRow(sharedConsultantId);
     sub.status = "trial";
     sub.canceledAt = null;
     sub.currentPeriodEnd = null;
     sub.trialEndAt = new Date(Date.now() - 1 * DAY_MS);
 
-    // /api/dashboard no tiene ningún endpoint concreto propio (el único que tuvo, seed-demo,
-    // se eliminó en la Etapa I-B.2 por no tener consumidor real) — igual sigue montado con la
-    // misma cadena de middleware que los otros 5 prefijos, así que golpear el prefijo pelado
-    // sigue siendo la forma correcta de probar que ese gate lo cubre también.
+    // Golpea el prefijo pelado de cada uno (sin parámetros) — a varios eso les da 400 por
+    // validación propia del endpoint (ej. /api/appointments pide un rango de fechas) y a
+    // /api/dashboard un 404 llano (no tiene ruta propia, solo el middleware montado, igual
+    // que antes de este prompt) — nada de eso es lo que se prueba acá. Lo que importa
+    // confirmar es que NINGUNO devuelve 401/403: antes del Prompt 14, los 6 sí daban 403 con
+    // esta misma suscripción "vencida", porque requireActiveSubscription cortaba antes de
+    // llegar a la validación propia de cada endpoint.
     const [products, clients, sales, appointments, reports, dashboard] = await Promise.all([
       fetch(`${baseUrl}/api/products`, { headers: { Cookie: sharedCookie } }),
       fetch(`${baseUrl}/api/clients`, { headers: { Cookie: sharedCookie } }),
@@ -210,7 +213,8 @@ describe("requireActiveSubscription — gate de acceso por suscripción", () => 
       fetch(`${baseUrl}/api/dashboard`, { headers: { Cookie: sharedCookie } }),
     ]);
     for (const res of [products, clients, sales, appointments, reports, dashboard]) {
-      expect(res.status).toBe(403);
+      expect(res.status).not.toBe(401);
+      expect(res.status).not.toBe(403);
     }
   });
 });

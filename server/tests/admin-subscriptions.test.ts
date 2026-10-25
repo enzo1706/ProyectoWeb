@@ -14,11 +14,11 @@ let baseUrl: string;
 let storage: typeof import("../storage").storage;
 let adminCookie: string;
 
-async function login(username: string, password: string) {
+async function login(identifier: string, password: string) {
   const res = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ identifier, password }),
   });
   return { status: res.status, cookie: res.headers.get("set-cookie") };
 }
@@ -68,7 +68,7 @@ describe("GET /api/admin/subscriptions", () => {
     expect(res.status).toBe(403);
   });
 
-  it("5. el estado mostrado coincide con la misma lógica central del gate (trial vencido → expired)", async () => {
+  it("5. el estado mostrado coincide con la misma lógica central (Prompt 14: trialEndAt pasado ya no cambia nada — sigue en trial, con acceso, plan gratis)", async () => {
     const user = await storage.createUser({
       username: `vitest_admin_status_${Date.now()}`,
       password: "vitest-test-password-123",
@@ -83,8 +83,11 @@ describe("GET /api/admin/subscriptions", () => {
     const body = await res.json();
     const row = body.rows.find((r: any) => r.consultantId === consultantId);
     expect(row).toBeDefined();
-    expect(row.status).toBe("expired");
-    expect(row.hasAccess).toBe(false);
+    expect(row.status).toBe("trial");
+    expect(row.hasAccess).toBe(true);
+    expect(row.isFreePlan).toBe(true);
+    expect(row.productsWithStockCount).toBe(0);
+    expect(row.freePlanProductLimit).toBe(10);
   });
 
   it("9. filtro por status funciona", async () => {
@@ -126,7 +129,10 @@ describe("GET /api/admin/subscriptions", () => {
     const row = body.rows.find((r: any) => r.consultantId === consultantId);
     expect(row).toBeDefined();
     expect(row.status).toBe("expired");
-    expect(row.hasAccess).toBe(false);
+    // Prompt 14 — ninguna consultora queda bloqueada por su estado, ni siquiera este caso
+    // huérfano que no debería pasar en uso normal.
+    expect(row.hasAccess).toBe(true);
+    expect(row.isFreePlan).toBe(true);
     expect(row.trialEndAt).toBeNull();
   });
 

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { formatPesos } from "@/lib/currency";
 import {
   Table,
   TableBody,
@@ -40,6 +41,11 @@ interface AdminSubscriptionRow {
   email: string | null;
   status: SubscriptionStatus;
   hasAccess: boolean;
+  // Prompt 14 (P30) — true para trial/expired/canceled (cualquiera sin pago activo). La
+  // prueba ya no vence por fecha: el dato real es el límite de productos en stock.
+  isFreePlan: boolean;
+  productsWithStockCount: number | null;
+  freePlanProductLimit: number;
   daysRemaining: number;
   trialStartAt: string | null;
   trialEndAt: string | null;
@@ -102,8 +108,12 @@ function formatDate(iso: string | null): string {
   return new Date(iso).toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit", year: "numeric" });
 }
 
+// Prompt 15 — mismo caso que SubscriptionPricing.tsx: estos montos (pagos de Mercado Pago)
+// están en PESOS ENTEROS, no en centavos, así que usan `formatPesos` (nunca la `formatPrice`
+// global, que asume centavos) — antes esta pantalla tenía su propio formateador ad-hoc, con
+// un estilo distinto al de la otra pantalla de admin que también maneja plata en pesos enteros.
 function formatMoney(amount: number, currency: string): string {
-  return `$${amount.toLocaleString("es-AR")} ${currency}`;
+  return formatPesos(amount, currency);
 }
 
 function StatusBadge({ status }: { status: SubscriptionStatus }) {
@@ -170,20 +180,29 @@ function ConsultantDetailDialog({ consultantId, businessName, onClose }: { consu
                   <span className="text-muted-foreground">Acceso actual</span>
                   <span className="font-medium">{row.hasAccess ? "Habilitado" : "Bloqueado"}</span>
                 </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Prueba (trial)</span>
-                  <span className="font-medium">{formatDate(row.trialStartAt)} — {formatDate(row.trialEndAt)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Período pago actual</span>
-                  <span className="font-medium">
-                    {row.currentPeriodStart ? `${formatDate(row.currentPeriodStart)} — ${formatDate(row.currentPeriodEnd)}` : "—"}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Días restantes</span>
-                  <span className="font-medium">{row.daysRemaining}</span>
-                </div>
+                {row.isFreePlan ? (
+                  // Prompt 14 (P30) — la prueba gratis ya no vence por fecha: lo que importa
+                  // es el límite de productos en stock, no "desde cuándo" está en trial.
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Productos en stock</span>
+                    <span className="font-medium" data-testid="text-admin-products-with-stock">
+                      {row.productsWithStockCount ?? 0} de {row.freePlanProductLimit}
+                    </span>
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Período pago actual</span>
+                      <span className="font-medium">
+                        {row.currentPeriodStart ? `${formatDate(row.currentPeriodStart)} — ${formatDate(row.currentPeriodEnd)}` : "—"}
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Días restantes</span>
+                      <span className="font-medium">{row.daysRemaining}</span>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
 
@@ -288,7 +307,9 @@ function SubscriptionsTab() {
                       <p className="text-xs text-muted-foreground font-normal">{row.username}</p>
                     </TableCell>
                     <TableCell><StatusBadge status={row.status} /></TableCell>
-                    <TableCell className="text-sm">{formatDate(row.currentPeriodEnd ?? row.trialEndAt)}</TableCell>
+                    <TableCell className="text-sm">
+                      {row.isFreePlan ? `${row.productsWithStockCount ?? 0}/${row.freePlanProductLimit} productos` : formatDate(row.currentPeriodEnd)}
+                    </TableCell>
                     <TableCell className="text-sm">
                       {row.lastPayment ? formatMoney(row.lastPayment.amount, row.lastPayment.currency) : "—"}
                     </TableCell>
@@ -316,7 +337,11 @@ function SubscriptionsTab() {
                   <StatusBadge status={row.status} />
                 </div>
                 <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                  <span>Vence: {formatDate(row.currentPeriodEnd ?? row.trialEndAt)}</span>
+                  <span>
+                    {row.isFreePlan
+                      ? `${row.productsWithStockCount ?? 0}/${row.freePlanProductLimit} productos`
+                      : `Vence: ${formatDate(row.currentPeriodEnd)}`}
+                  </span>
                   <Badge variant={row.hasAccess ? "default" : "destructive"} className="shrink-0">
                     {row.hasAccess ? "Habilitado" : "Bloqueado"}
                   </Badge>
@@ -371,7 +396,7 @@ function PaymentsTab() {
           </Card>
           <Card data-testid="summary-approved-revenue">
             <CardContent className="p-4">
-              <p className="text-2xl font-bold">${data.summary.approvedRevenue.toLocaleString("es-AR")}</p>
+              <p className="text-2xl font-bold">{formatPesos(data.summary.approvedRevenue)}</p>
               <p className="text-xs text-muted-foreground mt-1">Ingresos aprobados (ARS)</p>
             </CardContent>
           </Card>

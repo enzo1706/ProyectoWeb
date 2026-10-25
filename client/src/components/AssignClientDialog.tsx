@@ -8,6 +8,7 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 import { Plus, Search, User } from "lucide-react";
+import { formatArgentinaPhoneDisplay } from "@shared/phone";
 import { ClientDialog } from "./ClientDialog";
 import type { Client } from "./ClientCard";
 import type { Sale } from "./SaleCard";
@@ -125,8 +126,8 @@ export function AssignClientDialog({ sale, onOpenChange }: AssignClientDialogPro
                       <User className="h-4 w-4" />
                     </span>
                     <div className="min-w-0">
-                      <p className="truncate text-sm font-medium">{c.name?.trim() || c.phone}</p>
-                      <p className="text-xs text-muted-foreground">{c.phone}</p>
+                      <p className="truncate text-sm font-medium">{c.name?.trim() || formatArgentinaPhoneDisplay(c.phone)}</p>
+                      <p className="text-xs text-muted-foreground">{formatArgentinaPhoneDisplay(c.phone)}</p>
                     </div>
                   </button>
                 ))

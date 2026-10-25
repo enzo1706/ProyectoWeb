@@ -6,6 +6,8 @@ import { z } from "zod";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
+import { normalizeArgentinaPhoneDigits } from "@shared/phone";
+import { WHATSAPP_FORMAT_HINT } from "@/lib/phoneHint";
 import type { Consultant } from "@shared/schema";
 import {
   Card,
@@ -24,6 +26,10 @@ import {
   FormDescription,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { MoneyInput } from "@/components/MoneyInput";
+import { PercentInput } from "@/components/PercentInput";
+import { PasswordInput } from "@/components/PasswordInput";
+import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -35,6 +41,149 @@ import {
 } from "@/components/ui/select";
 import { Settings, Plus, Trash2 } from "lucide-react";
 
+/** Prompt 14 — Configuración → "Tus datos": nombre, email, WhatsApp, ciudad, edad y cargo.
+ * Form propio, separado del de "Tu negocio" (otro endpoint, otra regla: cambiar email o
+ * WhatsApp exige la contraseña actual). */
+function TusDatosCard({ settings }: { settings: BusinessSettingsResponse | undefined }) {
+  const { toast } = useToast();
+  const [contactName, setContactName] = useState("");
+  const [email, setEmail] = useState("");
+  const [whatsapp, setWhatsapp] = useState("");
+  const [city, setCity] = useState("");
+  const [age, setAge] = useState("");
+  const [jobTitle, setJobTitle] = useState("");
+  const [currentPassword, setCurrentPassword] = useState("");
+
+  useEffect(() => {
+    if (!settings) return;
+    setContactName(settings.contactName ?? "");
+    setEmail(settings.email ?? "");
+    setWhatsapp(settings.whatsapp ?? "");
+    setCity(settings.city ?? "");
+    setAge(settings.age !== null ? String(settings.age) : "");
+    setJobTitle(settings.jobTitle ?? "");
+  }, [settings]);
+
+  const emailChanged = email.trim() !== (settings?.email ?? "");
+  const whatsappChanged = whatsapp.trim() !== (settings?.whatsapp ?? "");
+  const needsCurrentPassword = emailChanged || whatsappChanged;
+  const invalidWhatsapp = whatsapp.trim() !== "" && !normalizeArgentinaPhoneDigits(whatsapp).valid;
+
+  const mutation = useGuardedMutation({
+    mutationFn: async () => {
+      const res = await apiRequest("PATCH", "/api/consultant/profile", {
+        contactName: contactName.trim() || null,
+        email: email.trim() || null,
+        whatsapp: whatsapp.trim() || null,
+        city: city.trim() || null,
+        age: age.trim() ? Number(age) : null,
+        jobTitle: jobTitle.trim() || null,
+        ...(needsCurrentPassword ? { currentPassword } : {}),
+      });
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/business-settings"] });
+      setCurrentPassword("");
+      toast({ title: "Tus datos se guardaron" });
+    },
+    onError: (err: Error) => {
+      toast({ title: "No se pudieron guardar tus datos", description: err.message, variant: "destructive" });
+    },
+  });
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-lg">Tus datos</CardTitle>
+        <CardDescription>Tu nombre, cómo te contactamos y cómo entrás a la cuenta.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="space-y-1.5">
+          <Label htmlFor="profile-contact-name">Nombre y apellido</Label>
+          <Input
+            id="profile-contact-name"
+            value={contactName}
+            onChange={(e) => setContactName(e.target.value)}
+            data-testid="input-profile-contact-name"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="profile-email">Email</Label>
+          <Input
+            id="profile-email"
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            data-testid="input-profile-email"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="profile-whatsapp">WhatsApp</Label>
+          <Input
+            id="profile-whatsapp"
+            value={whatsapp}
+            onChange={(e) => setWhatsapp(e.target.value)}
+            placeholder="261 555 1234"
+            data-testid="input-profile-whatsapp"
+          />
+          {invalidWhatsapp && (
+            <p className="text-sm text-destructive" data-testid="text-profile-whatsapp-hint">
+              {WHATSAPP_FORMAT_HINT}
+            </p>
+          )}
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="profile-city">Ciudad</Label>
+          <Input id="profile-city" value={city} onChange={(e) => setCity(e.target.value)} data-testid="input-profile-city" />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="profile-age">Edad</Label>
+          <Input
+            id="profile-age"
+            type="number"
+            min={14}
+            max={100}
+            value={age}
+            onChange={(e) => setAge(e.target.value)}
+            data-testid="input-profile-age"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="profile-job-title">Tu cargo</Label>
+          <Input
+            id="profile-job-title"
+            value={jobTitle}
+            onChange={(e) => setJobTitle(e.target.value)}
+            placeholder="Consultora, Directora..."
+            data-testid="input-profile-job-title"
+          />
+        </div>
+        {needsCurrentPassword && (
+          <div className="space-y-1.5">
+            <Label htmlFor="profile-current-password">Contraseña actual</Label>
+            <PasswordInput
+              id="profile-current-password"
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+              data-testid="input-profile-current-password"
+            />
+            <p className="text-xs text-muted-foreground">Para cambiar el email o el WhatsApp, confirmá tu contraseña actual.</p>
+          </div>
+        )}
+        <Button
+          type="button"
+          onClick={() => mutation.mutate()}
+          disabled={mutation.isPending || invalidWhatsapp || (needsCurrentPassword && !currentPassword)}
+          data-testid="button-save-profile-data"
+        >
+          {mutation.isPending ? "Guardando..." : "Guardar"}
+        </Button>
+      </CardContent>
+    </Card>
+  );
+}
+
 interface BusinessSettingsResponse extends Consultant {
   habitualDiscountPercent: number;
 }
@@ -45,11 +194,9 @@ interface BusinessSettingsResponse extends Consultant {
 const formSchema = z
   .object({
     businessName: z.string().trim().min(1, "El nombre del negocio no puede estar vacío").max(120),
-    monthlyGoal: z.string().optional(),
     orderReminderDay1: z.string().optional(),
     orderReminderDay2: z.string().optional(),
     defaultLowStockThreshold: z.string().optional(),
-    grossIncomeTaxPercent: z.string().optional(),
   })
   .refine((v) => !v.orderReminderDay2 || v.orderReminderDay1, {
     message: "Para elegir un segundo día, primero elegí el primero",
@@ -71,37 +218,36 @@ export default function Configuracion() {
     queryKey: ["/api/business-settings"],
   });
 
+  const [monthlyGoalCents, setMonthlyGoalCents] = useState<number | null>(null);
+  const [grossIncomeTaxPercent, setGrossIncomeTaxPercent] = useState<number | null>(null);
+
   const form = useForm<FormData>({
     resolver: zodResolver(formSchema),
-    defaultValues: { businessName: "", monthlyGoal: "", orderReminderDay1: "", orderReminderDay2: "", defaultLowStockThreshold: "", grossIncomeTaxPercent: "" },
+    defaultValues: { businessName: "", orderReminderDay1: "", orderReminderDay2: "", defaultLowStockThreshold: "" },
   });
 
   useEffect(() => {
     if (settings) {
       form.reset({
         businessName: settings.businessName,
-        monthlyGoal: settings.monthlyGoal !== null ? String(settings.monthlyGoal / 100) : "",
         orderReminderDay1: settings.orderReminderDay1 !== null ? String(settings.orderReminderDay1) : "",
         orderReminderDay2: settings.orderReminderDay2 !== null ? String(settings.orderReminderDay2) : "",
         defaultLowStockThreshold:
           settings.defaultLowStockThreshold !== null ? String(settings.defaultLowStockThreshold) : "",
-        grossIncomeTaxPercent:
-          settings.grossIncomeTaxPercentTenths !== null ? String(settings.grossIncomeTaxPercentTenths / 10) : "",
       });
+      setMonthlyGoalCents(settings.monthlyGoal);
+      setGrossIncomeTaxPercent(settings.grossIncomeTaxPercentTenths !== null ? settings.grossIncomeTaxPercentTenths / 10 : null);
       setShowSecondDay(settings.orderReminderDay2 !== null);
     }
   }, [settings, form]);
 
   const saveMutation = useGuardedMutation({
     mutationFn: async (data: FormData) => {
-      // Décimas de punto porcentual: acepta coma o punto (3,5 o 3.5).
-      const grossIncomeTaxPercentTenths = data.grossIncomeTaxPercent
-        ? Math.round(Number(data.grossIncomeTaxPercent.replace(",", ".")) * 10)
-        : null;
+      const grossIncomeTaxPercentTenths = grossIncomeTaxPercent !== null ? Math.round(grossIncomeTaxPercent * 10) : null;
       const res = await apiRequest("PATCH", "/api/business-settings", {
         businessName: data.businessName,
         currency: "ARS",
-        monthlyGoal: data.monthlyGoal ? Math.round(Number(data.monthlyGoal) * 100) : null,
+        monthlyGoal: monthlyGoalCents,
         orderReminderDay1: data.orderReminderDay1 ? Number(data.orderReminderDay1) : null,
         orderReminderDay2: data.orderReminderDay2 ? Number(data.orderReminderDay2) : null,
         defaultLowStockThreshold: data.defaultLowStockThreshold ? Math.round(Number(data.defaultLowStockThreshold)) : null,
@@ -139,6 +285,9 @@ export default function Configuracion() {
           Error al cargar la configuración: {(error as Error).message}
         </div>
       ) : (
+        <div className="space-y-6">
+          <TusDatosCard settings={settings} />
+
         <Form {...form}>
           <form onSubmit={form.handleSubmit((data) => saveMutation.mutate(data))} className="space-y-6">
             <Card>
@@ -160,20 +309,19 @@ export default function Configuracion() {
                   )}
                 />
 
-                <FormField
-                  control={form.control}
-                  name="monthlyGoal"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Objetivo de ventas del mes</FormLabel>
-                      <FormControl>
-                        <Input {...field} type="number" min={0} step="1" placeholder="Sin definir" data-testid="input-monthly-goal" />
-                      </FormControl>
-                      <FormDescription>Opcional. Se ve en Inicio.</FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
+                <FormItem>
+                  <FormLabel>Objetivo de ventas del mes</FormLabel>
+                  <FormControl>
+                    <MoneyInput
+                      unit="cents"
+                      value={monthlyGoalCents}
+                      onChange={setMonthlyGoalCents}
+                      placeholder="Sin definir"
+                      data-testid="input-monthly-goal"
+                    />
+                  </FormControl>
+                  <FormDescription>Opcional. Se ve en Inicio.</FormDescription>
+                </FormItem>
               </CardContent>
             </Card>
 
@@ -301,23 +449,21 @@ export default function Configuracion() {
                 <CardTitle className="text-lg">Impuestos</CardTitle>
               </CardHeader>
               <CardContent>
-                <FormField
-                  control={form.control}
-                  name="grossIncomeTaxPercent"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Ingresos Brutos (%)</FormLabel>
-                      <FormControl>
-                        <Input {...field} placeholder="Sin cargar" data-testid="input-gross-income-tax" />
-                      </FormControl>
-                      <FormDescription>
-                        Si pagás Ingresos Brutos, poné el porcentaje y lo descontamos de tu ganancia (acepta decimales
-                        con coma o punto, ej. 3,5). Si no pagás, dejalo vacío.
-                      </FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
+                <FormItem>
+                  <FormLabel>Ingresos brutos (%)</FormLabel>
+                  <FormControl>
+                    <PercentInput
+                      value={grossIncomeTaxPercent}
+                      onChange={setGrossIncomeTaxPercent}
+                      placeholder="Sin cargar"
+                      data-testid="input-gross-income-tax"
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    Si pagás Ingresos Brutos, poné el porcentaje y lo descontamos de tu ganancia (acepta decimales
+                    con coma o punto, ej. 3,5). Si no pagás, dejalo vacío.
+                  </FormDescription>
+                </FormItem>
               </CardContent>
             </Card>
 
@@ -326,6 +472,7 @@ export default function Configuracion() {
             </Button>
           </form>
         </Form>
+        </div>
       )}
     </div>
   );

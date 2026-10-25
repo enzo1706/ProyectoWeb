@@ -63,11 +63,13 @@ export function ProductRow({
       data-testid={`row-product-${product.id}`}
     >
       {!compact && (
-        product.imagen ? (
+        product.imagenMiniatura || product.imagen ? (
           <img
-            src={product.imagen}
+            src={product.imagenMiniatura || product.imagen || undefined}
             alt={product.producto}
             className="h-11 w-11 rounded-md object-cover shrink-0"
+            loading="lazy"
+            decoding="async"
             data-testid={`image-product-${product.id}`}
           />
         ) : (
@@ -158,11 +160,13 @@ export function ProductGroup({
         }}
         data-testid={`row-group-${primary.id}`}
       >
-        {primary.imagen ? (
+        {primary.imagenMiniatura || primary.imagen ? (
           <img
-            src={primary.imagen}
+            src={primary.imagenMiniatura || primary.imagen || undefined}
             alt={primary.producto}
             className="h-11 w-11 rounded-md object-cover shrink-0"
+            loading="lazy"
+            decoding="async"
             data-testid={`image-product-${primary.id}`}
           />
         ) : (

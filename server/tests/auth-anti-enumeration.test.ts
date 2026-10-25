@@ -31,6 +31,13 @@ function uniqueUsername(tag: string): string {
 function uniqueEmail(tag: string): string {
   return `vitest.antienum.${tag}.${Date.now()}.${Math.floor(Math.random() * 1e6)}@example.com`;
 }
+// Prompt 14 — WhatsApp único por llamada, nunca "los 10 dígitos son todos iguales"
+// (shared/phone.ts lo rechaza a propósito).
+let nextWhatsappSuffix = 1;
+function uniqueWhatsapp(): string {
+  const suffix = String(nextWhatsappSuffix++).padStart(7, "0");
+  return `261${suffix}`;
+}
 
 // Cada test usa su propia IP sintética (mismo criterio que auth-password-reset.test.ts) para
 // no compartir balde de rate limit entre los distintos casos de este archivo.
@@ -40,20 +47,23 @@ function nextTestIp(): string {
   return `10.78.${(ipCounter >> 8) & 0xff}.${ipCounter & 0xff}`;
 }
 
-async function register(username: string, email: string, ip: string, password = "vitest-test-password-123") {
+/** Prompt 14 — el registro ya no pide "usuario": lo deriva el backend del email. El `body` de
+ * la respuesta exitosa trae `username` con el valor derivado — los tests que necesitan loguear
+ * después con ese username lo toman de ahí, nunca lo eligen ellos. */
+async function register(email: string, ip: string, password = "vitest-test-password-123", whatsapp = uniqueWhatsapp()) {
   const res = await fetch(`${baseUrl}/api/auth/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Forwarded-For": ip },
-    body: JSON.stringify({ username, email, password }),
+    body: JSON.stringify({ contactName: "Vitest Test", email, whatsapp, password }),
   });
   return { status: res.status, body: await res.json() };
 }
 
-async function login(username: string, password: string, ip: string) {
+async function login(identifier: string, password: string, ip: string) {
   const res = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Forwarded-For": ip },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ identifier, password }),
   });
   return { status: res.status, body: await res.json() };
 }
@@ -93,9 +103,8 @@ describe("Anti-enumeración — timing de forgot-password (Etapa 7.6)", () => {
 
   it("la respuesta para un email EXISTENTE NO espera el envío de Resend (el mock tarda 600ms en resolver)", async () => {
     const ip = nextTestIp();
-    const username = uniqueUsername("timing");
     const email = uniqueEmail("timing");
-    await register(username, email, ip);
+    await register(email, ip);
 
     const { status, elapsed } = await forgotPassword(email, nextTestIp());
     expect(status).toBe(200);
@@ -111,9 +120,8 @@ describe("Anti-enumeración — timing de forgot-password (Etapa 7.6)", () => {
   });
 
   it("diferencia estructural entre ambas ramas: mucho menor que los 600ms del mock de Resend (eso es justo lo que este fix elimina)", async () => {
-    const username = uniqueUsername("cmp");
     const email = uniqueEmail("cmp");
-    await register(username, email, nextTestIp());
+    await register(email, nextTestIp());
 
     const existing = await forgotPassword(email, nextTestIp());
     const missing = await forgotPassword(uniqueEmail("cmp-missing"), nextTestIp());
@@ -124,43 +132,59 @@ describe("Anti-enumeración — timing de forgot-password (Etapa 7.6)", () => {
   });
 });
 
-describe("Anti-enumeración — login (Etapa 7.6)", () => {
-  it("1. usuario inexistente: 401 'Credenciales inválidas'", async () => {
+describe("Anti-enumeración — login (Etapa 7.6, Prompt 14: identifier acepta email/WhatsApp/usuario)", () => {
+  it("1. identifier inexistente (con forma de usuario viejo): 401 'Email, WhatsApp o contraseña incorrectos.'", async () => {
     const { status, body } = await login(uniqueUsername("noexiste-login"), "cualquier-password", nextTestIp());
     expect(status).toBe(401);
-    expect(body.error).toBe("Credenciales inválidas");
+    expect(body.error).toBe("Email, WhatsApp o contraseña incorrectos.");
   });
 
-  it("2. usuario existente + password incorrecta: MISMO status y MISMO mensaje que usuario inexistente", async () => {
-    const username = uniqueUsername("wrongpass");
-    const email = uniqueEmail("wrongpass");
-    await register(username, email, nextTestIp());
+  it("1b. identifier inexistente con forma de email: mismo 401 y mismo mensaje", async () => {
+    const { status, body } = await login(uniqueEmail("noexiste-email"), "cualquier-password", nextTestIp());
+    expect(status).toBe(401);
+    expect(body.error).toBe("Email, WhatsApp o contraseña incorrectos.");
+  });
 
-    const wrongPass = await login(username, "password-incorrecta-123", nextTestIp());
+  it("1c. identifier inexistente con forma de WhatsApp válido: mismo 401 y mismo mensaje", async () => {
+    const { status, body } = await login(uniqueWhatsapp(), "cualquier-password", nextTestIp());
+    expect(status).toBe(401);
+    expect(body.error).toBe("Email, WhatsApp o contraseña incorrectos.");
+  });
+
+  it("2. cuenta existente + password incorrecta: MISMO status y MISMO mensaje que identifier inexistente (probado con las 3 formas: username, email y WhatsApp)", async () => {
+    const email = uniqueEmail("wrongpass");
+    const whatsapp = uniqueWhatsapp();
+    const { body: registered } = await register(email, nextTestIp(), "vitest-test-password-123", whatsapp);
+    const username: string = registered.username;
+
     const noUser = await login(uniqueUsername("otronoexiste"), "password-incorrecta-123", nextTestIp());
 
-    expect(wrongPass.status).toBe(noUser.status);
-    expect(wrongPass.body.error).toBe(noUser.body.error);
-    expect(wrongPass.body.error).toBe("Credenciales inválidas");
+    for (const identifier of [username, email, whatsapp]) {
+      const wrongPass = await login(identifier, "password-incorrecta-123", nextTestIp());
+      expect(wrongPass.status).toBe(noUser.status);
+      expect(wrongPass.body.error).toBe(noUser.body.error);
+      expect(wrongPass.body.error).toBe("Email, WhatsApp o contraseña incorrectos.");
+    }
   });
 
-  it("3. usuario existente + password correcta: login exitoso", async () => {
-    const username = uniqueUsername("rightpass");
+  it("3. cuenta existente + password correcta: login exitoso con cualquiera de las 3 formas", async () => {
     const email = uniqueEmail("rightpass");
+    const whatsapp = uniqueWhatsapp();
     const password = "vitest-correct-password-999";
-    await register(username, email, nextTestIp(), password);
+    const { body: registered } = await register(email, nextTestIp(), password, whatsapp);
 
-    const { status } = await login(username, password, nextTestIp());
-    expect(status).toBe(200);
+    for (const identifier of [registered.username, email, whatsapp]) {
+      const { status } = await login(identifier, password, nextTestIp());
+      expect(status).toBe(200);
+    }
   });
 
-  it("timing: usuario inexistente y password incorrecta responden en un orden de magnitud comparable (bcrypt.compare corre en las dos ramas)", async () => {
-    const username = uniqueUsername("timinglogin");
+  it("timing: identifier inexistente y password incorrecta responden en un orden de magnitud comparable (bcrypt.compare corre en las dos ramas), sin cambios por este prompt", async () => {
     const email = uniqueEmail("timinglogin");
-    await register(username, email, nextTestIp());
+    const { body: registered } = await register(email, nextTestIp());
 
     const t1 = Date.now();
-    await login(username, "password-incorrecta-abc", nextTestIp());
+    await login(registered.username, "password-incorrecta-abc", nextTestIp());
     const wrongPassElapsed = Date.now() - t1;
 
     const t2 = Date.now();
@@ -168,51 +192,52 @@ describe("Anti-enumeración — login (Etapa 7.6)", () => {
     const noUserElapsed = Date.now() - t2;
 
     // Generoso a propósito (evitar flakiness por jitter de máquina) — lo que importa es que
-    // no haya un salto estructural grande como el que había antes (usuario inexistente
+    // no haya un salto estructural grande como el que había antes (identifier inexistente
     // devolvía casi al instante, sin ningún bcrypt de por medio).
     expect(Math.abs(wrongPassElapsed - noUserElapsed)).toBeLessThan(250);
   });
 });
 
-describe("Anti-enumeración — register (Etapa 7.6)", () => {
-  it("1. email nuevo: éxito, 201", async () => {
-    const { status } = await register(uniqueUsername("newemail"), uniqueEmail("newemail"), nextTestIp());
+describe("Anti-enumeración — register (Etapa 7.6, Prompt 14: también cubre WhatsApp duplicado)", () => {
+  it("1. email y WhatsApp nuevos: éxito, 201", async () => {
+    const { status } = await register(uniqueEmail("newemail"), nextTestIp());
     expect(status).toBe(201);
   });
 
   it("2/3/4. email duplicado: 409, el mensaje ya NO confirma explícitamente 'ya existe una cuenta con ese email'", async () => {
     const email = uniqueEmail("dup");
-    await register(uniqueUsername("dup1"), email, nextTestIp());
+    await register(email, nextTestIp());
 
-    const { status, body } = await register(uniqueUsername("dup2"), email, nextTestIp());
+    const { status, body } = await register(email, nextTestIp());
     expect(status).toBe(409);
     expect(body.error).not.toMatch(/ya existe una cuenta con ese email/i);
     expect(typeof body.error).toBe("string");
   });
 
-  it("username duplicado: sigue con mensaje específico (dato público, no sensible — sin cambios de esta etapa)", async () => {
-    const username = uniqueUsername("dupuser");
-    await register(username, uniqueEmail("dupuser1"), nextTestIp());
+  it("WhatsApp duplicado (Prompt 14): mismo 409 y mismo mensaje genérico que email — nunca confirma explícitamente que ese WhatsApp ya está en uso", async () => {
+    const whatsapp = uniqueWhatsapp();
+    await register(uniqueEmail("dupwa1"), nextTestIp(), "vitest-test-password-123", whatsapp);
 
-    const { status, body } = await register(username, uniqueEmail("dupuser2"), nextTestIp());
+    const { status, body } = await register(uniqueEmail("dupwa2"), nextTestIp(), "vitest-test-password-123", whatsapp);
     expect(status).toBe(409);
-    expect(body.error).toMatch(/nombre de usuario ya está en uso/i);
+    expect(body.error).not.toMatch(/ya existe (una cuenta|otra cuenta) con ese whatsapp/i);
+    expect(typeof body.error).toBe("string");
   });
 
   it("5. la respuesta nunca filtra datos sensibles (password, hash bcrypt)", async () => {
-    const { body } = await register(uniqueUsername("noleak"), uniqueEmail("noleak"), nextTestIp());
+    const { body } = await register(uniqueEmail("noleak"), nextTestIp());
     expect(body.password).toBeUndefined();
     expect(JSON.stringify(body)).not.toMatch(/\$2[aby]\$/); // ningún hash bcrypt en la respuesta
   });
 
   it("6. la cuenta creada tiene su propio tenant (consultantId propio) — transacción completa, sin registros parciales", async () => {
-    const username = uniqueUsername("tenant");
-    const { status, body } = await register(username, uniqueEmail("tenant"), nextTestIp());
+    const email = uniqueEmail("tenant");
+    const { status, body } = await register(email, nextTestIp());
     expect(status).toBe(201);
     expect(typeof body.consultantId).toBe("number");
 
     const { storage } = await import("../storage");
-    const user = await storage.getUserByUsername(username);
+    const user = await storage.getUserByUsername(body.username);
     expect(user).toBeDefined();
     expect(user!.consultantId).toBe(body.consultantId);
   });

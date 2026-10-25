@@ -1,7 +1,8 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import type { Product, Draft } from "@shared/schema";
+import { pluralize } from "@shared/text";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -31,8 +32,10 @@ import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { getProductCategories, toneFamilyKey } from "@/lib/productCategories";
 import { LoadOrderDialog } from "@/components/LoadOrderDialog";
+import { consumeOrderReminderPreload } from "@/lib/orderReminderPreload";
 import { UnfinishedDraftsSection } from "@/components/UnfinishedDraftsSection";
 import { AddProductDialog } from "@/components/stock/AddProductDialog";
+import { FreePlanLimitDialog, isFreePlanLimitError } from "@/components/FreePlanLimitDialog";
 import { EditProductDialog } from "@/components/stock/EditProductDialog";
 import { ProductGroup } from "@/components/stock/ProductRow";
 import {
@@ -44,6 +47,7 @@ import {
   SearchX,
   Plus,
   PackagePlus,
+  X,
 } from "lucide-react";
 
 const MANUAL_FILTER = "__manual";
@@ -89,7 +93,7 @@ function EmptyCatalog({ onSeed, isSeeding }: { onSeed: () => void; isSeeding: bo
       </h2>
       <p className="mt-2 max-w-md text-sm text-muted-foreground">
         Cuando el administrador cargue productos aparecerán aquí. Mientras tanto,
-        puedes cargar 6 productos de demostración con temática Mary Kay.
+        podés cargar 6 productos de demostración con temática Mary Kay.
       </p>
       <Button
         size="lg"
@@ -130,19 +134,63 @@ export default function Productos() {
   const [categoryFilter, setCategoryFilter] = useState<string>(ALL_FILTER);
   // Por defecto solo se ven productos con stock > 0 — el checkbox habilita ver también los de 0.
   const [showOutOfStock, setShowOutOfStock] = useState(false);
+  // Prompt 10 — "?filter=sin_costo" en la URL (desde el aviso de Inicio "Tenés N productos sin
+  // costo cargado") deja la lista mostrando solo esos, mismo patrón que Clientas (Prompt 11).
+  const [missingCostOnly, setMissingCostOnly] = useState(() => new URLSearchParams(window.location.search).get("filter") === "sin_costo");
   // Prompt 4: alternar entre ver el precio de venta al público o el costo de cada producto.
   const [showPublicPrice, setShowPublicPrice] = useState(true);
   const [addProductOpen, setAddProductOpen] = useState(false);
   const [loadOrderOpen, setLoadOrderOpen] = useState(false);
+  const [freePlanLimitOpen, setFreePlanLimitOpen] = useState(false);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [resumingOrderDraft, setResumingOrderDraft] = useState<Draft | null>(null);
+  // Prompt 8, Parte 3 — "Armar pedido con estos productos" desde el recordatorio de Inicio.
+  const [orderPreload, setOrderPreload] = useState<Record<number, number> | null>(null);
 
-  const { data: products = [], isLoading, isError, error } = useQuery<Product[]>({
-    queryKey: ["/api/products"],
+  useEffect(() => {
+    const preload = consumeOrderReminderPreload();
+    if (preload) {
+      setOrderPreload(preload);
+      setLoadOrderOpen(true);
+    }
+  }, []);
+
+  // Prompt 16, punto 2 — por default Stock solo pide lo que la consultora YA tiene en stock
+  // (mucho más liviano que el catálogo global completo). El catálogo entero ("Ver productos
+  // sin stock" / "Cargar pedido") se pide aparte, recién cuando hace falta — una vez pedido,
+  // se sigue usando para el resto de esta visita a la pantalla (es un superset, el filtro de
+  // "sin stock" de más abajo ya lo recorta igual si el checkbox está apagado).
+  const myProductsQuery = useQuery<Product[]>({
+    queryKey: ["/api/products", "mine"],
+    queryFn: async () => (await apiRequest("GET", "/api/products?scope=mine")).json(),
   });
+  // Además del toggle y "Cargar pedido": Agregar/Editar producto también usan `products` para
+  // sugerir categorías ya existentes del catálogo completo, no solo las que la consultora ya
+  // tiene en stock.
+  const needsFullCatalog =
+    showOutOfStock || loadOrderOpen || resumingOrderDraft !== null || addProductOpen || editingProduct !== null;
+  const fullCatalogQuery = useQuery<Product[]>({
+    queryKey: ["/api/products", "all"],
+    queryFn: async () => (await apiRequest("GET", "/api/products?scope=all")).json(),
+    enabled: needsFullCatalog,
+  });
+  const products = fullCatalogQuery.data ?? myProductsQuery.data ?? [];
+  const isLoading = needsFullCatalog ? fullCatalogQuery.isLoading : myProductsQuery.isLoading;
+  const isError = needsFullCatalog ? fullCatalogQuery.isError : myProductsQuery.isError;
+  const error = needsFullCatalog ? fullCatalogQuery.error : myProductsQuery.error;
 
   const stockValuationQuery = useQuery<StockValuationData>({
     queryKey: ["/api/reports/stock-valuation"],
+  });
+
+  // Prompt 14 (P30) — mismo queryKey que Subscription.tsx/Dashboard: react-query reusa el
+  // cache, no dispara una consulta de más.
+  const { data: subscriptionStatus } = useQuery<{
+    isFreePlan: boolean;
+    productsWithStockCount: number | null;
+    freePlanProductLimit: number;
+  }>({
+    queryKey: ["/api/subscription/status"],
   });
 
   const categories = useMemo(() => getProductCategories(products), [products]);
@@ -163,10 +211,13 @@ export default function Productos() {
       else if (categoryFilter !== ALL_FILTER) matchesCategory = p.seccion === categoryFilter;
 
       const matchesStock = showOutOfStock || p.unidades > 0;
+      // Prompt 10 — mismo criterio que storage.countProductsWithoutCost (el número del aviso
+      // de Inicio tiene que coincidir con esta lista filtrada).
+      const matchesCost = !missingCostOnly || (p.costPrice === null && p.unidades > 0);
 
-      return matchesSearch && matchesCategory && matchesStock;
+      return matchesSearch && matchesCategory && matchesStock && matchesCost;
     });
-  }, [products, search, categoryFilter, showOutOfStock]);
+  }, [products, search, categoryFilter, showOutOfStock, missingCostOnly]);
 
   // Agrupa por familia (sección+línea+nombre) para que los tonos de un mismo producto
   // aparezcan como una sola fila expandible en vez de una fila por variante.
@@ -196,10 +247,14 @@ export default function Productos() {
       queryClient.invalidateQueries({ queryKey: ["/api/admin/stats"] });
       toast({
         title: "Catálogo listo",
-        description: `${data.count} productos de prueba cargados correctamente.`,
+        description: `${pluralize(data.count, "producto de prueba cargado", "productos de prueba cargados")} correctamente.`,
       });
     },
     onError: (err: Error) => {
+      if (isFreePlanLimitError(err)) {
+        setFreePlanLimitOpen(true);
+        return;
+      }
       toast({
         title: "No se pudo cargar el catálogo",
         description: err.message,
@@ -257,7 +312,29 @@ export default function Productos() {
             {products.length} producto{products.length !== 1 ? "s" : ""} · {totalUnidades} unidad{totalUnidades !== 1 ? "es" : ""}
           </p>
         )}
+        {/* Prompt 14 (P30) — línea chica del plan gratis, texto exacto aprobado. */}
+        {subscriptionStatus?.isFreePlan && (
+          <p className="text-xs text-muted-foreground" data-testid="text-free-plan-stock-status">
+            {(subscriptionStatus.productsWithStockCount ?? 0) >= subscriptionStatus.freePlanProductLimit
+              ? `Prueba gratis: llegaste al límite de ${subscriptionStatus.freePlanProductLimit} productos. Para sumar nuevos o reponer los agotados, suscribite.`
+              : `Prueba gratis: ${subscriptionStatus.productsWithStockCount ?? 0} de ${subscriptionStatus.freePlanProductLimit} productos.`}
+          </p>
+        )}
       </header>
+
+      {missingCostOnly && (
+        <div>
+          <button
+            type="button"
+            onClick={() => setMissingCostOnly(false)}
+            className="inline-flex items-center gap-1.5 rounded-full border bg-muted/50 px-3 py-1.5 text-sm font-medium hover-elevate active-elevate-2"
+            data-testid="chip-active-filter"
+          >
+            Sin costo cargado
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
 
       {!isLoading && !isError && products.length > 0 && (
         <Card data-testid="card-stock-value">
@@ -403,10 +480,18 @@ export default function Productos() {
           if (!next) {
             setLoadOrderOpen(false);
             setResumingOrderDraft(null);
+            setOrderPreload(null);
           }
         }}
         products={products}
         draftToResume={resumingOrderDraft}
+        initialQtyByProduct={orderPreload ?? undefined}
+      />
+
+      <FreePlanLimitDialog
+        open={freePlanLimitOpen}
+        onOpenChange={setFreePlanLimitOpen}
+        limit={subscriptionStatus?.freePlanProductLimit ?? 10}
       />
     </div>
   );

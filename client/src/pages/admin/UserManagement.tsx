@@ -86,15 +86,15 @@ export default function UserManagement() {
         <div>
           <h1 className="text-3xl font-bold text-foreground flex items-center gap-2">
             <Users className="h-7 w-7 text-primary" />
-            Gestión de Consultoras
+            Gestión de consultoras
           </h1>
           <p className="text-muted-foreground mt-1">
-            Administra el acceso y registro de consultoras Mary Kay
+            Administrá el acceso y registro de consultoras Mary Kay
           </p>
         </div>
         <Button onClick={() => setDialogOpen(true)} className="gap-2">
           <UserPlus className="h-4 w-4" />
-          Crear Nueva Consultora
+          Crear nueva consultora
         </Button>
       </div>
 
@@ -106,7 +106,7 @@ export default function UserManagement() {
         <ErrorBlock message="No pudimos cargar el listado de consultoras. Probá recargar la página." />
       ) : consultants.length === 0 ? (
         <div className="rounded-lg border bg-card shadow-sm p-8 text-center text-muted-foreground">
-          No hay consultoras registradas. Crea la primera con el botón superior.
+          No hay consultoras registradas. Creá la primera con el botón superior.
         </div>
       ) : (
         <>
@@ -202,7 +202,7 @@ export default function UserManagement() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle className="text-foreground">
-              Crear Nueva Consultora
+              Crear nueva consultora
             </DialogTitle>
           </DialogHeader>
           <form onSubmit={handleCreate} className="space-y-4">
@@ -234,7 +234,7 @@ export default function UserManagement() {
                 Cancelar
               </Button>
               <Button type="submit" disabled={createMutation.isPending}>
-                {createMutation.isPending ? "Creando..." : "Registrar Consultora"}
+                {createMutation.isPending ? "Creando..." : "Registrar consultora"}
               </Button>
             </DialogFooter>
           </form>

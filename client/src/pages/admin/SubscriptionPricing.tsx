@@ -14,6 +14,8 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { MoneyInput } from "@/components/MoneyInput";
+import { PercentInput } from "@/components/PercentInput";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
@@ -34,6 +36,13 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Tag, DollarSign, Plus } from "lucide-react";
+// Prompt 15 — estos precios (suscripción y cupones) se guardan en PESOS ENTEROS, nunca en
+// centavos (unidad distinta a la del resto de la app: ver `formatPesos`/el prop `unit` de
+// `MoneyInput`). Antes esta pantalla tenía una función LOCAL llamada igual que la global
+// `formatPrice` del cliente (`client/src/lib/currency.ts`) pero que hacía otra cosa — un
+// foot-gun real, por eso ahora pasa por el mismo formateador compartido y con un nombre que
+// no se puede confundir con el otro.
+import { formatPesos } from "@/lib/currency";
 
 type PriceChangeScope = "new_only" | "all";
 type CouponDiscountType = "percentage" | "fixed";
@@ -70,10 +79,6 @@ interface CouponRow {
   createdAt: string;
 }
 
-function formatPrice(n: number): string {
-  return `$${n.toLocaleString("es-AR")}`;
-}
-
 function formatDate(iso: string | null): string {
   if (!iso) return "—";
   return new Date(iso).toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit", year: "numeric" });
@@ -87,7 +92,7 @@ function couponStatus(coupon: CouponRow): { label: string; variant: "default" | 
 }
 
 function discountLabel(coupon: Pick<CouponRow, "discountType" | "discountValue">): string {
-  return coupon.discountType === "percentage" ? `${coupon.discountValue}%` : formatPrice(coupon.discountValue);
+  return coupon.discountType === "percentage" ? `${coupon.discountValue}%` : formatPesos(coupon.discountValue);
 }
 
 function durationLabel(coupon: Pick<CouponRow, "duration" | "durationMonths">): string {
@@ -127,14 +132,14 @@ function PriceTab() {
   const { toast } = useToast();
   const { data, isLoading } = useQuery<PriceResponse>({ queryKey: ["/api/admin/subscription-price"] });
 
-  const [newPrice, setNewPrice] = useState("");
+  const [newPrice, setNewPrice] = useState<number | null>(null);
   const [appliesTo, setAppliesTo] = useState<PriceChangeScope>("new_only");
   const [effectiveAt, setEffectiveAt] = useState("");
 
   const mutation = useGuardedMutation({
     mutationFn: async () => {
       const res = await apiRequest("PUT", "/api/admin/subscription-price", {
-        newPriceArs: Number(newPrice),
+        newPriceArs: newPrice,
         appliesTo,
         ...(appliesTo === "all" ? { effectiveAt: new Date(effectiveAt).toISOString() } : {}),
       });
@@ -143,7 +148,7 @@ function PriceTab() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/admin/subscription-price"] });
       toast({ title: "Precio actualizado" });
-      setNewPrice("");
+      setNewPrice(null);
       setAppliesTo("new_only");
       setEffectiveAt("");
     },
@@ -171,7 +176,7 @@ function PriceTab() {
             <p className="text-muted-foreground">Cargando…</p>
           ) : (
             <p className="text-3xl font-bold" data-testid="text-current-price">
-              {formatPrice(data?.currentPriceArs ?? 0)} <span className="text-sm font-normal text-muted-foreground">ARS / mes</span>
+              {formatPesos(data?.currentPriceArs ?? 0)} <span className="text-sm font-normal text-muted-foreground">ARS / mes</span>
             </p>
           )}
         </CardContent>
@@ -184,15 +189,7 @@ function PriceTab() {
         <CardContent className="space-y-4">
           <div className="space-y-1.5">
             <Label htmlFor="input-new-price">Precio nuevo (ARS)</Label>
-            <Input
-              id="input-new-price"
-              type="number"
-              min={1}
-              value={newPrice}
-              onChange={(e) => setNewPrice(e.target.value)}
-              placeholder="20000"
-              data-testid="input-new-price"
-            />
+            <MoneyInput id="input-new-price" unit="pesos" value={newPrice} onChange={setNewPrice} placeholder="20.000" data-testid="input-new-price" />
           </div>
 
           <RadioGroup value={appliesTo} onValueChange={(v) => setAppliesTo(v as PriceChangeScope)} className="space-y-3">
@@ -227,7 +224,7 @@ function PriceTab() {
 
           <Button
             onClick={() => mutation.mutate()}
-            disabled={!newPrice || Number(newPrice) <= 0 || mutation.isPending}
+            disabled={newPrice === null || newPrice <= 0 || mutation.isPending}
             data-testid="button-save-price"
           >
             Guardar precio
@@ -258,8 +255,8 @@ function PriceTab() {
                   <TableRow key={entry.id}>
                     <TableCell>{formatDate(entry.changedAt)}</TableCell>
                     <TableCell>{entry.changedByUsername ?? "—"}</TableCell>
-                    <TableCell>{entry.oldPriceArs !== null ? formatPrice(entry.oldPriceArs) : "—"}</TableCell>
-                    <TableCell className="font-medium">{formatPrice(entry.newPriceArs)}</TableCell>
+                    <TableCell>{entry.oldPriceArs !== null ? formatPesos(entry.oldPriceArs) : "—"}</TableCell>
+                    <TableCell className="font-medium">{formatPesos(entry.newPriceArs)}</TableCell>
                     <TableCell>
                       {entry.appliesTo === "new_only" ? (
                         "Solo nuevas"
@@ -372,7 +369,7 @@ function CreateCouponDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   const { toast } = useToast();
   const [code, setCode] = useState("");
   const [discountType, setDiscountType] = useState<CouponDiscountType>("percentage");
-  const [discountValue, setDiscountValue] = useState("");
+  const [discountValue, setDiscountValue] = useState<number | null>(null);
   const [duration, setDuration] = useState<CouponDuration>("forever");
   const [durationMonths, setDurationMonths] = useState("3");
   const [maxUses, setMaxUses] = useState("");
@@ -381,7 +378,7 @@ function CreateCouponDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   const reset = () => {
     setCode("");
     setDiscountType("percentage");
-    setDiscountValue("");
+    setDiscountValue(null);
     setDuration("forever");
     setDurationMonths("3");
     setMaxUses("");
@@ -393,7 +390,7 @@ function CreateCouponDialog({ open, onOpenChange }: { open: boolean; onOpenChang
       const res = await apiRequest("POST", "/api/admin/coupons", {
         code,
         discountType,
-        discountValue: Number(discountValue),
+        discountValue,
         duration,
         ...(duration === "months" ? { durationMonths: Number(durationMonths) } : {}),
         ...(maxUses ? { maxUses: Number(maxUses) } : {}),
@@ -412,7 +409,13 @@ function CreateCouponDialog({ open, onOpenChange }: { open: boolean; onOpenChang
     },
   });
 
-  const valid = code.trim().length >= 3 && !code.includes(" ") && Number(discountValue) > 0 && (duration !== "months" || Number(durationMonths) > 0);
+  const valid =
+    code.trim().length >= 3 &&
+    !code.includes(" ") &&
+    discountValue !== null &&
+    discountValue > 0 &&
+    (discountType !== "percentage" || discountValue <= 100) &&
+    (duration !== "months" || Number(durationMonths) > 0);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -448,16 +451,24 @@ function CreateCouponDialog({ open, onOpenChange }: { open: boolean; onOpenChang
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="input-discount-value">Valor</Label>
-              <Input
-                id="input-discount-value"
-                type="number"
-                min={1}
-                max={discountType === "percentage" ? 100 : undefined}
-                value={discountValue}
-                onChange={(e) => setDiscountValue(e.target.value)}
-                placeholder={discountType === "percentage" ? "50" : "10000"}
-                data-testid="input-discount-value"
-              />
+              {discountType === "percentage" ? (
+                <PercentInput
+                  id="input-discount-value"
+                  value={discountValue}
+                  onChange={setDiscountValue}
+                  placeholder="50"
+                  data-testid="input-discount-value"
+                />
+              ) : (
+                <MoneyInput
+                  id="input-discount-value"
+                  unit="pesos"
+                  value={discountValue}
+                  onChange={setDiscountValue}
+                  placeholder="10.000"
+                  data-testid="input-discount-value"
+                />
+              )}
             </div>
           </div>
 

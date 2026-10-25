@@ -24,11 +24,14 @@ let storage: typeof import("../storage").storage;
 const PASSWORD = "vitest-test-password-123";
 const NEW_PASSWORD = "vitest-new-password-456";
 
-function uniqueUsername(tag: string): string {
-  return `vitest_reset_${tag}_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-}
 function uniqueEmail(tag: string): string {
   return `vitest.reset.${tag}.${Date.now()}.${Math.floor(Math.random() * 1e6)}@example.com`;
+}
+// Prompt 14 — WhatsApp único por llamada (el registro ahora lo pide siempre).
+let nextWhatsappSuffix = 1;
+function uniqueWhatsapp(): string {
+  const suffix = String(nextWhatsappSuffix++).padStart(7, "0");
+  return `261${suffix}`;
 }
 
 // Cada test usa su propia IP sintética (X-Forwarded-For, trust proxy en 1 hop — ver app.ts)
@@ -40,11 +43,14 @@ function nextTestIp(): string {
   return `10.79.${(ipCounter >> 8) & 0xff}.${ipCounter & 0xff}`;
 }
 
-async function register(username: string, email: string, ip: string, password = PASSWORD) {
+/** Prompt 14 — el registro ya no pide "usuario": lo deriva el backend del email. Devuelve el
+ * body completo (incluye `username`, para los tests que necesitan loguear o buscar el User
+ * después — nunca lo eligen ellos). */
+async function register(email: string, ip: string, password = PASSWORD) {
   const res = await fetch(`${baseUrl}/api/auth/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Forwarded-For": ip },
-    body: JSON.stringify({ username, email, password }),
+    body: JSON.stringify({ contactName: "Vitest Test", email, whatsapp: uniqueWhatsapp(), password }),
   });
   return res.json();
 }
@@ -76,11 +82,11 @@ async function resetPassword(email: string, code: string, newPassword: string, i
   return { status: res.status, body: await res.json() };
 }
 
-async function login(username: string, password: string, ip: string) {
+async function login(identifier: string, password: string, ip: string) {
   const res = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Forwarded-For": ip },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ identifier, password }),
   });
   return res.status;
 }
@@ -106,9 +112,8 @@ afterEach(() => {
 describe("Recuperación de contraseña", () => {
   it("12. email existente genera y envía un código de 6 dígitos", async () => {
     const ip = nextTestIp();
-    const username = uniqueUsername("gen");
     const email = uniqueEmail("gen");
-    await register(username, email, ip);
+    await register(email, ip);
 
     const { status, body } = await forgotPassword(email, ip);
     expect(status).toBe(200);
@@ -119,7 +124,7 @@ describe("Recuperación de contraseña", () => {
   it("13. email inexistente devuelve la MISMA respuesta genérica (sin revelar si existe)", async () => {
     const ip = nextTestIp();
     const existingEmail = uniqueEmail("existegen");
-    await register(uniqueUsername("existegen"), existingEmail, ip);
+    await register(existingEmail, ip);
     const forExisting = await forgotPassword(existingEmail, ip);
 
     const forMissing = await forgotPassword(uniqueEmail("noexiste"), ip);
@@ -130,9 +135,8 @@ describe("Recuperación de contraseña", () => {
 
   it("14. código correcto permite verificar y resetear", async () => {
     const ip = nextTestIp();
-    const username = uniqueUsername("ok");
     const email = uniqueEmail("ok");
-    await register(username, email, ip);
+    await register(email, ip);
     await forgotPassword(email, ip);
     const code = sentCodes[email];
 
@@ -147,7 +151,7 @@ describe("Recuperación de contraseña", () => {
   it("15. código incorrecto falla, con mensaje genérico", async () => {
     const ip = nextTestIp();
     const email = uniqueEmail("wrong");
-    await register(uniqueUsername("wrong"), email, ip);
+    await register(email, ip);
     await forgotPassword(email, ip);
 
     const verify = await verifyCode(email, "000000", ip);
@@ -157,9 +161,8 @@ describe("Recuperación de contraseña", () => {
 
   it("16. código expirado falla", async () => {
     const ip = nextTestIp();
-    const username = uniqueUsername("exp");
     const email = uniqueEmail("exp");
-    await register(username, email, ip);
+    await register(email, ip);
     await forgotPassword(email, ip);
     const code = sentCodes[email];
 
@@ -173,9 +176,8 @@ describe("Recuperación de contraseña", () => {
 
   it("17. un código ya usado no puede reutilizarse", async () => {
     const ip = nextTestIp();
-    const username = uniqueUsername("used");
     const email = uniqueEmail("used");
-    await register(username, email, ip);
+    await register(email, ip);
     await forgotPassword(email, ip);
     const code = sentCodes[email];
 
@@ -188,9 +190,8 @@ describe("Recuperación de contraseña", () => {
 
   it("18. demasiados intentos fallidos bloquean incluso el código correcto", async () => {
     const ip = nextTestIp();
-    const username = uniqueUsername("attempts");
     const email = uniqueEmail("attempts");
-    await register(username, email, ip);
+    await register(email, ip);
     await forgotPassword(email, ip);
     const code = sentCodes[email];
 
@@ -207,22 +208,20 @@ describe("Recuperación de contraseña", () => {
 
   it("19+20. la contraseña nueva permite login y la anterior deja de funcionar", async () => {
     const ip = nextTestIp();
-    const username = uniqueUsername("switch");
     const email = uniqueEmail("switch");
-    await register(username, email, ip, PASSWORD);
+    const registered = await register(email, ip, PASSWORD);
     await forgotPassword(email, ip);
     const code = sentCodes[email];
     await resetPassword(email, code, NEW_PASSWORD, ip);
 
-    expect(await login(username, NEW_PASSWORD, ip)).toBe(200);
-    expect(await login(username, PASSWORD, ip)).toBe(401);
+    expect(await login(registered.username, NEW_PASSWORD, ip)).toBe(200);
+    expect(await login(registered.username, PASSWORD, ip)).toBe(401);
   });
 
   it("21. una solicitud repetida invalida el código anterior — solo el más nuevo sirve", async () => {
     const ip = nextTestIp();
-    const username = uniqueUsername("repeat");
     const email = uniqueEmail("repeat");
-    await register(username, email, ip);
+    await register(email, ip);
 
     await forgotPassword(email, ip);
     const firstCode = sentCodes[email];
@@ -239,9 +238,8 @@ describe("Recuperación de contraseña", () => {
 
   it("22+23. el código nunca aparece en ninguna respuesta de la API, y nunca se guarda en texto plano", async () => {
     const ip = nextTestIp();
-    const username = uniqueUsername("noleak");
     const email = uniqueEmail("noleak");
-    await register(username, email, ip);
+    const registered = await register(email, ip);
     const forgot = await forgotPassword(email, ip);
     const code = sentCodes[email];
 
@@ -250,7 +248,7 @@ describe("Recuperación de contraseña", () => {
     const verify = await verifyCode(email, code, ip);
     expect(JSON.stringify(verify.body)).not.toContain(code);
 
-    const user = await storage.getUserByUsername(username);
+    const user = await storage.getUserByUsername(registered.username);
     const record = await storage.getLatestPasswordResetCode(user!.id);
     expect(record).toBeDefined();
     expect(record!.codeHash).not.toBe(code);

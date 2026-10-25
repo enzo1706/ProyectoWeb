@@ -45,7 +45,7 @@ export function buildPasswordResetEmailContent(code: string, expiryMinutes: numb
     `Recibimos una solicitud para restablecer la contraseña de tu cuenta de MaryKayManager.\n\n` +
     `Tu código de verificación es: ${code}\n\n` +
     `Este código vence en ${expiryMinutes} minutos y solo se puede usar una vez.\n\n` +
-    `Nunca compartas este código con nadie, ni siquiera con alguien que diga ser del equipo de MaryKayManager.\n\n` +
+    `Nunca compartás este código con nadie, ni siquiera con alguien que diga ser del equipo de MaryKayManager.\n\n` +
     `Si vos no pediste este cambio, podés ignorar este email — tu contraseña actual sigue funcionando sin cambios.`;
 
   const html = `
@@ -54,7 +54,7 @@ export function buildPasswordResetEmailContent(code: string, expiryMinutes: numb
   <p>Recibimos una solicitud para restablecer la contraseña de tu cuenta.</p>
   <p style="font-size: 32px; font-weight: bold; letter-spacing: 8px; text-align: center; padding: 16px; margin: 24px 0; background: #f5f5f5; border-radius: 8px;">${code}</p>
   <p>Este código vence en <strong>${expiryMinutes} minutos</strong> y solo se puede usar <strong>una vez</strong>.</p>
-  <p style="color: #b91c1c;"><strong>Nunca compartas este código con nadie</strong>, ni siquiera con alguien que diga ser del equipo de MaryKayManager.</p>
+  <p style="color: #b91c1c;"><strong>Nunca compartás este código con nadie</strong>, ni siquiera con alguien que diga ser del equipo de MaryKayManager.</p>
   <p style="color: #666; font-size: 13px; margin-top: 24px;">Si vos no pediste este cambio, podés ignorar este email — tu contraseña actual sigue funcionando sin cambios.</p>
 </div>
 `.trim();

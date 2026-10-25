@@ -4,18 +4,20 @@ import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Card, CardContent } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 import { ClientCard, type Client } from "@/components/ClientCard";
 import { ClientDialog } from "@/components/ClientDialog";
 import { ClientDetailSheet } from "@/components/ClientDetailSheet";
-import { NewSaleDialog } from "@/components/NewSaleDialog";
+import { useSaleDialog } from "@/hooks/use-sale-dialog";
 import { ErrorBlock } from "@/components/ErrorBlock";
 import { Plus, Search, ChevronLeft, ChevronRight, Filter, X } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { cn } from "@/lib/utils";
-import type { InsertClient, Product } from "@shared/schema";
-import { type ClientListFilter, CLIENT_LIST_FILTER_LABELS, DEFAULT_CLIENTS_PAGE_SIZE } from "@shared/clientFilters";
+import type { InsertClient } from "@shared/schema";
+import { type ClientListFilter, CLIENT_LIST_FILTER_LABELS, DEFAULT_CLIENTS_PAGE_SIZE, isClientListFilter } from "@shared/clientFilters";
 
 // Prompt 9, punto 2 — las 3 opciones del botón "Filtros" (nunca "todas", que es "sin filtro").
 const FILTER_OPTIONS: ClientListFilter[] = ["pendiente_pago", "no_compran_hace", "cumplen_anios"];
@@ -31,6 +33,27 @@ interface PaginatedClientsResponse {
   totalRevenue: number;
 }
 
+// Prompt 16, punto 1 — misma forma que ClientCard (avatar + nombre + 2 líneas), para que la
+// pantalla no "salte" cuando llegan los datos reales.
+function ClientCardSkeleton() {
+  return (
+    <Card>
+      <CardContent className="pt-4">
+        <div className="flex items-start gap-3">
+          <Skeleton className="h-12 w-12 rounded-full shrink-0" />
+          <div className="flex-1 space-y-2">
+            <Skeleton className="h-4 w-32" />
+            <Skeleton className="h-3 w-24" />
+          </div>
+        </div>
+        <div className="mt-4 pt-3 border-t">
+          <Skeleton className="h-3 w-20" />
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function Clientas() {
   const { toast } = useToast();
   const { format } = useHideMoney();
@@ -40,10 +63,14 @@ export default function Clientas() {
   const [editingClient, setEditingClient] = useState<Client | null>(null);
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
-  const [saleDialogOpen, setSaleDialogOpen] = useState(false);
-  const [filter, setFilter] = useState<ClientListFilter>("todas");
+  const { openCreateSale } = useSaleDialog();
+  // Prompt 11 — Reportes ("Te deben hoy", "Ver todas" de Clientas para recontactar) navega
+  // acá con "?filter=..." en la URL, para abrir Clientas ya con ese filtro aplicado.
+  const [filter, setFilter] = useState<ClientListFilter>(() => {
+    const fromUrl = new URLSearchParams(window.location.search).get("filter");
+    return isClientListFilter(fromUrl) ? fromUrl : "todas";
+  });
   const [filterSheetOpen, setFilterSheetOpen] = useState(false);
-  const [saleClient, setSaleClient] = useState<Client | null>(null);
   const [page, setPage] = useState(1);
 
   useEffect(() => {
@@ -75,8 +102,6 @@ export default function Clientas() {
   const total = data?.total ?? 0;
   const totalPages = data?.totalPages ?? 0;
   const totalRevenue = data?.totalRevenue ?? 0;
-
-  const { data: products = [] } = useQuery<Product[]>({ queryKey: ["/api/products"] });
 
   const createMutation = useGuardedMutation({
     mutationFn: async (data: Partial<InsertClient>) => {
@@ -135,8 +160,7 @@ export default function Clientas() {
   };
 
   const handleNewSale = (client: Client) => {
-    setSaleClient(client);
-    setSaleDialogOpen(true);
+    openCreateSale({ preselectedClient: client });
     setDetailOpen(false);
   };
 
@@ -153,7 +177,7 @@ export default function Clientas() {
         </div>
         <Button onClick={handleNewClient} data-testid="button-add-client">
           <Plus className="h-4 w-4 mr-2" />
-          Nueva Clienta
+          Nueva clienta
         </Button>
       </div>
 
@@ -198,7 +222,11 @@ export default function Clientas() {
       )}
 
       {isLoading ? (
-        <div className="text-center py-12 text-muted-foreground">Cargando clientas...</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <ClientCardSkeleton key={i} />
+          ))}
+        </div>
       ) : isError ? (
         <ErrorBlock message="No pudimos cargar tus clientas. Tus datos siguen intactos — probá recargar la página." />
       ) : (
@@ -262,13 +290,6 @@ export default function Clientas() {
         client={selectedClient}
         onEdit={handleEdit}
         onNewSale={handleNewSale}
-      />
-
-      <NewSaleDialog
-        open={saleDialogOpen}
-        onOpenChange={setSaleDialogOpen}
-        products={products}
-        preselectedClient={saleClient}
       />
 
       <Dialog open={filterSheetOpen} onOpenChange={setFilterSheetOpen}>

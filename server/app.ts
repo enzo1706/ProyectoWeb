@@ -1,4 +1,5 @@
 import express, { type Express, type Request, Response, NextFunction } from "express";
+import compression from "compression";
 import { createServer, type Server } from "http";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
@@ -38,6 +39,12 @@ export async function createApp(): Promise<{ app: Express; httpServer: Server }>
   // revisarlo.
   app.set("trust proxy", 1);
 
+  // Prompt 16, punto 1 — gzip para TODO lo que sale de acá: las respuestas JSON de la API
+  // (un catálogo de 181 productos pasa de 78 KB a ~2,4 KB) y los archivos estáticos del
+  // frontend que sirve `serveStatic` más abajo (JS/CSS del primer ingreso). Antes de
+  // `express.json` a propósito — comprime la RESPUESTA, no depende de nada del body parser.
+  app.use(compression());
+
   app.use(
     express.json({
       verify: (req, _res, buf) => {
@@ -65,6 +72,12 @@ export async function createApp(): Promise<{ app: Express; httpServer: Server }>
         responseSize = JSON.stringify(bodyJson).length;
       } catch {
         responseSize = undefined;
+      }
+      // Prompt 16 — mismo número que ya se logueaba, visible además en las DevTools del
+      // navegador (pestaña Network → Timing) sin tener que ir al log del servidor. Se fija
+      // ACÁ (antes de escribir el body) porque después de eso los headers ya se mandaron.
+      if (!res.headersSent) {
+        res.set("Server-Timing", `app;dur=${Date.now() - start}`);
       }
       return originalResJson.apply(res, [bodyJson, ...args]);
     };

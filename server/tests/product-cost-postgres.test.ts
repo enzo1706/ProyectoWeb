@@ -52,10 +52,10 @@ describe("Prompt 2 — costo promedio ponderado sobre Postgres real", () => {
       producto: "Base TimeWise 3D",
       precio: 27200,
       unidades: 0,
-    });
+    }, false);
 
-    await storage.incrementProductStockBatch(consultantId, [{ productId: product.id, delta: 2 }], 45);
-    await storage.incrementProductStockBatch(consultantId, [{ productId: product.id, delta: 3 }], 40);
+    await storage.incrementProductStockBatch(consultantId, [{ productId: product.id, delta: 2 }], false, 45);
+    await storage.incrementProductStockBatch(consultantId, [{ productId: product.id, delta: 3 }], false, 40);
 
     const [stock] = await db
       .select()
@@ -67,15 +67,15 @@ describe("Prompt 2 — costo promedio ponderado sobre Postgres real", () => {
 
   it("redondea a pesos enteros (promedio no exacto)", async () => {
     const consultantId = await fixtureConsultant("rounding");
-    const product = await storage.createProduct(consultantId, { seccion: "VITEST", producto: "Producto", precio: 1000, unidades: 0 });
+    const product = await storage.createProduct(consultantId, { seccion: "VITEST", producto: "Producto", precio: 1000, unidades: 0 }, false);
 
     // 1 unidad a costo 333 (precio 1000 * (1-33%) no es una opción válida de discountOptions,
     // así que armamos el redondeo con descuentos reales: 35% -> 650, luego 1 unidad a 45% -> 550.
     // (1*650 + 1*550) / 2 = 600 exacto -> probamos un caso que SÍ cae en .5 para forzar el redondeo:
     // 3 unidades a 650 + 1 unidad a 550 = (3*650+1*550)/4 = 2500/4 = 625 exacto también.
     // Usamos cantidades que fuerzan un resto: 1*650 + 2*550 = 1750/3 = 583.33... -> redondea a 583.
-    await storage.incrementProductStockBatch(consultantId, [{ productId: product.id, delta: 1 }], 35); // costo 650
-    await storage.incrementProductStockBatch(consultantId, [{ productId: product.id, delta: 2 }], 45); // costo 550
+    await storage.incrementProductStockBatch(consultantId, [{ productId: product.id, delta: 1 }], false, 35); // costo 650
+    await storage.incrementProductStockBatch(consultantId, [{ productId: product.id, delta: 2 }], false, 45); // costo 550
 
     const [stock] = await db.select().from(productStock).where(inArray(productStock.productId, [product.id]));
     expect(stock.unidades).toBe(3);
@@ -84,7 +84,7 @@ describe("Prompt 2 — costo promedio ponderado sobre Postgres real", () => {
 
   it("un pedido NUNCA recalcula ventas viejas estimadas — la ganancia de una venta vieja no cambia (acuerdo del Prompt 2)", async () => {
     const consultantId = await fixtureConsultant("no-auto-recalc");
-    const product = await storage.createProduct(consultantId, { seccion: "VITEST", producto: "Sin costo", precio: 10000, unidades: 5 });
+    const product = await storage.createProduct(consultantId, { seccion: "VITEST", producto: "Sin costo", precio: 10000, unidades: 5 }, false);
     const [client] = await db.insert(clients).values({ consultantId, name: "Clienta VITEST", phone: "9990009999" }).returning();
 
     const sale = await storage.createSale(consultantId, {
@@ -101,7 +101,7 @@ describe("Prompt 2 — costo promedio ponderado sobre Postgres real", () => {
 
     // Llega un pedido real para este producto — el producto toma el costo promedio ponderado,
     // pero la venta vieja queda EXACTAMENTE igual: sigue estimada, con su "≈".
-    await storage.incrementProductStockBatch(consultantId, [{ productId: product.id, delta: 10 }], 45);
+    await storage.incrementProductStockBatch(consultantId, [{ productId: product.id, delta: 10 }], false, 45);
 
     const detail = await storage.getSaleDetails(consultantId, sale.id);
     expect(detail!.items[0].costIsEstimated).toBe(true);
@@ -110,7 +110,7 @@ describe("Prompt 2 — costo promedio ponderado sobre Postgres real", () => {
 
   it("recalculateEstimatedSalesForProduct (llamada directa, simulando 'Editar producto' del Prompt 4) corrige ventas viejas estimadas y recalcula el profit cacheado", async () => {
     const consultantId = await fixtureConsultant("manual-recalc");
-    const product = await storage.createProduct(consultantId, { seccion: "VITEST", producto: "Sin costo", precio: 10000, unidades: 5 });
+    const product = await storage.createProduct(consultantId, { seccion: "VITEST", producto: "Sin costo", precio: 10000, unidades: 5 }, false);
     const [client] = await db.insert(clients).values({ consultantId, name: "Clienta VITEST", phone: "9990009998" }).returning();
 
     const sale = await storage.createSale(consultantId, {

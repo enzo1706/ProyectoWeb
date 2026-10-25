@@ -15,16 +15,14 @@ import { useGuardedMutation } from "@/hooks/use-guarded-mutation";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Trash2 } from "lucide-react";
 import { saleDraftPayloadSchema, orderDraftPayloadSchema, type Draft, type DraftType } from "@shared/schema";
+import { pluralize } from "@shared/text";
+import { formatDateList, toDateStr } from "@/lib/date";
 
-/** Prompt 7, punto 7 — fecha relativa para "Ventas/Pedidos sin terminar". Una ventana chica (3
- * valores concretos) alcanza: nadie necesita precisión de hora acá, solo ubicarse rápido. */
+/** Prompt 7, punto 7 / Prompt 15, punto 6 — fecha relativa para "Ventas/Pedidos sin
+ * terminar", vía la función reutilizable de fechas en lista (antes era una implementación
+ * propia acá, equivalente para el pasado — `formatDateList` además cubre el futuro). */
 function formatRelativeDraftDate(iso: string | Date): string {
-  const updated = new Date(iso);
-  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-  const days = Math.round((startOfDay(new Date()) - startOfDay(updated)) / (1000 * 60 * 60 * 24));
-  if (days <= 0) return "hoy";
-  if (days === 1) return "ayer";
-  return `hace ${days} días`;
+  return formatDateList(toDateStr(new Date(iso)));
 }
 
 /** Descripción corta de un borrador para la lista — nunca falla aunque el payload tenga un
@@ -89,7 +87,7 @@ export function UnfinishedDraftsSection({ type, title, onResume }: UnfinishedDra
                   {rowTitle}
                 </p>
                 <p className="text-xs text-muted-foreground">
-                  {itemCount} producto{itemCount !== 1 ? "s" : ""} · {formatRelativeDraftDate(draft.updatedAt)}
+                  {pluralize(itemCount, "producto", "productos")} · {formatRelativeDraftDate(draft.updatedAt)}
                 </p>
               </div>
               <div className="flex shrink-0 items-center gap-1">

@@ -4,6 +4,7 @@ import { Phone, Mail, Calendar, ShoppingBag } from "lucide-react";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { onActivationKeyDown } from "@/lib/utils";
 import { WhatsAppButton } from "./WhatsAppButton";
+import { formatArgentinaPhoneDisplay } from "@shared/phone";
 import type { Client as BaseClient } from "@shared/schema";
 
 export interface Client extends BaseClient {
@@ -23,7 +24,7 @@ export function ClientCard({ client, onClick }: ClientCardProps) {
   // vieja puede seguir sin uno (nunca se la fuerza a completarlo fuera del formulario de
   // edición) — y ahora el teléfono también es opcional, así que puede faltar el fallback de
   // siempre. "Sin nombre" es el último recurso, nunca debería verse en una clienta nueva.
-  const displayName = client.name?.trim() || client.phone || "Sin nombre";
+  const displayName = client.name?.trim() || formatArgentinaPhoneDisplay(client.phone) || "Sin nombre";
   const initials = displayName
     .split(" ")
     .map((n) => n[0])
@@ -58,7 +59,7 @@ export function ClientCard({ client, onClick }: ClientCardProps) {
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2 text-sm text-muted-foreground min-w-0">
                     <Phone className="h-3 w-3 shrink-0" />
-                    <span className="truncate">{client.phone}</span>
+                    <span className="truncate">{formatArgentinaPhoneDisplay(client.phone)}</span>
                   </div>
                   <WhatsAppButton phone={client.phone} className="-my-2" />
                 </div>

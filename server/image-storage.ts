@@ -1,6 +1,15 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import sharp from "sharp";
 
 const BUCKET = "product-images";
+
+// Prompt 16, punto 3 — miniatura generada ACÁ, en el servidor, en vez de depender del
+// transform de imágenes de Supabase Storage (`?width=`), que solo está disponible desde el
+// plan Pro. Esto funciona en cualquier plan, porque la miniatura es un archivo real, no un
+// parámetro de URL. 200x200 "cover" (recorta, nunca deforma) alcanza de sobra para la lista
+// de Stock (se muestra a 44px, pero se sirve a 200 para que se vea bien en pantallas de alta
+// densidad) — la imagen original se sigue usando tal cual en cualquier vista de detalle.
+const THUMBNAIL_SIZE = 200;
 
 /** Firma binaria real de cada formato — el `mimetype` que manda multer viene del header
  * `Content-Type` de la parte multipart, que el cliente arma libremente (falsificable con
@@ -62,14 +71,27 @@ async function ensureBucket(supabase: SupabaseClient): Promise<void> {
   bucketReady = true;
 }
 
-/** Sube el buffer al bucket fijo `product-images` y devuelve la URL pública. `upsert: true`
- * porque el path incluye un timestamp — nunca pisa una imagen anterior por accidente. */
+/** Redimensiona a `THUMBNAIL_SIZE`x`THUMBNAIL_SIZE`, recortando (nunca deformando). Siempre
+ * jpeg de salida — una miniatura no necesita preservar el formato original (más liviana, y
+ * un solo `contentType` sin importar si la original era png/webp). */
+async function generateThumbnail(buffer: Buffer): Promise<Buffer> {
+  return sharp(buffer)
+    .resize(THUMBNAIL_SIZE, THUMBNAIL_SIZE, { fit: "cover" })
+    .jpeg({ quality: 80 })
+    .toBuffer();
+}
+
+/** Sube el original Y la miniatura al bucket fijo `product-images`, devuelve las dos URLs
+ * públicas. `upsert: true` porque el path incluye un timestamp — nunca pisa una imagen
+ * anterior por accidente. Si falla generar/subir la miniatura, no aborta la subida del
+ * original (mejor una imagen sin miniatura todavía que ninguna imagen) — el caller usa
+ * `imagen` como respaldo en ese caso (ver `thumbnailUrl: null`). */
 export async function uploadProductImage(
   productId: number,
   buffer: Buffer,
   mimeType: string,
   extension: string,
-): Promise<string> {
+): Promise<{ url: string; thumbnailUrl: string | null }> {
   const supabase = getClient();
   await ensureBucket(supabase);
   const path = `products/${productId}-${Date.now()}.${extension}`;
@@ -83,7 +105,53 @@ export async function uploadProductImage(
   }
 
   const { data } = supabase.storage.from(BUCKET).getPublicUrl(path);
-  return data.publicUrl;
+
+  let thumbnailUrl: string | null = null;
+  try {
+    const thumbnailBuffer = await generateThumbnail(buffer);
+    const thumbnailPath = `products/${productId}-${Date.now()}-thumb.jpg`;
+    const { error: thumbError } = await supabase.storage.from(BUCKET).upload(thumbnailPath, thumbnailBuffer, {
+      contentType: "image/jpeg",
+      upsert: true,
+    });
+    if (!thumbError) {
+      thumbnailUrl = supabase.storage.from(BUCKET).getPublicUrl(thumbnailPath).data.publicUrl;
+    } else {
+      console.error("No se pudo subir la miniatura (se sigue usando la original):", thumbError.message);
+    }
+  } catch (err) {
+    console.error("No se pudo generar la miniatura (se sigue usando la original):", err);
+  }
+
+  return { url: data.publicUrl, thumbnailUrl };
+}
+
+/** Prompt 16 — backfill (script/backfill-thumbnails.ts): descarga la imagen ORIGINAL ya
+ * subida (por su URL pública, venga de este bucket o no — a diferencia de `uploadProductImage`
+ * nunca recibe el buffer de memoria, porque la imagen ya existe de antes), genera la miniatura
+ * y la sube. `null` si la descarga o la generación fallan (se loguea el motivo, nunca
+ * interrumpe un backfill en lote por una sola imagen rota). */
+export async function uploadThumbnailFromExistingImage(productId: number, originalUrl: string): Promise<string | null> {
+  const res = await fetch(originalUrl);
+  if (!res.ok) {
+    console.error(`No se pudo descargar la imagen original (producto ${productId}, HTTP ${res.status}): ${originalUrl}`);
+    return null;
+  }
+  const buffer = Buffer.from(await res.arrayBuffer());
+
+  const supabase = getClient();
+  await ensureBucket(supabase);
+  const thumbnailBuffer = await generateThumbnail(buffer);
+  const thumbnailPath = `products/${productId}-${Date.now()}-thumb.jpg`;
+  const { error } = await supabase.storage.from(BUCKET).upload(thumbnailPath, thumbnailBuffer, {
+    contentType: "image/jpeg",
+    upsert: true,
+  });
+  if (error) {
+    console.error(`No se pudo subir la miniatura del backfill (producto ${productId}): ${error.message}`);
+    return null;
+  }
+  return supabase.storage.from(BUCKET).getPublicUrl(thumbnailPath).data.publicUrl;
 }
 
 /** Todos los archivos ya presentes en el bucket bajo `products/` (donde vive todo lo que

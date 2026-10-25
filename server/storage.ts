@@ -20,11 +20,15 @@ import {
   clientPayments,
   paymentAllocations,
   paymentMethods,
+  orderReminders,
+  dashboardNoticeDismissals,
+  dashboardNoticeTypes,
   createSaleSchema,
   updateSaleSchema,
   createAppointmentSchema,
   updateAppointmentSchema,
   updateBusinessSettingsSchema,
+  updateConsultantProfileSchema,
   createProductSchema,
   updateProductSchema,
   appointmentStatuses,
@@ -62,6 +66,10 @@ import {
   type ClientNote,
   type ClientPayment,
   type PaymentAllocation,
+  type OrderReminder,
+  type OrderReminderItemSnapshot,
+  type DashboardNoticeType,
+  type DashboardNoticeDismissal,
 } from "@shared/schema";
 import { normalizeEmail } from "@shared/email";
 import {
@@ -77,28 +85,40 @@ import {
   HABITUAL_DISCOUNT_WINDOW_MS,
   resolveLineCost,
   computeGrossIncomeTax,
+  resolveStockAllocation,
+  resolveInitialLineCost,
+  resolveBlendedLineCost,
+  applyRealCostToLine,
+  applyManualCostCorrection,
+  resolveQuantityDecrease,
+  computeDiscountedCost,
 } from "@shared/saleCalculations";
-import { resolveLowStockThreshold, DEFAULT_LOW_STOCK_THRESHOLD } from "@shared/stockAlerts";
+import { resolveLowStockThreshold, DEFAULT_LOW_STOCK_THRESHOLD, isReminderActive } from "@shared/stockAlerts";
+import { resolveOrderReminderPeriod, resolveNextOrderDate, ymdToStr } from "@shared/orderReminderSchedule";
 import {
   type ClientListFilter,
   STALE_THRESHOLD_DAYS,
   matchesBalanceFilter,
   matchesStaleFilter,
   matchesBirthdayMonth,
+  matchesMissingPhoneFilter,
   birthdayDay,
   MAX_CLIENTS_PAGE_SIZE,
 } from "@shared/clientFilters";
-import { getArgentinaDateStr, getArgentinaMonth } from "@shared/argentinaTime";
-import { normalizeArgentinaPhoneForStorage } from "@shared/phone";
+import { getArgentinaDateStr, getArgentinaMonth, toArgentinaDateStr, getArgentinaNow, getDaysInMonth, getArgentinaTimeStr, resolveOrderDayForMonth } from "@shared/argentinaTime";
+import { type ReportPeriodKind, getComparisonPeriod } from "@shared/reportsPeriods";
+import { normalizeArgentinaPhoneForStorage, normalizeArgentinaPhoneDigits } from "@shared/phone";
 import { isKnownEventType, normalizeCustomEventTypeName, KNOWN_EVENT_TYPES } from "@shared/eventTypes";
 import type { z } from "zod";
-import { eq, ne, count, sql, and, gt, gte, lt, asc, desc, isNotNull, isNull, inArray, notInArray, ilike, or } from "drizzle-orm";
+import { eq, ne, count, sql, and, gt, gte, lt, lte, asc, desc, isNotNull, isNull, inArray, notInArray, ilike, or, getTableColumns } from "drizzle-orm";
 import type { db as database } from "./db";
 import { resolveStorageMode } from "./storage-mode";
 import { shouldUseTestDatabase } from "./test-db-guard";
 import { slugify } from "@shared/slug";
+import { pluralize } from "@shared/text";
+import { formatMoney } from "@shared/money";
 import bcrypt from "bcryptjs";
-import { TRIAL_DAYS, PERIOD_DAYS } from "./config/subscription";
+import { TRIAL_DAYS, PERIOD_DAYS, FREE_PLAN_PRODUCT_LIMIT } from "./config/subscription";
 
 /** Misma fórmula que `computeDiscountEndsAt` de server/subscription.ts, duplicada acá adentro
  * (sin import) para no crear una dependencia circular storage.ts ↔ subscription.ts
@@ -135,10 +155,26 @@ export class ProductValidationError extends Error {}
 export class DuplicateEmailError extends Error {}
 /** Etapa 3 (registro): ya existe una cuenta con ese username — mapea a 409. */
 export class DuplicateUsernameError extends Error {}
+/** Prompt 14: ya existe otra cuenta con ese WhatsApp normalizado — mapea a 409, mismo
+ * criterio que DuplicateEmailError. */
+export class DuplicateWhatsAppError extends Error {}
+/** Prompt 14, ajuste — el WhatsApp que se intenta guardar coincide con el USERNAME de otra
+ * cuenta (una cuenta vieja cuyo usuario es, literalmente, un número de teléfono). Si se
+ * permitiera, el login (orden fijo email → WhatsApp → usuario) nunca volvería a llegar a
+ * buscarla como usuario, porque ese string siempre matchearía primero por WhatsApp — mapea a
+ * 409, mismo criterio que DuplicateWhatsAppError. */
+export class WhatsAppMatchesUsernameError extends Error {}
+/** Prompt 14 (P30): el plan gratis llegó a FREE_PLAN_PRODUCT_LIMIT productos con stock y esta
+ * operación sumaría uno más — mapea a 403 (el payload es válido, lo que falta es el plan). */
+export class FreePlanProductLimitError extends Error {}
 
+/** Prompt 14 — ya no incluye `username`: el registro público deja de pedirlo, el backend lo
+ * deriva del email (ver deriveUniqueUsername). Las cuentas viejas con username propio siguen
+ * existiendo y pudiendo loguearse con él — esto solo afecta a las cuentas NUEVAS. */
 export interface RegisterConsultantInput {
-  username: string;
+  contactName: string;
   email: string;
+  whatsapp: string;
   password: string;
 }
 
@@ -255,6 +291,7 @@ export type UpdateSaleInput = z.infer<typeof updateSaleSchema>;
 export type CreateAppointmentInput = z.infer<typeof createAppointmentSchema>;
 export type UpdateAppointmentInput = z.infer<typeof updateAppointmentSchema>;
 export type UpdateBusinessSettingsInput = z.infer<typeof updateBusinessSettingsSchema>;
+export type UpdateConsultantProfileInput = z.infer<typeof updateConsultantProfileSchema>;
 export type CreateProductInput = z.infer<typeof createProductSchema>;
 export type UpdateProductInput = z.infer<typeof updateProductSchema>;
 export type SubscriptionUpdate = Partial<
@@ -383,6 +420,7 @@ type StockFields = Pick<
 export interface SetProductImageResult {
   product: ProductRow | undefined;
   previousImage: string | null;
+  previousThumbnail: string | null;
 }
 
 /** Combina un producto de catálogo con la fila de stock de la consultora que lo está mirando
@@ -522,6 +560,13 @@ export interface InactiveClient {
   totalPurchased: number;
 }
 
+/** Prompt 12 — `clientPhone` vía LEFT JOIN a `clients` (nunca rompe una cita sin clienta, que
+ * ahora es posible: ver Prompt 12, clienta opcional) — para el botón "WhatsApp" en citas,
+ * reusado por Inicio ("Citas de hoy") y Agenda. */
+export interface AppointmentWithPhone extends Appointment {
+  clientPhone: string | null;
+}
+
 export interface UpcomingBirthday {
   clientId: number;
   name: string | null;
@@ -539,7 +584,13 @@ export interface AppointmentsSummary {
 
 export interface PendingInstallmentRow {
   saleId: number;
+  // Prompt 10 — el id real de la fila, para poder cobrarla directo (PATCH /api/sales/:id/
+  // installments/:installmentId) sin tener que abrir el detalle completo de la venta.
+  installmentId: number;
   clientName: string;
+  // Prompt 10 — para el botón "WhatsApp" junto a "Cobrada" (Inicio/Agenda). `null` si la venta
+  // no tiene clienta o la clienta no tiene celular cargado — el botón simplemente no sale.
+  clientPhone: string | null;
   installmentNumber: number;
   amount: number;
   dueDate: string;
@@ -577,6 +628,129 @@ export interface PendingInstallmentsTotals {
   overdueCount: number;
 }
 
+export interface ReportsOverviewParams {
+  start: string;
+  end: string;
+  period: ReportPeriodKind;
+}
+
+/** Prompt 11 — todo lo que necesita la pantalla de Reportes de arranque, en una sola llamada.
+ * Quedan AFUERA a propósito "Productos más vendidos" y "Mejores clientas" (siguen pegándole a
+ * getTopProductsByCategory/getTopClients, ya existentes y compartidos con el wizard de venta) y
+ * "Clientas para recontactar" (reusa getInactiveClients, compartido con Inicio) — ninguno de
+ * los tres necesitaba cambiar, así que no se duplicó su lógica acá adentro. */
+export interface ReportsOverview {
+  // "Vendiste"/"Ganaste" del período — MISMA fuente que Inicio (getSalesSummary), nunca un
+  // cálculo paralelo, para que los dos números coincidan siempre.
+  totalSales: number;
+  totalProfit: number;
+  hasIncompleteCostData: boolean;
+  // Período anterior (ver getComparisonPeriod) — null en los dos si no hubo ninguna venta ahí
+  // (nunca se divide por cero, y la línea de comparación no se muestra).
+  previousTotalSales: number | null;
+  previousTotalProfit: number | null;
+  comparisonPeriod: { start: string; end: string; truncated: boolean };
+  // "Compra promedio por clienta": ventas CON clienta ÷ clientas distintas — las ventas "Sin
+  // clienta" no entran ni al numerador ni al denominador (mismo criterio que ya usa
+  // getTopClients con `isNotNull(sales.clientId)`, no se les reparte ni se les inventa una fila).
+  distinctClientCount: number;
+  totalSalesToClients: number;
+  averagePurchasePerClient: number | null;
+  // "Te deben hoy" / "de eso, $X ya venció" — no depende del período elegido. Calculado con la
+  // MISMA función que ya usa el filtro "Pendiente de pago" de Clientas
+  // (getClientsPendingBalanceDetail), sumada sobre TODAS las clientas — nunca una fórmula nueva.
+  pendingBalanceToday: number;
+  overdueBalanceToday: number;
+}
+
+/** Prompt 10 — 7 días visible otra vez después de "Ocultar", si el aviso sigue vigente. */
+const DASHBOARD_NOTICE_HIDDEN_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Prompt 10 — mes actual en hora de Argentina, con el rango [monthStart, monthEnd) que ya usa
+ * getSalesSummary (medio abierto: `lt(sales.date, monthEnd)`) y cuántos días quedan del mes
+ * DESPUÉS de hoy (hoy mismo no cuenta como "día que queda", todavía está en curso). */
+function getArgentinaCurrentMonthInfo(): { monthStart: string; monthEnd: string; daysLeftInMonth: number } {
+  const now = getArgentinaNow();
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth() + 1;
+  const day = now.getUTCDate();
+  const pad2 = (n: number) => String(n).padStart(2, "0");
+  const monthStart = `${year}-${pad2(month)}-01`;
+  const nextMonth = month === 12 ? 1 : month + 1;
+  const nextYear = month === 12 ? year + 1 : year;
+  const monthEnd = `${nextYear}-${pad2(nextMonth)}-01`;
+  const daysLeftInMonth = getDaysInMonth(year, month) - day;
+  return { monthStart, monthEnd, daysLeftInMonth };
+}
+
+/** Prompt 10 — todo lo que necesita Inicio, en una sola llamada (mismo patrón que
+ * `getReportsOverview`): reusa las funciones de storage que ya existen, nunca un cálculo
+ * paralelo — así "Vas $X" coincide con "Vendiste" de Reportes, el conteo de "hace tiempo que no
+ * compran" coincide con Clientas, etc. `isFreePlan`/`productsWithStockCount` vienen del handler
+ * (requireren `getConsultantAccessStatus`, en server/subscription.ts — que ya importa storage,
+ * así que storage.ts no puede importarlo de vuelta sin ciclo). */
+export interface DashboardOverviewAccessInfo {
+  isFreePlan: boolean;
+  productsWithStockCount: number | null;
+  freePlanProductLimit: number;
+}
+
+export interface DashboardOverview {
+  businessName: string;
+  monthlyGoal: number | null;
+  monthSales: number;
+  daysLeftInMonth: number;
+  paraHacerHoy: {
+    deliveryReady: { saleId: number; itemId: number; clientId: number | null; clientName: string; productName: string; quantity: number }[];
+    orderReminder: {
+      reminder: OrderReminder;
+      items: { productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[];
+    } | null;
+    appointmentsToday: Appointment[];
+    birthdaysToday: UpcomingBirthday[];
+  };
+  pendientes: {
+    installments: PendingInstallmentRow[];
+    unfinishedSalesCount: number;
+    unfinishedOrdersCount: number;
+    salesWithoutClientCount: number;
+  };
+  paraMejorarTuNegocio: {
+    // Siempre en este orden (ajuste del Prompt 10): límite del plan gratis primero, los 4 del
+    // prompt original después, "Completá tu perfil" al final. `null` = oculta (sin condición o
+    // tapada por "Ocultar" hace menos de 7 días) — el frontend no necesita saber cuál de las dos
+    // cosas es, solo si se muestra.
+    limitePlanGratis: boolean;
+    stockBajo: { count: number; products: Product[] } | null;
+    clientasInactivas: { count: number } | null;
+    productosSinCosto: { count: number } | null;
+    clientasSinCelular: { count: number } | null;
+    completarPerfil: boolean;
+  };
+}
+
+/** Prompt 12 — un día de pedido dentro del mes mostrado en Agenda. "real" = el recordatorio
+ * abierto de verdad (Prompt 8), con `reminderId` para poder cerrarlo ("Listo, ya lo pedí").
+ * "preview" = el próximo día de pedido SIN recordatorio abierto todavía: la misma lógica del
+ * Prompt 8 calculada en vivo (lo vendido desde el último día de pedido hasta hoy, más lo
+ * pendiente), sin guardar ninguna fila — nunca se puede cerrar. "marker" = cualquier otro día
+ * de pedido del mes (pasado, o de más adelante): solo la fecha, sin lista. */
+export interface AgendaOrderDay {
+  date: string;
+  kind: "real" | "preview" | "marker";
+  reminderId?: number;
+  items?: { productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[];
+}
+
+/** Prompt 12 — todo lo que necesita Agenda para un mes, en una sola llamada (mismo patrón que
+ * `getDashboardOverview`): citas cargadas a mano + los 3 tipos de evento automático. */
+export interface AgendaMonth {
+  appointments: AppointmentWithPhone[];
+  cobros: PendingInstallmentRow[];
+  cumpleanos: { clientId: number; name: string | null; phone: string | null; day: number }[];
+  diasDePedido: AgendaOrderDay[];
+}
+
 function getCurrentMonthRange(): { monthStart: string; monthEnd: string } {
   const now = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -605,17 +779,25 @@ function daysBetween(from: Date, to: Date): number {
   return Math.round((toMidnight.getTime() - fromMidnight.getTime()) / 86400000);
 }
 
-/** Días hasta el próximo cumpleaños, resolviendo el cruce de año (ej. hoy en diciembre, cumpleaños en enero). */
-function daysUntilNextBirthday(birthday: string, today: Date): number {
+/** Días hasta el próximo cumpleaños, resolviendo el cruce de año (ej. hoy en diciembre,
+ * cumpleaños en enero) y el 29 de febrero en años no bisiestos (Prompt 12: se muestra el 28 —
+ * mismo criterio que `resolveOrderDayForMonth`). `todayStr` tiene que venir siempre de
+ * `getArgentinaDateStr()` — aritmética en `Date.UTC` puro, nunca getters locales (`getDate()`,
+ * `getMonth()`, etc. dependen de la zona del PROCESO, no de Argentina: mismo criterio que ya
+ * documenta shared/argentinaTime.ts). */
+function daysUntilNextBirthday(birthday: string, todayStr: string): number {
   const [, month, day] = birthday.split("-").map(Number);
-  const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const [todayYear, todayMonth, todayDay] = todayStr.split("-").map(Number);
+  const todayValue = Date.UTC(todayYear, todayMonth - 1, todayDay);
 
-  let next = new Date(today.getFullYear(), month - 1, day);
-  if (next.getTime() < todayMidnight.getTime()) {
-    next = new Date(today.getFullYear() + 1, month - 1, day);
+  let year = todayYear;
+  let nextValue = Date.UTC(year, month - 1, resolveOrderDayForMonth(day, year, month));
+  if (nextValue < todayValue) {
+    year += 1;
+    nextValue = Date.UTC(year, month - 1, resolveOrderDayForMonth(day, year, month));
   }
 
-  return Math.round((next.getTime() - todayMidnight.getTime()) / 86400000);
+  return Math.round((nextValue - todayValue) / 86400000);
 }
 
 export interface IStorage {
@@ -633,6 +815,12 @@ export interface IStorage {
   listConsultantAccounts(): Promise<Consultant[]>;
   getBusinessSettings(consultantId: number): Promise<Consultant | undefined>;
   updateBusinessSettings(consultantId: number, input: UpdateBusinessSettingsInput): Promise<Consultant | undefined>;
+  /** Prompt 14 — Configuración → "Tus datos" (nombre, email, WhatsApp, ciudad, edad, cargo).
+   * El chequeo de "hace falta la contraseña actual para cambiar email/whatsapp" vive en el
+   * handler (routes.ts), que es quien tiene el hash de la cuenta — storage.ts solo escribe los
+   * campos ya validados. Tira `DuplicateEmailError`/`DuplicateWhatsAppError` si el nuevo valor
+   * ya lo usa otra cuenta. */
+  updateConsultantProfile(consultantId: number, input: UpdateConsultantProfileInput): Promise<Consultant | undefined>;
   /** Prompt 1/2 — una fila por pedido confirmado, para calcular el "descuento de compra
    * habitual" (ver server/orderDiscount.ts). Append-only, nunca se edita ni se borra. */
   createOrderDiscountLogEntry(consultantId: number, input: { discountPercent: number; publicValueArs: number }): Promise<OrderDiscountLogEntry>;
@@ -652,6 +840,9 @@ export interface IStorage {
   /** Recuperación de contraseña: el email vive en `consultants.email`, no en `users` — resuelve
    * el usuario consultora dueño de ese email ya normalizado. undefined si no existe ninguno. */
   getUserByConsultantEmail(normalizedEmail: string): Promise<User | undefined>;
+  /** Prompt 14 — mismo patrón que getUserByConsultantEmail, para el ingreso con WhatsApp
+   * (`consultants.whatsapp`, siempre ya normalizado a 10 dígitos). */
+  getUserByConsultantWhatsapp(normalizedWhatsapp: string): Promise<User | undefined>;
   /** Marca usados (sin poder volver a intentarse) todos los códigos de recuperación sin usar
    * de este usuario — se llama antes de crear uno nuevo (una solicitud nueva invalida
    * cualquier código anterior todavía pendiente) y también después de un reset exitoso. */
@@ -731,16 +922,26 @@ export interface IStorage {
   listAdminSubscriptions(): Promise<AdminSubscriptionRow[]>;
   /** Admin-only: ledger completo de payments de todas las consultoras, con filtros opcionales. */
   listAllPayments(filters?: AdminPaymentFilters): Promise<AdminPaymentRow[]>;
-  getAllProducts(consultantId: number): Promise<Product[]>;
+  /** Prompt 16, punto 2 — `onlyMine` (default false, mantiene el comportamiento de siempre)
+   * trae solo lo que la consultora YA tiene en stock (manual o de catálogo con unidades > 0)
+   * en vez del catálogo global completo — lo usa Stock por default; "Ver productos sin
+   * stock"/"Cargar pedido" siguen pidiendo el catálogo entero con `onlyMine: false`. */
+  getAllProducts(consultantId: number, onlyMine?: boolean): Promise<Product[]>;
   getProductsByIds(consultantId: number, ids: number[]): Promise<Product[]>;
   /** Admin-only: carga/actualiza el catálogo GLOBAL (consultantId null) — no toca stock de nadie. */
   bulkInsertProducts(items: InsertProduct[]): Promise<number>;
   /** Catálogo de prueba de una consultora (ej. botón "Cargar catálogo de prueba"): productos
-   * privados de ella, no globales — igual que bulkInsertProducts pero scopeado, con stock propio. */
-  seedOwnProducts(consultantId: number, items: CreateProductInput[]): Promise<number>;
+   * privados de ella, no globales — igual que bulkInsertProducts pero scopeado, con stock propio.
+   * Prompt 14 (P30) — mismo criterio de `isFreePlan` que el resto de los caminos que suman stock. */
+  seedOwnProducts(consultantId: number, items: CreateProductInput[], isFreePlan: boolean): Promise<number>;
   getLowStockProducts(consultantId: number): Promise<Product[]>;
   applyProductDiscount(consultantId: number, productId: number, discountPercent: number): Promise<Product | undefined>;
-  createProduct(consultantId: number, input: CreateProductInput): Promise<Product>;
+  /** Prompt 14 (P30) — `isFreePlan` lo decide SIEMPRE el caller (routes.ts, vía
+   * isFreePlan(status) de server/subscription.ts): storage.ts no puede importar ese módulo
+   * sin crear un ciclo (subscription.ts ya importa `storage` de acá). Si la consultora está
+   * en el plan gratis y este producto nace con `unidades > 0`, cuenta contra el cupo de
+   * FREE_PLAN_PRODUCT_LIMIT — tira `FreePlanProductLimitError` si ya está lleno. */
+  createProduct(consultantId: number, input: CreateProductInput, isFreePlan: boolean): Promise<Product>;
   /**
    * Etapa I-B.8-C: edita los campos CORE (nombre/precio/sección/línea/código) de un producto
    * MANUAL propio — nunca uno global (`consultantId` null), esos son catálogo compartido y no
@@ -773,13 +974,20 @@ export interface IStorage {
    * menciona el Prompt 2, a diferencia de un pedido nuevo). */
   setProductCost(consultantId: number, productId: number, costPrice: number): Promise<Product | undefined>;
   /** La consultora fija su propio stock sobre un producto (global o manual propio). `stockMinimo`
-   * es opcional: si viene, actualiza también el umbral propio del producto (null lo borra). */
+   * es opcional: si viene, actualiza también el umbral propio del producto (null lo borra).
+   * Prompt 14 (P30) — `isFreePlan` igual criterio que `createProduct`: si este SET lleva el
+   * producto de 0 (o inexistente) a más de 0 unidades ("reponer" cuenta como sumar uno nuevo,
+   * ver docs/prompts-mejoras.md Prompt 14), y ya está en el límite, tira
+   * `FreePlanProductLimitError`. Bajar o mantener unidades nunca se bloquea.
+   * Prompt 8, punto 6 — antes de nada, solo lo que SUBE respecto del valor anterior cubre
+   * ventas pendientes de este producto (bajar a mano nunca cubre pendientes). */
   setProductStock(
     consultantId: number,
     productId: number,
     unidades: number,
+    isFreePlan: boolean,
     stockMinimo?: number | null,
-  ): Promise<Product | undefined>;
+  ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined>;
   /** Pospone la alerta de stock bajo de este producto hasta `remindAt` (YYYY-MM-DD), o la
    * cancela si `remindAt` es null. */
   setProductStockReminder(consultantId: number, productId: number, remindAt: string | null): Promise<Product | undefined>;
@@ -791,8 +999,15 @@ export interface IStorage {
    * `setProductStock`, que sigue siendo un SET ABSOLUTO para ajustes manuales — no la
    * reemplaza, coexisten. Tira `SaleValidationError` si el delta dejaría el stock negativo
    * (mismo error de dominio que ya usa `createSale`/`updateSale` para "stock insuficiente").
+   * Prompt 14 (P30) — mismo criterio de `isFreePlan` que `setProductStock`/`createProduct`.
+   * Prompt 8, punto 6 — solo un delta POSITIVO cubre ventas pendientes primero.
    */
-  incrementProductStock(consultantId: number, productId: number, delta: number): Promise<Product | undefined>;
+  incrementProductStock(
+    consultantId: number,
+    productId: number,
+    delta: number,
+    isFreePlan: boolean,
+  ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined>;
   /** Etapa 7.2 — confirmación de pedido/importación como UNA sola operación atómica (todo o
    * nada), en vez del loop de `incrementProductStock` por línea que podía dejar una
    * importación aplicada a medias si una línea intermedia fallaba (hallazgo P2, Etapa 6).
@@ -800,13 +1015,26 @@ export interface IStorage {
    * JS) que ya usa `incrementProductStock`, solo que ahora las líneas comparten una única
    * transacción. Si cualquier línea es inválida (producto no visible para este consultantId,
    * o el resultado quedaría negativo), tira `SaleValidationError` y NINGUNA línea queda
-   * aplicada — ni las que "ya habían pasado" antes en el loop. */
+   * aplicada — ni las que "ya habían pasado" antes en el loop.
+   * Prompt 14 (P30) — `isFreePlan`: si la consultora está en el plan gratis, cuenta cuántas
+   * líneas de este MISMO lote traen un producto de 0 (o inexistente) a positivo ("reponer"
+   * cuenta como nuevo) y, si sumadas al cupo ya ocupado superarían FREE_PLAN_PRODUCT_LIMIT,
+   * tira `FreePlanProductLimitError` ANTES de aplicar nada — todo o nada, igual que el resto
+   * de esta función. `cancelSale`/`updateSale` (el stock que "vuelve" al cancelar/editar una
+   * venta, nunca una carga) escriben `productStock.unidades` directo, sin pasar por esta
+   * función — por diseño nunca pueden quedar bloqueados por este límite, porque es una
+   * corrección, no una carga (ver docs/prompts-mejoras.md Prompt 14).
+   * Prompt 8 — antes de sumar nada a stock disponible, cubre las ventas con este producto
+   * pendiente (vender sin stock), de la más vieja a la más nueva — esas unidades nunca llegan
+   * a contar para el límite de arriba. `pendingAssignments` es para el mensaje al usuario
+   * ("2 unidades se asignaron a ventas pendientes: María Gómez (2)"). */
   incrementProductStockBatch(
     consultantId: number,
     lines: { productId: number; delta: number }[],
+    isFreePlan: boolean,
     discountPercent?: number,
     draftId?: number,
-  ): Promise<{ updated: number }>;
+  ): Promise<{ updated: number; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] }>;
   /** Prompt 2 — corrige las líneas de venta estimadas (producto sin costo al momento de
    * vender) de un producto con el costo recién conocido, y recalcula el `profit` cacheado de
    * cada venta afectada. NO se llama desde `incrementProductStockBatch`: un pedido nunca
@@ -819,13 +1047,20 @@ export interface IStorage {
    * del aviso en sí es otra tarea). Solo cuenta productos con unidades en stock: uno agotado y
    * sin costo no tiene ninguna urgencia de completarse. */
   countProductsWithoutCost(consultantId: number): Promise<number>;
+  /** Prompt 14 (P30) — cuántos productos tiene esta consultora con `unidades > 0` ahora mismo.
+   * Es el número real del cupo del plan gratis ("8 de 10 productos") y también la base del
+   * chequeo de límite (mismo WHERE que `countProductsWithoutCost`, sin el filtro de costo). */
+  countProductsWithStock(consultantId: number): Promise<number>;
   /** Admin-only: catálogo global completo (sin stock, eso es por consultora) para la pantalla de imágenes. */
   listGlobalProducts(): Promise<ProductRow[]>;
   /** Admin-only: solo aplica a productos globales — las imágenes de productos manuales las
    * gestiona cada consultora dueña, no el admin. */
-  setProductImage(productId: number, imagen: string | null): Promise<SetProductImageResult>;
-  getUpcomingAppointments(consultantId: number, limit?: number): Promise<Appointment[]>;
-  getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<Appointment[]>;
+  /** Las dos columnas se escriben siempre juntas — nunca una imagen principal nueva/borrada
+   * sin que la miniatura siga el mismo destino (las dos null al borrar, las dos con URL al
+   * subir), para que nunca quede una miniatura vieja apuntando a un archivo que ya no existe. */
+  setProductImage(productId: number, imagen: string | null, imagenMiniatura: string | null): Promise<SetProductImageResult>;
+  getUpcomingAppointments(consultantId: number, limit?: number): Promise<AppointmentWithPhone[]>;
+  getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<AppointmentWithPhone[]>;
   /** Tipos de evento personalizados (no fijos/legacy) que la consultora ya usó alguna vez, para
    * ofrecerlos de nuevo al crear una cita y para el filtro "Todos los eventos" de la Agenda. */
   getAppointmentCustomTypes(consultantId: number): Promise<string[]>;
@@ -864,6 +1099,28 @@ export interface IStorage {
   /** Prompt 6, punto 6 — cambiar a mano entre "entregada" y "pendiente_entrega" desde el
    * detalle de la venta. Independiente del pago: no toca sale_installments ni status. */
   setSaleDeliveryStatus(consultantId: number, saleId: number, deliveryStatus: "entregada" | "pendiente_entrega"): Promise<Sale | undefined>;
+  /** Prompt 8, Parte 2 — "Marcar como entregado" de un renglón puntual. */
+  markSaleItemDelivered(consultantId: number, saleId: number, itemId: number): Promise<Sale | undefined>;
+  /** Prompt 8, Parte 2 — aviso "Ya podés entregarle a...": renglones listos para entregar. */
+  getDeliveryReadyItems(
+    consultantId: number,
+  ): Promise<{ saleId: number; itemId: number; clientId: number | null; clientName: string; productName: string; quantity: number }[]>;
+  /** Prompt 8, Parte 3 — calcula/recupera el recordatorio del día de pedido, sin tarea
+   * programada (ver implementación en DatabaseStorage para el detalle del mecanismo). */
+  getOrderReminder(consultantId: number): Promise<{
+    reminder: OrderReminder;
+    items: { productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[];
+  } | null>;
+  /** Prompt 8, Parte 3 — "Listo, ya lo pedí". */
+  dismissOrderReminder(consultantId: number, reminderId: number): Promise<OrderReminder | undefined>;
+  /** Prompt 10 — "Tenés N ventas sin clienta" (bloque "Pendientes" de Inicio). */
+  countSalesWithoutClient(consultantId: number): Promise<number>;
+  /** Prompt 10 — "Ocultar" de un aviso de "Para mejorar tu negocio" (UPSERT por consultora +
+   * tipo de aviso). */
+  dismissDashboardNotice(consultantId: number, noticeType: DashboardNoticeType): Promise<void>;
+  /** Prompt 10 — todo lo que necesita Inicio en una sola llamada (ver detalle en
+   * DatabaseStorage.getDashboardOverview). */
+  getDashboardOverview(consultantId: number, access: DashboardOverviewAccessInfo): Promise<DashboardOverview>;
   /** Prompt 6, punto 1 — asigna una clienta a una venta creada sin una ("Sin clienta"). Solo
    * de `null` a una clienta real. */
   assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined>;
@@ -905,11 +1162,20 @@ export interface IStorage {
   getStockValuation(consultantId: number): Promise<StockValuation>;
   getInactiveClients(consultantId: number, days: number): Promise<InactiveClient[]>;
   getUpcomingBirthdays(consultantId: number, days: number): Promise<UpcomingBirthday[]>;
+  /** Prompt 12 — cumpleaños del mes mostrado en Agenda (nunca "próximos N días desde hoy"). */
+  getBirthdaysInMonth(consultantId: number, year: number, month: number): Promise<{ clientId: number; name: string | null; phone: string | null; day: number }[]>;
   getAppointmentsSummary(consultantId: number, start: string, end: string): Promise<AppointmentsSummary>;
   getPendingInstallments(consultantId: number, limit?: number): Promise<PendingInstallmentRow[]>;
+  /** Prompt 12 — "Cobro" de Agenda: mismo criterio que getPendingInstallments, con rango de
+   * fechas en vez de `limit`. */
+  getInstallmentsInRange(consultantId: number, start: string, end: string): Promise<PendingInstallmentRow[]>;
+  /** Prompt 12 — todo lo que necesita Agenda para un mes (ver detalle en
+   * DatabaseStorage.getAgendaMonth). */
+  getAgendaMonth(consultantId: number, start: string, end: string): Promise<AgendaMonth>;
   getProductCostSummary(consultantId: number, start?: string, end?: string): Promise<ProductCostSummary>;
   getCollectedPayments(consultantId: number): Promise<CollectedPayments>;
   getPendingInstallmentsTotals(consultantId: number): Promise<PendingInstallmentsTotals>;
+  getReportsOverview(consultantId: number, params: ReportsOverviewParams): Promise<ReportsOverview>;
 }
 
 type Database = typeof database;
@@ -1048,6 +1314,19 @@ export class DatabaseStorage implements IStorage {
 
   async updateBusinessSettings(consultantId: number, input: UpdateBusinessSettingsInput): Promise<Consultant | undefined> {
     const db = await this.getDb();
+    const newDay1 = input.orderReminderDay1 ?? null;
+    const newDay2 = input.orderReminderDay2 ?? null;
+
+    // Prompt 8, ajuste 1 — solo se pisa la fecha cuando los días de pedido REALMENTE cambian
+    // (no en cada guardado de Configuración: cambiar la moneda o el objetivo no tiene nada que
+    // ver con "cuándo configuró el día de pedido"). Comparar contra lo que había ANTES de este
+    // UPDATE, nunca contra el resultado.
+    const [existing] = await db
+      .select({ orderReminderDay1: consultants.orderReminderDay1, orderReminderDay2: consultants.orderReminderDay2 })
+      .from(consultants)
+      .where(eq(consultants.id, consultantId));
+    const daysChanged = existing !== undefined && (existing.orderReminderDay1 !== newDay1 || existing.orderReminderDay2 !== newDay2);
+
     const [updated] = await db
       .update(consultants)
       .set({
@@ -1055,13 +1334,51 @@ export class DatabaseStorage implements IStorage {
         currency: input.currency,
         monthlyGoal: input.monthlyGoal ?? null,
         defaultLowStockThreshold: input.defaultLowStockThreshold ?? null,
-        orderReminderDay1: input.orderReminderDay1 ?? null,
-        orderReminderDay2: input.orderReminderDay2 ?? null,
+        orderReminderDay1: newDay1,
+        orderReminderDay2: newDay2,
+        ...(daysChanged ? { orderReminderDaysUpdatedAt: new Date() } : {}),
         grossIncomeTaxPercentTenths: input.grossIncomeTaxPercentTenths ?? null,
       })
       .where(eq(consultants.id, consultantId))
       .returning();
     return updated;
+  }
+
+  async updateConsultantProfile(consultantId: number, input: UpdateConsultantProfileInput): Promise<Consultant | undefined> {
+    const db = await this.getDb();
+    const setFields: Partial<typeof consultants.$inferInsert> = {};
+    if (input.contactName !== undefined) setFields.contactName = input.contactName;
+    if (input.email !== undefined) setFields.email = input.email === null ? null : normalizeEmail(input.email);
+    if (input.whatsapp !== undefined) setFields.whatsapp = input.whatsapp;
+    if (input.city !== undefined) setFields.city = input.city;
+    if (input.age !== undefined) setFields.age = input.age;
+    if (input.jobTitle !== undefined) setFields.jobTitle = input.jobTitle;
+
+    // Ajuste — el WhatsApp que se guarda nunca puede coincidir con el username de OTRA cuenta
+    // (ver WhatsAppMatchesUsernameError): si coincidiera, esa otra cuenta dejaría de poder
+    // entrar con su usuario de siempre, porque el login la buscaría primero como WhatsApp.
+    if (input.whatsapp !== undefined && input.whatsapp !== null) {
+      const [usernameClash] = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(and(eq(users.username, input.whatsapp), or(isNull(users.consultantId), ne(users.consultantId, consultantId))));
+      if (usernameClash) {
+        throw new WhatsAppMatchesUsernameError("Ese WhatsApp coincide con el usuario de otra cuenta");
+      }
+    }
+
+    try {
+      const [updated] = await db.update(consultants).set(setFields).where(eq(consultants.id, consultantId)).returning();
+      return updated;
+    } catch (err) {
+      if (isUniqueViolationOn(err, "consultants_email_unique_idx")) {
+        throw new DuplicateEmailError("Ya existe otra cuenta con ese email");
+      }
+      if (isUniqueViolationOn(err, "consultants_whatsapp_unique_idx")) {
+        throw new DuplicateWhatsAppError("Ya existe otra cuenta con ese WhatsApp");
+      }
+      throw err;
+    }
   }
 
   async createOrderDiscountLogEntry(consultantId: number, input: { discountPercent: number; publicValueArs: number }): Promise<OrderDiscountLogEntry> {
@@ -1105,19 +1422,61 @@ export class DatabaseStorage implements IStorage {
     return updated;
   }
 
+  /**
+   * Prompt 14 — el registro público ya no pide "usuario": se deriva de la parte del email
+   * antes del `@`. Nunca puede coincidir con la forma de un WhatsApp válido (10 dígitos
+   * argentinos tras normalizar) — si coincidiera, el orden de búsqueda del login
+   * (findUserForLogin: @ → email; si no, WhatsApp válido → WhatsApp; si no, usuario) nunca
+   * llegaría a buscarlo como usuario, porque ese string siempre se interpretaría como un
+   * WhatsApp primero. Tampoco puede repetir un username ya existente (cuentas viejas con
+   * usuario propio). En cualquiera de los dos casos, se le agrega un sufijo numérico.
+   */
+  private async deriveUniqueUsername(db: Pick<Database, "select">, email: string): Promise<string> {
+    const localPart = email.split("@")[0]?.trim().toLowerCase() || "consultora";
+    let suffix = 0;
+    while (true) {
+      const candidate = suffix === 0 ? localPart : `${localPart}${suffix}`;
+      const looksLikeWhatsapp = normalizeArgentinaPhoneDigits(candidate).valid;
+      if (!looksLikeWhatsapp) {
+        const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.username, candidate));
+        if (!existing) return candidate;
+      }
+      suffix += 1;
+    }
+  }
+
   async registerConsultant(input: RegisterConsultantInput): Promise<{ user: User; consultant: Consultant }> {
     const db = await this.getDb();
     const normalizedEmail = normalizeEmail(input.email);
+    const normalizedWhatsapp = normalizeArgentinaPhoneForStorage(input.whatsapp);
     const hashedPassword = await bcrypt.hash(input.password, BCRYPT_SALT_ROUNDS);
 
     try {
       // Mismo criterio transaccional que createUser: consultant + trial + user nacen juntos o
-      // no nace ninguno — acá además el email queda seteado desde el vamos, en la misma
-      // transacción (a diferencia del flujo de suscripción, que lo completa después).
+      // no nace ninguno — acá además el email/whatsapp quedan seteados desde el vamos, en la
+      // misma transacción (a diferencia del flujo de suscripción, que completa el email después).
       return await db.transaction(async (tx) => {
+        const username = await this.deriveUniqueUsername(tx, normalizedEmail);
+
+        // Ajuste — mismo criterio que updateConsultantProfile: el WhatsApp nunca puede coincidir
+        // con el username de una cuenta ya existente.
+        if (normalizedWhatsapp !== null) {
+          const [usernameClash] = await tx.select({ id: users.id }).from(users).where(eq(users.username, normalizedWhatsapp));
+          if (usernameClash) {
+            throw new WhatsAppMatchesUsernameError("Ese WhatsApp coincide con el usuario de otra cuenta");
+          }
+        }
+
         const [consultant] = await tx
           .insert(consultants)
-          .values({ businessName: input.username, currency: "ARS", monthlyGoal: null, email: normalizedEmail })
+          .values({
+            businessName: "",
+            currency: "ARS",
+            monthlyGoal: null,
+            email: normalizedEmail,
+            whatsapp: normalizedWhatsapp,
+            contactName: input.contactName,
+          })
           .returning();
 
         const trialStartAt = new Date();
@@ -1128,7 +1487,7 @@ export class DatabaseStorage implements IStorage {
 
         const [user] = await tx
           .insert(users)
-          .values({ username: input.username, password: hashedPassword, role: "consultant", status: true, consultantId: consultant.id })
+          .values({ username, password: hashedPassword, role: "consultant", status: true, consultantId: consultant.id })
           .returning();
 
         return { user, consultant };
@@ -1136,6 +1495,9 @@ export class DatabaseStorage implements IStorage {
     } catch (err) {
       if (isUniqueViolationOn(err, "consultants_email_unique_idx")) {
         throw new DuplicateEmailError("Ya existe una cuenta con ese email");
+      }
+      if (isUniqueViolationOn(err, "consultants_whatsapp_unique_idx")) {
+        throw new DuplicateWhatsAppError("Ya existe una cuenta con ese WhatsApp");
       }
       if (isUniqueViolationOn(err, "users_username_unique")) {
         throw new DuplicateUsernameError("Ese nombre de usuario ya está en uso");
@@ -1151,6 +1513,17 @@ export class DatabaseStorage implements IStorage {
       .from(consultants)
       .innerJoin(users, eq(users.consultantId, consultants.id))
       .where(and(eq(consultants.email, normalizedEmail), eq(users.role, "consultant")));
+    return row?.user;
+  }
+
+  /** Prompt 14 — mismo patrón que getUserByConsultantEmail, para el ingreso con WhatsApp. */
+  async getUserByConsultantWhatsapp(normalizedWhatsapp: string): Promise<User | undefined> {
+    const db = await this.getDb();
+    const [row] = await db
+      .select({ user: users })
+      .from(consultants)
+      .innerJoin(users, eq(users.consultantId, consultants.id))
+      .where(and(eq(consultants.whatsapp, normalizedWhatsapp), eq(users.role, "consultant")));
     return row?.user;
   }
 
@@ -1609,14 +1982,20 @@ export class DatabaseStorage implements IStorage {
 
   /** Catálogo visible para la consultora: lo global (consultantId null) + lo manual propio,
    * con su stock resuelto (o defaults si todavía no cargó stock para ese producto). */
-  async getAllProducts(consultantId: number): Promise<Product[]> {
+  async getAllProducts(consultantId: number, onlyMine = false): Promise<Product[]> {
     const db = await this.getDb();
+    // Prompt 16, punto 2 — `onlyMine` agrega `productStock.unidades > 0` sobre el mismo LEFT
+    // JOIN de siempre: un producto de catálogo sin fila de stock (unidades NULL) o con
+    // unidades = 0 queda afuera, sin necesidad de un INNER JOIN ni una segunda consulta. Es
+    // el default nuevo de Stock — el catálogo global completo (comportamiento de siempre)
+    // sigue a un click de distancia ("Ver productos sin stock"/"Cargar pedido").
+    const baseCondition = or(isNull(products.consultantId), eq(products.consultantId, consultantId));
     const [rows, defaultThreshold] = await Promise.all([
       db
         .select({ product: products, stock: productStock })
         .from(products)
         .leftJoin(productStock, and(eq(productStock.productId, products.id), eq(productStock.consultantId, consultantId)))
-        .where(or(isNull(products.consultantId), eq(products.consultantId, consultantId)))
+        .where(onlyMine ? and(baseCondition, sql`${productStock.unidades} > 0`) : baseCondition)
         .orderBy(products.seccion, products.linea, products.producto),
       this.getDefaultThreshold(db, consultantId),
     ]);
@@ -1693,8 +2072,10 @@ export class DatabaseStorage implements IStorage {
 
   /** Mismo patrón select-then-upsert que bulkInsertProducts, pero scopeado a UNA consultora
    * (productos privados, no globales) y sembrando también su propio stock en la misma pasada —
-   * usado por el botón "Cargar catálogo de prueba". Idempotente: reintentar no duplica. */
-  async seedOwnProducts(consultantId: number, items: CreateProductInput[]): Promise<number> {
+   * usado por el botón "Cargar catálogo de prueba". Idempotente: reintentar no duplica.
+   * Prompt 14 (P30) — mismo chequeo de límite que el resto de los caminos que suman stock: sin
+   * esto, este botón sería una puerta trasera para esquivar el cupo del plan gratis. */
+  async seedOwnProducts(consultantId: number, items: CreateProductInput[], isFreePlan: boolean): Promise<number> {
     if (items.length === 0) return 0;
 
     const db = await this.getDb();
@@ -1742,6 +2123,12 @@ export class DatabaseStorage implements IStorage {
             .returning();
           productId = created.id;
         }
+
+        const [existingStock] = await tx
+          .select({ unidades: productStock.unidades })
+          .from(productStock)
+          .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, productId)));
+        await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, existingStock?.unidades ?? 0, item.unidades);
 
         await tx
           .insert(productStock)
@@ -1799,11 +2186,40 @@ export class DatabaseStorage implements IStorage {
     return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
   }
 
-  async createProduct(consultantId: number, input: CreateProductInput): Promise<Product> {
+  /**
+   * Prompt 14 (P30) — chequeo del límite del plan gratis, reusado por createProduct/
+   * setProductStock/incrementProductStock/incrementProductStockBatch/seedOwnProducts. Solo
+   * bloquea cuando el producto pasa de "sin stock" (0 o inexistente) a "con stock"
+   * (`newUnidades > 0`) — sumar a algo que ya tenía stock es libre, sin importar el plan.
+   * Cuenta DENTRO de `tx` (la misma transacción que va a escribir el cambio) para que el
+   * conteo sea consistente con lo que esta operación está a punto de aplicar — nunca lee desde
+   * afuera de la transacción que aplicaría el cambio.
+   */
+  private async assertFreePlanProductLimit(
+    tx: Pick<Database, "select">,
+    consultantId: number,
+    isFreePlan: boolean,
+    previousUnidades: number,
+    newUnidades: number,
+  ): Promise<void> {
+    if (!isFreePlan || previousUnidades > 0 || newUnidades <= 0) return;
+    const [row] = await tx
+      .select({ value: count() })
+      .from(productStock)
+      .where(and(eq(productStock.consultantId, consultantId), gt(productStock.unidades, 0)));
+    if ((row?.value ?? 0) >= FREE_PLAN_PRODUCT_LIMIT) {
+      throw new FreePlanProductLimitError(
+        `Llegaste al límite de la prueba gratis (${FREE_PLAN_PRODUCT_LIMIT} productos). Suscribite para cargar todos los que quieras.`,
+      );
+    }
+  }
+
+  async createProduct(consultantId: number, input: CreateProductInput, isFreePlan: boolean): Promise<Product> {
     const db = await this.getDb();
     const variante = input.variante ?? "Estándar";
     const codigo = input.codigo ?? slugify(`${input.seccion}-${input.linea ?? ""}-${input.producto}-${variante}-${Date.now()}`);
     const [created, stock] = await db.transaction(async (tx) => {
+      await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, 0, input.unidades);
       const [created] = await tx
         .insert(products)
         .values({
@@ -1969,29 +2385,53 @@ export class DatabaseStorage implements IStorage {
     consultantId: number,
     productId: number,
     unidades: number,
+    isFreePlan: boolean,
     stockMinimo?: number | null,
-  ): Promise<Product | undefined> {
+  ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined> {
     const db = await this.getDb();
     const product = await this.findVisibleProduct(db, consultantId, productId);
     if (!product) return undefined;
 
-    const setFields: Partial<typeof productStock.$inferInsert> = { unidades };
-    if (stockMinimo !== undefined) setFields.stockMinimo = stockMinimo;
+    const { stock, pendingAssignments } = await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select({ unidades: productStock.unidades })
+        .from(productStock)
+        .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, productId)));
+      const existingUnidades = existing?.unidades ?? 0;
 
-    const [stock] = await db
-      .insert(productStock)
-      .values({ consultantId, productId, ...setFields })
-      .onConflictDoUpdate({
-        target: [productStock.consultantId, productStock.productId],
-        set: setFields,
-      })
-      .returning();
-    return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
+      // Prompt 8, punto 6 — "Editar producto" también cubre pendientes primero: solo lo que
+      // SUBE respecto de lo que ya había cuenta como "unidades que llegan" (bajar el número a
+      // mano es una corrección, no una carga — nunca cubre pendientes).
+      const arriving = Math.max(0, unidades - existingUnidades);
+      const { leftoverDelta, assignments } = await this.assignUnitsToPendingSales(tx, consultantId, productId, arriving, null);
+      // El campo final nunca incluye lo que se fue a pendientes: eso no es stock disponible.
+      const finalUnidades = unidades - (arriving - leftoverDelta);
+
+      await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, existingUnidades, finalUnidades);
+
+      const setFields: Partial<typeof productStock.$inferInsert> = { unidades: finalUnidades };
+      if (stockMinimo !== undefined) setFields.stockMinimo = stockMinimo;
+      const [stock] = await tx
+        .insert(productStock)
+        .values({ consultantId, productId, ...setFields })
+        .onConflictDoUpdate({
+          target: [productStock.consultantId, productStock.productId],
+          set: setFields,
+        })
+        .returning();
+      return { stock, pendingAssignments: assignments };
+    });
+    return { product: withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId)), pendingAssignments };
   }
 
-  async incrementProductStock(consultantId: number, productId: number, delta: number): Promise<Product | undefined> {
+  async incrementProductStock(
+    consultantId: number,
+    productId: number,
+    delta: number,
+    isFreePlan: boolean,
+  ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined> {
     if (delta === 0) {
-      throw new SaleValidationError("El delta de stock no puede ser 0");
+      throw new SaleValidationError("La cantidad no puede ser 0");
     }
     const db = await this.getDb();
     const product = await this.findVisibleProduct(db, consultantId, productId);
@@ -2007,32 +2447,147 @@ export class DatabaseStorage implements IStorage {
     //
     // La transacción es necesaria para poder deshacer la escritura si el resultado da negativo:
     // el UPSERT por sí solo ya habría comiteado el valor antes de que este código lo revise.
-    const stock = await db.transaction(async (tx) => {
+    const { stock, pendingAssignments } = await db.transaction(async (tx) => {
+      // Prompt 8, punto 6 — solo un delta POSITIVO (unidades que llegan) cubre pendientes
+      // primero; un decremento manual es una corrección, nunca pasa por acá.
+      const { leftoverDelta, assignments } = await this.assignUnitsToPendingSales(tx, consultantId, productId, delta, null);
+
       const [stock] = await tx
         .insert(productStock)
-        .values({ consultantId, productId, unidades: delta })
+        .values({ consultantId, productId, unidades: leftoverDelta })
         .onConflictDoUpdate({
           target: [productStock.consultantId, productStock.productId],
-          set: { unidades: sql`${productStock.unidades} + ${delta}` },
+          set: { unidades: sql`${productStock.unidades} + ${leftoverDelta}` },
         })
         .returning();
       if (stock.unidades < 0) {
-        throw new SaleValidationError(`Stock insuficiente: quedarían ${stock.unidades} unidades`);
+        throw new SaleValidationError(`Stock insuficiente de ${product.producto}: quedarían ${pluralize(stock.unidades, "unidad", "unidades")}`);
       }
-      return stock;
+      // previousUnidades = stock.unidades - leftoverDelta: el UPSERT ya aplicó +leftoverDelta,
+      // así que el valor de ANTES se reconstruye sin una SELECT aparte.
+      await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - leftoverDelta, stock.unidades);
+      return { stock, pendingAssignments: assignments };
     });
 
-    return withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId));
+    return { product: withStockDefaults(product, stock, await this.getDefaultThreshold(db, consultantId)), pendingAssignments };
+  }
+
+  /**
+   * Prompt 8, Parte 2 y punto 6 — antes de que `delta` unidades entren a `productStock.unidades`,
+   * cubre primero las ventas que tenían este producto pendiente (sin stock), de la más vieja a
+   * la más nueva. Esas unidades NUNCA llegan a sumar stock disponible — por diseño, nunca
+   * cuentan para el límite de productos del plan gratis (Prompt 14): el caller solo valida el
+   * límite sobre `leftoverDelta`, nunca sobre `delta` crudo.
+   *
+   * `realUnitCost` es el costo real de ESTA entrada de stock (el de un pedido con descuento,
+   * `lineCost`) — si viene `null` (carga manual sin contexto de pedido, ver setProductStock/
+   * incrementProductStock), las unidades asignadas quedan físicamente "listas para entregar"
+   * igual, pero el costo de ese renglón no se toca (sigue con lo que tenía, real o estimado).
+   */
+  private async assignUnitsToPendingSales(
+    tx: Pick<Database, "select" | "update">,
+    consultantId: number,
+    productId: number,
+    delta: number,
+    realUnitCost: number | null,
+  ): Promise<{ leftoverDelta: number; assignments: { saleId: number; clientName: string; quantity: number }[] }> {
+    if (delta <= 0) return { leftoverDelta: delta, assignments: [] };
+
+    const pendingLines = await tx
+      .select({
+        id: saleItems.id,
+        saleId: saleItems.saleId,
+        quantity: saleItems.quantity,
+        quantityPending: saleItems.quantityPending,
+        estimatedCostPerUnit: saleItems.estimatedCostPerUnit,
+        realCostAccumulated: saleItems.realCostAccumulated,
+        realCostUnits: saleItems.realCostUnits,
+        clientName: sales.clientName,
+      })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .where(
+        and(
+          eq(sales.consultantId, consultantId),
+          eq(saleItems.productId, productId),
+          gt(saleItems.quantityPending, 0),
+          ne(sales.status, "cancelada"),
+        ),
+      )
+      .orderBy(asc(sales.date), asc(sales.id));
+
+    let remaining = delta;
+    const assignments: { saleId: number; clientName: string; quantity: number }[] = [];
+    const affectedSaleIds = new Set<number>();
+
+    for (const line of pendingLines) {
+      if (remaining <= 0) break;
+      const assigned = Math.min(remaining, line.quantityPending);
+      if (assigned <= 0) continue;
+      remaining -= assigned;
+
+      const costFields =
+        realUnitCost !== null
+          ? applyRealCostToLine(line, assigned, realUnitCost)
+          : { estimatedCostPerUnit: line.estimatedCostPerUnit, realCostAccumulated: line.realCostAccumulated, realCostUnits: line.realCostUnits };
+      const blended = resolveBlendedLineCost({ quantity: line.quantity, ...costFields });
+
+      await tx
+        .update(saleItems)
+        .set({ quantityPending: line.quantityPending - assigned, costPrice: blended.costPrice, costIsEstimated: blended.isEstimated, ...costFields })
+        .where(eq(saleItems.id, line.id));
+
+      assignments.push({ saleId: line.saleId, clientName: line.clientName, quantity: assigned });
+      affectedSaleIds.add(line.saleId);
+    }
+
+    for (const saleId of Array.from(affectedSaleIds)) {
+      const [sale] = await tx.select().from(sales).where(eq(sales.id, saleId));
+      if (!sale) continue;
+      const items = await tx
+        .select({ quantity: saleItems.quantity, costPrice: saleItems.costPrice })
+        .from(saleItems)
+        .where(eq(saleItems.saleId, saleId));
+      const productCost = computeHistoricalProductCost(items);
+      if (productCost === null) continue;
+      const profit = computeSaleProfit({ total: sale.total, productCost, shippingCost: sale.shippingCost, ingresosBrutos: sale.ingresosBrutos });
+      await tx.update(sales).set({ profit }).where(eq(sales.id, saleId));
+    }
+
+    return { leftoverDelta: remaining, assignments };
   }
 
   async incrementProductStockBatch(
     consultantId: number,
     lines: { productId: number; delta: number }[],
+    isFreePlan: boolean,
     discountPercent?: number,
     draftId?: number,
-  ): Promise<{ updated: number }> {
+  ): Promise<{ updated: number; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] }> {
     if (lines.length === 0) {
       throw new SaleValidationError("El lote no puede estar vacío");
+    }
+
+    const db = await this.getDb();
+
+    // Prompt 15 — se busca el nombre ANTES de validar nada de cada línea, para que los
+    // mensajes de error de abajo nombren el producto por su nombre, nunca por su id. Visible
+    // ANTES de abrir la transacción — igual criterio que createSale: el catálogo no lo
+    // modifica ninguna venta/import concurrente, no hace falta bloquearlo. Un producto de OTRO
+    // consultantId (privado, no global) da exactamente el mismo error que uno inexistente —
+    // nunca se distingue, para no filtrar si existe. Prompt 2: también trae `precio`,
+    // necesario para el costo de esta compra cuando viene discountPercent.
+    const rawProductIds = Array.from(new Set(lines.map((l) => l.productId))).sort((a, b) => a - b);
+    const catalogRows = await db
+      .select({ id: products.id, precio: products.precio, producto: products.producto })
+      .from(products)
+      .where(and(inArray(products.id, rawProductIds), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
+    const precioById = new Map(catalogRows.map((p) => [p.id, p.precio]));
+    const nombreById = new Map(catalogRows.map((p) => [p.id, p.producto]));
+    for (const productId of rawProductIds) {
+      if (!precioById.has(productId)) {
+        throw new SaleValidationError("No encontramos uno de los productos del pedido");
+      }
     }
 
     // Duplicados: se combinan (nunca dos escrituras separadas para el mismo producto) — mismo
@@ -2041,7 +2596,7 @@ export class DatabaseStorage implements IStorage {
     const deltaByProductId = new Map<number, number>();
     for (const line of lines) {
       if (!Number.isInteger(line.delta) || line.delta <= 0) {
-        throw new SaleValidationError(`Delta inválido para el producto ${line.productId}: tiene que ser un entero positivo`);
+        throw new SaleValidationError(`La cantidad de ${nombreById.get(line.productId)} tiene que ser un entero positivo`);
       }
       deltaByProductId.set(line.productId, (deltaByProductId.get(line.productId) ?? 0) + line.delta);
     }
@@ -2054,25 +2609,6 @@ export class DatabaseStorage implements IStorage {
     // así que basta con procesarlas siempre en el mismo orden dentro de la transacción.
     const orderedProductIds = Array.from(deltaByProductId.keys()).sort((a, b) => a - b);
 
-    const db = await this.getDb();
-
-    // Visibilidad de catálogo (global o propio) ANTES de abrir la transacción — igual criterio
-    // que createSale: el catálogo no lo modifica ninguna venta/import concurrente, no hace
-    // falta bloquearlo. Un producto de OTRO consultantId (privado, no global) da exactamente
-    // el mismo error que uno inexistente — nunca se distingue, para no filtrar si existe.
-    // Prompt 2: también trae `precio`, necesario para el costo de esta compra cuando viene
-    // discountPercent.
-    const catalogRows = await db
-      .select({ id: products.id, precio: products.precio })
-      .from(products)
-      .where(and(inArray(products.id, orderedProductIds), or(isNull(products.consultantId), eq(products.consultantId, consultantId))));
-    const precioById = new Map(catalogRows.map((p) => [p.id, p.precio]));
-    for (const productId of orderedProductIds) {
-      if (!precioById.has(productId)) {
-        throw new SaleValidationError(`Producto ${productId} no encontrado`);
-      }
-    }
-
     // TODO o NADA: las N líneas comparten una única transacción. Si cualquiera tira
     // SaleValidationError (stock insuficiente), Postgres revierte TODAS las escrituras ya
     // hechas por líneas anteriores de este mismo batch — nunca queda una importación aplicada
@@ -2084,24 +2620,37 @@ export class DatabaseStorage implements IStorage {
     // "estimadas" con su "≈". La única puerta para recalcularlas es que la consultora cargue el
     // costo a mano desde "Editar producto" (Prompt 4) — esa función ya existe y está testeada,
     // lista para engancharse ahí.
+    const pendingAssignments: { saleId: number; clientName: string; quantity: number }[] = [];
+
     await db.transaction(async (tx) => {
       for (const productId of orderedProductIds) {
         const delta = deltaByProductId.get(productId)!;
+        const lineCost =
+          discountPercent !== undefined ? Math.round(precioById.get(productId)! * (1 - discountPercent / 100)) : null;
 
-        if (discountPercent === undefined) {
+        // Prompt 8, Parte 2 y punto 6 — antes de sumar nada a productStock.unidades, cubre
+        // primero las ventas que tenían este producto pendiente. Lo asignado ahí NUNCA llega a
+        // ser stock disponible: todo lo que sigue abajo (cantidad, costo promedio, límite del
+        // plan gratis) corre sobre `leftoverDelta`, nunca sobre `delta` crudo.
+        const { leftoverDelta, assignments } = await this.assignUnitsToPendingSales(tx, consultantId, productId, delta, lineCost);
+        pendingAssignments.push(...assignments);
+        if (leftoverDelta <= 0) continue;
+
+        if (lineCost === null) {
           // Camino de siempre: solo cantidad, no toca costo (correcciones manuales de stock
           // sin contexto de pedido/costo).
           const [stock] = await tx
             .insert(productStock)
-            .values({ consultantId, productId, unidades: delta })
+            .values({ consultantId, productId, unidades: leftoverDelta })
             .onConflictDoUpdate({
               target: [productStock.consultantId, productStock.productId],
-              set: { unidades: sql`${productStock.unidades} + ${delta}` },
+              set: { unidades: sql`${productStock.unidades} + ${leftoverDelta}` },
             })
             .returning();
           if (stock.unidades < 0) {
-            throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${stock.unidades} unidades`);
+            throw new SaleValidationError(`Stock insuficiente de ${nombreById.get(productId)}: quedarían ${pluralize(stock.unidades, "unidad", "unidades")}`);
           }
+          await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - leftoverDelta, stock.unidades);
           continue;
         }
 
@@ -2111,26 +2660,27 @@ export class DatabaseStorage implements IStorage {
         // siempre los valores previos a este pedido, sin necesidad de FOR UPDATE explícito (el
         // propio UPSERT ya toma el lock de fila al ejecutarse). Si no había costo o el stock
         // estaba en 0 (o menos), el costo nuevo es directamente el de esta compra — nunca se
-        // promedia contra "nada".
-        const lineCost = Math.round(precioById.get(productId)! * (1 - discountPercent / 100));
+        // promedia contra "nada". Usa `leftoverDelta`, no `delta`: las unidades que se fueron a
+        // cubrir pendientes nunca se mezclan en el promedio de lo que queda disponible.
         const [stock] = await tx
           .insert(productStock)
-          .values({ consultantId, productId, unidades: delta, costPrice: lineCost, selectedDiscount: discountPercent })
+          .values({ consultantId, productId, unidades: leftoverDelta, costPrice: lineCost, selectedDiscount: discountPercent })
           .onConflictDoUpdate({
             target: [productStock.consultantId, productStock.productId],
             set: {
-              unidades: sql`${productStock.unidades} + ${delta}`,
+              unidades: sql`${productStock.unidades} + ${leftoverDelta}`,
               costPrice: sql`CASE
                 WHEN ${productStock.costPrice} IS NULL OR ${productStock.unidades} <= 0 THEN ${lineCost}
-                ELSE ROUND((${productStock.unidades} * ${productStock.costPrice} + ${delta}::integer * ${lineCost}::integer)::numeric / (${productStock.unidades} + ${delta}))
+                ELSE ROUND((${productStock.unidades} * ${productStock.costPrice} + ${leftoverDelta}::integer * ${lineCost}::integer)::numeric / (${productStock.unidades} + ${leftoverDelta}))
               END`,
               selectedDiscount: discountPercent,
             },
           })
           .returning({ unidades: productStock.unidades });
         if (stock.unidades < 0) {
-          throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${stock.unidades} unidades`);
+          throw new SaleValidationError(`Stock insuficiente de ${nombreById.get(productId)}: quedarían ${pluralize(stock.unidades, "unidad", "unidades")}`);
         }
+        await this.assertFreePlanProductLimit(tx, consultantId, isFreePlan, stock.unidades - leftoverDelta, stock.unidades);
       }
 
       // Prompt 7, punto 2: mismo criterio que createSale.draftId — si este pedido viene de un
@@ -2140,32 +2690,45 @@ export class DatabaseStorage implements IStorage {
       }
     });
 
-    return { updated: orderedProductIds.length };
+    return { updated: orderedProductIds.length, pendingAssignments };
   }
 
+  /** Prompt 2 (manual), extendida en Prompt 8, ajuste 2 — costo cargado a mano desde "Editar
+   * producto" sobre líneas estimadas de este producto. Si una línea todavía tiene unidades
+   * pendientes (esperando un pedido real), NO se resuelve del todo: solo se actualiza el
+   * estimado congelado (`applyManualCostCorrection`), para que cuando ese pedido llegue
+   * (incrementProductStockBatch / assignUnitsToPendingSales) combine bien lo ya real con lo
+   * recién estimado, sin pisar ninguna de las dos partes. */
   async recalculateEstimatedSalesForProduct(consultantId: number, productId: number, newCostPrice: number): Promise<void> {
     const db = await this.getDb();
     await db.transaction(async (tx) => {
       const estimatedItems = await tx
-        .select({ id: saleItems.id, saleId: saleItems.saleId })
+        .select({
+          id: saleItems.id,
+          saleId: saleItems.saleId,
+          quantity: saleItems.quantity,
+          quantityPending: saleItems.quantityPending,
+          estimatedCostPerUnit: saleItems.estimatedCostPerUnit,
+          realCostAccumulated: saleItems.realCostAccumulated,
+          realCostUnits: saleItems.realCostUnits,
+        })
         .from(saleItems)
         .innerJoin(sales, eq(saleItems.saleId, sales.id))
         .where(and(eq(sales.consultantId, consultantId), eq(saleItems.productId, productId), eq(saleItems.costIsEstimated, true)));
       if (estimatedItems.length === 0) return;
 
-      await tx
-        .update(saleItems)
-        .set({ costPrice: newCostPrice, costIsEstimated: false })
-        .where(
-          inArray(
-            saleItems.id,
-            estimatedItems.map((i) => i.id),
-          ),
-        );
+      for (const item of estimatedItems) {
+        const corrected = applyManualCostCorrection(item, newCostPrice);
+        const blended = resolveBlendedLineCost({ quantity: item.quantity, ...corrected });
+        await tx
+          .update(saleItems)
+          .set({ costPrice: blended.costPrice, costIsEstimated: blended.isEstimated, ...corrected })
+          .where(eq(saleItems.id, item.id));
+      }
 
       // Una venta puede tener más de un producto — el profit se recalcula con TODAS sus
       // líneas, no solo las que se acaban de corregir.
-      const affectedSaleIds = Array.from(new Set(estimatedItems.map((i) => i.saleId)));
+      const affectedSaleIds = Array.from(new Set(estimatedItems.map((item) => item.saleId)));
       for (const saleId of affectedSaleIds) {
         const [sale] = await tx.select().from(sales).where(eq(sales.id, saleId));
         if (!sale) continue;
@@ -2198,6 +2761,15 @@ export class DatabaseStorage implements IStorage {
     return row?.value ?? 0;
   }
 
+  async countProductsWithStock(consultantId: number): Promise<number> {
+    const db = await this.getDb();
+    const [row] = await db
+      .select({ value: count() })
+      .from(productStock)
+      .where(and(eq(productStock.consultantId, consultantId), gt(productStock.unidades, 0)));
+    return row?.value ?? 0;
+  }
+
   async setProductStockReminder(consultantId: number, productId: number, remindAt: string | null): Promise<Product | undefined> {
     const db = await this.getDb();
     const product = await this.findVisibleProduct(db, consultantId, productId);
@@ -2223,37 +2795,39 @@ export class DatabaseStorage implements IStorage {
       .orderBy(products.seccion, products.linea, products.producto);
   }
 
-  async setProductImage(productId: number, imagen: string | null): Promise<SetProductImageResult> {
+  async setProductImage(productId: number, imagen: string | null, imagenMiniatura: string | null): Promise<SetProductImageResult> {
     const db = await this.getDb();
     return db.transaction(async (tx) => {
       // FOR UPDATE: si dos requests tocan la imagen del mismo producto a la vez (dos filas
       // de una carga masiva apuntando al mismo id, o un reemplazo superpuesto con un borrado),
       // el segundo espera acá y lee el valor que dejó el primero — nunca una foto stale.
       const [current] = await tx
-        .select({ imagen: products.imagen })
+        .select({ imagen: products.imagen, imagenMiniatura: products.imagenMiniatura })
         .from(products)
         .where(and(eq(products.id, productId), isNull(products.consultantId)))
         .for("update");
-      if (!current) return { product: undefined, previousImage: null };
+      if (!current) return { product: undefined, previousImage: null, previousThumbnail: null };
 
       const [updated] = await tx
         .update(products)
-        .set({ imagen })
+        .set({ imagen, imagenMiniatura })
         .where(and(eq(products.id, productId), isNull(products.consultantId)))
         .returning();
-      return { product: updated, previousImage: current.imagen };
+      return { product: updated, previousImage: current.imagen, previousThumbnail: current.imagenMiniatura };
     });
   }
 
-  async getUpcomingAppointments(consultantId: number, limit = 10): Promise<Appointment[]> {
+  async getUpcomingAppointments(consultantId: number, limit = 10): Promise<AppointmentWithPhone[]> {
     const db = await this.getDb();
-    const now = new Date();
-    const nowDate = toDateStr(now);
-    const nowTime = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+    // Prompt 12 — hora de Argentina, nunca el reloj del proceso (en Railway es UTC): "próximas"
+    // tiene que coincidir con lo que Inicio considera "hoy".
+    const nowDate = getArgentinaDateStr();
+    const nowTime = getArgentinaTimeStr();
 
     return db
-      .select()
+      .select({ ...getTableColumns(appointments), clientPhone: clients.phone })
       .from(appointments)
+      .leftJoin(clients, eq(appointments.clientId, clients.id))
       .where(
         and(
           eq(appointments.consultantId, consultantId),
@@ -2265,11 +2839,12 @@ export class DatabaseStorage implements IStorage {
       .limit(limit);
   }
 
-  async getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<Appointment[]> {
+  async getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<AppointmentWithPhone[]> {
     const db = await this.getDb();
     return db
-      .select()
+      .select({ ...getTableColumns(appointments), clientPhone: clients.phone })
       .from(appointments)
+      .leftJoin(clients, eq(appointments.clientId, clients.id))
       .where(and(eq(appointments.consultantId, consultantId), gte(appointments.date, start), lt(appointments.date, end)))
       .orderBy(asc(appointments.date), asc(appointments.time));
   }
@@ -2323,12 +2898,20 @@ export class DatabaseStorage implements IStorage {
 
   async createAppointment(consultantId: number, input: CreateAppointmentInput): Promise<Appointment | undefined> {
     const db = await this.getDb();
-    const [client] = await db
-      .select()
-      .from(clients)
-      .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
-    if (!client) return undefined;
-    const clientName = client.name ?? client.phone ?? "Sin nombre";
+    // Prompt 12 — la clienta es opcional en todos los tipos ("Crear evento" nunca tuvo una
+    // forma natural de elegirla). Sin clientId: clientId null y clientName "" — nunca se lee
+    // clientName para decidir nada, siempre clientId (mismo criterio que "venta sin clienta").
+    let clientId: number | null = null;
+    let clientName = "";
+    if (input.clientId !== undefined) {
+      const [client] = await db
+        .select()
+        .from(clients)
+        .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
+      if (!client) return undefined;
+      clientId = client.id;
+      clientName = client.name ?? client.phone ?? "Sin nombre";
+    }
     const type = await this.resolveEventType(consultantId, input.type);
 
     if (await this.findConflictingAppointment(db, consultantId, input.date, input.time)) {
@@ -2340,7 +2923,7 @@ export class DatabaseStorage implements IStorage {
         .insert(appointments)
         .values({
           consultantId,
-          clientId: client.id,
+          clientId,
           clientName,
           date: input.date,
           time: input.time,
@@ -2369,12 +2952,18 @@ export class DatabaseStorage implements IStorage {
       .where(and(eq(appointments.id, id), eq(appointments.consultantId, consultantId)));
     if (!existing) return undefined;
 
-    const [client] = await db
-      .select()
-      .from(clients)
-      .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
-    if (!client) throw new AppointmentValidationError("Clienta no encontrada");
-    const clientName = client.name ?? client.phone ?? "Sin nombre";
+    // Prompt 12 — mismo criterio que createAppointment: sin clientId, queda sin clienta.
+    let clientId: number | null = null;
+    let clientName = "";
+    if (input.clientId !== undefined) {
+      const [client] = await db
+        .select()
+        .from(clients)
+        .where(and(eq(clients.id, input.clientId), eq(clients.consultantId, consultantId)));
+      if (!client) throw new AppointmentValidationError("Clienta no encontrada");
+      clientId = client.id;
+      clientName = client.name ?? client.phone ?? "Sin nombre";
+    }
     const type = input.type === existing.type ? existing.type : await this.resolveEventType(consultantId, input.type);
 
     if (await this.findConflictingAppointment(db, consultantId, input.date, input.time, id)) {
@@ -2385,7 +2974,7 @@ export class DatabaseStorage implements IStorage {
       const [updated] = await db
         .update(appointments)
         .set({
-          clientId: client.id,
+          clientId,
           clientName,
           date: input.date,
           time: input.time,
@@ -2486,6 +3075,46 @@ export class DatabaseStorage implements IStorage {
     return client;
   }
 
+  /** Prompt 9 + Prompt 11 — condición y suma del saldo pendiente real de una clienta
+   * (`amount - amountPaid` de cuotas "pendiente" de ventas no canceladas), compartida por
+   * `computeClientStats` (filtro "Pendiente de pago" de Clientas) y `getReportsOverview`
+   * ("Te deben hoy"). Sin `clientIds`, agrega TODAS las clientas de la consultora de una —
+   * nunca incluye ventas "Sin clienta" (mismo criterio que ya usa `getTopClients` con
+   * `isNotNull(sales.clientId)`). `todayStr` tiene que venir siempre de
+   * `getArgentinaDateStr()` (nunca `new Date()` del proceso) — define el subconjunto vencido
+   * (`dueDate < todayStr`), igual criterio que ya usa `getPendingInstallments`. */
+  private async getClientsPendingBalanceDetail(
+    consultantId: number,
+    todayStr: string,
+    clientIds?: number[],
+  ): Promise<Map<number, { balance: number; overdueBalance: number }>> {
+    const db = await this.getDb();
+    if (clientIds && clientIds.length === 0) {
+      return new Map();
+    }
+
+    const conditions = [
+      eq(sales.consultantId, consultantId),
+      isNotNull(sales.clientId),
+      eq(saleInstallments.status, "pendiente"),
+      ne(sales.status, "cancelada"),
+    ];
+    if (clientIds) conditions.push(inArray(sales.clientId, clientIds));
+
+    const rows = await db
+      .select({
+        clientId: sales.clientId,
+        balance: sql<number>`coalesce(sum(${saleInstallments.amount} - ${saleInstallments.amountPaid}), 0)`,
+        overdueBalance: sql<number>`coalesce(sum(case when ${saleInstallments.dueDate} < ${todayStr} then ${saleInstallments.amount} - ${saleInstallments.amountPaid} else 0 end), 0)`,
+      })
+      .from(saleInstallments)
+      .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
+      .where(and(...conditions))
+      .groupBy(sales.clientId);
+
+    return new Map(rows.map((r) => [r.clientId as number, { balance: Number(r.balance), overdueBalance: Number(r.overdueBalance) }]));
+  }
+
   /** Compartido por searchClients (combobox, truncado) y searchClientsPaginated (listado
    * real) — dos queries agregadas separadas (nunca un JOIN sales+saleInstallments directo,
    * que produciría un fan-out y falsearía las sumas) unidas en JS por clientId. */
@@ -2501,40 +3130,24 @@ export class DatabaseStorage implements IStorage {
       return { statsByClient: new Map(), balanceByClient: new Map() };
     }
 
-    const statsRows = await db
-      .select({
-        clientId: sales.clientId,
-        totalAmount: sql<number>`coalesce(sum(${sales.total}), 0)`,
-        lastDate: sql<string | null>`max(${sales.date})`,
-      })
-      .from(sales)
-      .where(and(eq(sales.consultantId, consultantId), inArray(sales.clientId, clientIds), ne(sales.status, "cancelada")))
-      .groupBy(sales.clientId);
+    // Prompt 16 — las dos consultas no dependen entre sí (una agrega sales, la otra
+    // sale_installments), así que corren en paralelo en vez de una detrás de la otra: un
+    // round trip menos contra Supabase en cada llamada a searchClientsPaginated/searchClients.
+    const [statsRows, balanceDetailByClient] = await Promise.all([
+      db
+        .select({
+          clientId: sales.clientId,
+          totalAmount: sql<number>`coalesce(sum(${sales.total}), 0)`,
+          lastDate: sql<string | null>`max(${sales.date})`,
+        })
+        .from(sales)
+        .where(and(eq(sales.consultantId, consultantId), inArray(sales.clientId, clientIds), ne(sales.status, "cancelada")))
+        .groupBy(sales.clientId),
+      this.getClientsPendingBalanceDetail(consultantId, getArgentinaDateStr(), clientIds),
+    ]);
 
     const statsByClient = new Map(statsRows.map((s) => [s.clientId, s]));
-
-    // Misma condición que getPendingInstallments (cuota "pendiente" de una venta no cancelada),
-    // acá agregada por clienta en vez de listada por cuota individual.
-    const balanceRows = await db
-      .select({
-        clientId: sales.clientId,
-        // Prompt 9: el saldo real es lo que falta (amount - amountPaid), no el monto
-        // original de la cuota — una "pendiente" puede tener un pago parcial.
-        pendingBalance: sql<number>`coalesce(sum(${saleInstallments.amount} - ${saleInstallments.amountPaid}), 0)`,
-      })
-      .from(saleInstallments)
-      .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
-      .where(
-        and(
-          eq(sales.consultantId, consultantId),
-          inArray(sales.clientId, clientIds),
-          eq(saleInstallments.status, "pendiente"),
-          ne(sales.status, "cancelada"),
-        ),
-      )
-      .groupBy(sales.clientId);
-
-    const balanceByClient = new Map(balanceRows.map((b) => [b.clientId, Number(b.pendingBalance)]));
+    const balanceByClient = new Map(Array.from(balanceDetailByClient.entries()).map(([clientId, detail]) => [clientId, detail.balance]));
 
     return { statsByClient, balanceByClient };
   }
@@ -2637,6 +3250,8 @@ export class DatabaseStorage implements IStorage {
     } else if (filter === "cumplen_anios") {
       const currentMonth = getArgentinaMonth();
       withStats = withStats.filter((c) => matchesBirthdayMonth(c.birthday, currentMonth));
+    } else if (filter === "sin_celular") {
+      withStats = withStats.filter((c) => matchesMissingPhoneFilter(c.phone));
     }
 
     // Orden estable y reproducible. "Cumplen años este mes" ordena por día (punto 6); el resto
@@ -3049,7 +3664,8 @@ export class DatabaseStorage implements IStorage {
       .from(clients)
       .where(and(eq(clients.consultantId, consultantId), isNotNull(clients.birthday)));
 
-    const today = new Date();
+    // Prompt 12 — hora de Argentina, nunca el reloj del proceso (en Railway es UTC).
+    const today = getArgentinaDateStr();
     return rows
       .map((row) => ({
         clientId: row.id,
@@ -3060,6 +3676,29 @@ export class DatabaseStorage implements IStorage {
       }))
       .filter((r) => r.daysUntil <= days)
       .sort((a, b) => a.daysUntil - b.daysUntil);
+  }
+
+  /** Prompt 12 — cumpleaños del mes mostrado en Agenda (nunca "próximos N días desde hoy":
+   * tiene que poder mostrar meses pasados o futuros igual). `day` ya viene clampeado (29 de
+   * febrero en año no bisiesto → 28, mismo criterio que `resolveOrderDayForMonth`). */
+  async getBirthdaysInMonth(
+    consultantId: number,
+    year: number,
+    month: number,
+  ): Promise<{ clientId: number; name: string | null; phone: string | null; day: number }[]> {
+    const db = await this.getDb();
+    const rows = await db
+      .select({ id: clients.id, name: clients.name, phone: clients.phone, birthday: clients.birthday })
+      .from(clients)
+      .where(and(eq(clients.consultantId, consultantId), isNotNull(clients.birthday)));
+
+    const results: { clientId: number; name: string | null; phone: string | null; day: number }[] = [];
+    for (const row of rows) {
+      const [, bMonth, bDay] = (row.birthday as string).split("-").map(Number);
+      if (bMonth !== month) continue;
+      results.push({ clientId: row.id, name: row.name, phone: row.phone, day: resolveOrderDayForMonth(bDay, year, month) });
+    }
+    return results.sort((a, b) => a.day - b.day);
   }
 
   async getAppointmentsSummary(consultantId: number, start: string, end: string): Promise<AppointmentsSummary> {
@@ -3081,12 +3720,19 @@ export class DatabaseStorage implements IStorage {
 
   async getPendingInstallments(consultantId: number, limit = 20): Promise<PendingInstallmentRow[]> {
     const db = await this.getDb();
-    const today = toDateStr(new Date());
+    // Prompt 10 — "hoy" en hora de Argentina, nunca el reloj del proceso (en Railway es UTC):
+    // Inicio distingue "vence hoy" de "venció" con este mismo valor.
+    const today = getArgentinaDateStr();
 
     const rows = await db
       .select({
         saleId: saleInstallments.saleId,
+        installmentId: saleInstallments.id,
         clientName: sales.clientName,
+        // Prompt 10 — para el botón "WhatsApp" de Inicio/Agenda. LEFT JOIN: una venta sin
+        // clienta (sales.clientId null) no puede perder su cuota por un INNER JOIN que no
+        // encuentra fila en clients — queda con clientPhone null, el botón simplemente no sale.
+        clientPhone: clients.phone,
         installmentNumber: saleInstallments.installmentNumber,
         // Prompt 9: lo que falta de verdad (amount - amountPaid) — una "pendiente" puede
         // tener un pago parcial.
@@ -3095,9 +3741,45 @@ export class DatabaseStorage implements IStorage {
       })
       .from(saleInstallments)
       .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
+      .leftJoin(clients, eq(sales.clientId, clients.id))
       .where(and(eq(sales.consultantId, consultantId), eq(saleInstallments.status, "pendiente"), ne(sales.status, "cancelada")))
       .orderBy(asc(saleInstallments.dueDate))
       .limit(limit);
+
+    return rows.map((row) => ({ ...row, isOverdue: row.dueDate < today }));
+  }
+
+  /** Prompt 12 — "Cobro" en la Agenda: cuotas pendientes (saldo > 0, venta no cancelada) cuyo
+   * `dueDate` cae en el mes mostrado, en su fecha ORIGINAL (una vencida nunca se mueve a hoy,
+   * solo se marca `isOverdue`). Mismo criterio y mismo join que `getPendingInstallments`, con
+   * rango de fechas en vez de `limit`. */
+  async getInstallmentsInRange(consultantId: number, start: string, end: string): Promise<PendingInstallmentRow[]> {
+    const db = await this.getDb();
+    const today = getArgentinaDateStr();
+
+    const rows = await db
+      .select({
+        saleId: saleInstallments.saleId,
+        installmentId: saleInstallments.id,
+        clientName: sales.clientName,
+        clientPhone: clients.phone,
+        installmentNumber: saleInstallments.installmentNumber,
+        amount: sql<number>`${saleInstallments.amount} - ${saleInstallments.amountPaid}`,
+        dueDate: saleInstallments.dueDate,
+      })
+      .from(saleInstallments)
+      .innerJoin(sales, eq(saleInstallments.saleId, sales.id))
+      .leftJoin(clients, eq(sales.clientId, clients.id))
+      .where(
+        and(
+          eq(sales.consultantId, consultantId),
+          eq(saleInstallments.status, "pendiente"),
+          ne(sales.status, "cancelada"),
+          gte(saleInstallments.dueDate, start),
+          lt(saleInstallments.dueDate, end),
+        ),
+      )
+      .orderBy(asc(saleInstallments.dueDate));
 
     return rows.map((row) => ({ ...row, isOverdue: row.dueDate < today }));
   }
@@ -3194,38 +3876,121 @@ export class DatabaseStorage implements IStorage {
     };
   }
 
+  /** Prompt 11 — pantalla de Reportes de arranque, en una sola llamada. Ver el comentario de
+   * `ReportsOverview` sobre qué queda afuera a propósito. */
+  async getReportsOverview(consultantId: number, params: ReportsOverviewParams): Promise<ReportsOverview> {
+    const db = await this.getDb();
+    const { start, end, period } = params;
+
+    // "hoy" siempre en hora de Argentina — nunca el reloj del proceso (en Railway es UTC),
+    // tanto para el período de comparación como para "Te deben hoy"/"vencido" más abajo.
+    const todayStr = getArgentinaDateStr();
+    const comparisonPeriod = getComparisonPeriod(period, start, end, todayStr);
+
+    // Prompt 16 — las 5 consultas de abajo no dependen entre sí (ninguna necesita el resultado
+    // de otra), así que corren en paralelo en vez de una detrás de la otra: antes este endpoint
+    // era el único de los "combinadores" (Inicio/Agenda ya usan Promise.all) que encadenaba
+    // todo en serie.
+    const [currentPoints, previousPoints, { hasIncompleteCostData }, [clientAgg], balanceDetail] = await Promise.all([
+      // "Vendiste"/"Ganaste" — misma función que usa Inicio (getSalesSummary), nunca un
+      // cálculo paralelo, para que los dos números coincidan siempre.
+      this.getSalesSummary(consultantId, start, end, "day"),
+      this.getSalesSummary(consultantId, comparisonPeriod.start, comparisonPeriod.end, "day"),
+      this.getProductCostSummary(consultantId, start, end),
+      // "Compra promedio por clienta": ventas CON clienta ÷ clientas distintas — las ventas
+      // "Sin clienta" no entran ni al numerador ni al denominador (mismo criterio que
+      // getTopClients).
+      db
+        .select({
+          distinctClientCount: sql<number>`coalesce(count(distinct ${sales.clientId}), 0)`,
+          totalSalesToClients: sql<number>`coalesce(sum(${sales.total}), 0)`,
+        })
+        .from(sales)
+        .where(
+          and(
+            eq(sales.consultantId, consultantId),
+            isNotNull(sales.clientId),
+            gte(sales.date, start),
+            lt(sales.date, end),
+            ne(sales.status, "cancelada"),
+          ),
+        ),
+      // "Te deben hoy" / "de eso, $X ya venció" — no depende del período elegido. Misma
+      // función que ya usa el filtro "Pendiente de pago" de Clientas, sumada sobre TODAS las
+      // clientas.
+      this.getClientsPendingBalanceDetail(consultantId, todayStr),
+    ]);
+
+    const totalSales = currentPoints.reduce((sum, p) => sum + p.totalSales, 0);
+    const totalProfit = currentPoints.reduce((sum, p) => sum + p.totalProfit, 0);
+
+    const previousSalesCount = previousPoints.reduce((sum, p) => sum + p.salesCount, 0);
+    // Si el período anterior no tuvo ninguna venta, no se compara (nunca se divide por cero,
+    // y la línea de comparación directamente no se muestra).
+    const previousTotalSales = previousSalesCount > 0 ? previousPoints.reduce((sum, p) => sum + p.totalSales, 0) : null;
+    const previousTotalProfit = previousSalesCount > 0 ? previousPoints.reduce((sum, p) => sum + p.totalProfit, 0) : null;
+
+    const distinctClientCount = Number(clientAgg?.distinctClientCount ?? 0);
+    const totalSalesToClients = Number(clientAgg?.totalSalesToClients ?? 0);
+    const averagePurchasePerClient = distinctClientCount > 0 ? Math.round(totalSalesToClients / distinctClientCount) : null;
+
+    let pendingBalanceToday = 0;
+    let overdueBalanceToday = 0;
+    for (const detail of Array.from(balanceDetail.values())) {
+      pendingBalanceToday += detail.balance;
+      overdueBalanceToday += detail.overdueBalance;
+    }
+
+    return {
+      totalSales,
+      totalProfit,
+      hasIncompleteCostData,
+      previousTotalSales,
+      previousTotalProfit,
+      comparisonPeriod,
+      distinctClientCount,
+      totalSalesToClients,
+      averagePurchasePerClient,
+      pendingBalanceToday,
+      overdueBalanceToday,
+    };
+  }
+
   async getAllSales(consultantId: number): Promise<SaleWithItemCount[]> {
     const db = await this.getDb();
     const salesRows = await db.select().from(sales).where(eq(sales.consultantId, consultantId)).orderBy(desc(sales.date), desc(sales.id));
     if (salesRows.length === 0) return [];
 
     const saleIds = salesRows.map((s) => s.id);
-    const counts = await db
-      .select({
-        saleId: saleItems.saleId,
-        itemCount: sql<number>`coalesce(sum(${saleItems.quantity}), 0)`,
-        // Prompt 2: "≈" en la lista cuando alguna línea es estimada, o cuando es tan vieja que
-        // ni siquiera tiene costPrice (misma incertidumbre, mismo símbolo).
-        hasEstimatedCost: sql<boolean>`coalesce(bool_or(${saleItems.costIsEstimated} = true or ${saleItems.costPrice} is null), false)`,
-      })
-      .from(saleItems)
-      .where(inArray(saleItems.saleId, saleIds))
-      .groupBy(saleItems.saleId);
+    // Prompt 16 — las dos consultas de abajo son independientes entre sí (ambas solo
+    // necesitan `saleIds`), así que corren en paralelo en vez de una detrás de la otra.
+    const [counts, pendingAgg] = await Promise.all([
+      db
+        .select({
+          saleId: saleItems.saleId,
+          itemCount: sql<number>`coalesce(sum(${saleItems.quantity}), 0)`,
+          // Prompt 2: "≈" en la lista cuando alguna línea es estimada, o cuando es tan vieja
+          // que ni siquiera tiene costPrice (misma incertidumbre, mismo símbolo).
+          hasEstimatedCost: sql<boolean>`coalesce(bool_or(${saleItems.costIsEstimated} = true or ${saleItems.costPrice} is null), false)`,
+        })
+        .from(saleItems)
+        .where(inArray(saleItems.saleId, saleIds))
+        .groupBy(saleItems.saleId),
+      // Prompt 6: agregado de cuotas pendientes — mismo patrón que arriba (un solo query
+      // extra, nunca un fetch por venta).
+      db
+        .select({
+          saleId: saleInstallments.saleId,
+          // Prompt 9: el saldo real es amount - amountPaid — una "pendiente" puede tener un
+          // pago parcial.
+          pendingAmount: sql<number>`coalesce(sum(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.amount} - ${saleInstallments.amountPaid} else 0 end), 0)`,
+          nextDueDate: sql<string | null>`min(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.dueDate} end)`,
+        })
+        .from(saleInstallments)
+        .where(inArray(saleInstallments.saleId, saleIds))
+        .groupBy(saleInstallments.saleId),
+    ]);
     const countsBySale = new Map(counts.map((c) => [c.saleId, c]));
-
-    // Prompt 6: agregado de cuotas pendientes — mismo patrón que arriba (un solo query extra,
-    // nunca un fetch por venta).
-    const pendingAgg = await db
-      .select({
-        saleId: saleInstallments.saleId,
-        // Prompt 9: el saldo real es amount - amountPaid — una "pendiente" puede tener un
-        // pago parcial.
-        pendingAmount: sql<number>`coalesce(sum(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.amount} - ${saleInstallments.amountPaid} else 0 end), 0)`,
-        nextDueDate: sql<string | null>`min(case when ${saleInstallments.status} = 'pendiente' then ${saleInstallments.dueDate} end)`,
-      })
-      .from(saleInstallments)
-      .where(inArray(saleInstallments.saleId, saleIds))
-      .groupBy(saleInstallments.saleId);
     const pendingBySale = new Map(pendingAgg.map((p) => [p.saleId, p]));
 
     return salesRows.map((s) => {
@@ -3497,7 +4262,7 @@ export class DatabaseStorage implements IStorage {
 
       const lines = input.items.map((item) => {
         const product = catalogById.get(item.productId);
-        if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
+        if (!product) throw new SaleValidationError("No encontramos uno de los productos de la venta");
         const stock = stockByProductId.get(item.productId);
         // Etapa 7.4: un producto discontinuado no es vendible en una venta NUEVA — se
         // comprueba con el mismo `stock` ya releído bajo el `FOR UPDATE` de arriba, nunca con
@@ -3507,21 +4272,28 @@ export class DatabaseStorage implements IStorage {
           throw new SaleValidationError(`"${product.producto}" está discontinuado y no está disponible para nuevas ventas`);
         }
         const available = stock?.unidades ?? 0;
-        if (available < item.quantity) {
-          throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);
-        }
-        const resolvedCost = resolveLineCost({
-          costPrice: stock?.costPrice ?? null,
+        // Prompt 8, Parte 1: vender sin stock (o sin stock suficiente) ya no se rechaza — lo
+        // que no hay queda "pendiente" en este renglón, a la espera de un pedido futuro.
+        const allocation = resolveStockAllocation(item.quantity, available);
+        const initialCost = resolveInitialLineCost({
+          quantity: item.quantity,
+          quantityPending: allocation.pending,
+          realCostPerUnitKnown: stock?.costPrice ?? null,
           publicPrice: product.precio,
           habitualDiscountPercent,
         });
+        const blendedCost = resolveBlendedLineCost({ quantity: item.quantity, ...initialCost });
         return {
           product,
           quantity: item.quantity,
           unitPrice: item.unitPrice ?? product.precio,
-          costPrice: resolvedCost.costPrice,
-          costIsEstimated: resolvedCost.isEstimated,
-          remainingAfterSale: available - item.quantity,
+          costPrice: blendedCost.costPrice,
+          costIsEstimated: blendedCost.isEstimated,
+          quantityPending: allocation.pending,
+          // Lo que ya tenía en mano se entrega en el momento, igual que toda venta antes de
+          // este prompt — solo lo pendiente (si hay) espera a un pedido futuro.
+          quantityDelivered: allocation.covered,
+          ...initialCost,
         };
       });
 
@@ -3602,7 +4374,10 @@ export class DatabaseStorage implements IStorage {
             // Prompt 6: único valor real que se escribe hoy en creación — "entregado"/"pagado"
             // quedaron retirados (ver comentario en shared/schema.ts).
             status: "pendiente",
-            deliveryStatus: "entregada",
+            // Prompt 8: "entregada" solo si TODOS los renglones quedaron con quantityDelivered
+            // === quantity (nunca basta con quantityPending === 0: puede estar "lista para
+            // entregar" sin que todavía se haya tocado "Marcar como entregado").
+            deliveryStatus: lines.every((l) => l.quantityDelivered === l.quantity) ? "entregada" : "pendiente_entrega",
             notes: input.notes ?? null,
             clientRequestId: input.clientRequestId ?? null,
           })
@@ -3627,6 +4402,11 @@ export class DatabaseStorage implements IStorage {
           // una fuente distinta para lo que se persiste vs. lo que se calculó.
           costPrice: l.costPrice,
           costIsEstimated: l.costIsEstimated,
+          quantityPending: l.quantityPending,
+          quantityDelivered: l.quantityDelivered,
+          estimatedCostPerUnit: l.estimatedCostPerUnit,
+          realCostAccumulated: l.realCostAccumulated,
+          realCostUnits: l.realCostUnits,
         })),
       );
 
@@ -3648,10 +4428,15 @@ export class DatabaseStorage implements IStorage {
         .returning();
       await this.recordInitialPaidInstallments(tx, consultantId, sale.clientId, input.paymentMethod, insertedInstallments);
 
+      // Prompt 8, punto 8: aunque el `FOR UPDATE` de arriba ya impide la carrera real (la
+      // segunda venta simultánea queda esperando y relee el valor ya descontado por la
+      // primera), el UPDATE en sí queda expresado como una resta atómica calculada por
+      // Postgres (nunca negativo) en vez de pasar un valor ya calculado en JS — mismo patrón
+      // que ya usa incrementProductStockBatch.
       for (const line of lines) {
         await tx
           .update(productStock)
-          .set({ unidades: line.remainingAfterSale })
+          .set({ unidades: sql`${productStock.unidades} - LEAST(${productStock.unidades}, ${line.quantityDelivered})` })
           .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, line.product.id)));
       }
 
@@ -3777,39 +4562,178 @@ export class DatabaseStorage implements IStorage {
         : [];
       const stockRowById = new Map(stockRows.map((s) => [s.productId, s]));
       const stockById = new Map(involvedIds.map((pid) => [pid, stockRowById.get(pid)?.unidades ?? 0]));
+      // Prompt 8 — se empareja por productId, nunca por el id del renglón: una venta nunca
+      // puede tener el mismo producto en dos renglones (NewSaleDialog.tsx fusiona cualquier
+      // producto repetido del carrito en una sola línea, sumando cantidades), así que emparejar
+      // por productId es exactamente lo mismo que emparejar por id, sin necesitar que el
+      // cliente mande ids de renglones que hoy no conoce.
+      const existingByProductId = new Map(
+        existingItems.filter((i): i is typeof i & { productId: number } => i.productId !== null).map((i) => [i.productId, i]),
+      );
 
-      // 1) Restaurar el stock que esta venta tenía reservado (como si se hubiera eliminado).
-      for (const item of existingItems) {
-        if (item.productId !== null) {
-          stockById.set(item.productId, (stockById.get(item.productId) ?? 0) + item.quantity);
+      // Renglones que desaparecen en esta edición: se tratan como una baja completa de ese
+      // renglón (misma fórmula que cancelSale) — devuelven quantity - quantityPending al stock
+      // y no vuelven a insertarse.
+      const newProductIds = new Set(input.items.map((i) => i.productId));
+      for (const old of existingItems) {
+        if (old.productId !== null && !newProductIds.has(old.productId)) {
+          const covered = old.quantity - old.quantityPending;
+          stockById.set(old.productId, (stockById.get(old.productId) ?? 0) + covered);
         }
       }
 
-      // 2) Validar y reservar stock para la nueva composición, sobre el stock ya restaurado.
       const lines = input.items.map((item) => {
         const product = productById.get(item.productId);
-        if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
+        if (!product) throw new SaleValidationError("No encontramos uno de los productos de la venta");
         // Solo se rechaza si es un producto NUEVO en esta edición — uno que ya era parte de
         // la venta sigue siendo histórico válido aunque hoy esté discontinuado (sección 14).
         if (stockRowById.get(item.productId)?.discontinued && !existingProductIds.has(item.productId)) {
           throw new SaleValidationError(`"${product.producto}" está discontinuado y no está disponible para nuevas ventas`);
         }
-        const available = stockById.get(item.productId) ?? 0;
-        if (available < item.quantity) {
-          throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);
+        const realCostPerUnitKnown = stockRowById.get(item.productId)?.costPrice ?? null;
+        const existing = existingByProductId.get(item.productId);
+
+        if (!existing) {
+          // Renglón nuevo en esta edición: misma lógica que un renglón de createSale.
+          const available = stockById.get(item.productId) ?? 0;
+          const allocation = resolveStockAllocation(item.quantity, available);
+          stockById.set(item.productId, available - allocation.covered);
+          const initialCost = resolveInitialLineCost({
+            quantity: item.quantity,
+            quantityPending: allocation.pending,
+            realCostPerUnitKnown,
+            publicPrice: product.precio,
+            habitualDiscountPercent,
+          });
+          const blended = resolveBlendedLineCost({ quantity: item.quantity, ...initialCost });
+          return {
+            product,
+            quantity: item.quantity,
+            unitPrice: item.unitPrice ?? product.precio,
+            costPrice: blended.costPrice,
+            costIsEstimated: blended.isEstimated,
+            quantityPending: allocation.pending,
+            quantityDelivered: allocation.covered,
+            ...initialCost,
+          };
         }
-        stockById.set(item.productId, available - item.quantity);
-        const resolvedCost = resolveLineCost({
-          costPrice: stockRowById.get(item.productId)?.costPrice ?? null,
+
+        if (item.quantity === existing.quantity) {
+          // Sin cambio de cantidad: nunca toca el stock ni el progreso de entrega (ya quedó
+          // "restaurado" arriba solo si desapareció, no es este caso). El costo es distinto:
+          // Prompt 2 ya establecía que CUALQUIER edición usa el costo VIGENTE de ese momento,
+          // nunca el histórico — eso sigue así cuando no queda nada pendiente (se re-resuelve
+          // entero, exactamente como un renglón nuevo). Solo cuando SÍ queda algo pendiente se
+          // preserva el acumulado real/estimado tal cual: no hay un "costo vigente" único del
+          // que recalcular sin perder la parte ya resuelta con costo real de un pedido previo.
+          if (existing.quantityPending === 0) {
+            const initialCost = resolveInitialLineCost({
+              quantity: existing.quantity,
+              quantityPending: 0,
+              realCostPerUnitKnown,
+              publicPrice: product.precio,
+              habitualDiscountPercent,
+            });
+            const blended = resolveBlendedLineCost({ quantity: existing.quantity, ...initialCost });
+            return {
+              product,
+              quantity: existing.quantity,
+              unitPrice: item.unitPrice ?? product.precio,
+              costPrice: blended.costPrice,
+              costIsEstimated: blended.isEstimated,
+              quantityPending: 0,
+              quantityDelivered: existing.quantityDelivered,
+              ...initialCost,
+            };
+          }
+          const blended = resolveBlendedLineCost({
+            quantity: existing.quantity,
+            estimatedCostPerUnit: existing.estimatedCostPerUnit,
+            realCostAccumulated: existing.realCostAccumulated,
+            realCostUnits: existing.realCostUnits,
+          });
+          return {
+            product,
+            quantity: existing.quantity,
+            unitPrice: item.unitPrice ?? product.precio,
+            costPrice: blended.costPrice,
+            costIsEstimated: blended.isEstimated,
+            quantityPending: existing.quantityPending,
+            quantityDelivered: existing.quantityDelivered,
+            estimatedCostPerUnit: existing.estimatedCostPerUnit,
+            realCostAccumulated: existing.realCostAccumulated,
+            realCostUnits: existing.realCostUnits,
+          };
+        }
+
+        if (item.quantity < existing.quantity) {
+          // Ajuste 5: primero se descuenta de lo pendiente, después de lo que tenía en mano sin
+          // entregar, y por último (una devolución de la clienta) de lo ya entregado. Todo lo
+          // que no salga de "pendiente" vuelve al stock.
+          const decrease = resolveQuantityDecrease(
+            existing.quantity - item.quantity,
+            existing.quantity,
+            existing.quantityPending,
+            existing.quantityDelivered,
+          );
+          stockById.set(item.productId, (stockById.get(item.productId) ?? 0) + decrease.stockToReturn);
+          let realCostAccumulated = existing.realCostAccumulated;
+          let realCostUnits = existing.realCostUnits;
+          if (decrease.stockToReturn > 0 && existing.realCostUnits > 0) {
+            const avgRealCost = existing.realCostAccumulated / existing.realCostUnits;
+            const unitsRemovedFromReal = Math.min(decrease.stockToReturn, existing.realCostUnits);
+            realCostAccumulated = existing.realCostAccumulated - Math.round(avgRealCost * unitsRemovedFromReal);
+            realCostUnits = existing.realCostUnits - unitsRemovedFromReal;
+          }
+          const blended = resolveBlendedLineCost({
+            quantity: item.quantity,
+            estimatedCostPerUnit: existing.estimatedCostPerUnit,
+            realCostAccumulated,
+            realCostUnits,
+          });
+          return {
+            product,
+            quantity: item.quantity,
+            unitPrice: item.unitPrice ?? product.precio,
+            costPrice: blended.costPrice,
+            costIsEstimated: blended.isEstimated,
+            quantityPending: decrease.quantityPending,
+            quantityDelivered: decrease.quantityDelivered,
+            estimatedCostPerUnit: existing.estimatedCostPerUnit,
+            realCostAccumulated,
+            realCostUnits,
+          };
+        }
+
+        // item.quantity > existing.quantity: la diferencia sigue la lógica de vender sin stock.
+        const increaseAmount = item.quantity - existing.quantity;
+        const available = stockById.get(item.productId) ?? 0;
+        const allocation = resolveStockAllocation(increaseAmount, available);
+        stockById.set(item.productId, available - allocation.covered);
+        const deltaCost = resolveInitialLineCost({
+          quantity: increaseAmount,
+          quantityPending: allocation.pending,
+          realCostPerUnitKnown,
           publicPrice: product.precio,
           habitualDiscountPercent,
         });
+        const estimatedCostPerUnit = existing.estimatedCostPerUnit ?? deltaCost.estimatedCostPerUnit;
+        const realCostAccumulated = existing.realCostAccumulated + deltaCost.realCostAccumulated;
+        const realCostUnits = existing.realCostUnits + deltaCost.realCostUnits;
+        const blended = resolveBlendedLineCost({ quantity: item.quantity, estimatedCostPerUnit, realCostAccumulated, realCostUnits });
         return {
           product,
           quantity: item.quantity,
           unitPrice: item.unitPrice ?? product.precio,
-          costPrice: resolvedCost.costPrice,
-          costIsEstimated: resolvedCost.isEstimated,
+          costPrice: blended.costPrice,
+          costIsEstimated: blended.isEstimated,
+          // Lo ya entregado nunca se toca; la porción nueva que SÍ había en stock se entrega
+          // en el momento, igual que al crear la venta.
+          quantityPending: existing.quantityPending + allocation.pending,
+          quantityDelivered: existing.quantityDelivered + allocation.covered,
+          estimatedCostPerUnit,
+          realCostAccumulated,
+          realCostUnits,
         };
       });
 
@@ -3827,7 +4751,7 @@ export class DatabaseStorage implements IStorage {
       const installmentAmounts = input.installments.map((i) => i.amount);
       const remainingTotal = totals.total - alreadyPaidAmount;
       if (remainingTotal < 0) {
-        throw new SaleValidationError(`El nuevo total no puede ser menor que lo que ya se cobró (${alreadyPaidAmount})`);
+        throw new SaleValidationError(`El nuevo total no puede ser menor que lo que ya se cobró (${formatMoney(alreadyPaidAmount / 100)})`);
       }
       if (!installmentsSumMatches(installmentAmounts, remainingTotal)) {
         throw new SaleValidationError("La suma de las cuotas no coincide con el saldo pendiente de la venta");
@@ -3886,11 +4810,17 @@ export class DatabaseStorage implements IStorage {
           originalPrice: l.product.precio,
           price: l.unitPrice,
           // Costo vigente al momento de esta edición (releído de productStock bajo el mismo
-          // lock, arriba) — misma fuente que computeProductCost. Una edición reemplaza la
-          // composición completa, así que el snapshot viejo de la línea anterior no se
-          // conserva (mismo criterio ya vigente para el resto de la fila).
+          // lock, arriba) — misma fuente que computeProductCost. La FILA se reemplaza por
+          // completo (delete + insert), pero el progreso de entrega/costo de un renglón sin
+          // cambios o editado (Prompt 8) sí se preserva/ajusta — ver el armado de `lines` más
+          // arriba, nunca nace de cero salvo que sea un renglón nuevo en esta edición.
           costPrice: l.costPrice,
           costIsEstimated: l.costIsEstimated,
+          quantityPending: l.quantityPending,
+          quantityDelivered: l.quantityDelivered,
+          estimatedCostPerUnit: l.estimatedCostPerUnit,
+          realCostAccumulated: l.realCostAccumulated,
+          realCostUnits: l.realCostUnits,
         })),
       );
 
@@ -3934,6 +4864,9 @@ export class DatabaseStorage implements IStorage {
           installmentsCount,
           installmentFrequency: installmentsCount > 1 ? input.installmentFrequency ?? null : null,
           notes: input.notes ?? null,
+          // Prompt 8: igual que en createSale — "entregada" solo si TODOS los renglones de la
+          // composición nueva tienen quantityDelivered === quantity.
+          deliveryStatus: lines.every((l) => l.quantityDelivered === l.quantity) ? "entregada" : "pendiente_entrega",
         })
         .where(and(eq(sales.id, id), eq(sales.consultantId, consultantId)))
         .returning();
@@ -3979,8 +4912,14 @@ export class DatabaseStorage implements IStorage {
           .for("update");
         const stockById = new Map(stockRows.map((s) => [s.productId, s.unidades]));
         for (const item of items) {
+          // Prompt 8 — solo vuelve al stock lo que REALMENTE salió de ahí (quantity -
+          // quantityPending): lo pendiente nunca tocó productStock.unidades, y lo que un
+          // pedido ya le haya asignado a este renglón (bypasseando el stock disponible) queda
+          // incluido acá igual, porque esas unidades físicas quedan libres de nuevo al
+          // cancelarse la venta que las tenía reservadas.
           if (item.productId !== null) {
-            stockById.set(item.productId, (stockById.get(item.productId) ?? 0) + item.quantity);
+            const covered = item.quantity - item.quantityPending;
+            stockById.set(item.productId, (stockById.get(item.productId) ?? 0) + covered);
           }
         }
         for (const productId of productIds) {
@@ -3989,6 +4928,8 @@ export class DatabaseStorage implements IStorage {
             .set({ unidades: stockById.get(productId)! })
             .where(and(eq(productStock.consultantId, consultantId), eq(productStock.productId, productId)));
         }
+        // Una venta cancelada no puede seguir "esperando" un pedido futuro.
+        await tx.update(saleItems).set({ quantityPending: 0 }).where(eq(saleItems.saleId, id));
       }
 
       const [updated] = await tx
@@ -4053,19 +4994,501 @@ export class DatabaseStorage implements IStorage {
     });
   }
 
+  /** Prompt 8 — el toggle manual ahora aplica a TODOS los renglones de la venta a la vez:
+   * "entregada" los marca todos entregados (`quantityDelivered = quantity`), bloqueado si a
+   * alguno le queda `quantityPending > 0` (no se puede marcar como entregado lo que todavía no
+   * se tiene); "pendiente_entrega" los vuelve todos a `quantityDelivered = 0`. */
   async setSaleDeliveryStatus(consultantId: number, saleId: number, deliveryStatus: "entregada" | "pendiente_entrega"): Promise<Sale | undefined> {
     const db = await this.getDb();
-    const [sale] = await db.select().from(sales).where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)));
-    if (!sale) return undefined;
-    if (sale.status === "cancelada") {
-      throw new SaleValidationError("No se puede cambiar la entrega de una venta cancelada");
+    return db.transaction(async (tx) => {
+      const [sale] = await tx
+        .select()
+        .from(sales)
+        .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+        .for("update");
+      if (!sale) return undefined;
+      if (sale.status === "cancelada") {
+        throw new SaleValidationError("No se puede cambiar la entrega de una venta cancelada");
+      }
+
+      if (deliveryStatus === "entregada") {
+        const items = await tx.select().from(saleItems).where(eq(saleItems.saleId, saleId));
+        if (items.some((i) => i.quantityPending > 0)) {
+          throw new SaleValidationError("No se puede marcar como entregada: todavía tiene unidades pendientes de un pedido");
+        }
+        await tx.update(saleItems).set({ quantityDelivered: sql`${saleItems.quantity}` }).where(eq(saleItems.saleId, saleId));
+      } else {
+        await tx.update(saleItems).set({ quantityDelivered: 0 }).where(eq(saleItems.saleId, saleId));
+      }
+
+      const [updated] = await tx
+        .update(sales)
+        .set({ deliveryStatus })
+        .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+        .returning();
+      return updated;
+    });
+  }
+
+  /** Prompt 8, Parte 2 — "Marcar como entregado" de UN renglón puntual (botón del aviso "Ya
+   * podés entregarle..."): entrega lo que esté "listo para entregar" en ese momento (quantity -
+   * quantityPending - quantityDelivered) y recalcula sales.deliveryStatus como agregado de
+   * todos los renglones, en la misma transacción. */
+  async markSaleItemDelivered(consultantId: number, saleId: number, itemId: number): Promise<Sale | undefined> {
+    const db = await this.getDb();
+    return db.transaction(async (tx) => {
+      const [sale] = await tx
+        .select()
+        .from(sales)
+        .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+        .for("update");
+      if (!sale) return undefined;
+      if (sale.status === "cancelada") {
+        throw new SaleValidationError("No se puede entregar un renglón de una venta cancelada");
+      }
+
+      const [item] = await tx
+        .select()
+        .from(saleItems)
+        .where(and(eq(saleItems.id, itemId), eq(saleItems.saleId, saleId)))
+        .for("update");
+      if (!item) return undefined;
+
+      const readyToDeliver = item.quantity - item.quantityPending - item.quantityDelivered;
+      if (readyToDeliver <= 0) {
+        throw new SaleValidationError("Este renglón no tiene nada listo para entregar todavía");
+      }
+      await tx
+        .update(saleItems)
+        .set({ quantityDelivered: item.quantityDelivered + readyToDeliver })
+        .where(eq(saleItems.id, itemId));
+
+      const allItems = await tx.select().from(saleItems).where(eq(saleItems.saleId, saleId));
+      const allDelivered = allItems.every((i) => (i.id === itemId ? true : i.quantityDelivered === i.quantity));
+      const [updated] = await tx
+        .update(sales)
+        .set({ deliveryStatus: allDelivered ? "entregada" : "pendiente_entrega" })
+        .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+        .returning();
+      return updated;
+    });
+  }
+
+  /** Prompt 8, Parte 2 — todos los renglones "listos para entregar" (quantityPending === 0 y
+   * todavía no se tocó "Marcar como entregado") de cualquier venta no cancelada, para el aviso
+   * de Inicio "Ya podés entregarle a...". Agrupado por renglón, no por venta: cada uno con su
+   * propio botón. */
+  async getDeliveryReadyItems(
+    consultantId: number,
+  ): Promise<{ saleId: number; itemId: number; clientId: number | null; clientName: string; productName: string; quantity: number }[]> {
+    const db = await this.getDb();
+    const rows = await db
+      .select({
+        saleId: saleItems.saleId,
+        itemId: saleItems.id,
+        quantity: saleItems.quantity,
+        quantityDelivered: saleItems.quantityDelivered,
+        productName: saleItems.productName,
+        clientId: sales.clientId,
+        clientName: sales.clientName,
+      })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .where(
+        and(
+          eq(sales.consultantId, consultantId),
+          ne(sales.status, "cancelada"),
+          eq(saleItems.quantityPending, 0),
+          sql`${saleItems.quantityDelivered} < ${saleItems.quantity}`,
+        ),
+      )
+      .orderBy(asc(sales.date), asc(sales.id));
+    return rows.map((r) => ({
+      saleId: r.saleId,
+      itemId: r.itemId,
+      clientId: r.clientId,
+      clientName: r.clientName,
+      productName: r.productName,
+      quantity: r.quantity - r.quantityDelivered,
+    }));
+  }
+
+  /** Prompt 8, Parte 3 — productos vendidos entre `periodStart` y `periodEnd` (criterio a) que
+   * HOY tienen stock <= umbral efectivo. A propósito `<=`, no el `<` estricto de `isLowStock`
+   * (shared/stockAlerts.ts: ese es el criterio del aviso genérico de stock bajo, un criterio
+   * distinto). Nunca excluye por discontinuado: "Discontinuos" es una categoría de catálogo
+   * más, no un criterio de visibilidad (Prompt 6) — la cascada de umbral de siempre tampoco lo
+   * excluye (ver getLowStockProducts). */
+  private async computeOrderReminderSoldCandidates(
+    tx: Pick<Database, "select">,
+    consultantId: number,
+    periodStart: string,
+    periodEnd: string,
+  ): Promise<OrderReminderItemSnapshot[]> {
+    const soldRows = await tx
+      .select({ productId: saleItems.productId, soldInPeriod: sql<number>`coalesce(sum(${saleItems.quantity}), 0)`.mapWith(Number) })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .where(
+        and(
+          eq(sales.consultantId, consultantId),
+          ne(sales.status, "cancelada"),
+          gte(sales.date, periodStart),
+          lte(sales.date, periodEnd),
+          isNotNull(saleItems.productId),
+        ),
+      )
+      .groupBy(saleItems.productId);
+    if (soldRows.length === 0) return [];
+
+    const productIds = soldRows.map((r) => r.productId).filter((id): id is number => id !== null);
+    const [consultantRow] = await tx
+      .select({ defaultLowStockThreshold: consultants.defaultLowStockThreshold })
+      .from(consultants)
+      .where(eq(consultants.id, consultantId));
+    const defaultThreshold = consultantRow?.defaultLowStockThreshold ?? null;
+    const stockRows = await tx
+      .select({ productId: productStock.productId, unidades: productStock.unidades, stockMinimo: productStock.stockMinimo })
+      .from(productStock)
+      .where(and(eq(productStock.consultantId, consultantId), inArray(productStock.productId, productIds)));
+    const stockByProductId = new Map(stockRows.map((s) => [s.productId, s]));
+
+    const qualifying: OrderReminderItemSnapshot[] = [];
+    for (const row of soldRows) {
+      if (row.productId === null) continue;
+      const stock = stockByProductId.get(row.productId);
+      const unidades = stock?.unidades ?? 0;
+      const threshold = resolveLowStockThreshold(stock?.stockMinimo ?? null, defaultThreshold);
+      if (unidades <= threshold) {
+        qualifying.push({ productId: row.productId, soldInPeriod: row.soldInPeriod });
+      }
     }
+    return qualifying;
+  }
+
+  /** Unidades pendientes de ventas FUERA del período [`periodStart`, `periodEnd`]: de antes
+   * (`date < periodStart`) o del propio día de pedido en adelante (`date > periodEnd`, que por
+   * construcción es `reminderDate` — ver resolveOrderReminderPeriod). Nunca de ventas DENTRO
+   * del período: esas ya están en `soldInPeriod`, contarlas de nuevo acá las duplicaría.
+   * Siempre en vivo, nunca congelado en la fila del recordatorio (ajuste del Prompt 8). */
+  private async computeOrderReminderPendingCandidates(
+    tx: Pick<Database, "select">,
+    consultantId: number,
+    periodStart: string,
+    periodEnd: string,
+  ): Promise<{ productId: number; pendingFromBefore: number }[]> {
+    const rows = await tx
+      .select({ productId: saleItems.productId, pendingFromBefore: sql<number>`coalesce(sum(${saleItems.quantityPending}), 0)`.mapWith(Number) })
+      .from(saleItems)
+      .innerJoin(sales, eq(saleItems.saleId, sales.id))
+      .where(
+        and(
+          eq(sales.consultantId, consultantId),
+          ne(sales.status, "cancelada"),
+          gt(saleItems.quantityPending, 0),
+          or(lt(sales.date, periodStart), gt(sales.date, periodEnd)),
+          isNotNull(saleItems.productId),
+        ),
+      )
+      .groupBy(saleItems.productId);
+    return rows.filter((r): r is { productId: number; pendingFromBefore: number } => r.productId !== null);
+  }
+
+  /** Arma la lista final a mostrar: una sola fila por producto (nunca duplicado entre los dos
+   * criterios), cantidad sugerida = vendido en el período + pendiente de fuera del período.
+   * Ambos criterios se recalculan en vivo a partir de las fechas congeladas en `reminder`
+   * (nunca de una lista guardada — ajuste del Prompt 8). */
+  private async buildOrderReminderDisplayItems(
+    tx: Pick<Database, "select">,
+    consultantId: number,
+    reminder: OrderReminder,
+  ): Promise<{ productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[]> {
+    const soldItems = await this.computeOrderReminderSoldCandidates(tx, consultantId, reminder.periodStart, reminder.periodEnd);
+    const pendingCandidates = await this.computeOrderReminderPendingCandidates(tx, consultantId, reminder.periodStart, reminder.periodEnd);
+    const pendingByProductId = new Map(pendingCandidates.map((p) => [p.productId, p.pendingFromBefore]));
+    const soldByProductId = new Map(soldItems.map((s) => [s.productId, s.soldInPeriod]));
+    const productIds = Array.from(new Set([...soldItems.map((s) => s.productId), ...pendingCandidates.map((p) => p.productId)]));
+    if (productIds.length === 0) return [];
+
+    const productRows = await tx.select().from(products).where(inArray(products.id, productIds));
+    const stockRows = await tx
+      .select()
+      .from(productStock)
+      .where(and(eq(productStock.consultantId, consultantId), inArray(productStock.productId, productIds)));
+    const productById = new Map(productRows.map((p) => [p.id, p]));
+    const stockByProductId = new Map(stockRows.map((s) => [s.productId, s]));
+
+    return productIds
+      .map((productId) => {
+        const product = productById.get(productId);
+        const stock = stockByProductId.get(productId);
+        const soldInPeriod = soldByProductId.get(productId) ?? 0;
+        const pendingFromBefore = pendingByProductId.get(productId) ?? 0;
+        const variante = product?.variante;
+        return {
+          productId,
+          productName: product ? (variante && variante !== "Estándar" ? `${product.producto} - ${variante}` : product.producto) : "Producto",
+          soldInPeriod,
+          pendingFromBefore,
+          currentStock: stock?.unidades ?? 0,
+          suggestedQuantity: soldInPeriod + pendingFromBefore,
+        };
+      })
+      .sort((a, b) => b.suggestedQuantity - a.suggestedQuantity);
+  }
+
+  /** Prompt 8, Parte 3 — calcula/recupera el recordatorio del día de pedido, sin ninguna tarea
+   * programada: busca el más reciente sin cerrar (así aparece aunque no haya entrado el día
+   * exacto); si no hay ninguno y hoy ya pasó (o es) el último ciclo configurado, intenta
+   * generarlo (nunca para un ciclo anterior a `orderReminderDaysUpdatedAt` — ajuste 1). Si la
+   * lista queda vacía, no inserta nada (se vuelve a intentar la próxima vez que entre). */
+  async getOrderReminder(
+    consultantId: number,
+  ): Promise<{ reminder: OrderReminder; items: Awaited<ReturnType<DatabaseStorage["buildOrderReminderDisplayItems"]>> } | null> {
+    const db = await this.getDb();
+    return db.transaction(async (tx) => {
+      let [reminder] = await tx
+        .select()
+        .from(orderReminders)
+        .where(and(eq(orderReminders.consultantId, consultantId), isNull(orderReminders.dismissedAt)))
+        .orderBy(desc(orderReminders.reminderDate))
+        .limit(1);
+
+      if (!reminder) {
+        const [consultant] = await tx
+          .select({
+            day1: consultants.orderReminderDay1,
+            day2: consultants.orderReminderDay2,
+            configuredAt: consultants.orderReminderDaysUpdatedAt,
+          })
+          .from(consultants)
+          .where(eq(consultants.id, consultantId));
+
+        const period = consultant
+          ? resolveOrderReminderPeriod(
+              consultant.day1,
+              consultant.day2,
+              getArgentinaDateStr(),
+              consultant.configuredAt ? toArgentinaDateStr(consultant.configuredAt) : null,
+            )
+          : null;
+
+        if (period) {
+          const [alreadyGenerated] = await tx
+            .select({ id: orderReminders.id })
+            .from(orderReminders)
+            .where(and(eq(orderReminders.consultantId, consultantId), eq(orderReminders.reminderDate, period.reminderDate)));
+
+          if (!alreadyGenerated) {
+            const soldCandidates = await this.computeOrderReminderSoldCandidates(tx, consultantId, period.periodStart, period.periodEnd);
+            const pendingCandidates = await this.computeOrderReminderPendingCandidates(tx, consultantId, period.periodStart, period.periodEnd);
+            if (soldCandidates.length > 0 || pendingCandidates.length > 0) {
+              [reminder] = await tx
+                .insert(orderReminders)
+                .values({
+                  consultantId,
+                  reminderDate: period.reminderDate,
+                  periodStart: period.periodStart,
+                  periodEnd: period.periodEnd,
+                })
+                .returning();
+            }
+          }
+          // Si `alreadyGenerated` existe, ya se generó y se cerró para este ciclo — no se
+          // vuelve a mostrar (point 1: nunca se duplica, ni reaparece algo ya resuelto).
+        }
+      }
+
+      if (!reminder) return null;
+      const items = await this.buildOrderReminderDisplayItems(tx, consultantId, reminder);
+      return { reminder, items };
+    });
+  }
+
+  /** Prompt 8, Parte 3 — "Listo, ya lo pedí". */
+  async dismissOrderReminder(consultantId: number, reminderId: number): Promise<OrderReminder | undefined> {
+    const db = await this.getDb();
     const [updated] = await db
-      .update(sales)
-      .set({ deliveryStatus })
-      .where(and(eq(sales.id, saleId), eq(sales.consultantId, consultantId)))
+      .update(orderReminders)
+      .set({ dismissedAt: new Date() })
+      .where(and(eq(orderReminders.id, reminderId), eq(orderReminders.consultantId, consultantId), isNull(orderReminders.dismissedAt)))
       .returning();
     return updated;
+  }
+
+  /** Prompt 10 — "Tenés N ventas sin clienta" (bloque "Pendientes" de Inicio). */
+  async countSalesWithoutClient(consultantId: number): Promise<number> {
+    const db = await this.getDb();
+    const [row] = await db
+      .select({ value: count() })
+      .from(sales)
+      .where(and(eq(sales.consultantId, consultantId), isNull(sales.clientId), ne(sales.status, "cancelada")));
+    return Number(row?.value ?? 0);
+  }
+
+  /** Prompt 10 — "Ocultar" de un aviso de "Para mejorar tu negocio": UPSERT por
+   * (consultantId, noticeType), nunca una fila nueva cada vez que se oculta el mismo aviso. */
+  async dismissDashboardNotice(consultantId: number, noticeType: DashboardNoticeType): Promise<void> {
+    const db = await this.getDb();
+    await db
+      .insert(dashboardNoticeDismissals)
+      .values({ consultantId, noticeType, dismissedAt: new Date() })
+      .onConflictDoUpdate({
+        target: [dashboardNoticeDismissals.consultantId, dashboardNoticeDismissals.noticeType],
+        set: { dismissedAt: new Date() },
+      });
+  }
+
+  /** Prompt 10 — qué avisos de "Para mejorar tu negocio" siguen tapados por "Ocultar" (menos de
+   * `DASHBOARD_NOTICE_HIDDEN_MS` desde que se ocultaron). */
+  private async getHiddenDashboardNoticeTypes(consultantId: number): Promise<Set<DashboardNoticeType>> {
+    const db = await this.getDb();
+    const rows = await db
+      .select({ noticeType: dashboardNoticeDismissals.noticeType, dismissedAt: dashboardNoticeDismissals.dismissedAt })
+      .from(dashboardNoticeDismissals)
+      .where(eq(dashboardNoticeDismissals.consultantId, consultantId));
+    const cutoff = Date.now() - DASHBOARD_NOTICE_HIDDEN_MS;
+    const hidden = new Set<DashboardNoticeType>();
+    for (const row of rows) {
+      if (row.dismissedAt.getTime() > cutoff) hidden.add(row.noticeType as DashboardNoticeType);
+    }
+    return hidden;
+  }
+
+  /** Prompt 10 — todo lo que necesita Inicio en una sola llamada. Las consultas que no dependen
+   * entre sí corren en paralelo (`Promise.all`); solo `paraMejorarTuNegocio` espera a
+   * `getHiddenDashboardNoticeTypes` para decidir qué mostrar, pero esa consulta corre en el
+   * mismo `Promise.all` que todo lo demás, nunca antes. */
+  async getDashboardOverview(consultantId: number, access: DashboardOverviewAccessInfo): Promise<DashboardOverview> {
+    const todayStr = getArgentinaDateStr();
+    const { monthStart, monthEnd, daysLeftInMonth } = getArgentinaCurrentMonthInfo();
+
+    const [
+      consultant,
+      monthPoints,
+      deliveryReady,
+      orderReminderResult,
+      appointmentsUpcoming,
+      birthdaysToday,
+      pendingInstallmentsRaw,
+      salesDrafts,
+      orderDrafts,
+      salesWithoutClientCount,
+      lowStockProductsRaw,
+      inactiveClientsResult,
+      productsWithoutCostCount,
+      clientsWithoutPhoneResult,
+      hiddenNoticeTypes,
+    ] = await Promise.all([
+      this.getBusinessSettings(consultantId),
+      this.getSalesSummary(consultantId, monthStart, monthEnd, "month"),
+      this.getDeliveryReadyItems(consultantId),
+      this.getOrderReminder(consultantId),
+      this.getUpcomingAppointments(consultantId, 50),
+      this.getUpcomingBirthdays(consultantId, 0),
+      this.getPendingInstallments(consultantId, 200),
+      this.getDrafts(consultantId, "sale"),
+      this.getDrafts(consultantId, "order"),
+      this.countSalesWithoutClient(consultantId),
+      this.getLowStockProducts(consultantId),
+      this.searchClientsPaginated(consultantId, { filter: "no_compran_hace", page: 1, pageSize: 1 }),
+      this.countProductsWithoutCost(consultantId),
+      // Prompt 10, ajuste — misma función que usa Clientas con "Completar" (filtro
+      // sin_celular), nunca countClientsWithoutPhone: el número del aviso tiene que coincidir
+      // por construcción con la lista filtrada que abre ese botón, no con un cálculo aparte.
+      this.searchClientsPaginated(consultantId, { filter: "sin_celular", page: 1, pageSize: 1 }),
+      this.getHiddenDashboardNoticeTypes(consultantId),
+    ]);
+
+    const monthSales = monthPoints.reduce((sum, p) => sum + p.totalSales, 0);
+    const appointmentsToday = appointmentsUpcoming.filter((a) => a.date === todayStr);
+    // "Pendientes" solo cuotas vencidas o que vencen hoy — las que todavía no vencen no son
+    // urgentes (siguen apareciendo en la ficha de la clienta, no acá).
+    const installments = pendingInstallmentsRaw.filter((i) => i.dueDate <= todayStr);
+    const stockBajoProducts = lowStockProductsRaw.filter((p) => !isReminderActive(p.remindStockAt, todayStr));
+    const profileIncomplete = !consultant?.city || !consultant?.age || !consultant?.jobTitle;
+    const freePlanAtLimit = access.isFreePlan && (access.productsWithStockCount ?? 0) >= access.freePlanProductLimit;
+
+    const hide = (type: DashboardNoticeType) => hiddenNoticeTypes.has(type);
+
+    return {
+      businessName: consultant?.businessName ?? "",
+      monthlyGoal: consultant?.monthlyGoal ?? null,
+      monthSales,
+      daysLeftInMonth,
+      paraHacerHoy: {
+        deliveryReady,
+        orderReminder: orderReminderResult,
+        appointmentsToday,
+        birthdaysToday,
+      },
+      pendientes: {
+        installments,
+        unfinishedSalesCount: salesDrafts.length,
+        unfinishedOrdersCount: orderDrafts.length,
+        salesWithoutClientCount,
+      },
+      paraMejorarTuNegocio: {
+        limitePlanGratis: freePlanAtLimit && !hide("limite_plan_gratis"),
+        stockBajo: stockBajoProducts.length > 0 && !hide("stock_bajo") ? { count: stockBajoProducts.length, products: stockBajoProducts } : null,
+        clientasInactivas: inactiveClientsResult.total > 0 && !hide("clientas_inactivas") ? { count: inactiveClientsResult.total } : null,
+        productosSinCosto: productsWithoutCostCount > 0 && !hide("productos_sin_costo") ? { count: productsWithoutCostCount } : null,
+        clientasSinCelular:
+          clientsWithoutPhoneResult.total > 0 && !hide("clientas_sin_celular") ? { count: clientsWithoutPhoneResult.total } : null,
+        completarPerfil: profileIncomplete && !hide("completar_perfil"),
+      },
+    };
+  }
+
+  /** Prompt 12 — todo lo que necesita Agenda para el mes [start, end), en una sola llamada. Las
+   * 5 consultas independientes corren en paralelo; el día de pedido se resuelve después, en
+   * JS puro, sin ninguna consulta extra (ya tiene lo que necesita: los días configurados, el
+   * recordatorio abierto si hay, y el período para la vista previa). */
+  async getAgendaMonth(consultantId: number, start: string, end: string): Promise<AgendaMonth> {
+    const db = await this.getDb();
+    const todayStr = getArgentinaDateStr();
+    const [year, month] = start.split("-").map(Number);
+
+    const [appointmentsList, cobros, cumpleanos, consultant, orderReminderResult] = await Promise.all([
+      this.getAppointmentsInRange(consultantId, start, end),
+      this.getInstallmentsInRange(consultantId, start, end),
+      this.getBirthdaysInMonth(consultantId, year, month),
+      this.getBusinessSettings(consultantId),
+      this.getOrderReminder(consultantId),
+    ]);
+
+    const day1 = consultant?.orderReminderDay1 ?? null;
+    const day2 = consultant?.orderReminderDay2 ?? null;
+    const configuredSinceStr = consultant?.orderReminderDaysUpdatedAt ? toArgentinaDateStr(consultant.orderReminderDaysUpdatedAt) : null;
+
+    const orderDayDates = new Set<string>();
+    if (day1 !== null) orderDayDates.add(ymdToStr({ year, month, day: resolveOrderDayForMonth(day1, year, month) }));
+    if (day2 !== null) orderDayDates.add(ymdToStr({ year, month, day: resolveOrderDayForMonth(day2, year, month) }));
+
+    const realReminderDate = orderReminderResult?.reminder.reminderDate ?? null;
+    const nextOrderDate = resolveNextOrderDate(day1, day2, todayStr);
+    // Prompt 12, ajuste — sin recordatorio abierto, el PRÓXIMO día de pedido igual muestra una
+    // lista en vivo: lo vendido desde el último día de pedido hasta HOY, más lo pendiente de
+    // afuera de ese período — misma función del Prompt 8 (`buildOrderReminderDisplayItems`),
+    // nunca una copia, solo que con un período armado al vuelo en vez de leído de una fila.
+    const lastOrderDay = resolveOrderReminderPeriod(day1, day2, todayStr, configuredSinceStr)?.reminderDate ?? null;
+
+    const diasDePedido: AgendaOrderDay[] = [];
+    for (const date of Array.from(orderDayDates)) {
+      if (date === realReminderDate) {
+        diasDePedido.push({ date, kind: "real", reminderId: orderReminderResult!.reminder.id, items: orderReminderResult!.items });
+      } else if (date === nextOrderDate && lastOrderDay !== null) {
+        const previewItems = await this.buildOrderReminderDisplayItems(db, consultantId, {
+          periodStart: lastOrderDay,
+          periodEnd: todayStr,
+        } as OrderReminder);
+        diasDePedido.push({ date, kind: "preview", items: previewItems });
+      } else {
+        diasDePedido.push({ date, kind: "marker" });
+      }
+    }
+
+    return { appointments: appointmentsList, cobros, cumpleanos, diasDePedido };
   }
 
   /** Prompt 6, punto 1 — "Completar después": asigna una clienta a una venta que se creó sin
@@ -4148,6 +5571,10 @@ export class MemoryStorage implements IStorage {
   private clientNoteRecords: ClientNote[] = [];
   private clientPaymentRecords: ClientPayment[] = [];
   private paymentAllocationRecords: PaymentAllocation[] = [];
+  private orderReminderRecords: OrderReminder[] = [];
+  private nextOrderReminderId = 1;
+  private dashboardNoticeDismissalRecords: DashboardNoticeDismissal[] = [];
+  private nextDashboardNoticeDismissalId = 1;
   private nextOrderDiscountLogId = 1;
   private nextDraftId = 1;
   private nextClientNoteId = 1;
@@ -4195,6 +5622,28 @@ export class MemoryStorage implements IStorage {
     return this.products.find((p) => p.id === productId && (p.consultantId === null || p.consultantId === consultantId));
   }
 
+  /** Espejo de DatabaseStorage.assertFreePlanProductLimit. `extraAlreadyCountedThisBatch` es
+   * solo para incrementProductStockBatch (dos pasadas, sin mutar nada hasta la segunda): cuántos
+   * productos de ESTE MISMO lote ya se planearon como "nuevos" antes de esta línea, porque
+   * `this.productStock` todavía no los refleja (a diferencia de los demás métodos, que mutan
+   * de inmediato y por eso nunca necesitan este extra). */
+  private assertFreePlanProductLimitMem(
+    consultantId: number,
+    isFreePlan: boolean,
+    previousUnidades: number,
+    newUnidades: number,
+    extraAlreadyCountedThisBatch = 0,
+  ): void {
+    if (!isFreePlan || previousUnidades > 0 || newUnidades <= 0) return;
+    const currentCount =
+      this.productStock.filter((s) => s.consultantId === consultantId && s.unidades > 0).length + extraAlreadyCountedThisBatch;
+    if (currentCount >= FREE_PLAN_PRODUCT_LIMIT) {
+      throw new FreePlanProductLimitError(
+        `Llegaste al límite de la prueba gratis (${FREE_PLAN_PRODUCT_LIMIT} productos). Suscribite para cargar todos los que quieras.`,
+      );
+    }
+  }
+
   /** Espejo de DatabaseStorage.resolveHabitualDiscountPercent. */
   private resolveHabitualDiscountPercentMem(consultantId: number): number {
     const since = new Date(Date.now() - HABITUAL_DISCOUNT_WINDOW_MS);
@@ -4229,8 +5678,14 @@ export class MemoryStorage implements IStorage {
         monthlyGoal: null,
         defaultLowStockThreshold: null,
         email: null,
+        whatsapp: null,
+        contactName: null,
+        city: null,
+        age: null,
+        jobTitle: null,
         orderReminderDay1: null,
         orderReminderDay2: null,
+        orderReminderDaysUpdatedAt: null,
         grossIncomeTaxPercentTenths: null,
       };
       this.consultants.push(consultant);
@@ -4290,13 +5745,47 @@ export class MemoryStorage implements IStorage {
   async updateBusinessSettings(consultantId: number, input: UpdateBusinessSettingsInput): Promise<Consultant | undefined> {
     const consultant = this.consultants.find((c) => c.id === consultantId);
     if (!consultant) return undefined;
+    const newDay1 = input.orderReminderDay1 ?? null;
+    const newDay2 = input.orderReminderDay2 ?? null;
+    // Prompt 8, ajuste 1 — mismo criterio que DatabaseStorage: solo se pisa la fecha cuando los
+    // días REALMENTE cambian.
+    const daysChanged = consultant.orderReminderDay1 !== newDay1 || consultant.orderReminderDay2 !== newDay2;
     consultant.businessName = input.businessName;
     consultant.currency = input.currency;
     consultant.monthlyGoal = input.monthlyGoal ?? null;
     consultant.defaultLowStockThreshold = input.defaultLowStockThreshold ?? null;
-    consultant.orderReminderDay1 = input.orderReminderDay1 ?? null;
-    consultant.orderReminderDay2 = input.orderReminderDay2 ?? null;
+    consultant.orderReminderDay1 = newDay1;
+    consultant.orderReminderDay2 = newDay2;
+    if (daysChanged) consultant.orderReminderDaysUpdatedAt = new Date();
     consultant.grossIncomeTaxPercentTenths = input.grossIncomeTaxPercentTenths ?? null;
+    return consultant;
+  }
+
+  async updateConsultantProfile(consultantId: number, input: UpdateConsultantProfileInput): Promise<Consultant | undefined> {
+    const consultant = this.consultants.find((c) => c.id === consultantId);
+    if (!consultant) return undefined;
+
+    if (input.email !== undefined) {
+      const normalized = input.email === null ? null : normalizeEmail(input.email);
+      if (normalized !== null && this.consultants.some((c) => c.id !== consultantId && c.email === normalized)) {
+        throw new DuplicateEmailError("Ya existe otra cuenta con ese email");
+      }
+      consultant.email = normalized;
+    }
+    if (input.whatsapp !== undefined) {
+      if (input.whatsapp !== null && this.consultants.some((c) => c.id !== consultantId && c.whatsapp === input.whatsapp)) {
+        throw new DuplicateWhatsAppError("Ya existe otra cuenta con ese WhatsApp");
+      }
+      if (input.whatsapp !== null && this.users.some((u) => u.username === input.whatsapp && u.consultantId !== consultantId)) {
+        throw new WhatsAppMatchesUsernameError("Ese WhatsApp coincide con el usuario de otra cuenta");
+      }
+      consultant.whatsapp = input.whatsapp;
+    }
+    if (input.contactName !== undefined) consultant.contactName = input.contactName;
+    if (input.city !== undefined) consultant.city = input.city;
+    if (input.age !== undefined) consultant.age = input.age;
+    if (input.jobTitle !== undefined) consultant.jobTitle = input.jobTitle;
+
     return consultant;
   }
 
@@ -4329,26 +5818,51 @@ export class MemoryStorage implements IStorage {
     return consultant;
   }
 
+  /** Espejo de DatabaseStorage.deriveUniqueUsername. */
+  private deriveUniqueUsernameMem(email: string): string {
+    const localPart = email.split("@")[0]?.trim().toLowerCase() || "consultora";
+    let suffix = 0;
+    while (true) {
+      const candidate = suffix === 0 ? localPart : `${localPart}${suffix}`;
+      const looksLikeWhatsapp = normalizeArgentinaPhoneDigits(candidate).valid;
+      if (!looksLikeWhatsapp && !this.users.some((u) => u.username === candidate)) {
+        return candidate;
+      }
+      suffix += 1;
+    }
+  }
+
   async registerConsultant(input: RegisterConsultantInput): Promise<{ user: User; consultant: Consultant }> {
     const normalizedEmail = normalizeEmail(input.email);
-    if (this.users.some((u) => u.username === input.username)) {
-      throw new DuplicateUsernameError("Ese nombre de usuario ya está en uso");
-    }
+    const normalizedWhatsapp = normalizeArgentinaPhoneForStorage(input.whatsapp);
     if (this.consultants.some((c) => c.email === normalizedEmail)) {
       throw new DuplicateEmailError("Ya existe una cuenta con ese email");
     }
+    if (normalizedWhatsapp !== null && this.consultants.some((c) => c.whatsapp === normalizedWhatsapp)) {
+      throw new DuplicateWhatsAppError("Ya existe una cuenta con ese WhatsApp");
+    }
+    if (normalizedWhatsapp !== null && this.users.some((u) => u.username === normalizedWhatsapp)) {
+      throw new WhatsAppMatchesUsernameError("Ese WhatsApp coincide con el usuario de otra cuenta");
+    }
 
     const hashedPassword = await bcrypt.hash(input.password, BCRYPT_SALT_ROUNDS);
+    const username = this.deriveUniqueUsernameMem(normalizedEmail);
 
     const consultant: Consultant = {
       id: this.nextConsultantId++,
-      businessName: input.username,
+      businessName: "",
       currency: "ARS",
       monthlyGoal: null,
       defaultLowStockThreshold: null,
       email: normalizedEmail,
+      whatsapp: normalizedWhatsapp,
+      contactName: input.contactName,
+      city: null,
+      age: null,
+      jobTitle: null,
       orderReminderDay1: null,
       orderReminderDay2: null,
+      orderReminderDaysUpdatedAt: null,
       grossIncomeTaxPercentTenths: null,
     };
     this.consultants.push(consultant);
@@ -4359,7 +5873,7 @@ export class MemoryStorage implements IStorage {
 
     const user: User = {
       id: this.nextUserId++,
-      username: input.username,
+      username,
       password: hashedPassword,
       role: "consultant",
       status: true,
@@ -4372,6 +5886,12 @@ export class MemoryStorage implements IStorage {
 
   async getUserByConsultantEmail(normalizedEmail: string): Promise<User | undefined> {
     const consultant = this.consultants.find((c) => c.email === normalizedEmail);
+    if (!consultant) return undefined;
+    return this.users.find((u) => u.consultantId === consultant.id && u.role === "consultant");
+  }
+
+  async getUserByConsultantWhatsapp(normalizedWhatsapp: string): Promise<User | undefined> {
+    const consultant = this.consultants.find((c) => c.whatsapp === normalizedWhatsapp);
     if (!consultant) return undefined;
     return this.users.find((u) => u.consultantId === consultant.id && u.role === "consultant");
   }
@@ -4764,18 +6284,19 @@ export class MemoryStorage implements IStorage {
     return this.consultants.find((c) => c.id === consultantId)?.defaultLowStockThreshold ?? null;
   }
 
-  async getAllProducts(consultantId: number): Promise<Product[]> {
+  async getAllProducts(consultantId: number, onlyMine = false): Promise<Product[]> {
     const defaultThreshold = this.getDefaultThresholdMem(consultantId);
     return this.products
       .filter((p) => p.consultantId === null || p.consultantId === consultantId)
+      .map((p) => ({ p, stock: this.productStock.find((s) => s.consultantId === consultantId && s.productId === p.id) }))
+      // Mismo criterio que DatabaseStorage: sin fila de stock o con 0 unidades, afuera.
+      .filter(({ stock }) => !onlyMine || (stock && stock.unidades > 0))
       .sort((a, b) =>
-        [a.seccion, a.linea ?? "", a.producto].join(" ").localeCompare(
-          [b.seccion, b.linea ?? "", b.producto].join(" "),
+        [a.p.seccion, a.p.linea ?? "", a.p.producto].join(" ").localeCompare(
+          [b.p.seccion, b.p.linea ?? "", b.p.producto].join(" "),
         ),
       )
-      .map((p) =>
-        withStockDefaults(p, this.productStock.find((s) => s.consultantId === consultantId && s.productId === p.id), defaultThreshold),
-      );
+      .map(({ p, stock }) => withStockDefaults(p, stock, defaultThreshold));
   }
 
   async getProductsByIds(consultantId: number, ids: number[]): Promise<Product[]> {
@@ -4813,6 +6334,7 @@ export class MemoryStorage implements IStorage {
           puntos: item.puntos ?? 0,
           precio: item.precio,
           imagen: item.imagen ?? null,
+          imagenMiniatura: null,
           source: "import",
         });
       }
@@ -4824,7 +6346,7 @@ export class MemoryStorage implements IStorage {
 
   /** Catálogo de prueba de UNA consultora — productos privados (no globales), con su propio
    * stock sembrado en la misma pasada. Idempotente, igual que bulkInsertProducts. */
-  async seedOwnProducts(consultantId: number, items: CreateProductInput[]): Promise<number> {
+  async seedOwnProducts(consultantId: number, items: CreateProductInput[], isFreePlan: boolean): Promise<number> {
     let changed = 0;
 
     for (const item of items) {
@@ -4854,12 +6376,14 @@ export class MemoryStorage implements IStorage {
           puntos: item.puntos,
           precio: item.precio,
           imagen: item.imagen ?? null,
+          imagenMiniatura: null,
           source: "manual",
         };
         this.products.push(product);
       }
 
       const stock = this.getOrCreateStock(consultantId, product.id);
+      this.assertFreePlanProductLimitMem(consultantId, isFreePlan, stock.unidades, item.unidades);
       stock.unidades = item.unidades;
       changed++;
     }
@@ -4889,9 +6413,10 @@ export class MemoryStorage implements IStorage {
     return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
-  async createProduct(consultantId: number, input: CreateProductInput): Promise<Product> {
+  async createProduct(consultantId: number, input: CreateProductInput, isFreePlan: boolean): Promise<Product> {
     const variante = input.variante ?? "Estándar";
     const codigo = input.codigo ?? slugify(`${input.seccion}-${input.linea ?? ""}-${input.producto}-${variante}-${Date.now()}`);
+    this.assertFreePlanProductLimitMem(consultantId, isFreePlan, 0, input.unidades);
     const product: ProductRow = {
       id: this.nextProductId++,
       consultantId,
@@ -4903,6 +6428,7 @@ export class MemoryStorage implements IStorage {
       puntos: input.puntos,
       precio: input.precio,
       imagen: input.imagen ?? null,
+      imagenMiniatura: null,
       source: "manual",
     };
     this.products.push(product);
@@ -4973,57 +6499,173 @@ export class MemoryStorage implements IStorage {
     return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
   }
 
+  /** Prompt 8, Parte 2 y punto 6 — espejo de DatabaseStorage.assignUnitsToPendingSales: antes
+   * de que `delta` unidades entren a stock disponible, cubre primero las ventas que tenían
+   * este producto pendiente, de la más vieja a la más nueva. */
+  private assignUnitsToPendingSalesMem(
+    consultantId: number,
+    productId: number,
+    delta: number,
+    realUnitCost: number | null,
+  ): { leftoverDelta: number; assignments: { saleId: number; clientName: string; quantity: number }[] } {
+    if (delta <= 0) return { leftoverDelta: delta, assignments: [] };
+
+    const saleIdsByConsultant = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
+    const pendingLines = this.saleItems
+      .filter((i) => i.productId === productId && i.quantityPending > 0 && saleIdsByConsultant.get(i.saleId)?.status !== "cancelada")
+      .sort((a, b) => {
+        const saleA = saleIdsByConsultant.get(a.saleId)!;
+        const saleB = saleIdsByConsultant.get(b.saleId)!;
+        return saleA.date === saleB.date ? saleA.id - saleB.id : saleA.date.localeCompare(saleB.date);
+      });
+
+    let remaining = delta;
+    const assignments: { saleId: number; clientName: string; quantity: number }[] = [];
+    const affectedSaleIds = new Set<number>();
+
+    for (const line of pendingLines) {
+      if (remaining <= 0) break;
+      const assigned = Math.min(remaining, line.quantityPending);
+      if (assigned <= 0) continue;
+      remaining -= assigned;
+
+      if (realUnitCost !== null) {
+        const costFields = applyRealCostToLine(line, assigned, realUnitCost);
+        line.estimatedCostPerUnit = costFields.estimatedCostPerUnit;
+        line.realCostAccumulated = costFields.realCostAccumulated;
+        line.realCostUnits = costFields.realCostUnits;
+      }
+      line.quantityPending -= assigned;
+      const blended = resolveBlendedLineCost({
+        quantity: line.quantity,
+        estimatedCostPerUnit: line.estimatedCostPerUnit,
+        realCostAccumulated: line.realCostAccumulated,
+        realCostUnits: line.realCostUnits,
+      });
+      line.costPrice = blended.costPrice;
+      line.costIsEstimated = blended.isEstimated;
+
+      const sale = saleIdsByConsultant.get(line.saleId)!;
+      assignments.push({ saleId: line.saleId, clientName: sale.clientName, quantity: assigned });
+      affectedSaleIds.add(line.saleId);
+    }
+
+    for (const saleId of Array.from(affectedSaleIds)) {
+      const sale = this.sales.find((s) => s.id === saleId);
+      if (!sale) continue;
+      const items = this.saleItems.filter((i) => i.saleId === saleId);
+      const productCost = computeHistoricalProductCost(items.map((i) => ({ quantity: i.quantity, costPrice: i.costPrice })));
+      if (productCost === null) continue;
+      sale.profit = computeSaleProfit({ total: sale.total, productCost, shippingCost: sale.shippingCost, ingresosBrutos: sale.ingresosBrutos });
+    }
+
+    return { leftoverDelta: remaining, assignments };
+  }
+
   async setProductStock(
     consultantId: number,
     productId: number,
     unidades: number,
+    isFreePlan: boolean,
     stockMinimo?: number | null,
-  ): Promise<Product | undefined> {
+  ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined> {
     const product = this.findVisibleProduct(consultantId, productId);
     if (!product) return undefined;
     const stock = this.getOrCreateStock(consultantId, productId);
-    stock.unidades = unidades;
+    const existingUnidades = stock.unidades;
+
+    // Prompt 8, punto 6 — solo lo que SUBE cubre pendientes primero (bajar a mano es una
+    // corrección, nunca una carga).
+    const arriving = Math.max(0, unidades - existingUnidades);
+    const { leftoverDelta, assignments } = this.assignUnitsToPendingSalesMem(consultantId, productId, arriving, null);
+    const finalUnidades = unidades - (arriving - leftoverDelta);
+
+    this.assertFreePlanProductLimitMem(consultantId, isFreePlan, existingUnidades, finalUnidades);
+    stock.unidades = finalUnidades;
     if (stockMinimo !== undefined) stock.stockMinimo = stockMinimo;
-    return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
+    return { product: withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId)), pendingAssignments: assignments };
   }
 
-  async incrementProductStock(consultantId: number, productId: number, delta: number): Promise<Product | undefined> {
+  async incrementProductStock(
+    consultantId: number,
+    productId: number,
+    delta: number,
+    isFreePlan: boolean,
+  ): Promise<{ product: Product; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] } | undefined> {
     if (delta === 0) {
-      throw new SaleValidationError("El delta de stock no puede ser 0");
+      throw new SaleValidationError("La cantidad no puede ser 0");
     }
     const product = this.findVisibleProduct(consultantId, productId);
     if (!product) return undefined;
     const stock = this.getOrCreateStock(consultantId, productId);
-    // Misma semántica que la versión atómica de Postgres: `actual = actual + delta`, y si el
-    // resultado da negativo se rechaza SIN tocar la fila (no hay "commit parcial" que deshacer,
-    // simplemente no se asigna hasta después de validar).
-    const nextUnidades = stock.unidades + delta;
+
+    // Prompt 8, punto 6 — solo un delta positivo cubre pendientes primero.
+    const { leftoverDelta, assignments } = this.assignUnitsToPendingSalesMem(consultantId, productId, delta, null);
+
+    // Misma semántica que la versión atómica de Postgres: `actual = actual + leftoverDelta`, y
+    // si el resultado da negativo se rechaza SIN tocar la fila.
+    const nextUnidades = stock.unidades + leftoverDelta;
     if (nextUnidades < 0) {
-      throw new SaleValidationError(`Stock insuficiente: quedarían ${nextUnidades} unidades`);
+      throw new SaleValidationError(`Stock insuficiente de ${product.producto}: quedarían ${pluralize(nextUnidades, "unidad", "unidades")}`);
     }
+    this.assertFreePlanProductLimitMem(consultantId, isFreePlan, stock.unidades, nextUnidades);
     stock.unidades = nextUnidades;
-    return withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId));
+    return { product: withStockDefaults(product, stock, this.getDefaultThresholdMem(consultantId)), pendingAssignments: assignments };
   }
 
   async incrementProductStockBatch(
     consultantId: number,
     lines: { productId: number; delta: number }[],
+    isFreePlan: boolean,
     discountPercent?: number,
     draftId?: number,
-  ): Promise<{ updated: number }> {
+  ): Promise<{ updated: number; pendingAssignments: { saleId: number; clientName: string; quantity: number }[] }> {
     if (lines.length === 0) {
       throw new SaleValidationError("El lote no puede estar vacío");
+    }
+
+    // Prompt 15 — se busca el nombre ANTES de validar nada de cada línea, para que los
+    // mensajes de abajo nombren el producto por su nombre, nunca por su id. Visibilidad de
+    // catálogo ANTES de mutar nada — la asignación a pendientes de más abajo SÍ muta
+    // sale_items (nunca product_stock), así que tiene que quedar atrás de esta validación
+    // para no romper el "todo o nada" de esta función (si un producto no existe, nada se tocó
+    // todavía, ni siquiera un renglón pendiente).
+    const rawProductIds = Array.from(new Set(lines.map((l) => l.productId))).sort((a, b) => a - b);
+    const productByIdForBatch = new Map<number, ProductRow>();
+    for (const productId of rawProductIds) {
+      const product = this.findVisibleProduct(consultantId, productId);
+      if (!product) {
+        throw new SaleValidationError("No encontramos uno de los productos del pedido");
+      }
+      productByIdForBatch.set(productId, product);
     }
 
     const deltaByProductId = new Map<number, number>();
     for (const line of lines) {
       if (!Number.isInteger(line.delta) || line.delta <= 0) {
-        throw new SaleValidationError(`Delta inválido para el producto ${line.productId}: tiene que ser un entero positivo`);
+        throw new SaleValidationError(`La cantidad de ${productByIdForBatch.get(line.productId)!.producto} tiene que ser un entero positivo`);
       }
       deltaByProductId.set(line.productId, (deltaByProductId.get(line.productId) ?? 0) + line.delta);
     }
 
     const orderedProductIds = Array.from(deltaByProductId.keys()).sort((a, b) => a - b);
+
+    // Prompt 8 — cubre pendientes ANTES de la planificación de stock de abajo.
+    const pendingAssignments: { saleId: number; clientName: string; quantity: number }[] = [];
+    const leftoverByProductId = new Map<number, number>();
+    for (const productId of orderedProductIds) {
+      const delta = deltaByProductId.get(productId)!;
+      const lineCost =
+        discountPercent !== undefined ? Math.round(productByIdForBatch.get(productId)!.precio * (1 - discountPercent / 100)) : null;
+      const { leftoverDelta, assignments } = this.assignUnitsToPendingSalesMem(consultantId, productId, delta, lineCost);
+      leftoverByProductId.set(productId, leftoverDelta);
+      pendingAssignments.push(...assignments);
+    }
+
+    // Prompt 14 (P30) — cuántas líneas de ESTE lote ya se planearon como "nuevas" (0 → positivo)
+    // antes de la línea actual del loop de abajo: `this.productStock` todavía no las refleja
+    // (recién se aplican en la segunda pasada), así que el chequeo de límite las cuenta aparte.
+    let newProductsPlannedThisBatch = 0;
 
     // Lógicamente atómico sin transacción real (no hay DB acá): DOS pasadas. La primera valida
     // TODO (visibilidad + resultado no negativo) sin escribir nada; recién si las N líneas
@@ -5036,23 +6678,24 @@ export class MemoryStorage implements IStorage {
     // recalcularlas es la carga manual de costo desde "Editar producto" (Prompt 4).
     const planned: { stock: ProductStock; nextUnidades: number; nextCostPrice?: number }[] = [];
     for (const productId of orderedProductIds) {
-      const product = this.findVisibleProduct(consultantId, productId);
-      if (!product) {
-        throw new SaleValidationError(`Producto ${productId} no encontrado`);
-      }
+      const product = productByIdForBatch.get(productId)!;
       const stock = this.getOrCreateStock(consultantId, productId);
-      const delta = deltaByProductId.get(productId)!;
+      const delta = leftoverByProductId.get(productId)!;
+      if (delta <= 0) continue;
       const nextUnidades = stock.unidades + delta;
       if (nextUnidades < 0) {
-        throw new SaleValidationError(`Stock insuficiente para el producto ${productId}: quedarían ${nextUnidades} unidades`);
+        throw new SaleValidationError(`Stock insuficiente de ${product.producto}: quedarían ${pluralize(nextUnidades, "unidad", "unidades")}`);
       }
+      this.assertFreePlanProductLimitMem(consultantId, isFreePlan, stock.unidades, nextUnidades, newProductsPlannedThisBatch);
+      if (stock.unidades <= 0 && nextUnidades > 0) newProductsPlannedThisBatch++;
       if (discountPercent === undefined) {
         planned.push({ stock, nextUnidades });
         continue;
       }
       // Prompt 2 — mismo criterio que DatabaseStorage: promedio ponderado por unidades,
       // redondeado a pesos enteros; sin costo previo o con 0 unidades, el costo nuevo es
-      // directamente el de esta compra.
+      // directamente el de esta compra. Usa `leftoverDelta` (acá `delta`), no el delta crudo
+      // del pedido: lo que se fue a cubrir pendientes nunca se mezcla en este promedio.
       const lineCost = Math.round(product.precio * (1 - discountPercent / 100));
       const hadNoRealCost = stock.costPrice === null || stock.unidades <= 0;
       const nextCostPrice = hadNoRealCost
@@ -5074,7 +6717,7 @@ export class MemoryStorage implements IStorage {
       if (index !== -1) this.draftRecords.splice(index, 1);
     }
 
-    return { updated: orderedProductIds.length };
+    return { updated: orderedProductIds.length, pendingAssignments };
   }
 
   async recalculateEstimatedSalesForProduct(consultantId: number, productId: number, newCostPrice: number): Promise<void> {
@@ -5085,8 +6728,13 @@ export class MemoryStorage implements IStorage {
     if (estimatedItems.length === 0) return;
 
     for (const item of estimatedItems) {
-      item.costPrice = newCostPrice;
-      item.costIsEstimated = false;
+      const corrected = applyManualCostCorrection(item, newCostPrice);
+      item.estimatedCostPerUnit = corrected.estimatedCostPerUnit;
+      item.realCostAccumulated = corrected.realCostAccumulated;
+      item.realCostUnits = corrected.realCostUnits;
+      const blended = resolveBlendedLineCost({ quantity: item.quantity, ...corrected });
+      item.costPrice = blended.costPrice;
+      item.costIsEstimated = blended.isEstimated;
     }
 
     const affectedSaleIds = Array.from(new Set(estimatedItems.map((i) => i.saleId)));
@@ -5109,6 +6757,10 @@ export class MemoryStorage implements IStorage {
     return this.productStock.filter((s) => s.consultantId === consultantId && s.costPrice === null && s.unidades > 0).length;
   }
 
+  async countProductsWithStock(consultantId: number): Promise<number> {
+    return this.productStock.filter((s) => s.consultantId === consultantId && s.unidades > 0).length;
+  }
+
   async setProductStockReminder(consultantId: number, productId: number, remindAt: string | null): Promise<Product | undefined> {
     const product = this.findVisibleProduct(consultantId, productId);
     if (!product) return undefined;
@@ -5127,18 +6779,26 @@ export class MemoryStorage implements IStorage {
       );
   }
 
-  async setProductImage(productId: number, imagen: string | null): Promise<SetProductImageResult> {
+  async setProductImage(productId: number, imagen: string | null, imagenMiniatura: string | null): Promise<SetProductImageResult> {
     const product = this.products.find((p) => p.id === productId && p.consultantId === null);
-    if (!product) return { product: undefined, previousImage: null };
+    if (!product) return { product: undefined, previousImage: null, previousThumbnail: null };
     const previousImage = product.imagen;
+    const previousThumbnail = product.imagenMiniatura;
     product.imagen = imagen;
-    return { product, previousImage };
+    product.imagenMiniatura = imagenMiniatura;
+    return { product, previousImage, previousThumbnail };
   }
 
-  async getUpcomingAppointments(consultantId: number, limit = 10): Promise<Appointment[]> {
-    const now = new Date();
-    const nowDate = toDateStr(now);
-    const nowTime = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+  /** Espejo de DatabaseStorage: agrega `clientPhone` (null si no tiene clienta o no tiene celular). */
+  private withClientPhone(a: Appointment): AppointmentWithPhone {
+    const client = a.clientId !== null ? this.clients.find((c) => c.id === a.clientId) : undefined;
+    return { ...a, clientPhone: client?.phone ?? null };
+  }
+
+  async getUpcomingAppointments(consultantId: number, limit = 10): Promise<AppointmentWithPhone[]> {
+    // Prompt 12 — mismo criterio que DatabaseStorage: hora de Argentina, nunca el reloj del proceso.
+    const nowDate = getArgentinaDateStr();
+    const nowTime = getArgentinaTimeStr();
 
     return this.appointments
       .filter(
@@ -5148,13 +6808,15 @@ export class MemoryStorage implements IStorage {
           UPCOMING_APPOINTMENT_STATUSES.includes(a.status as AppointmentStatus),
       )
       .sort((a, b) => (a.date === b.date ? a.time.localeCompare(b.time) : a.date.localeCompare(b.date)))
-      .slice(0, limit);
+      .slice(0, limit)
+      .map((a) => this.withClientPhone(a));
   }
 
-  async getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<Appointment[]> {
+  async getAppointmentsInRange(consultantId: number, start: string, end: string): Promise<AppointmentWithPhone[]> {
     return this.appointments
       .filter((a) => a.consultantId === consultantId && a.date >= start && a.date < end)
-      .sort((a, b) => (a.date === b.date ? a.time.localeCompare(b.time) : a.date.localeCompare(b.date)));
+      .sort((a, b) => (a.date === b.date ? a.time.localeCompare(b.time) : a.date.localeCompare(b.date)))
+      .map((a) => this.withClientPhone(a));
   }
 
   async getAppointmentCustomTypes(consultantId: number): Promise<string[]> {
@@ -5188,9 +6850,15 @@ export class MemoryStorage implements IStorage {
   }
 
   async createAppointment(consultantId: number, input: CreateAppointmentInput): Promise<Appointment | undefined> {
-    const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
-    if (!client) return undefined;
-    const clientName = client.name ?? client.phone ?? "Sin nombre";
+    // Prompt 12 — espejo de DatabaseStorage: sin clientId, queda sin clienta.
+    let clientId: number | null = null;
+    let clientName = "";
+    if (input.clientId !== undefined) {
+      const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
+      if (!client) return undefined;
+      clientId = client.id;
+      clientName = client.name ?? client.phone ?? "Sin nombre";
+    }
     const type = await this.resolveEventType(consultantId, input.type);
 
     if (this.hasConflictingAppointment(consultantId, input.date, input.time)) {
@@ -5200,7 +6868,7 @@ export class MemoryStorage implements IStorage {
     const appointment: Appointment = {
       id: this.nextAppointmentId++,
       consultantId,
-      clientId: client.id,
+      clientId,
       clientName,
       date: input.date,
       time: input.time,
@@ -5217,16 +6885,21 @@ export class MemoryStorage implements IStorage {
     const existing = this.appointments.find((a) => a.id === id && a.consultantId === consultantId);
     if (!existing) return undefined;
 
-    const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
-    if (!client) throw new AppointmentValidationError("Clienta no encontrada");
-    const clientName = client.name ?? client.phone ?? "Sin nombre";
+    let clientId: number | null = null;
+    let clientName = "";
+    if (input.clientId !== undefined) {
+      const client = this.clients.find((c) => c.id === input.clientId && c.consultantId === consultantId);
+      if (!client) throw new AppointmentValidationError("Clienta no encontrada");
+      clientId = client.id;
+      clientName = client.name ?? client.phone ?? "Sin nombre";
+    }
     const type = input.type === existing.type ? existing.type : await this.resolveEventType(consultantId, input.type);
 
     if (this.hasConflictingAppointment(consultantId, input.date, input.time, id)) {
       throw new AppointmentConflictError("Ya existe un turno en ese horario");
     }
 
-    existing.clientId = client.id;
+    existing.clientId = clientId;
     existing.clientName = clientName;
     existing.date = input.date;
     existing.time = input.time;
@@ -5307,27 +6980,54 @@ export class MemoryStorage implements IStorage {
     );
   }
 
+  /** Espejo de DatabaseStorage.getClientsPendingBalanceDetail — misma condición y suma,
+   * compartida por computeClientStatsMemory y getReportsOverviewMemory. Sin `clientIds`,
+   * agrega TODAS las clientas de la consultora (nunca ventas "Sin clienta"). */
+  private getClientsPendingBalanceDetailMemory(
+    consultantId: number,
+    todayStr: string,
+    clientIds?: number[],
+  ): Map<number, { balance: number; overdueBalance: number }> {
+    const idSet = clientIds ? new Set(clientIds) : null;
+    const result = new Map<number, { balance: number; overdueBalance: number }>();
+
+    const relevantSaleIds = new Map(
+      this.sales
+        .filter((s) => s.consultantId === consultantId && s.clientId !== null && s.status !== "cancelada" && (!idSet || idSet.has(s.clientId)))
+        .map((s) => [s.id, s.clientId as number]),
+    );
+
+    for (const inst of this.saleInstallments) {
+      if (inst.status !== "pendiente") continue;
+      const clientId = relevantSaleIds.get(inst.saleId);
+      if (clientId === undefined) continue;
+      const entry = result.get(clientId) ?? { balance: 0, overdueBalance: 0 };
+      const owed = inst.amount - inst.amountPaid;
+      entry.balance += owed;
+      if (inst.dueDate < todayStr) entry.overdueBalance += owed;
+      result.set(clientId, entry);
+    }
+
+    return result;
+  }
+
   /** Espejo de DatabaseStorage.computeClientStats. */
-  private computeClientStatsMemory(clientIds: number[]): { statsByClient: Map<number, { totalAmount: number; lastDate: string | null }>; balanceByClient: Map<number, number> } {
+  private computeClientStatsMemory(
+    consultantId: number,
+    clientIds: number[],
+  ): { statsByClient: Map<number, { totalAmount: number; lastDate: string | null }>; balanceByClient: Map<number, number> } {
     const idSet = new Set(clientIds);
     const statsByClient = new Map<number, { totalAmount: number; lastDate: string | null }>();
-    const balanceByClient = new Map<number, number>();
 
     for (const clientId of Array.from(idSet)) {
       const clientSales = this.sales.filter((s) => s.clientId === clientId && s.status !== "cancelada");
       const totalAmount = clientSales.reduce((sum, s) => sum + s.total, 0);
       const lastDate = clientSales.length ? clientSales.map((s) => s.date).sort().slice(-1)[0] : null;
       statsByClient.set(clientId, { totalAmount, lastDate });
-
-      // Misma condición que getPendingInstallments (cuota "pendiente" de una venta no cancelada).
-      const clientSaleIds = new Set(clientSales.map((s) => s.id));
-      // Prompt 9: el saldo real es amount - amountPaid — una "pendiente" puede tener un pago
-      // parcial (nunca el monto original de la cuota).
-      const pendingBalance = this.saleInstallments
-        .filter((i) => i.status === "pendiente" && clientSaleIds.has(i.saleId))
-        .reduce((sum, i) => sum + (i.amount - i.amountPaid), 0);
-      balanceByClient.set(clientId, pendingBalance);
     }
+
+    const balanceDetailByClient = this.getClientsPendingBalanceDetailMemory(consultantId, getArgentinaDateStr(), clientIds);
+    const balanceByClient = new Map(Array.from(balanceDetailByClient.entries()).map(([clientId, detail]) => [clientId, detail.balance]));
 
     return { statsByClient, balanceByClient };
   }
@@ -5344,7 +7044,7 @@ export class MemoryStorage implements IStorage {
   async searchClients(consultantId: number, query = "", limit = 20): Promise<ClientWithStats[]> {
     const filtered = MemoryStorage.sortClientsDeterministically(this.matchClients(consultantId, query));
     const page = filtered.slice(0, limit);
-    const { statsByClient, balanceByClient } = this.computeClientStatsMemory(page.map((c) => c.id));
+    const { statsByClient, balanceByClient } = this.computeClientStatsMemory(consultantId, page.map((c) => c.id));
 
     return page.map((c) => ({
       ...c,
@@ -5366,7 +7066,7 @@ export class MemoryStorage implements IStorage {
       return { items: [], total: 0, page, pageSize, totalPages: 0, totalRevenue: 0 };
     }
 
-    const { statsByClient, balanceByClient } = this.computeClientStatsMemory(matched.map((c) => c.id));
+    const { statsByClient, balanceByClient } = this.computeClientStatsMemory(consultantId, matched.map((c) => c.id));
 
     let withStats: ClientWithStats[] = matched.map((c) => ({
       ...c,
@@ -5383,6 +7083,8 @@ export class MemoryStorage implements IStorage {
     } else if (filter === "cumplen_anios") {
       const currentMonth = getArgentinaMonth();
       withStats = withStats.filter((c) => matchesBirthdayMonth(c.birthday, currentMonth));
+    } else if (filter === "sin_celular") {
+      withStats = withStats.filter((c) => matchesMissingPhoneFilter(c.phone));
     }
 
     if (filter === "cumplen_anios") {
@@ -5721,7 +7423,8 @@ export class MemoryStorage implements IStorage {
   }
 
   async getUpcomingBirthdays(consultantId: number, days: number): Promise<UpcomingBirthday[]> {
-    const today = new Date();
+    // Prompt 12 — mismo criterio que DatabaseStorage: hora de Argentina, nunca el reloj del proceso.
+    const today = getArgentinaDateStr();
     return this.clients
       .filter((c): c is Client & { birthday: string } => c.consultantId === consultantId && !!c.birthday)
       .map((c) => ({
@@ -5733,6 +7436,22 @@ export class MemoryStorage implements IStorage {
       }))
       .filter((r) => r.daysUntil <= days)
       .sort((a, b) => a.daysUntil - b.daysUntil);
+  }
+
+  /** Espejo de DatabaseStorage.getBirthdaysInMonth. */
+  async getBirthdaysInMonth(
+    consultantId: number,
+    year: number,
+    month: number,
+  ): Promise<{ clientId: number; name: string | null; phone: string | null; day: number }[]> {
+    const results: { clientId: number; name: string | null; phone: string | null; day: number }[] = [];
+    for (const c of this.clients) {
+      if (c.consultantId !== consultantId || !c.birthday) continue;
+      const [, bMonth, bDay] = c.birthday.split("-").map(Number);
+      if (bMonth !== month) continue;
+      results.push({ clientId: c.id, name: c.name, phone: c.phone, day: resolveOrderDayForMonth(bDay, year, month) });
+    }
+    return results.sort((a, b) => a.day - b.day);
   }
 
   async getAppointmentsSummary(consultantId: number, start: string, end: string): Promise<AppointmentsSummary> {
@@ -5747,22 +7466,97 @@ export class MemoryStorage implements IStorage {
   }
 
   async getPendingInstallments(consultantId: number, limit = 20): Promise<PendingInstallmentRow[]> {
-    const today = toDateStr(new Date());
+    // Prompt 10 — mismo criterio que DatabaseStorage: hora de Argentina, nunca el reloj del proceso.
+    const today = getArgentinaDateStr();
     const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
 
     return this.saleInstallments
       .filter((i) => i.status === "pendiente" && saleById.get(i.saleId) !== undefined && saleById.get(i.saleId)?.status !== "cancelada")
       .sort((a, b) => a.dueDate.localeCompare(b.dueDate))
       .slice(0, limit)
-      .map((i) => ({
-        saleId: i.saleId,
-        clientName: saleById.get(i.saleId)?.clientName ?? "—",
-        installmentNumber: i.installmentNumber,
-        // Prompt 9: lo que falta de verdad (amount - amountPaid).
-        amount: i.amount - i.amountPaid,
-        dueDate: i.dueDate,
-        isOverdue: i.dueDate < today,
-      }));
+      .map((i) => {
+        const sale = saleById.get(i.saleId);
+        const client = sale?.clientId !== null && sale?.clientId !== undefined ? this.clients.find((c) => c.id === sale.clientId) : undefined;
+        return {
+          saleId: i.saleId,
+          installmentId: i.id,
+          clientName: sale?.clientName ?? "—",
+          clientPhone: client?.phone ?? null,
+          installmentNumber: i.installmentNumber,
+          // Prompt 9: lo que falta de verdad (amount - amountPaid).
+          amount: i.amount - i.amountPaid,
+          dueDate: i.dueDate,
+          isOverdue: i.dueDate < today,
+        };
+      });
+  }
+
+  /** Espejo de DatabaseStorage.getInstallmentsInRange. */
+  async getInstallmentsInRange(consultantId: number, start: string, end: string): Promise<PendingInstallmentRow[]> {
+    const today = getArgentinaDateStr();
+    const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
+
+    return this.saleInstallments
+      .filter((i) => {
+        const sale = saleById.get(i.saleId);
+        return i.status === "pendiente" && sale !== undefined && sale.status !== "cancelada" && i.dueDate >= start && i.dueDate < end;
+      })
+      .sort((a, b) => a.dueDate.localeCompare(b.dueDate))
+      .map((i) => {
+        const sale = saleById.get(i.saleId);
+        const client = sale?.clientId !== null && sale?.clientId !== undefined ? this.clients.find((c) => c.id === sale.clientId) : undefined;
+        return {
+          saleId: i.saleId,
+          installmentId: i.id,
+          clientName: sale?.clientName ?? "—",
+          clientPhone: client?.phone ?? null,
+          installmentNumber: i.installmentNumber,
+          amount: i.amount - i.amountPaid,
+          dueDate: i.dueDate,
+          isOverdue: i.dueDate < today,
+        };
+      });
+  }
+
+  /** Espejo de DatabaseStorage.getAgendaMonth. */
+  async getAgendaMonth(consultantId: number, start: string, end: string): Promise<AgendaMonth> {
+    const todayStr = getArgentinaDateStr();
+    const [year, month] = start.split("-").map(Number);
+
+    const appointmentsList = await this.getAppointmentsInRange(consultantId, start, end);
+    const cobros = await this.getInstallmentsInRange(consultantId, start, end);
+    const cumpleanos = await this.getBirthdaysInMonth(consultantId, year, month);
+    const consultant = this.consultants.find((c) => c.id === consultantId);
+    const orderReminderResult = await this.getOrderReminder(consultantId);
+
+    const day1 = consultant?.orderReminderDay1 ?? null;
+    const day2 = consultant?.orderReminderDay2 ?? null;
+    const configuredSinceStr = consultant?.orderReminderDaysUpdatedAt ? toArgentinaDateStr(consultant.orderReminderDaysUpdatedAt) : null;
+
+    const orderDayDates = new Set<string>();
+    if (day1 !== null) orderDayDates.add(ymdToStr({ year, month, day: resolveOrderDayForMonth(day1, year, month) }));
+    if (day2 !== null) orderDayDates.add(ymdToStr({ year, month, day: resolveOrderDayForMonth(day2, year, month) }));
+
+    const realReminderDate = orderReminderResult?.reminder.reminderDate ?? null;
+    const nextOrderDate = resolveNextOrderDate(day1, day2, todayStr);
+    const lastOrderDay = resolveOrderReminderPeriod(day1, day2, todayStr, configuredSinceStr)?.reminderDate ?? null;
+
+    const diasDePedido: AgendaOrderDay[] = [];
+    for (const date of Array.from(orderDayDates)) {
+      if (date === realReminderDate) {
+        diasDePedido.push({ date, kind: "real", reminderId: orderReminderResult!.reminder.id, items: orderReminderResult!.items });
+      } else if (date === nextOrderDate && lastOrderDay !== null) {
+        const previewItems = this.buildOrderReminderDisplayItemsMem(consultantId, {
+          periodStart: lastOrderDay,
+          periodEnd: todayStr,
+        } as OrderReminder);
+        diasDePedido.push({ date, kind: "preview", items: previewItems });
+      } else {
+        diasDePedido.push({ date, kind: "marker" });
+      }
+    }
+
+    return { appointments: appointmentsList, cobros, cumpleanos, diasDePedido };
   }
 
   /** Espejo de DatabaseStorage.getProductCostSummary. */
@@ -5840,6 +7634,53 @@ export class MemoryStorage implements IStorage {
       }
     }
     return { totalPendingAmount, totalPendingCount, overdueAmount, overdueCount };
+  }
+
+  /** Espejo de DatabaseStorage.getReportsOverview. */
+  async getReportsOverview(consultantId: number, params: ReportsOverviewParams): Promise<ReportsOverview> {
+    const { start, end, period } = params;
+
+    const currentPoints = await this.getSalesSummary(consultantId, start, end, "day");
+    const totalSales = currentPoints.reduce((sum, p) => sum + p.totalSales, 0);
+    const totalProfit = currentPoints.reduce((sum, p) => sum + p.totalProfit, 0);
+
+    const todayStr = getArgentinaDateStr();
+    const comparisonPeriod = getComparisonPeriod(period, start, end, todayStr);
+    const previousPoints = await this.getSalesSummary(consultantId, comparisonPeriod.start, comparisonPeriod.end, "day");
+    const previousSalesCount = previousPoints.reduce((sum, p) => sum + p.salesCount, 0);
+    const previousTotalSales = previousSalesCount > 0 ? previousPoints.reduce((sum, p) => sum + p.totalSales, 0) : null;
+    const previousTotalProfit = previousSalesCount > 0 ? previousPoints.reduce((sum, p) => sum + p.totalProfit, 0) : null;
+
+    const { hasIncompleteCostData } = await this.getProductCostSummary(consultantId, start, end);
+
+    const salesToClients = this.sales.filter(
+      (s) => s.consultantId === consultantId && s.clientId !== null && s.date >= start && s.date < end && s.status !== "cancelada",
+    );
+    const distinctClientCount = new Set(salesToClients.map((s) => s.clientId)).size;
+    const totalSalesToClients = salesToClients.reduce((sum, s) => sum + s.total, 0);
+    const averagePurchasePerClient = distinctClientCount > 0 ? Math.round(totalSalesToClients / distinctClientCount) : null;
+
+    const balanceDetail = this.getClientsPendingBalanceDetailMemory(consultantId, todayStr);
+    let pendingBalanceToday = 0;
+    let overdueBalanceToday = 0;
+    for (const detail of Array.from(balanceDetail.values())) {
+      pendingBalanceToday += detail.balance;
+      overdueBalanceToday += detail.overdueBalance;
+    }
+
+    return {
+      totalSales,
+      totalProfit,
+      hasIncompleteCostData,
+      previousTotalSales,
+      previousTotalProfit,
+      comparisonPeriod,
+      distinctClientCount,
+      totalSalesToClients,
+      averagePurchasePerClient,
+      pendingBalanceToday,
+      overdueBalanceToday,
+    };
   }
 
   async getAllSales(consultantId: number): Promise<SaleWithItemCount[]> {
@@ -6030,22 +7871,31 @@ export class MemoryStorage implements IStorage {
 
     const lines = input.items.map((item) => {
       const product = productById.get(item.productId);
-      if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
+      if (!product) throw new SaleValidationError("No encontramos uno de los productos de la venta");
       // Etapa 7.4: mismo criterio que DatabaseStorage — un producto discontinuado no es
       // vendible en una venta nueva.
       if (product.discontinued) {
         throw new SaleValidationError(`"${product.producto}" está discontinuado y no está disponible para nuevas ventas`);
       }
-      if (product.unidades < item.quantity) {
-        throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${product.unidades})`);
-      }
-      const resolvedCost = resolveLineCost({ costPrice: product.costPrice, publicPrice: product.precio, habitualDiscountPercent });
+      // Prompt 8, Parte 1: vender sin stock (o sin stock suficiente) ya no se rechaza.
+      const allocation = resolveStockAllocation(item.quantity, product.unidades);
+      const initialCost = resolveInitialLineCost({
+        quantity: item.quantity,
+        quantityPending: allocation.pending,
+        realCostPerUnitKnown: product.costPrice,
+        publicPrice: product.precio,
+        habitualDiscountPercent,
+      });
+      const blendedCost = resolveBlendedLineCost({ quantity: item.quantity, ...initialCost });
       return {
         product,
         quantity: item.quantity,
         unitPrice: item.unitPrice ?? product.precio,
-        costPrice: resolvedCost.costPrice,
-        costIsEstimated: resolvedCost.isEstimated,
+        costPrice: blendedCost.costPrice,
+        costIsEstimated: blendedCost.isEstimated,
+        quantityPending: allocation.pending,
+        quantityDelivered: allocation.covered,
+        ...initialCost,
       };
     });
 
@@ -6120,7 +7970,8 @@ export class MemoryStorage implements IStorage {
       installmentsCount: input.installments.length,
       installmentFrequency: input.installments.length > 1 ? input.installmentFrequency ?? null : null,
       status: "pendiente",
-      deliveryStatus: "entregada",
+      // Prompt 8: "entregada" solo si TODOS los renglones tienen quantityDelivered === quantity.
+      deliveryStatus: lines.every((l) => l.quantityDelivered === l.quantity) ? "entregada" : "pendiente_entrega",
       notes: input.notes ?? null,
       clientRequestId: input.clientRequestId ?? null,
     };
@@ -6139,9 +7990,15 @@ export class MemoryStorage implements IStorage {
         // Misma fuente que computeProductCost más arriba.
         costPrice: line.costPrice,
         costIsEstimated: line.costIsEstimated,
+        quantityPending: line.quantityPending,
+        quantityDelivered: line.quantityDelivered,
+        estimatedCostPerUnit: line.estimatedCostPerUnit,
+        realCostAccumulated: line.realCostAccumulated,
+        realCostUnits: line.realCostUnits,
       });
+      // Prompt 8, punto 8: resta atómica (nunca negativa) — mismo criterio que DatabaseStorage.
       const stock = this.getOrCreateStock(consultantId, line.product.id);
-      stock.unidades -= line.quantity;
+      stock.unidades -= Math.min(stock.unidades, line.quantityDelivered);
     }
 
     const insertedInstallments: SaleInstallment[] = installmentPlans.map((plan, index) => ({
@@ -6200,34 +8057,161 @@ export class MemoryStorage implements IStorage {
     const productById = new Map((await this.getProductsByIds(consultantId, involvedIds)).map((p) => [p.id, p]));
     const stockById = new Map<number, number>();
     productById.forEach((p) => stockById.set(p.id, p.unidades));
+    // Prompt 8 — se empareja por productId (nunca hay dos renglones con el mismo producto en
+    // una venta, ver mismo comentario en DatabaseStorage.updateSale).
+    const existingByProductId = new Map(
+      existingItems.filter((i): i is typeof i & { productId: number } => i.productId !== null).map((i) => [i.productId, i]),
+    );
 
-    // 1) Restaurar el stock que esta venta tenía reservado (como si se hubiera eliminado).
-    for (const item of existingItems) {
-      if (item.productId !== null) {
-        stockById.set(item.productId, (stockById.get(item.productId) ?? 0) + item.quantity);
+    // Renglones que desaparecen en esta edición: baja completa (misma fórmula que cancelSale).
+    const newProductIds = new Set(input.items.map((i) => i.productId));
+    for (const old of existingItems) {
+      if (old.productId !== null && !newProductIds.has(old.productId)) {
+        const covered = old.quantity - old.quantityPending;
+        stockById.set(old.productId, (stockById.get(old.productId) ?? 0) + covered);
       }
     }
 
-    // 2) Validar y reservar stock para la nueva composición, sobre el stock ya restaurado.
     const habitualDiscountPercent = this.resolveHabitualDiscountPercentMem(consultantId);
     const lines = input.items.map((item) => {
       const product = productById.get(item.productId);
-      if (!product) throw new SaleValidationError(`Producto ${item.productId} no encontrado`);
+      if (!product) throw new SaleValidationError("No encontramos uno de los productos de la venta");
       if (product.discontinued && !existingProductIds.has(item.productId)) {
         throw new SaleValidationError(`"${product.producto}" está discontinuado y no está disponible para nuevas ventas`);
       }
-      const available = stockById.get(item.productId) ?? 0;
-      if (available < item.quantity) {
-        throw new SaleValidationError(`Stock insuficiente para "${product.producto}" (disponible: ${available})`);
+      const realCostPerUnitKnown = product.costPrice;
+      const existing = existingByProductId.get(item.productId);
+
+      if (!existing) {
+        const available = stockById.get(item.productId) ?? 0;
+        const allocation = resolveStockAllocation(item.quantity, available);
+        stockById.set(item.productId, available - allocation.covered);
+        const initialCost = resolveInitialLineCost({
+          quantity: item.quantity,
+          quantityPending: allocation.pending,
+          realCostPerUnitKnown,
+          publicPrice: product.precio,
+          habitualDiscountPercent,
+        });
+        const blended = resolveBlendedLineCost({ quantity: item.quantity, ...initialCost });
+        return {
+          product,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice ?? product.precio,
+          costPrice: blended.costPrice,
+          costIsEstimated: blended.isEstimated,
+          quantityPending: allocation.pending,
+          quantityDelivered: allocation.covered,
+          ...initialCost,
+        };
       }
-      stockById.set(item.productId, available - item.quantity);
-      const resolvedCost = resolveLineCost({ costPrice: product.costPrice, publicPrice: product.precio, habitualDiscountPercent });
+
+      if (item.quantity === existing.quantity) {
+        // Prompt 2: cualquier edición usa el costo VIGENTE, nunca el histórico — sigue así
+        // cuando no queda nada pendiente (se re-resuelve entero). Solo con algo pendiente se
+        // preserva el acumulado tal cual (mismo criterio que DatabaseStorage.updateSale).
+        if (existing.quantityPending === 0) {
+          const initialCost = resolveInitialLineCost({
+            quantity: existing.quantity,
+            quantityPending: 0,
+            realCostPerUnitKnown,
+            publicPrice: product.precio,
+            habitualDiscountPercent,
+          });
+          const blended = resolveBlendedLineCost({ quantity: existing.quantity, ...initialCost });
+          return {
+            product,
+            quantity: existing.quantity,
+            unitPrice: item.unitPrice ?? product.precio,
+            costPrice: blended.costPrice,
+            costIsEstimated: blended.isEstimated,
+            quantityPending: 0,
+            quantityDelivered: existing.quantityDelivered,
+            ...initialCost,
+          };
+        }
+        const blended = resolveBlendedLineCost({
+          quantity: existing.quantity,
+          estimatedCostPerUnit: existing.estimatedCostPerUnit,
+          realCostAccumulated: existing.realCostAccumulated,
+          realCostUnits: existing.realCostUnits,
+        });
+        return {
+          product,
+          quantity: existing.quantity,
+          unitPrice: item.unitPrice ?? product.precio,
+          costPrice: blended.costPrice,
+          costIsEstimated: blended.isEstimated,
+          quantityPending: existing.quantityPending,
+          quantityDelivered: existing.quantityDelivered,
+          estimatedCostPerUnit: existing.estimatedCostPerUnit,
+          realCostAccumulated: existing.realCostAccumulated,
+          realCostUnits: existing.realCostUnits,
+        };
+      }
+
+      if (item.quantity < existing.quantity) {
+        const decrease = resolveQuantityDecrease(
+          existing.quantity - item.quantity,
+          existing.quantity,
+          existing.quantityPending,
+          existing.quantityDelivered,
+        );
+        stockById.set(item.productId, (stockById.get(item.productId) ?? 0) + decrease.stockToReturn);
+        let realCostAccumulated = existing.realCostAccumulated;
+        let realCostUnits = existing.realCostUnits;
+        if (decrease.stockToReturn > 0 && existing.realCostUnits > 0) {
+          const avgRealCost = existing.realCostAccumulated / existing.realCostUnits;
+          const unitsRemovedFromReal = Math.min(decrease.stockToReturn, existing.realCostUnits);
+          realCostAccumulated = existing.realCostAccumulated - Math.round(avgRealCost * unitsRemovedFromReal);
+          realCostUnits = existing.realCostUnits - unitsRemovedFromReal;
+        }
+        const blended = resolveBlendedLineCost({
+          quantity: item.quantity,
+          estimatedCostPerUnit: existing.estimatedCostPerUnit,
+          realCostAccumulated,
+          realCostUnits,
+        });
+        return {
+          product,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice ?? product.precio,
+          costPrice: blended.costPrice,
+          costIsEstimated: blended.isEstimated,
+          quantityPending: decrease.quantityPending,
+          quantityDelivered: decrease.quantityDelivered,
+          estimatedCostPerUnit: existing.estimatedCostPerUnit,
+          realCostAccumulated,
+          realCostUnits,
+        };
+      }
+
+      const increaseAmount = item.quantity - existing.quantity;
+      const available = stockById.get(item.productId) ?? 0;
+      const allocation = resolveStockAllocation(increaseAmount, available);
+      stockById.set(item.productId, available - allocation.covered);
+      const deltaCost = resolveInitialLineCost({
+        quantity: increaseAmount,
+        quantityPending: allocation.pending,
+        realCostPerUnitKnown,
+        publicPrice: product.precio,
+        habitualDiscountPercent,
+      });
+      const estimatedCostPerUnit = existing.estimatedCostPerUnit ?? deltaCost.estimatedCostPerUnit;
+      const realCostAccumulated = existing.realCostAccumulated + deltaCost.realCostAccumulated;
+      const realCostUnits = existing.realCostUnits + deltaCost.realCostUnits;
+      const blended = resolveBlendedLineCost({ quantity: item.quantity, estimatedCostPerUnit, realCostAccumulated, realCostUnits });
       return {
         product,
         quantity: item.quantity,
         unitPrice: item.unitPrice ?? product.precio,
-        costPrice: resolvedCost.costPrice,
-        costIsEstimated: resolvedCost.isEstimated,
+        costPrice: blended.costPrice,
+        costIsEstimated: blended.isEstimated,
+        quantityPending: existing.quantityPending + allocation.pending,
+        quantityDelivered: existing.quantityDelivered + allocation.covered,
+        estimatedCostPerUnit,
+        realCostAccumulated,
+        realCostUnits,
       };
     });
 
@@ -6244,7 +8228,7 @@ export class MemoryStorage implements IStorage {
     const installmentAmounts = input.installments.map((i) => i.amount);
     const remainingTotal = totals.total - alreadyPaidAmount;
     if (remainingTotal < 0) {
-      throw new SaleValidationError(`El nuevo total no puede ser menor que lo que ya se cobró (${alreadyPaidAmount})`);
+      throw new SaleValidationError(`El nuevo total no puede ser menor que lo que ya se cobró (${formatMoney(alreadyPaidAmount / 100)})`);
     }
     if (!installmentsSumMatches(installmentAmounts, remainingTotal)) {
       throw new SaleValidationError("La suma de las cuotas no coincide con el saldo pendiente de la venta");
@@ -6298,9 +8282,15 @@ export class MemoryStorage implements IStorage {
         originalPrice: line.product.precio,
         price: line.unitPrice,
         // Costo vigente al momento de esta edición — misma fuente que computeProductCost más
-        // arriba. La composición se reemplaza por completo.
+        // arriba. La FILA se reemplaza por completo, pero el progreso de entrega/costo de un
+        // renglón sin cambios o editado se preserva/ajusta (ver el armado de `lines` arriba).
         costPrice: line.costPrice,
         costIsEstimated: line.costIsEstimated,
+        quantityPending: line.quantityPending,
+        quantityDelivered: line.quantityDelivered,
+        estimatedCostPerUnit: line.estimatedCostPerUnit,
+        realCostAccumulated: line.realCostAccumulated,
+        realCostUnits: line.realCostUnits,
       });
     }
 
@@ -6333,6 +8323,9 @@ export class MemoryStorage implements IStorage {
     existingSale.installmentsCount = installmentsCount;
     existingSale.installmentFrequency = installmentsCount > 1 ? input.installmentFrequency ?? null : null;
     existingSale.notes = input.notes ?? null;
+    // Prompt 8: igual que en createSale — "entregada" solo si TODOS los renglones de la
+    // composición nueva tienen quantityDelivered === quantity.
+    existingSale.deliveryStatus = lines.every((l) => l.quantityDelivered === l.quantity) ? "entregada" : "pendiente_entrega";
 
     return existingSale;
   }
@@ -6347,8 +8340,11 @@ export class MemoryStorage implements IStorage {
     const items = this.saleItems.filter((i) => i.saleId === id);
     for (const item of items) {
       if (item.productId !== null) {
+        // Prompt 8 — solo vuelve al stock lo que REALMENTE salió de ahí (ver mismo comentario
+        // en DatabaseStorage.cancelSale).
         const stock = this.getOrCreateStock(consultantId, item.productId);
-        stock.unidades += item.quantity;
+        stock.unidades += item.quantity - item.quantityPending;
+        item.quantityPending = 0;
       }
     }
 
@@ -6387,8 +8383,273 @@ export class MemoryStorage implements IStorage {
     if (sale.status === "cancelada") {
       throw new SaleValidationError("No se puede cambiar la entrega de una venta cancelada");
     }
+    const items = this.saleItems.filter((i) => i.saleId === saleId);
+    if (deliveryStatus === "entregada") {
+      if (items.some((i) => i.quantityPending > 0)) {
+        throw new SaleValidationError("No se puede marcar como entregada: todavía tiene unidades pendientes de un pedido");
+      }
+      for (const i of items) i.quantityDelivered = i.quantity;
+    } else {
+      for (const i of items) i.quantityDelivered = 0;
+    }
     sale.deliveryStatus = deliveryStatus;
     return sale;
+  }
+
+  /** Prompt 8, Parte 2 — "Marcar como entregado" de un renglón puntual. */
+  async markSaleItemDelivered(consultantId: number, saleId: number, itemId: number): Promise<Sale | undefined> {
+    const sale = this.sales.find((s) => s.id === saleId && s.consultantId === consultantId);
+    if (!sale) return undefined;
+    if (sale.status === "cancelada") {
+      throw new SaleValidationError("No se puede entregar un renglón de una venta cancelada");
+    }
+    const item = this.saleItems.find((i) => i.id === itemId && i.saleId === saleId);
+    if (!item) return undefined;
+
+    const readyToDeliver = item.quantity - item.quantityPending - item.quantityDelivered;
+    if (readyToDeliver <= 0) {
+      throw new SaleValidationError("Este renglón no tiene nada listo para entregar todavía");
+    }
+    item.quantityDelivered += readyToDeliver;
+
+    const allItems = this.saleItems.filter((i) => i.saleId === saleId);
+    sale.deliveryStatus = allItems.every((i) => i.quantityDelivered === i.quantity) ? "entregada" : "pendiente_entrega";
+    return sale;
+  }
+
+  async getDeliveryReadyItems(
+    consultantId: number,
+  ): Promise<{ saleId: number; itemId: number; clientId: number | null; clientName: string; productName: string; quantity: number }[]> {
+    const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
+    return this.saleItems
+      .filter((i) => {
+        const sale = saleById.get(i.saleId);
+        return sale !== undefined && sale.status !== "cancelada" && i.quantityPending === 0 && i.quantityDelivered < i.quantity;
+      })
+      .sort((a, b) => {
+        const saleA = saleById.get(a.saleId)!;
+        const saleB = saleById.get(b.saleId)!;
+        return saleA.date === saleB.date ? saleA.id - saleB.id : saleA.date.localeCompare(saleB.date);
+      })
+      .map((i) => {
+        const sale = saleById.get(i.saleId)!;
+        return { saleId: i.saleId, itemId: i.id, clientId: sale.clientId, clientName: sale.clientName, productName: i.productName, quantity: i.quantity - i.quantityDelivered };
+      });
+  }
+
+  /** Espejo de DatabaseStorage.computeOrderReminderSoldCandidates. */
+  private computeOrderReminderSoldCandidatesMem(consultantId: number, periodStart: string, periodEnd: string): OrderReminderItemSnapshot[] {
+    const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
+    const soldByProductId = new Map<number, number>();
+    for (const item of this.saleItems) {
+      if (item.productId === null) continue;
+      const sale = saleById.get(item.saleId);
+      if (!sale || sale.status === "cancelada") continue;
+      if (sale.date < periodStart || sale.date > periodEnd) continue;
+      soldByProductId.set(item.productId, (soldByProductId.get(item.productId) ?? 0) + item.quantity);
+    }
+    if (soldByProductId.size === 0) return [];
+
+    const consultant = this.consultants.find((c) => c.id === consultantId);
+    const defaultThreshold = consultant?.defaultLowStockThreshold ?? null;
+    const qualifying: OrderReminderItemSnapshot[] = [];
+    for (const [productId, soldInPeriod] of Array.from(soldByProductId)) {
+      const stock = this.productStock.find((s) => s.consultantId === consultantId && s.productId === productId);
+      const unidades = stock?.unidades ?? 0;
+      const threshold = resolveLowStockThreshold(stock?.stockMinimo ?? null, defaultThreshold);
+      if (unidades <= threshold) qualifying.push({ productId, soldInPeriod });
+    }
+    return qualifying;
+  }
+
+  /** Espejo de DatabaseStorage.computeOrderReminderPendingCandidates. */
+  private computeOrderReminderPendingCandidatesMem(consultantId: number, periodStart: string, periodEnd: string): { productId: number; pendingFromBefore: number }[] {
+    const saleById = new Map(this.sales.filter((s) => s.consultantId === consultantId).map((s) => [s.id, s]));
+    const pendingByProductId = new Map<number, number>();
+    for (const item of this.saleItems) {
+      if (item.productId === null || item.quantityPending <= 0) continue;
+      const sale = saleById.get(item.saleId);
+      if (!sale || sale.status === "cancelada") continue;
+      if (!(sale.date < periodStart || sale.date > periodEnd)) continue;
+      pendingByProductId.set(item.productId, (pendingByProductId.get(item.productId) ?? 0) + item.quantityPending);
+    }
+    return Array.from(pendingByProductId, ([productId, pendingFromBefore]) => ({ productId, pendingFromBefore }));
+  }
+
+  /** Espejo de DatabaseStorage.buildOrderReminderDisplayItems. */
+  private buildOrderReminderDisplayItemsMem(
+    consultantId: number,
+    reminder: OrderReminder,
+  ): { productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[] {
+    const soldItems = this.computeOrderReminderSoldCandidatesMem(consultantId, reminder.periodStart, reminder.periodEnd);
+    const pendingCandidates = this.computeOrderReminderPendingCandidatesMem(consultantId, reminder.periodStart, reminder.periodEnd);
+    const pendingByProductId = new Map(pendingCandidates.map((p) => [p.productId, p.pendingFromBefore]));
+    const soldByProductId = new Map(soldItems.map((s) => [s.productId, s.soldInPeriod]));
+    const productIds = Array.from(new Set([...soldItems.map((s) => s.productId), ...pendingCandidates.map((p) => p.productId)]));
+
+    return productIds
+      .map((productId) => {
+        const product = this.products.find((p) => p.id === productId);
+        const stock = this.productStock.find((s) => s.consultantId === consultantId && s.productId === productId);
+        const soldInPeriod = soldByProductId.get(productId) ?? 0;
+        const pendingFromBefore = pendingByProductId.get(productId) ?? 0;
+        const variante = product?.variante;
+        return {
+          productId,
+          productName: product ? (variante && variante !== "Estándar" ? `${product.producto} - ${variante}` : product.producto) : "Producto",
+          soldInPeriod,
+          pendingFromBefore,
+          currentStock: stock?.unidades ?? 0,
+          suggestedQuantity: soldInPeriod + pendingFromBefore,
+        };
+      })
+      .sort((a, b) => b.suggestedQuantity - a.suggestedQuantity);
+  }
+
+  async getOrderReminder(consultantId: number): Promise<{
+    reminder: OrderReminder;
+    items: { productId: number; productName: string; soldInPeriod: number; pendingFromBefore: number; currentStock: number; suggestedQuantity: number }[];
+  } | null> {
+    let reminder = this.orderReminderRecords
+      .filter((r) => r.consultantId === consultantId && r.dismissedAt === null)
+      .sort((a, b) => b.reminderDate.localeCompare(a.reminderDate))[0];
+
+    if (!reminder) {
+      const consultant = this.consultants.find((c) => c.id === consultantId);
+      const period = consultant
+        ? resolveOrderReminderPeriod(
+            consultant.orderReminderDay1,
+            consultant.orderReminderDay2,
+            getArgentinaDateStr(),
+            consultant.orderReminderDaysUpdatedAt ? toArgentinaDateStr(consultant.orderReminderDaysUpdatedAt) : null,
+          )
+        : null;
+
+      if (period) {
+        const alreadyGenerated = this.orderReminderRecords.some(
+          (r) => r.consultantId === consultantId && r.reminderDate === period.reminderDate,
+        );
+        if (!alreadyGenerated) {
+          const soldCandidates = this.computeOrderReminderSoldCandidatesMem(consultantId, period.periodStart, period.periodEnd);
+          const pendingCandidates = this.computeOrderReminderPendingCandidatesMem(consultantId, period.periodStart, period.periodEnd);
+          if (soldCandidates.length > 0 || pendingCandidates.length > 0) {
+            reminder = {
+              id: this.nextOrderReminderId++,
+              consultantId,
+              reminderDate: period.reminderDate,
+              periodStart: period.periodStart,
+              periodEnd: period.periodEnd,
+              dismissedAt: null,
+              createdAt: new Date(),
+            };
+            this.orderReminderRecords.push(reminder);
+          }
+        }
+      }
+    }
+
+    if (!reminder) return null;
+    return { reminder, items: this.buildOrderReminderDisplayItemsMem(consultantId, reminder) };
+  }
+
+  async dismissOrderReminder(consultantId: number, reminderId: number): Promise<OrderReminder | undefined> {
+    const reminder = this.orderReminderRecords.find(
+      (r) => r.id === reminderId && r.consultantId === consultantId && r.dismissedAt === null,
+    );
+    if (!reminder) return undefined;
+    reminder.dismissedAt = new Date();
+    return reminder;
+  }
+
+  /** Espejo de DatabaseStorage.countSalesWithoutClient. */
+  async countSalesWithoutClient(consultantId: number): Promise<number> {
+    return this.sales.filter((s) => s.consultantId === consultantId && s.clientId === null && s.status !== "cancelada").length;
+  }
+
+  /** Espejo de DatabaseStorage.dismissDashboardNotice. */
+  async dismissDashboardNotice(consultantId: number, noticeType: DashboardNoticeType): Promise<void> {
+    const existing = this.dashboardNoticeDismissalRecords.find((r) => r.consultantId === consultantId && r.noticeType === noticeType);
+    if (existing) {
+      existing.dismissedAt = new Date();
+      return;
+    }
+    this.dashboardNoticeDismissalRecords.push({
+      id: this.nextDashboardNoticeDismissalId++,
+      consultantId,
+      noticeType,
+      dismissedAt: new Date(),
+    });
+  }
+
+  /** Espejo de DatabaseStorage.getHiddenDashboardNoticeTypes. */
+  private getHiddenDashboardNoticeTypesMem(consultantId: number): Set<DashboardNoticeType> {
+    const cutoff = Date.now() - DASHBOARD_NOTICE_HIDDEN_MS;
+    const hidden = new Set<DashboardNoticeType>();
+    for (const row of this.dashboardNoticeDismissalRecords) {
+      if (row.consultantId === consultantId && row.dismissedAt.getTime() > cutoff) {
+        hidden.add(row.noticeType as DashboardNoticeType);
+      }
+    }
+    return hidden;
+  }
+
+  /** Espejo de DatabaseStorage.getDashboardOverview. */
+  async getDashboardOverview(consultantId: number, access: DashboardOverviewAccessInfo): Promise<DashboardOverview> {
+    const todayStr = getArgentinaDateStr();
+    const { monthStart, monthEnd, daysLeftInMonth } = getArgentinaCurrentMonthInfo();
+
+    const consultant = await this.getBusinessSettings(consultantId);
+    const monthPoints = await this.getSalesSummary(consultantId, monthStart, monthEnd, "month");
+    const deliveryReady = await this.getDeliveryReadyItems(consultantId);
+    const orderReminderResult = await this.getOrderReminder(consultantId);
+    const appointmentsUpcoming = await this.getUpcomingAppointments(consultantId, 50);
+    const birthdaysToday = await this.getUpcomingBirthdays(consultantId, 0);
+    const pendingInstallmentsRaw = await this.getPendingInstallments(consultantId, 200);
+    const salesDrafts = await this.getDrafts(consultantId, "sale");
+    const orderDrafts = await this.getDrafts(consultantId, "order");
+    const salesWithoutClientCount = await this.countSalesWithoutClient(consultantId);
+    const lowStockProductsRaw = await this.getLowStockProducts(consultantId);
+    const inactiveClientsResult = await this.searchClientsPaginated(consultantId, { filter: "no_compran_hace", page: 1, pageSize: 1 });
+    const productsWithoutCostCount = await this.countProductsWithoutCost(consultantId);
+    const clientsWithoutPhoneResult = await this.searchClientsPaginated(consultantId, { filter: "sin_celular", page: 1, pageSize: 1 });
+    const hiddenNoticeTypes = this.getHiddenDashboardNoticeTypesMem(consultantId);
+
+    const monthSales = monthPoints.reduce((sum, p) => sum + p.totalSales, 0);
+    const appointmentsToday = appointmentsUpcoming.filter((a) => a.date === todayStr);
+    const installments = pendingInstallmentsRaw.filter((i) => i.dueDate <= todayStr);
+    const stockBajoProducts = lowStockProductsRaw.filter((p) => !isReminderActive(p.remindStockAt, todayStr));
+    const profileIncomplete = !consultant?.city || !consultant?.age || !consultant?.jobTitle;
+    const freePlanAtLimit = access.isFreePlan && (access.productsWithStockCount ?? 0) >= access.freePlanProductLimit;
+
+    const hide = (type: DashboardNoticeType) => hiddenNoticeTypes.has(type);
+
+    return {
+      businessName: consultant?.businessName ?? "",
+      monthlyGoal: consultant?.monthlyGoal ?? null,
+      monthSales,
+      daysLeftInMonth,
+      paraHacerHoy: {
+        deliveryReady,
+        orderReminder: orderReminderResult,
+        appointmentsToday,
+        birthdaysToday,
+      },
+      pendientes: {
+        installments,
+        unfinishedSalesCount: salesDrafts.length,
+        unfinishedOrdersCount: orderDrafts.length,
+        salesWithoutClientCount,
+      },
+      paraMejorarTuNegocio: {
+        limitePlanGratis: freePlanAtLimit && !hide("limite_plan_gratis"),
+        stockBajo: stockBajoProducts.length > 0 && !hide("stock_bajo") ? { count: stockBajoProducts.length, products: stockBajoProducts } : null,
+        clientasInactivas: inactiveClientsResult.total > 0 && !hide("clientas_inactivas") ? { count: inactiveClientsResult.total } : null,
+        productosSinCosto: productsWithoutCostCount > 0 && !hide("productos_sin_costo") ? { count: productsWithoutCostCount } : null,
+        clientasSinCelular:
+          clientsWithoutPhoneResult.total > 0 && !hide("clientas_sin_celular") ? { count: clientsWithoutPhoneResult.total } : null,
+        completarPerfil: profileIncomplete && !hide("completar_perfil"),
+      },
+    };
   }
 
   async assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined> {

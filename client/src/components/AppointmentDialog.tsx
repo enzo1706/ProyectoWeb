@@ -152,7 +152,7 @@ export function AppointmentDialog({
         location: existingAppointment.location ?? "",
         notes: existingAppointment.notes ?? "",
       });
-      setSelectedClient(appointmentClientStub(existingAppointment));
+      setSelectedClient(existingAppointment.clientId !== null ? appointmentClientStub(existingAppointment) : null);
       setCustomMode(false);
     }
   }, [open, existingAppointment, form]);
@@ -174,10 +174,9 @@ export function AppointmentDialog({
   }, [open, defaultDate, defaultType, form]);
 
   const onSubmit = (data: AppointmentFormData) => {
-    if (!selectedClient) return;
-
     onSave({
-      clientId: selectedClient.id,
+      // Prompt 12 — clienta opcional: sin selectedClient, se omite el campo (nunca se manda null).
+      clientId: selectedClient?.id,
       date: data.date,
       time: data.time,
       type: data.type,
@@ -190,13 +189,13 @@ export function AppointmentDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-md" data-testid="dialog-appointment">
         <DialogHeader>
-          <DialogTitle>{isEditMode ? "Editar Cita" : "Nueva Cita"}</DialogTitle>
+          <DialogTitle>{isEditMode ? "Editar cita" : "Nueva cita"}</DialogTitle>
         </DialogHeader>
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="flex flex-1 flex-col min-h-0">
             <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain space-y-4 px-1 -mx-1">
               <div className="space-y-1.5">
-                <Label htmlFor="appointment-client">Clienta</Label>
+                <Label htmlFor="appointment-client">Clienta (opcional)</Label>
                 <ClientCombobox id="appointment-client" value={selectedClient} onSelect={setSelectedClient} />
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -330,7 +329,7 @@ export function AppointmentDialog({
               <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
                 Cancelar
               </Button>
-              <Button type="submit" disabled={!selectedClient || isSubmitting} data-testid="button-save-appointment">
+              <Button type="submit" disabled={isSubmitting} data-testid="button-save-appointment">
                 {isSubmitting ? "Guardando..." : isEditMode ? "Guardar Cambios" : "Crear Cita"}
               </Button>
             </div>

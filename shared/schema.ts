@@ -24,12 +24,30 @@ export const consultants = pgTable("consultants", {
   // SIEMPRE normalizado (ver shared/email.ts normalizeEmail, storage.setConsultantEmail) antes
   // de guardarse, nunca tal cual lo tipeó la consultora.
   email: text("email"),
+  // Prompt 14 — WhatsApp de la CONSULTORA misma (nunca confundir con `clients.phone`, el de
+  // sus clientas). Siempre normalizado a 10 dígitos (shared/phone.ts), igual criterio que
+  // `email`: único mientras no sea NULL, nunca se migran masivamente los datos históricos.
+  whatsapp: text("whatsapp"),
+  // Prompt 14 — "Nombre y apellido" de la consultora (dato personal, distinto de
+  // `businessName` que es el nombre DEL NEGOCIO). Se pide en "Crear cuenta" y se puede editar
+  // después en Configuración → "Tus datos".
+  contactName: text("contact_name"),
+  city: text("city"),
+  age: integer("age"),
+  // "cargo" en el texto del prompt — texto libre (ej. "Consultora", "Directora"). Nombrado
+  // jobTitle, no `role`, para no pisar `users.role` (el rol de autenticación: admin/consultant).
+  jobTitle: text("job_title"),
   // Prompt 1 — "¿Qué día del mes hacés tu pedido?". Hasta 2 días (1-31), ambos opcionales e
   // independientes entre sí — nunca un array, para no andar validando duplicados/orden adentro
   // de un tipo compuesto. day2 solo tiene sentido si day1 también está cargado (se valida en
   // updateBusinessSettingsSchema, no acá).
   orderReminderDay1: integer("order_reminder_day1"),
   orderReminderDay2: integer("order_reminder_day2"),
+  // Prompt 8 — cuándo se guardaron por última vez los días de arriba (se pisa en cada PATCH de
+  // business-settings que los toque). El recordatorio del día de pedido nunca genera una fecha
+  // anterior a esta: si una consultora configura el día de pedido hoy, no le aparece de golpe un
+  // aviso "atrasado" de un ciclo que ya pasó antes de que existiera la configuración.
+  orderReminderDaysUpdatedAt: timestamp("order_reminder_days_updated_at"),
   // Prompt 1 — "Ingresos Brutos (%)", en DÉCIMAS de punto porcentual (35 = 3,5%) para seguir
   // la convención de todo el schema de nunca guardar decimales como float/numeric — mismo
   // criterio que amount/precio en pesos enteros. Nullable: no todas pagan IIBB.
@@ -42,6 +60,8 @@ export const consultants = pgTable("consultants", {
   // Mercado Pago) — si alguno choca en el futuro, es una situación real a revisar a mano, no
   // algo para "arreglar" con una migración silenciosa.
   emailUnique: uniqueIndex("consultants_email_unique_idx").on(table.email).where(sql`${table.email} IS NOT NULL`),
+  // Prompt 14 — mismo criterio exacto que el de arriba, para WhatsApp.
+  whatsappUnique: uniqueIndex("consultants_whatsapp_unique_idx").on(table.whatsapp).where(sql`${table.whatsapp} IS NOT NULL`),
 }));
 
 export const users = pgTable("users", {
@@ -74,6 +94,13 @@ export const products = pgTable("products", {
   puntos: integer("puntos").notNull().default(0),
   precio: integer("precio").notNull(),
   imagen: text("imagen"),
+  // Prompt 16, punto 3 — miniatura generada en el servidor al subir (no depende del plan de
+  // Supabase, a diferencia del transform de imágenes que requiere Pro). Nullable: toda
+  // imagen de antes de este prompt queda sin miniatura hasta que el backfill opcional la
+  // genere (script/backfill-thumbnails.ts) — nunca se inventa una URL. La lista de Stock usa
+  // esta columna (con `imagen` como respaldo si todavía no tiene); el detalle sigue usando
+  // `imagen`, la original.
+  imagenMiniatura: text("imagen_miniatura"),
   // "import": catálogo global cargado por el admin (consultantId siempre null acá).
   // "manual": la consultora lo cargó ella misma (consultantId siempre el suyo).
   source: text("source").notNull().default("import"),
@@ -131,7 +158,10 @@ export const productStock = pgTable("product_stock", {
 }));
 
 export const PHONE_REGEX = /^\d{10}$/;
-export const PHONE_ERROR_MESSAGE = "El teléfono debe tener exactamente 10 dígitos, sin espacios, guiones ni código de país (ej: 2616570560)";
+// Prompt 15 — alineado al formato de ejemplo que ya usa CONSULTANT_WHATSAPP_ERROR_MESSAGE
+// (Prompt 9/14): un número sin agrupar como ejemplo contradice la vidriera "261 555 1234" que
+// se muestra en el resto de la app, y el normalizador ya tolera espacios/guiones igual.
+export const PHONE_ERROR_MESSAGE = "Escribí el teléfono sin el 0 y sin el 15. Por ejemplo: 261 555 1234.";
 
 export const clients = pgTable("clients", {
   id: serial("id").primaryKey(),
@@ -226,8 +256,12 @@ export type InstallmentStatus = (typeof installmentStatuses)[number];
 export const adjustmentTypes = ["percent", "fixed"] as const;
 export type AdjustmentType = (typeof adjustmentTypes)[number];
 // Prompt 6: estado de entrega, separado del estado de pago (que ya vive en sale_installments).
-// "entregada" es el default porque hoy TODA venta se hace con stock (vender sin stock es el
-// Prompt 8, todavía no existe) — toda venta pasada fue, en los hechos, entregada al momento.
+// Prompt 8: dejó de ser un valor manual puro — ahora es un AGREGADO de sale_items.quantityDelivered
+// ("entregada" solo cuando TODOS los renglones tienen quantityDelivered === quantity), recalculado
+// en la misma transacción que toca cualquier renglón. El toggle manual sigue existiendo
+// (PATCH /api/sales/:id/delivery-status) pero ahora aplica a TODOS los renglones de la venta a
+// la vez: "entregada" los marca todos entregados (bloqueado si a alguno le queda quantityPending
+// > 0) y "pendiente_entrega" los vuelve todos a 0 entregado.
 export const deliveryStatuses = ["entregada", "pendiente_entrega"] as const;
 export type DeliveryStatus = (typeof deliveryStatuses)[number];
 
@@ -323,6 +357,25 @@ export const saleItems = pgTable("sale_items", {
   // de antes de esta columna, donde no hay forma de saberlo con certeza (ver migración de
   // datos de la Etapa correspondiente). Nunca se "completa" retroactivamente a partir de null.
   costIsEstimated: boolean("cost_is_estimated"),
+  // Prompt 8 — unidades de este renglón que todavía esperan un pedido futuro (vender sin
+  // stock). 0 = esta línea nunca tuvo o ya no tiene nada pendiente. Nunca se suma a
+  // `product_stock.unidades`: son unidades ya vendidas, no stock disponible.
+  quantityPending: integer("quantity_pending").notNull().default(0),
+  // Prompt 8 — unidades de este renglón ya entregadas físicamente a la clienta. "Lista para
+  // entregar pero todavía no entregada" = quantity - quantityPending - quantityDelivered (eso
+  // es lo que dispara el aviso "Ya podés entregarle..." en Inicio). Al crear la venta, nace en
+  // quantity - quantityPending (lo que ya tenía en mano se entrega en el momento).
+  quantityDelivered: integer("quantity_delivered").notNull().default(0),
+  // Prompt 8 — las tres columnas de abajo separan el costo YA RESUELTO (de stock que ya tenía
+  // o de pedidos que llegaron) del costo todavía ESTIMADO (de las unidades pendientes), para no
+  // mezclar un promedio viejo con uno nuevo cada vez que llega un pedido parcial. `costPrice`
+  // sigue siendo el valor final usado para profit: round((realCostAccumulated +
+  // estimatedCostPerUnit * (quantity - realCostUnits)) / quantity). `costIsEstimated` sigue
+  // siendo realCostUnits < quantity. Ver recalculateEstimatedSalesForProduct para el caso de
+  // costo cargado a mano con unidades todavía pendientes.
+  estimatedCostPerUnit: integer("estimated_cost_per_unit"),
+  realCostAccumulated: integer("real_cost_accumulated").notNull().default(0),
+  realCostUnits: integer("real_cost_units").notNull().default(0),
 }, (table) => ({
   saleIdIdx: index("sale_items_sale_id_idx").on(table.saleId),
   productIdIdx: index("sale_items_product_id_idx").on(table.productId),
@@ -348,6 +401,73 @@ export const saleInstallments = pgTable("sale_installments", {
 }, (table) => ({
   dueDateIdx: index("sale_installments_due_date_idx").on(table.dueDate),
   statusIdx: index("sale_installments_status_idx").on(table.status),
+  // Prompt 16 — declarados acá aunque se creen con CREATE INDEX CONCURRENTLY (ver
+  // docs/migracion-deploy-3.md), nunca con drizzle-kit push, para que push los reconozca como
+  // ya aplicados. Sin esto, cualquier `drizzle-kit push` futuro contra una base que ya los
+  // tenga los proponía BORRAR — detectado en el ensayo completo de deploy del 2026-10-25.
+  saleIdIdx: index("sale_installments_sale_id_idx").on(table.saleId),
+  statusDueDateIdx: index("sale_installments_status_due_date_idx").on(table.status, table.dueDate),
+}));
+
+/**
+ * Prompt 8 — un recordatorio del día de pedido generado y guardado por consultora y fecha, sin
+ * ninguna tarea programada: se calcula "al vuelo" la primera vez que entra después de su día de
+ * pedido (ver getOrderReminder en server/storage.ts), y esta fila es justamente lo que le
+ * permite no duplicarse si entra dos veces ni perderse si no entra el día exacto. Solo las
+ * FECHAS del ciclo quedan congeladas en la fila (`reminderDate`, el día de pedido en sí;
+ * `periodStart`/`periodEnd`, el ciclo anterior a ese día — ver resolveOrderReminderPeriod en
+ * shared/orderReminderSchedule.ts, que arma el rango sin incluir `reminderDate`, para que una
+ * venta hecha el propio día de pedido entre entera en el ciclo SIGUIENTE, nunca en el que se
+ * está cerrando ni en los dos a la vez). Ni el criterio (a) (vendido en el período) ni el (b)
+ * (unidades pendientes de antes/del día de pedido) se congelan: ambos se recalculan en vivo
+ * cada vez que se muestra el recordatorio abierto, a partir de esas fechas guardadas. `dismissedAt`
+ * nulo = sigue abierto ("Listo, ya lo pedí" lo cierra). Deja el modelo listo para que una futura
+ * tarea programada (Parte 4, todavía no implementada: sin service worker/push/VAPID) solo tenga
+ * que leer las filas sin dismissedAt del día y mandar la notificación — nada de eso corre acá.
+ */
+export const orderReminders = pgTable("order_reminders", {
+  id: serial("id").primaryKey(),
+  consultantId: integer("consultant_id").notNull().references(() => consultants.id),
+  reminderDate: text("reminder_date").notNull(),
+  periodStart: text("period_start").notNull(),
+  periodEnd: text("period_end").notNull(),
+  dismissedAt: timestamp("dismissed_at"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (table) => ({
+  // Garantiza que nunca se duplique un recordatorio para la misma fecha, incluso si dos
+  // requests casi simultáneos intentan generarlo a la vez (defensa real, no solo el chequeo
+  // "ya existe" antes de insertar).
+  consultantReminderDateUnique: unique("order_reminders_consultant_date_unique").on(table.consultantId, table.reminderDate),
+  consultantIdx: index("order_reminders_consultant_idx").on(table.consultantId),
+}));
+
+/** Prompt 10 — los 6 avisos de baja prioridad que se pueden "Ocultar" (bloque "Para mejorar tu
+ * negocio" de Inicio). Nunca en el navegador: por consultora, en la base, para que valga en
+ * todos sus dispositivos — ver getDashboardOverview en server/storage.ts. */
+export const dashboardNoticeTypes = [
+  "limite_plan_gratis",
+  "stock_bajo",
+  "clientas_inactivas",
+  "productos_sin_costo",
+  "clientas_sin_celular",
+  "completar_perfil",
+] as const;
+export type DashboardNoticeType = (typeof dashboardNoticeTypes)[number];
+
+/**
+ * Prompt 10 — "Ocultar" de un aviso de baja prioridad: una fila por `(consultantId,
+ * noticeType)`, con la fecha en que se ocultó. Vuelve a aparecer a los 7 días (ver
+ * DISMISSED_NOTICE_HIDDEN_DAYS en server/storage.ts) SI la condición que lo generó sigue
+ * vigente — "Ocultar" nunca resuelve el aviso, solo lo posterga. Ocultar de nuevo antes de que
+ * pasen los 7 días reinicia el contador (UPSERT, nunca una fila nueva).
+ */
+export const dashboardNoticeDismissals = pgTable("dashboard_notice_dismissals", {
+  id: serial("id").primaryKey(),
+  consultantId: integer("consultant_id").notNull().references(() => consultants.id),
+  noticeType: text("notice_type").notNull(),
+  dismissedAt: timestamp("dismissed_at").notNull().defaultNow(),
+}, (table) => ({
+  consultantNoticeUnique: unique("dashboard_notice_dismissals_consultant_notice_unique").on(table.consultantId, table.noticeType),
 }));
 
 /**
@@ -662,6 +782,16 @@ export type SaleItem = typeof saleItems.$inferSelect;
 export type InsertSaleItem = typeof saleItems.$inferInsert;
 export type SaleInstallment = typeof saleInstallments.$inferSelect;
 export type InsertSaleInstallment = typeof saleInstallments.$inferInsert;
+export type OrderReminder = typeof orderReminders.$inferSelect;
+export type InsertOrderReminder = typeof orderReminders.$inferInsert;
+// Prompt 8 — una línea del criterio (a) (vendido en el período), recalculada en vivo en
+// buildOrderReminderDisplayItems — nunca se persiste (ver ajuste de período en server/storage.ts).
+export interface OrderReminderItemSnapshot {
+  productId: number;
+  soldInPeriod: number;
+}
+export type DashboardNoticeDismissal = typeof dashboardNoticeDismissals.$inferSelect;
+export type InsertDashboardNoticeDismissal = typeof dashboardNoticeDismissals.$inferInsert;
 export type Payment = typeof payments.$inferSelect;
 export type InsertPayment = typeof payments.$inferInsert;
 export type Subscription = typeof subscriptions.$inferSelect;
@@ -728,7 +858,9 @@ export const registerClientPaymentSchema = z.object({
 export const insertAppointmentSchema = createInsertSchema(appointments).omit({ id: true });
 
 export const createAppointmentSchema = z.object({
-  clientId: z.number().int().positive(),
+  // Prompt 12 — la clienta es opcional en todos los tipos (antes era obligatoria). Sin
+  // clientId, queda sin clienta — nunca se manda `null` (el campo se omite directo).
+  clientId: z.number().int().positive().optional(),
   date: z.string().min(1),
   time: z.string().min(1),
   type: appointmentTypeSchema,
@@ -739,7 +871,7 @@ export const createAppointmentSchema = z.object({
 // Deliberadamente separado de createAppointmentSchema: crear y editar son operaciones
 // distintas y pueden divergir con el tiempo (ej. qué campos se permiten tocar en cada caso).
 export const updateAppointmentSchema = z.object({
-  clientId: z.number().int().positive(),
+  clientId: z.number().int().positive().optional(),
   date: z.string().min(1),
   time: z.string().min(1),
   type: appointmentTypeSchema,
@@ -1170,8 +1302,11 @@ export const assignProductImageMatchesSchema = z.object({
     .min(1, "No hay ninguna asignación para aplicar"),
 });
 
+// Prompt 14 — el campo de ingreso acepta email, WhatsApp o un usuario viejo (las cuentas de
+// antes de este prompt siguen pudiendo entrar con su `username`) — un solo string, el backend
+// decide con qué lo busca (ver findUserForLogin en storage.ts).
 export const loginSchema = z.object({
-  username: z.string().min(1),
+  identifier: z.string().trim().min(1, "Ingresá tu email, WhatsApp o usuario"),
   password: z.string().min(1),
 });
 
@@ -1239,12 +1374,65 @@ const usernameFieldSchema = z.string().trim().min(3, "El usuario debe tener al m
 const passwordFieldSchema = z.string().min(6, "La contraseña debe tener al menos 6 caracteres");
 const resetCodeFieldSchema = z.string().regex(/^\d{6}$/, "El código debe tener 6 dígitos");
 
+// Prompt 14 — mismo criterio que PHONE_ERROR_MESSAGE (clientas), pero propio: el de clientas
+// no menciona el "15" porque ahí casi nadie lo tipea; en el ingreso/registro de la CONSULTORA
+// sí es común que alguien escriba su propio WhatsApp con el "15" de siempre (ej.
+// "0261 15 555 1234"), formato que `normalizeArgentinaPhoneForStorage` rechaza a propósito
+// (ambiguo sin conocer la longitud exacta del código de área) — el mensaje le dice
+// explícitamente qué sacar, en vez de solo decir "formato inválido".
+export const CONSULTANT_WHATSAPP_ERROR_MESSAGE = "Escribí tu WhatsApp sin el 0 y sin el 15. Por ejemplo: 261 555 1234.";
+
+const contactNameFieldSchema = z.string().trim().min(1, "El nombre es obligatorio").max(120);
+
+const consultantWhatsappFieldSchema = z
+  .string()
+  .trim()
+  .min(1, "El WhatsApp es obligatorio")
+  .refine((val) => normalizeArgentinaPhoneForStorage(val) !== null, { message: CONSULTANT_WHATSAPP_ERROR_MESSAGE })
+  .transform((val) => normalizeArgentinaPhoneForStorage(val)!);
+
+/** Mismo campo de arriba, pero OPCIONAL (para "Tus datos": nadie está obligado a cargar el
+ * WhatsApp ahí si no lo hizo en su momento — aunque en el registro nuevo sí es obligatorio). */
+const optionalConsultantWhatsappFieldSchema = z
+  .union([z.literal(""), consultantWhatsappFieldSchema])
+  .nullable()
+  .optional()
+  .transform((val) => (val === "" || val === undefined ? null : val));
+
+const optionalProfileTextFieldSchema = (maxLength: number) =>
+  z
+    .string()
+    .trim()
+    .max(maxLength)
+    .nullable()
+    .optional()
+    .transform((val) => (val && val.trim() ? val.trim() : null));
+
 // Deliberadamente NO incluye role/consultantId/status — el backend los asigna siempre de
-// forma autoritativa (ver POST /api/auth/register), nunca los toma del body.
+// forma autoritativa (ver POST /api/auth/register), nunca los toma del body. Tampoco incluye
+// `username`: el Prompt 14 saca ese campo del registro — el backend lo deriva internamente a
+// partir del email (ver storage.registerConsultant), nunca lo pide ni lo recibe del body.
 export const registerConsultantSchema = z.object({
-  username: usernameFieldSchema,
+  contactName: contactNameFieldSchema,
   email: emailFieldSchema,
+  whatsapp: consultantWhatsappFieldSchema,
   password: passwordFieldSchema,
+});
+
+/** Prompt 14 — Configuración → "Tus datos". Cambiar `email` o `whatsapp` exige la contraseña
+ * actual (son los datos para entrar y recuperar la cuenta) — ese chequeo compara contra el
+ * valor YA guardado, así que se hace en el handler (storage/routes), no acá: este schema solo
+ * valida la FORMA de cada campo. */
+export const updateConsultantProfileSchema = z.object({
+  contactName: optionalProfileTextFieldSchema(120),
+  email: z.union([z.literal(""), emailFieldSchema]).nullable().optional().transform((val) => (val === "" || val === undefined ? null : val)),
+  whatsapp: optionalConsultantWhatsappFieldSchema,
+  city: optionalProfileTextFieldSchema(120),
+  age: z.number().int().min(14, "La edad tiene que ser mayor a 14").max(100, "Revisá la edad").nullable().optional(),
+  jobTitle: optionalProfileTextFieldSchema(120),
+  // Solo obligatoria si email o whatsapp cambian de verdad — se valida en el handler, que es
+  // el único lugar que conoce el valor ANTERIOR para comparar.
+  currentPassword: z.string().optional(),
 });
 
 export const forgotPasswordSchema = z.object({

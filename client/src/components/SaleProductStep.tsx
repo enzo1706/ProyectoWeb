@@ -2,7 +2,18 @@ import { forwardRef, useImperativeHandle, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { MoneyInput } from "@/components/MoneyInput";
 import { Label } from "@/components/ui/label";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Package, Plus, Minus, ImagePlus, Search } from "lucide-react";
 import { apiRequest } from "@/lib/queryClient";
 import { useHideMoney } from "@/hooks/use-hide-money";
@@ -48,7 +59,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
   const [selectedTone, setSelectedTone] = useState<Product | null>(null);
   const [quantity, setQuantity] = useState(1);
-  const [priceInput, setPriceInput] = useState("");
+  const [priceInput, setPriceInput] = useState<number | null>(null);
   // Prompt 6, punto 2 — buscador por nombre o tono, en el punto de entrada de este paso.
   const [productSearch, setProductSearch] = useState("");
 
@@ -124,7 +135,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
     setSelectedProduct(product);
     setSelectedTone(null);
     setQuantity(1);
-    setPriceInput(String(product.precio / 100));
+    setPriceInput(product.precio);
     const siblings = getToneSiblings(product, sellableProducts);
     onSubViewChange(siblings.length > 1 ? "tone" : "qty");
   };
@@ -132,7 +143,7 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
   const openTone = (tone: Product) => {
     setSelectedTone(tone);
     setQuantity(1);
-    setPriceInput(String(tone.precio / 100));
+    setPriceInput(tone.precio);
     onSubViewChange("qty");
   };
 
@@ -141,9 +152,13 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
     return product.unidades - ordered;
   };
 
-  const handleAddToCart = () => {
+  // Prompt 8, Parte 1 — vender sin stock: al agregar más cantidad de la que hay, se pide
+  // confirmación con uno de dos textos según falte TODO o solo una parte.
+  const [outOfStockConfirm, setOutOfStockConfirm] = useState<{ remaining: number } | null>(null);
+
+  const addToCartNow = () => {
     if (!activeProduct) return;
-    const priceCents = priceInput ? Math.round(Number(priceInput) * 100) : activeProduct.precio;
+    const priceCents = priceInput !== null && priceInput > 0 ? priceInput : activeProduct.precio;
     onAddLine({
       productId: activeProduct.id,
       productName: activeProduct.producto,
@@ -157,7 +172,18 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
     });
     setSelectedProduct(null);
     setSelectedTone(null);
+    setOutOfStockConfirm(null);
     onSubViewChange("cart");
+  };
+
+  const handleAddToCart = () => {
+    if (!activeProduct) return;
+    const remaining = remainingFor(activeProduct);
+    if (quantity > remaining) {
+      setOutOfStockConfirm({ remaining: Math.max(0, remaining) });
+      return;
+    }
+    addToCartNow();
   };
 
   if (subView === "cart") {
@@ -185,9 +211,8 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
         <button
           key={product.id}
           type="button"
-          disabled={remaining <= 0}
           onClick={() => openProduct(product)}
-          className="flex w-full items-center gap-3 rounded-xl border bg-muted/40 p-3 text-left hover-elevate active-elevate-2 disabled:opacity-50 disabled:cursor-not-allowed"
+          className="flex w-full items-center gap-3 rounded-xl border bg-muted/40 p-3 text-left hover-elevate active-elevate-2"
           data-testid={`${testIdPrefix}-${product.id}`}
         >
           {product.imagen ? (
@@ -284,9 +309,8 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
               <button
                 key={product.id}
                 type="button"
-                disabled={remaining <= 0}
                 onClick={() => openProduct(product)}
-                className="flex w-full items-center gap-3 rounded-xl border bg-muted/40 p-3 text-left hover-elevate active-elevate-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="flex w-full items-center gap-3 rounded-xl border bg-muted/40 p-3 text-left hover-elevate active-elevate-2"
                 data-testid={`sale-picker-product-${product.id}`}
               >
                 {product.imagen ? (
@@ -322,9 +346,8 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
             <button
               key={sibling.id}
               type="button"
-              disabled={remainingFor(sibling) <= 0}
               onClick={() => openTone(sibling)}
-              className="flex flex-col items-center gap-1.5 disabled:opacity-40"
+              className="flex flex-col items-center gap-1.5"
               data-testid={`sale-picker-tone-${sibling.id}`}
             >
               <span
@@ -372,12 +395,12 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
             <span className="min-w-[1.5rem] text-center font-semibold tabular-nums" data-testid="text-step-qty">
               {quantity}
             </span>
+            {/* Prompt 8, Parte 1: vender sin stock — ya no tiene tope en el stock disponible. */}
             <Button
               type="button"
               variant="outline"
               size="icon"
-              onClick={() => setQuantity((q) => Math.min(Math.max(maxQty, 1), q + 1))}
-              disabled={quantity >= maxQty}
+              onClick={() => setQuantity((q) => q + 1)}
               aria-label="Aumentar cantidad"
               data-testid="button-step-qty-plus"
             >
@@ -386,31 +409,38 @@ export const SaleProductStep = forwardRef<SaleProductStepHandle, SaleProductStep
           </div>
         </div>
         {maxQty <= 0 ? (
-          <p className="text-sm text-destructive">Sin stock disponible para este producto.</p>
+          <p className="text-sm text-muted-foreground">No contás con stock de este producto.</p>
         ) : (
           <p className="text-sm text-muted-foreground">Stock disponible: {maxQty}</p>
         )}
         <div className="space-y-1.5">
           <Label htmlFor="step-price">Precio de venta</Label>
-          <Input
-            id="step-price"
-            type="number"
-            min={0}
-            step="0.01"
-            value={priceInput}
-            onChange={(e) => setPriceInput(e.target.value)}
-            data-testid="input-step-price"
-          />
+          <MoneyInput id="step-price" unit="cents" value={priceInput} onChange={setPriceInput} data-testid="input-step-price" />
         </div>
-        <Button
-          type="button"
-          className="h-12 w-full"
-          onClick={handleAddToCart}
-          disabled={maxQty <= 0 || quantity > maxQty}
-          data-testid="button-step-add-to-cart"
-        >
+        <Button type="button" className="h-12 w-full" onClick={handleAddToCart} data-testid="button-step-add-to-cart">
           Agregar a la venta
         </Button>
+
+        <AlertDialog open={outOfStockConfirm !== null} onOpenChange={(o) => !o && setOutOfStockConfirm(null)}>
+          <AlertDialogContent data-testid="dialog-confirm-no-stock">
+            <AlertDialogHeader>
+              {/* Texto exacto del prompt (docs/prompts-mejoras.md, Parte 1), partido en
+                  título/descripción solo por la frontera de la oración — nunca parafraseado. */}
+              <AlertDialogTitle>
+                {outOfStockConfirm?.remaining === 0
+                  ? "No contás con stock de este producto."
+                  : `Tenés ${outOfStockConfirm?.remaining} unidades de este producto. Las ${quantity - (outOfStockConfirm?.remaining ?? 0)} que faltan quedan pendientes para tu próximo pedido.`}
+              </AlertDialogTitle>
+              <AlertDialogDescription>¿Querés continuar con la venta?</AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel data-testid="button-no-stock-cancel">Cancelar</AlertDialogCancel>
+              <AlertDialogAction onClick={addToCartNow} data-testid="button-no-stock-continue">
+                Sí, continuar
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </div>
     );
   }

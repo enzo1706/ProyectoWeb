@@ -15,5 +15,10 @@ export default defineConfig({
     // carrera que no son las que se están probando. Uno a la vez, más lento pero sin ruido.
     fileParallelism: false,
     testTimeout: 20000,
+    // El primer archivo que corre paga el costo de compilar createApp() por primera vez en el
+    // proceso (tsx/esbuild) — en esta máquina eso puede superar los 10s por defecto de vitest y
+    // hacer que su beforeAll "time out" sin que haya ningún problema real (reproducido de forma
+    // consistente: siempre el primer archivo, nunca uno random más adelante).
+    hookTimeout: 20000,
   },
 });

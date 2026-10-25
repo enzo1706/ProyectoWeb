@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useState, useCallback } from "react";
 import { apiRequest } from "@/lib/queryClient";
+import { markSessionActive, clearSessionActivity } from "@/lib/sessionActivity";
 
 export interface AuthUser {
   id: number;
@@ -11,9 +12,12 @@ export interface AuthUser {
 interface AuthContextValue {
   user: AuthUser | null;
   isLoading: boolean;
-  login: (username: string, password: string) => Promise<AuthUser>;
-  /** Etapa 3: registro público — igual que login, deja la sesión iniciada. */
-  register: (input: { username: string; email: string; password: string }) => Promise<AuthUser>;
+  /** Prompt 14 — `identifier` acepta email, WhatsApp o un usuario viejo (el backend decide con
+   * cuál buscar). Ya no es necesariamente un "username". */
+  login: (identifier: string, password: string) => Promise<AuthUser>;
+  /** Etapa 3: registro público — igual que login, deja la sesión iniciada.
+   * Prompt 14: ya no pide "usuario" — nombre, email, WhatsApp y contraseña. */
+  register: (input: { contactName: string; email: string; whatsapp: string; password: string }) => Promise<AuthUser>;
   logout: () => Promise<void>;
 }
 
@@ -34,6 +38,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const current = await fetchCurrentUser();
       setUser(current);
+      // Prompt 13: "entrar a la app" con sesión iniciada — cada confirmación exitosa corre
+      // la fecha, para que la pantalla de ingreso pueda distinguir "se cerró por inactividad"
+      // de "nunca entró"/"se cerró por otro motivo".
+      if (current) markSessionActive();
     } catch {
       setUser(null);
     } finally {
@@ -45,23 +53,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     refreshUser();
   }, [refreshUser]);
 
-  const login = async (username: string, password: string): Promise<AuthUser> => {
-    const res = await apiRequest("POST", "/api/auth/login", { username, password });
+  const login = async (identifier: string, password: string): Promise<AuthUser> => {
+    const res = await apiRequest("POST", "/api/auth/login", { identifier, password });
     const data = await res.json();
     setUser(data);
+    markSessionActive();
     return data;
   };
 
-  const register = async (input: { username: string; email: string; password: string }): Promise<AuthUser> => {
+  const register = async (input: { contactName: string; email: string; whatsapp: string; password: string }): Promise<AuthUser> => {
     const res = await apiRequest("POST", "/api/auth/register", input);
     const data = await res.json();
     setUser(data);
+    markSessionActive();
     return data;
   };
 
   const logout = async () => {
     await apiRequest("POST", "/api/auth/logout");
     setUser(null);
+    // Cierre A PROPÓSITO — nunca tiene que mostrarse como "se cerró por inactividad".
+    clearSessionActivity();
   };
 
   return (

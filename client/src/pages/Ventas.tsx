@@ -1,17 +1,17 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useSaleCart } from "@/hooks/use-sale-cart";
+import { useSaleDialog } from "@/hooks/use-sale-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { SaleCard, type Sale, type SaleDetails } from "@/components/SaleCard";
-import { NewSaleDialog } from "@/components/NewSaleDialog";
+import { SaleCard, type Sale } from "@/components/SaleCard";
 import { SaleDetailDialog } from "@/components/SaleDetailDialog";
 import { AssignClientDialog } from "@/components/AssignClientDialog";
 import { UnfinishedDraftsSection } from "@/components/UnfinishedDraftsSection";
 import { ErrorBlock } from "@/components/ErrorBlock";
-import type { Draft } from "@shared/schema";
 import { Plus, Search, Filter } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   Select,
   SelectContent,
@@ -21,7 +21,6 @@ import {
 } from "@/components/ui/select";
 import { apiRequest } from "@/lib/queryClient";
 import { useHideMoney } from "@/hooks/use-hide-money";
-import type { Product } from "@shared/schema";
 import type { TopProductByCategory } from "@/components/CategoryProductsDialog";
 
 // Prompt 6, punto 8: reemplaza el filtro viejo, que filtraba por `sale.status` — ese campo ya
@@ -34,33 +33,42 @@ const statusFilters = [
   { value: "pendientes_entrega", label: "Pendientes de entrega" },
   { value: "cobradas", label: "Cobradas" },
   { value: "canceladas", label: "Canceladas" },
+  // Prompt 10 — se llega normalmente por link desde el aviso de Inicio "Tenés N ventas sin
+  // clienta" (?filter=sin_clienta en la URL, igual patrón que Clientas en el Prompt 11), pero
+  // sin la restricción de "tres opciones" que tiene el selector de Clientas — queda disponible
+  // también a mano en este mismo Select, sin nada especial que mantener aparte.
+  { value: "sin_clienta", label: "Sin clienta" },
 ];
 
 export default function Ventas() {
   const { format } = useHideMoney();
   const cart = useSaleCart();
+  const { isOpen: isSaleDialogOpen, openCreateSale, openEditSale } = useSaleDialog();
   const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState("todas");
-  const [dialogOpen, setDialogOpen] = useState(false);
+  // Prompt 10 — mismo patrón que Clientas: si se entra con "?filter=..." en la URL, arranca ya
+  // filtrado (ej. desde el aviso de Inicio "Tenés N ventas sin clienta").
+  const [statusFilter, setStatusFilter] = useState(() => {
+    const fromUrl = new URLSearchParams(window.location.search).get("filter");
+    return statusFilters.some((f) => f.value === fromUrl) ? fromUrl! : "todas";
+  });
   const [selectedSaleId, setSelectedSaleId] = useState<number | null>(null);
-  const [editingSale, setEditingSale] = useState<SaleDetails | null>(null);
   const [assigningClientSale, setAssigningClientSale] = useState<Sale | null>(null);
-  const [resumingSaleDraft, setResumingSaleDraft] = useState<Draft | null>(null);
 
   // Si venimos de "Ir a Ventas" desde Productos con un carrito ya armado, abrir el diálogo
   // de venta nueva automáticamente en vez de dejar el carrito perdido en un botón sin apretar.
+  // `clearCartOnClose: true` porque esta apertura (y la del botón "Nueva Venta" de abajo) están
+  // ligadas al carrito compartido — al cerrar sin editar, se vacía (ver use-sale-dialog.tsx).
+  // El diálogo compartido vive en AppShell y persiste al navegar — si ya está abierto (otra
+  // sesión de venta en curso desde otra pantalla), nunca se la pisa.
   useEffect(() => {
-    if (cart.lines.length > 0 && !dialogOpen && editingSale === null) {
-      setDialogOpen(true);
+    if (cart.lines.length > 0 && !isSaleDialogOpen) {
+      openCreateSale({ initialLines: cart.lines, clearCartOnClose: true });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const { data: sales = [], isError: errorSales } = useQuery<Sale[]>({ queryKey: ["/api/sales"] });
-  // Etapa I-B.8-E (F5): sin errorProducts, un fallo acá dejaba el diálogo de nueva/editar venta
-  // con el catálogo vacío en silencio, en vez de avisar que algo no cargó.
-  const { data: products = [], isError: errorProducts } = useQuery<Product[]>({ queryKey: ["/api/products"] });
-  const { data: topProducts = [], isError: errorTopProducts } = useQuery<TopProductByCategory[]>({
+  const { data: sales = [], isError: errorSales, isLoading: isLoadingSales } = useQuery<Sale[]>({ queryKey: ["/api/sales"] });
+  const { data: topProducts = [], isError: errorTopProducts, isLoading: isLoadingTopProducts } = useQuery<TopProductByCategory[]>({
     queryKey: ["/api/sales/top-products", "top5"],
     queryFn: async () => {
       const res = await apiRequest("GET", "/api/sales/top-products?limit=5");
@@ -68,7 +76,9 @@ export default function Ventas() {
     },
   });
 
-  const hasLoadError = errorSales || errorTopProducts || errorProducts;
+  // "/api/products" (para la venta nueva/editar) ya no se consulta en esta página — su propio
+  // aviso de error vive en use-sale-dialog.tsx, que es quien lo consulta ahora.
+  const hasLoadError = errorSales || errorTopProducts;
 
   const filteredSales = sales.filter((s) => {
     const matchesSearch = s.clientName.toLowerCase().includes(search.toLowerCase());
@@ -77,6 +87,9 @@ export default function Ventas() {
     else if (statusFilter === "te_deben") matchesStatus = s.status !== "cancelada" && s.paymentStatus === "te_debe";
     else if (statusFilter === "cobradas") matchesStatus = s.status !== "cancelada" && s.paymentStatus === "cobrada";
     else if (statusFilter === "pendientes_entrega") matchesStatus = s.status !== "cancelada" && s.deliveryStatus === "pendiente_entrega";
+    // Prompt 10 — mismo criterio que storage.countSalesWithoutClient (el número del aviso de
+    // Inicio tiene que coincidir con esta lista filtrada).
+    else if (statusFilter === "sin_clienta") matchesStatus = s.status !== "cancelada" && s.clientId === null;
     return matchesSearch && matchesStatus;
   });
 
@@ -93,20 +106,31 @@ export default function Ventas() {
 
   return (
     <div className="p-6 space-y-6" data-testid="page-ventas">
-      <UnfinishedDraftsSection type="sale" title="Ventas sin terminar" onResume={setResumingSaleDraft} />
+      <UnfinishedDraftsSection
+        type="sale"
+        title="Ventas sin terminar"
+        onResume={(draft) => openCreateSale({ draftToResume: draft, clearCartOnClose: true })}
+      />
 
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold">Ventas</h1>
           <p className="text-muted-foreground">
-            {errorSales
-              ? "No pudimos calcular tus totales"
-              : `${sales.length} venta${sales.length !== 1 ? "s" : ""} registrada${sales.length !== 1 ? "s" : ""} · ${owingCount} te debe${owingCount !== 1 ? "n" : ""}`}
+            {isLoadingSales ? (
+              <Skeleton className="h-4 w-48 inline-block" />
+            ) : errorSales ? (
+              "No pudimos calcular tus totales"
+            ) : (
+              `${sales.length} venta${sales.length !== 1 ? "s" : ""} registrada${sales.length !== 1 ? "s" : ""} · ${owingCount} te debe${owingCount !== 1 ? "n" : ""}`
+            )}
           </p>
         </div>
-        <Button onClick={() => setDialogOpen(true)} data-testid="button-add-sale">
+        <Button
+          onClick={() => openCreateSale({ initialLines: cart.lines, clearCartOnClose: true })}
+          data-testid="button-add-sale"
+        >
           <Plus className="h-4 w-4 mr-2" />
-          Nueva Venta
+          Nueva venta
         </Button>
       </div>
 
@@ -122,7 +146,9 @@ export default function Ventas() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {errorSales ? (
+            {isLoadingSales ? (
+              <Skeleton className="h-8 w-24" />
+            ) : errorSales ? (
               <p className="text-sm text-destructive">No se pudo calcular</p>
             ) : (
               <p className="text-2xl font-bold tabular-nums">{format(totalSales)}</p>
@@ -136,7 +162,9 @@ export default function Ventas() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {errorSales ? (
+            {isLoadingSales ? (
+              <Skeleton className="h-8 w-24" />
+            ) : errorSales ? (
               <p className="text-sm text-destructive">No se pudo calcular</p>
             ) : (
               <p className="text-2xl font-bold text-green-600 dark:text-green-400 tabular-nums">
@@ -152,7 +180,13 @@ export default function Ventas() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {errorTopProducts ? (
+            {isLoadingTopProducts ? (
+              <div className="space-y-1.5">
+                <Skeleton className="h-4 w-full" />
+                <Skeleton className="h-4 w-full" />
+                <Skeleton className="h-4 w-3/4" />
+              </div>
+            ) : errorTopProducts ? (
               <p className="text-sm text-destructive">No se pudo cargar</p>
             ) : topProducts.length === 0 ? (
               <p className="text-sm text-muted-foreground">Todavía no hay ventas registradas</p>
@@ -205,51 +239,47 @@ export default function Ventas() {
 
       {!errorSales && (
         <>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {filteredSales.map((sale) => (
-              <SaleCard
-                key={sale.id}
-                sale={sale}
-                onClick={(s) => setSelectedSaleId(s.id)}
-                onAssignClient={(s) => setAssigningClientSale(s)}
-              />
-            ))}
-          </div>
-
-          {filteredSales.length === 0 && (
-            <div className="text-center py-12 text-muted-foreground">
-              No se encontraron ventas
+          {isLoadingSales ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {Array.from({ length: 6 }).map((_, i) => (
+                <Card key={i}>
+                  <CardContent className="py-4 space-y-2">
+                    <Skeleton className="h-4 w-32" />
+                    <Skeleton className="h-3 w-40" />
+                    <Skeleton className="h-3 w-24" />
+                  </CardContent>
+                </Card>
+              ))}
             </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {filteredSales.map((sale) => (
+                  <SaleCard
+                    key={sale.id}
+                    sale={sale}
+                    onClick={(s) => setSelectedSaleId(s.id)}
+                    onAssignClient={(s) => setAssigningClientSale(s)}
+                  />
+                ))}
+              </div>
+
+              {filteredSales.length === 0 && (
+                <div className="text-center py-12 text-muted-foreground">
+                  No se encontraron ventas
+                </div>
+              )}
+            </>
           )}
         </>
       )}
-
-      <NewSaleDialog
-        open={dialogOpen || editingSale !== null || resumingSaleDraft !== null}
-        onOpenChange={(next) => {
-          if (!next) {
-            const wasEditing = editingSale !== null;
-            setDialogOpen(false);
-            setEditingSale(null);
-            setResumingSaleDraft(null);
-            // Solo se limpia el carrito compartido si esta sesión de venta arrancó (o pudo
-            // arrancar) desde el carrito de Productos — nunca al cerrar la edición de una
-            // venta ya existente, que no tiene relación con el carrito.
-            if (!wasEditing) cart.clear();
-          }
-        }}
-        products={products}
-        existingSale={editingSale}
-        initialLines={cart.lines}
-        draftToResume={resumingSaleDraft}
-      />
 
       <SaleDetailDialog
         saleId={selectedSaleId}
         onOpenChange={(next) => !next && setSelectedSaleId(null)}
         onEdit={(sale) => {
           setSelectedSaleId(null);
-          setEditingSale(sale);
+          openEditSale(sale);
         }}
       />
 

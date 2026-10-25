@@ -44,7 +44,7 @@ async function createConsultant(username: string) {
   const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Forwarded-For": nextTestIp() },
-    body: JSON.stringify({ username, password: "vitest-test-password-123" }),
+    body: JSON.stringify({ identifier: username, password: "vitest-test-password-123" }),
   });
   const cookie = loginRes.headers.get("set-cookie")!;
   return { consultantId: user.consultantId!, cookie };
@@ -55,7 +55,7 @@ async function adminCookie() {
   const res = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: "admin", password: "admin123" }),
+    body: JSON.stringify({ identifier: "admin", password: "admin123" }),
   });
   cachedAdminCookie = res.headers.get("set-cookie")!;
   return cachedAdminCookie;

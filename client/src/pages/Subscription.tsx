@@ -27,6 +27,12 @@ import { CreditCard, CheckCircle2, Clock, AlertTriangle, Tag, X } from "lucide-r
 interface SubscriptionStatusResponse {
   status: "trial" | "active" | "expired" | "canceled";
   hasAccess: boolean;
+  // Prompt 14 (P30) — true para cualquier estado que no sea un pago activo ("trial" nunca
+  // pagó, "expired"/"canceled" dejaron de pagar) — todas conservan acceso a todo, con el
+  // mismo límite de productos en stock.
+  isFreePlan: boolean;
+  productsWithStockCount: number | null;
+  freePlanProductLimit: number;
   trialEndAt: string | null;
   currentPeriodStart: string | null;
   currentPeriodEnd: string | null;
@@ -47,15 +53,16 @@ interface CouponPreview {
   estimatedDiscountEndsAt: string | null;
 }
 
+// Prompt 14 (P30) — reemplaza la lista genérica de funciones por beneficios concretos de
+// pagar; "Productos ilimitados" primero porque es la única restricción real del plan gratis.
 const FEATURES = [
-  "Gestión de productos",
-  "Control de stock",
-  "Gestión de clientas",
-  "Agenda",
-  "Ventas",
-  "Reportes",
-  "Gestión administrativa",
-  "Gestión de imágenes",
+  "Productos ilimitados en tu stock",
+  "Sabé cuánto ganás en cada venta",
+  "Controlá quién te debe y cobrá a tiempo",
+  "Recordatorio de qué pedir en tu día de pedido",
+  "Historial de todos tus meses",
+  "Agenda con citas, cobros y cumpleaños",
+  "WhatsApp de tus clientas a un toque",
 ];
 
 function formatDate(iso: string | null): string {
@@ -156,10 +163,17 @@ export default function Subscription() {
                 <div className="flex items-start gap-3">
                   <Clock className="h-5 w-5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
                   <div>
-                    <p className="font-medium">Estás usando la prueba gratuita</p>
+                    {/* Prompt 14 (P30) — la prueba gratis ya no vence por días, el límite real
+                       es de productos en stock. */}
+                    <p className="font-medium" data-testid="text-free-plan-status">
+                      {status.productsWithStockCount !== null && status.productsWithStockCount >= status.freePlanProductLimit
+                        ? `Estás usando la prueba gratis y llegaste al límite de ${status.freePlanProductLimit} productos.`
+                        : `Estás usando la prueba gratis: podés tener hasta ${status.freePlanProductLimit} productos con stock.`}
+                    </p>
                     <p className="text-sm text-muted-foreground">
-                      Tu período de prueba vence el {formatDate(status.trialEndAt)} ({status.daysRemaining}{" "}
-                      {status.daysRemaining === 1 ? "día" : "días"} restantes).
+                      {status.productsWithStockCount !== null && status.productsWithStockCount >= status.freePlanProductLimit
+                        ? "Suscribite para cargar todos los que quieras."
+                        : `Tenés ${status.productsWithStockCount ?? 0}.`}
                     </p>
                   </div>
                 </div>
@@ -183,10 +197,15 @@ export default function Subscription() {
               )}
               {(status.status === "expired" || status.status === "canceled") && (
                 <div className="flex items-start gap-3">
-                  <AlertTriangle className="h-5 w-5 text-destructive shrink-0 mt-0.5" />
+                  <AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
                   <div>
-                    <p className="font-medium">Tu período de prueba o suscripción venció</p>
-                    <p className="text-sm text-muted-foreground">Comprá la suscripción para recuperar el acceso.</p>
+                    {/* Prompt 14, ajuste 1 — una cuenta que pagaba y dejó de pagar (vencida,
+                       cancelada o con el pago rechazado) nunca se bloquea: pasa al mismo plan
+                       gratis que "trial", nunca un aviso de "perdiste el acceso". */}
+                    <p className="font-medium" data-testid="text-free-plan-status">Tu suscripción no está activa.</p>
+                    <p className="text-sm text-muted-foreground">
+                      Seguís con la prueba gratis: hasta {status.freePlanProductLimit} productos con stock.
+                    </p>
                   </div>
                 </div>
               )}

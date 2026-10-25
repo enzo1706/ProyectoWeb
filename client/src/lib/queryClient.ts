@@ -75,13 +75,24 @@ export const getQueryFn: <T>(options: {
     return await res.json();
   };
 
+// Prompt 16 — antes `staleTime: Infinity`: una vez cargado, un dato nunca se volvía a pedir
+// solo, dependía 100% de que alguna mutación lo invalidara a mano (y "volver a una sección" sí
+// era instantáneo, pero nunca se actualizaba sola en segundo plano — ej. una venta cargada
+// desde el celular no aparecía en Inicio si se la tenía abierta en otra pestaña/dispositivo).
+// Con un `staleTime` finito: la primera vez que se abre una pantalla sigue siendo instantánea
+// si el dato ya está en caché (se muestra tal cual, sin esperar nada), y si pasó más de este
+// tiempo desde que se pidió, React Query lo re-pide SOLO por detrás sin tapar lo que ya se
+// veía (`refetchOnMount` por default ya hace exactamente esto). 1 minuto alcanza para que no
+// se note al navegar rápido entre secciones, sin generar pedidos de más.
+const DEFAULT_STALE_TIME_MS = 60 * 1000;
+
 export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       queryFn: getQueryFn({ on401: "throw" }),
       refetchInterval: false,
       refetchOnWindowFocus: false,
-      staleTime: Infinity,
+      staleTime: DEFAULT_STALE_TIME_MS,
       retry: false,
     },
     mutations: {

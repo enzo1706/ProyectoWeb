@@ -539,6 +539,74 @@ Cómo verifico que quedó bien:
 - En un Android con avisos activados, "Probar aviso" llega al centro de notificaciones.
 ```
 
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **Partes implementadas**: 1, 2 y 3 completas. La Parte 4 (notificación al celular) queda
+  deliberadamente sin implementar — se dejó listo únicamente el modelo de datos (la tabla
+  `order_reminders`, que ya es "el recordatorio generado y guardado por consultora y fecha").
+  Nada de manifest, service worker, claves VAPID ni endpoint de suscripción todavía.
+- **Modelo de unidades pendientes**: `sale_items` gana `quantityPending` (unidades que esperan
+  un pedido futuro) y `quantityDelivered` (unidades ya entregadas físicamente). "Listo para
+  entregar, todavía no entregado" = `quantity - quantityPending - quantityDelivered` — eso es
+  lo que dispara el aviso "Ya podés entregarle...". `sales.deliveryStatus` (ya existía, Prompt
+  6) deja de ser un valor puramente manual: pasa a ser el agregado de los renglones
+  ("entregada" solo cuando TODOS tienen `quantityDelivered === quantity"), recalculado en la
+  misma transacción que toca cualquier renglón. El toggle manual de la venta sigue existiendo,
+  pero ahora aplica a todos sus renglones a la vez (bloqueado a "entregada" si queda algo
+  pendiente).
+- **Costo de las unidades pendientes**: tres campos separan lo YA resuelto de lo todavía
+  estimado (`estimatedCostPerUnit`, `realCostAccumulated`, `realCostUnits`), para no mezclar un
+  promedio viejo con uno nuevo en cada pedido parcial. Cuando llega un pedido, cada unidad
+  asignada a un renglón pendiente suma su costo real a ese renglón puntual — es una excepción
+  acotada a la regla del Prompt 2 ("un pedido nunca recalcula ventas viejas"), que sigue
+  rigiendo para todo lo demás. Cargar el costo a mano desde "Editar producto"
+  (`recalculateEstimatedSalesForProduct`) también respeta esto: si la línea todavía tiene
+  unidades pendientes, solo actualiza el estimado congelado, nunca resuelve de una lo que
+  todavía espera un pedido real.
+- **Los 4 caminos que suman stock** (pedido del catálogo, borrador de pedido confirmado —
+  misma función que el pedido, con `draftId` —, carga manual de un producto nuevo, "Editar
+  producto") cubren primero las ventas pendientes de ese producto, de la más vieja a la más
+  nueva, antes de que cualquier unidad llegue a contar como stock disponible. Por diseño, esas
+  unidades nunca cuentan para el límite de 10 productos del plan gratis (Prompt 14). La carga
+  manual de un producto NUEVO (`createProduct`) es la única excepción real: un producto recién
+  creado no puede tener ninguna venta pendiente previa, así que ahí no hay nada que cubrir.
+- **Cancelar o editar una venta con unidades pendientes**: cancelar devuelve al stock
+  `quantity - quantityPending` (nunca el total) y pone `quantityPending = 0` — nunca se
+  bloquea por el límite del plan gratis, es una corrección, no una carga. Editar empareja los
+  renglones por `productId` (nunca por el `id` del renglón: una venta nunca puede tener el
+  mismo producto en dos renglones, el carrito de "Nueva venta" ya fusiona cualquier repetido).
+  Al bajar la cantidad, el orden es primero lo pendiente, después lo que tenía en mano sin
+  entregar, y por último (una devolución de la clienta) lo ya entregado — todo lo que no sale
+  de "pendiente" vuelve al stock. Al subir, la diferencia sigue la lógica de vender sin stock,
+  sin tocar nunca lo que ya estaba entregado.
+- **Recordatorio del día de pedido, sin tarea programada**: se calcula al vuelo cada vez que
+  entra a la app (nunca con un cron). El período (para el criterio de "vendido desde el
+  recordatorio anterior") sale siempre de los días configurados, nunca de la última fila
+  guardada — así un ciclo con la lista vacía (que no genera fila) no corre el período del
+  siguiente. Nunca se genera un recordatorio para un ciclo anterior a la fecha en que se
+  configuraron los días de pedido (`consultants.orderReminderDaysUpdatedAt`, se pisa solo
+  cuando esos días realmente cambian). El criterio (a) (vendido en el período con stock bajo)
+  nunca excluye productos discontinuados — la cascada de umbral de siempre tampoco lo hace, y
+  "Discontinuos" es una categoría de catálogo más desde el Prompt 6, no un criterio de
+  visibilidad.
+  - **Período, ajuste**: `periodEnd` de un ciclo es el día ANTERIOR a `reminderDate` (nunca
+    `reminderDate` mismo) y `periodStart` es la ocurrencia configurada inmediatamente anterior
+    (incluida) — así una venta hecha el PROPIO día de pedido (por ejemplo a la tarde, después de
+    tocar "Listo, ya lo pedí" a la mañana) entra entera en el ciclo SIGUIENTE, cuyo
+    `periodStart` es justamente ese `reminderDate`: sin huecos entre un ciclo y el otro, y sin
+    que una misma venta se cuente en dos. Ni el criterio (a) ni el (b) se congelan en la fila
+    guardada (que solo tiene las 3 fechas): ambos se recalculan en vivo cada vez que se muestra
+    el recordatorio todavía abierto, a partir de esas fechas. El criterio (b) solo cuenta
+    pendientes de FUERA del período (de antes de `periodStart`, o del propio `reminderDate` en
+    adelante — lo de DENTRO del período ya está sumado en "vendido en el período") — así el
+    producto aparece una sola vez, con la cantidad sugerida = vendido en el período + pendiente
+    de fuera del período.
+- **Ubicación en Inicio**: ~~los dos avisos... viven por ahora en el Inicio actual... Cuando se
+  implemente el Prompt 10, mover los dos al bloque "Para hacer hoy"~~ — **resuelto en el Prompt
+  10**: "Ya podés entregarle a..." es un `TaskItem` más del bloque "Para hacer hoy"; "Hoy es tu
+  día de pedido" mantiene su tarjeta propia (lista + 2 botones, no entra en el formato
+  título/subtítulo de un aviso genérico), ubicada justo antes de ese mismo bloque.
+
 ## Clientas
 
 ### Prompt 9 · Clientas: alta, filtros y ficha
@@ -644,6 +712,101 @@ Cómo verifico que quedó bien:
 - En un celular de 375 px no se cortan los nombres.
 ```
 
+#### Advertencia para cuando se implemente (encontrado haciendo el Prompt 11) — resuelto en el Prompt 10
+
+El aviso **"N clientas hace más de 2 meses que no compran"** corría el riesgo de reusar
+`GET /api/reports/inactive-clients` (`getInactiveClients`), que **incluye a las clientas que
+NUNCA compraron** (`lastPurchase: null`) — habría contado distinto que Clientas. Se resolvió
+NO reusando ese endpoint: el conteo de Inicio llama directo a `searchClientsPaginated` con
+`filter: "no_compran_hace"` (la misma función que ya usa Clientas), así que el número es, por
+construcción, idéntico — ver decisiones del Prompt 10. `getInactiveClients` queda sin tocar,
+con el mismo comportamiento de siempre para quien ya lo use.
+
+#### Pendiente del Prompt 14 (encontrado haciendo el Prompt 14, sin tocar acá) — resuelto en el Prompt 10
+
+El aviso **"Completá tu perfil"** (nombre, ciudad, edad y cargo) que pide el Prompt 14 vivía en
+un lugar temporal, fuera de cualquier bloque — ahora es el último `TaskItem` del bloque "Para
+mejorar tu negocio" (ver orden final en las decisiones de este Prompt 10), con el mismo botón
+"Completar" que ya abría `CompleteProfileDialog`.
+
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **"Cobrada" en una cuota vencida o que vence hoy pide confirmación**: "¿[Clienta] te pagó los
+  $ [saldo]?", con "Sí, me pagó" y "Cancelar". El monto es el SALDO de esa cuota
+  (`amount - amountPaid`, nunca el monto original) — la misma cuenta que ya usa Clientas/Reportes
+  (`saleInstallments.amount - saleInstallments.amountPaid`, el mismo criterio detrás de
+  `getClientsPendingBalanceDetail`). Al confirmar, se registra como un pago con la misma lógica
+  de "Registrar pago" del Prompt 9 (crea `client_payments` + `payment_allocations` en la misma
+  transacción) — nunca cambiando el estado de la cuota a mano, nunca un camino nuevo: el PATCH
+  `/api/sales/:id/installments/:id` con `{status: "pagado"}` que ya existe
+  (`registerInstallmentPayment`/`applyPaymentToInstallments`, Prompt 9) ya hace exactamente esto.
+  Lo único que cambia es que el botón "Cobrada" de Inicio deja de abrir el detalle completo de la
+  venta (como hace hoy) y pasa a mostrar la confirmación y pegarle directo a ese mismo endpoint.
+- **Cuotas que vencen hoy, separadas de las vencidas**: entran igual en "Pendientes", con
+  "[Clienta] te debe $ X (vence hoy)" — las vencidas siguen con "venció el [fecha]". Ajuste de
+  base necesario: `getPendingInstallments` calculaba "hoy" con `new Date()` del proceso (UTC en
+  Railway) en vez de `getArgentinaDateStr()` — corregido, porque ahora Inicio depende de esa
+  distinción para decidir el texto.
+- **Aviso nuevo del límite del plan gratis en "Para mejorar tu negocio", primero en el orden**:
+  solo para cuentas del plan gratis con 10 o más productos con stock — "Llegaste al límite de la
+  prueba gratis. Suscribite para cargar todos los productos que quieras.", con el botón "Ver
+  planes" (lleva a Suscripción). Orden final del bloque: límite del plan gratis, poco stock,
+  clientas inactivas, productos sin costo, clientas sin celular, Completá tu perfil (los 4 del
+  medio son los del texto original del prompt, en su mismo orden).
+- **"Ocultar" se guarda en la base, por consultora y por tipo de aviso**: nunca en el navegador —
+  tiene que valer en todos sus dispositivos. No existía ningún mecanismo genérico para esto (lo
+  que había, `orderReminders.dismissedAt` y `productStock.remindStockAt`, son de un solo
+  propósito cada uno) — tabla nueva `dashboard_notice_dismissals` (`consultantId`, `noticeType`,
+  `dismissedAt`), única por `(consultantId, noticeType)`, con `noticeType` de un set chico y fijo
+  (`limite_plan_gratis`, `stock_bajo`, `clientas_inactivas`, `productos_sin_costo`,
+  `clientas_sin_celular`, `completar_perfil`) — nunca una clave por aviso individual. Vuelve a
+  aparecer a los 7 días SI la condición que lo generó sigue vigente (se revisa de nuevo en cada
+  carga, nunca se asume).
+- **Los números tienen que coincidir con el resto de la app, literalmente la misma función**:
+  - "Vas $ X" del objetivo usa `getSalesSummary` (la misma función que ya usa "Este mes
+    vendiste" de Inicio y, por adentro, `getReportsOverview` de Reportes) — nunca un cálculo
+    paralelo.
+  - "Lo que debe cada clienta" (cuotas de "Pendientes") usa la misma cuenta
+    `amount - amountPaid` que ya usa `getClientsPendingBalanceDetail` (Clientas/Reportes).
+  - "Hace más de 2 meses que no compran": en vez de ajustar `getInactiveClients` (que sigue
+    usándose en otros lados sin tocar, para no cambiarle el comportamiento a nadie más), el
+    conteo de Inicio llama directo a `searchClientsPaginated(consultantId, {filter:
+    "no_compran_hace", ...})` — LA MISMA función que usa Clientas al tocar "Hace tiempo que no
+    compran" — y toma `.total`. Así el número es, por construcción, idéntico al que muestra
+    Clientas, no una aproximación que podría desincronizarse.
+  - "N productos con poco stock" ya tenía un bug real: el badge de Inicio mostraba
+    `stockAlertProducts.length` después de un `.slice(0, 5)` (nunca más de 5, aunque hubiera más)
+    y el diálogo "Ver" mostraba la lista SIN filtrar por `remindStockAt` — dos números distintos
+    entre sí y ninguno el real. Corregido: el conteo y el diálogo usan la misma lista completa,
+    ya filtrada por `remindStockAt` (el mismo criterio que ya usa Stock).
+  - "Hoy", "quedan N días" y "venció el [fecha]" siempre con `getArgentinaDateStr()`, nunca
+    `new Date()` del proceso (que en Railway es UTC).
+- **Rendimiento**: `getDashboardOverview` corre en un solo `Promise.all` TODAS las consultas que
+  no dependen entre sí (son prácticamente todas — el único orden real es que "Para mejorar tu
+  negocio" necesita el resultado de `getHiddenDashboardNoticeTypes`, que corre en el mismo
+  `Promise.all`, nunca antes).
+- **Comportamiento de los bloques**: cada uno se oculta sin avisos, muestra hasta 3 con "Ver más"
+  para el resto. Si los tres bloques (y el recordatorio del día de pedido) están vacíos: "Estás
+  al día. No tenés nada pendiente." — reemplaza al "No hay nada pendiente por ahora" de antes.
+- **Cierre de dos huecos que el texto del prompt sí pedía** (encontrados recién al terminar la
+  primera pasada, no son opcionales):
+  - **WhatsApp en cuotas de "Pendientes"**: `getPendingInstallments` ahora trae `clientPhone`
+    (LEFT JOIN a `clients` sobre `sales.clientId` — nunca rompe una venta sin clienta, que de
+    todas formas nunca puede tener una cuota pendiente de verdad: `createSaleSchema` rechaza
+    "sin clienta" + "pendiente de cobro"). El botón `WhatsAppButton` ya se auto-oculta sin
+    teléfono, así que no hizo falta ninguna condición extra en Inicio.
+  - **Los 3 botones de "Para mejorar tu negocio"/"Pendientes" navegan ya filtrados, con el
+    filtro en la URL** (mismo patrón que Clientas/Reportes del Prompt 11): "Asignar clienta" →
+    `/ventas?filter=sin_clienta` (nuevo valor en el `Select` de Ventas, mismo criterio que
+    `countSalesWithoutClient`); "Completarlos" (sin costo) → `/productos?filter=sin_costo`
+    (chip nuevo con "✕" para sacarlo, mismo criterio que `countProductsWithoutCost`);
+    "Completar" (sin celular) → `/clientas?filter=sin_celular` (valor nuevo en
+    `ClientListFilter`, **a propósito NO** una de las "tres opciones grandes" del selector de
+    Filtros — se llega solo por link, el diseño del Prompt 9 queda intacto). El conteo de
+    "clientas sin celular" del aviso dejó de usar `countClientsWithoutPhone` y pasa a llamar
+    `searchClientsPaginated` con ese filtro — mismo criterio que "hace tiempo que no compran":
+    coincide por construcción, nunca por casualidad.
+
 ## Reportes
 
 ### Prompt 11 · Reportes: claro y liviano
@@ -696,6 +859,48 @@ Cómo verifico que quedó bien:
 - En un celular de 375 px se lee todo sin hacer zoom.
 ```
 
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **Comparación con el período anterior**: si el período está EN CURSO ("Este mes", "Esta
+  semana"), se compara con los mismos días del período anterior equivalente — hoy 8 de
+  octubre → del 1 al 8 de octubre contra del 1 al 8 de septiembre, con el texto
+  "▲ 12% vs. mismos días de septiembre". Si el mes anterior es más corto (31 de marzo contra
+  febrero), se toma hasta su último día real. Los períodos CERRADOS ("El mes pasado",
+  "Últimos 3 meses", "Personalizado") se comparan con el período anterior completo, de la
+  misma duración.
+- **"Te deben hoy"**: todo lo que falta cobrar a HOY (no depende del período elegido),
+  incluidas las cuotas que todavía no vencen, descontando los pagos parciales (`amount_paid`
+  del Prompt 9). Debajo va una línea chica en rojo, "de eso, $ X ya venció", solo si hay algo
+  vencido. El total tiene que coincidir exactamente con lo que suma Clientas con el filtro
+  "Pendiente de pago" — se reusa el mismo cálculo de saldo del Prompt 9, nunca uno nuevo.
+- **"Ganaste"**: se reusa la misma función de ganancia del Prompt 2 (con "≈" si hay costos
+  estimados, Ingresos Brutos incluidos) — no se recalcula de cero.
+- **Qué cuenta y qué no**: las ventas canceladas y los borradores no cuentan en nada de esta
+  pantalla. Las ventas con entrega pendiente SÍ cuentan (la entrega es un estado aparte del
+  pago, no afecta nada de Reportes).
+- **Endpoint único + reutilización, sin borrar nada del backend**: la pantalla nueva pega a un
+  endpoint nuevo (`GET /api/reports/overview`) más 2 que ya existían sin cambios
+  (`/api/reports/top-products`, `/api/reports/top-clients`) y uno más con un parámetro fijo en
+  vez de un selector (`/api/reports/inactive-clients?days=60`). Ningún endpoint ni función de
+  `storage.ts` se borró — `Reportes.tsx` simplemente dejó de llamar a los que ya no necesita,
+  para poder reusarlos el día que se arme el PDF de reportes. Quedan sin ningún consumidor
+  (ni Reportes, ni ninguna otra pantalla) desde este Prompt:
+  - `GET /api/reports/top-categories` (`getTopCategories`)
+  - `GET /api/reports/payment-methods` (`getSalesByPaymentMethod`)
+  - `GET /api/reports/installments-breakdown` (`getInstallmentsBreakdown`)
+  - `GET /api/reports/appointments-summary` (`getAppointmentsSummary`) — `Agenda.tsx` y
+    `AppointmentDetailDialog.tsx` todavía invalidan esta query al crear/editar una cita (no se
+    tocó, revisar si sigue teniendo sentido cuando se arme el PDF)
+  - `GET /api/reports/collected-payments` (`getCollectedPayments`) — **cuidado**: sigue siendo
+    la verificación de "nunca se cuenta dos veces" de los tests del Prompt 9
+    (`clients-payments.test.ts`, `clients-payments-legacy.test.ts`), no es solo un bloque de UI
+  - `GET /api/reports/pending-installments-totals` (`getPendingInstallmentsTotals`)
+  - `GET /api/reports/product-cost-summary` (`getProductCostSummary`)
+
+  Siguen con consumidor real, sin cambios: `sales-summary`/`pending-installments`/
+  `upcoming-birthdays` (Inicio), `stock-valuation` (Stock), `top-products` (wizard de venta +
+  Reportes), `top-clients`/`inactive-clients` (Reportes).
+
 ## Agenda
 
 ### Prompt 12 · Agenda: tipos, eventos automáticos y WhatsApp
@@ -733,6 +938,64 @@ Cómo verifico que quedó bien:
 - El cumpleaños de una clienta aparece en su día todos los años.
 - El botón de WhatsApp abre el chat de la clienta.
 ```
+
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **Evento "Cobro"**: botones "WhatsApp" y "Cobrada". "Cobrada" es el mismo flujo que ya usa
+  Inicio (Prompt 10) — misma confirmación ("¿[Clienta] te pagó los $ [saldo]?") y mismo PATCH
+  `/api/sales/:id/installments/:id` con `{status:"pagado"}`, nunca un camino nuevo. El monto es
+  el saldo (`amount - amountPaid`), la misma cuenta que usa Clientas. Una cuota vencida se ve en
+  su fecha ORIGINAL de vencimiento (nunca se mueve a "hoy"), solo con una marca visual de
+  "vencida".
+- **"Día de pedido"**: la lista de productos para pedir solo se muestra en el próximo día de
+  pedido, o en el actual si el recordatorio sigue abierto — es el MISMO recordatorio del Prompt
+  8 (`getOrderReminder`), calculado en vivo, nunca una copia. Los demás días de pedido del
+  calendario (pasados, o de meses futuros) se marcan igual en la grilla, pero sin lista: tocarlos
+  no abre nada especial.
+- **Cumpleaños 29 de febrero**: en años no bisiestos se muestran el 28 — mismo criterio que ya
+  usa `resolveOrderDayForMonth` para el día de pedido (`Math.min(día, días del mes)`), aplicado
+  ahora también a cumpleaños.
+- **Todo en hora de Argentina**: incluye corregir dos funciones que hoy usan el reloj del
+  proceso en vez de `getArgentinaDateStr()`/`getArgentinaNow()` — `getUpcomingBirthdays` y
+  `getUpcomingAppointments` (esta última la sigue usando Inicio para "hoy"/"citas de hoy", así
+  que el fix la beneficia también a ella, no solo a Agenda).
+- **Colores de los puntitos del calendario**: NO un color por cada uno de los 9 tipos (ámbar se
+  confunde con naranja, fucsia con rosa —y con el rosa de la marca—, celeste con azul). En
+  cambio, 4 colores, uno por GRUPO: Citas (todas las cargadas a mano, color principal de la
+  app), Cobros (verde; vencidas, en rojo), Cumpleaños (amarillo) y Días de pedido (azul, el 4º
+  color sin parecido con los otros tres). Máximo 1 punto por grupo por día → nunca más de 4
+  puntos, elimina de raíz el problema de "+N" por desborde. La referencia de abajo del calendario
+  tiene exactamente esas 4 entradas, cada una con su ícono (Citas: calendario; Cobros: billetera;
+  Cumpleaños: torta; Días de pedido: caja, el mismo ícono que ya usa Inicio/Stock para este
+  concepto). En la tarjeta de la lista del día, además del color cada tipo automático lleva su
+  ícono, para no depender solo del color. Las citas individuales (no automáticas) siguen
+  mostrando su propio color de tipo en su tarjeta, sin cambios — el color de grupo es solo para
+  el punto del calendario.
+- **Clienta opcional, revisado en todas las pantallas**: `AppointmentCard` (tarjeta de Agenda),
+  `AppointmentDetailDialog` (detalle) y "Citas de hoy" de Inicio ocultan la fila/el "con
+  [clienta]" cuando `clientId === null`, en vez de mostrar un hueco vacío — ej. "Hoy a las 15:00:
+  Reunión de unidad". El botón de WhatsApp en la tarjeta de cita solo aparece si hay clienta Y
+  tiene celular cargado.
+- **WhatsApp**: botón en toda cita con clienta-con-celular y en los eventos automáticos "Cobro" y
+  "Cumpleaños" — nunca en "Día de pedido" (no hay una clienta puntual a quien escribirle). Abre
+  el chat sin ningún mensaje precargado, mismo componente `WhatsAppButton` que ya usa el resto de
+  la app.
+- **Contador de arriba**: cuenta siempre `appointments.length` (la lista de citas cargadas a
+  mano que devuelve `/api/agenda/month`), nunca cobros/cumpleaños/días de pedido ni se ve
+  afectado por el filtro elegido.
+- **Componentes compartidos con Inicio (Prompt 10)**: `PayInstallmentConfirmDialog.tsx` (el
+  flujo de "Cobrada") y `OrderReminderCard.tsx` (la tarjeta del día de pedido) — un solo archivo
+  cada uno, usado por Dashboard.tsx y Agenda.tsx, para que ambas pantallas peguen siempre al
+  mismo camino.
+- **Orden del filtro**: "Todos los eventos", después "Cobros"/"Cumpleaños"/"Días de pedido",
+  después los 6 tipos fijos (en el orden del punto 1), al final los tipos personalizados que la
+  consultora ya haya creado.
+- **Tests agregados** (`server/tests/agenda-month.test.ts`): cobros del mes con cuota vencida/con
+  pago parcial (monto = saldo)/pagada (no aparece); cuota de una venta cancelada excluida;
+  cumpleaños del 29 de febrero se muestra el 28 en un año no bisiesto; el próximo día de pedido
+  sin recordatorio abierto todavía trae una lista en vivo sin guardar ninguna fila; una cita sin
+  clienta se crea y se lee con `clientId: null`; el contador no se mezcla con cobros/cumpleaños/
+  días de pedido (viven en listas separadas de la respuesta).
 
 ## Menú y navegación
 
@@ -775,6 +1038,63 @@ Cómo verifico que quedó bien:
 - Stock tiene el ícono de labial con el mismo estilo que el resto.
 - Cierro el navegador, vuelvo a los 2 días y la sesión sigue iniciada.
 ```
+
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **Menú "Más"**: suma "Ventas" como primera opción (lleva al listado de ventas). Queda, en
+  este orden: Ventas, Agenda, Reportes, Configuración, Suscripción y, al final y separado,
+  "Cerrar sesión".
+- **Panel de administración** (precio de suscripción y cupones, Prompt U): si hoy tiene una
+  entrada en el menú, se mantiene igual y visible solo para el rol admin — no es parte de este
+  rediseño.
+- **Aviso de "cerrada por inactividad"**: en vez de un flag sí/no, se guarda en `localStorage`
+  SOLO la fecha del último uso de la app con sesión iniciada (nada identificable). En la
+  pantalla de ingreso, el aviso se muestra únicamente si esa fecha tiene más de 10 días — si la
+  sesión se perdió por otro motivo (cookies borradas, problema del servidor), nunca se inventa
+  el motivo. Al cerrar sesión a propósito, esa fecha se borra. Ver `client/src/lib/sessionActivity.ts`.
+- **Teclado virtual**: mientras un campo de texto tiene el foco (y por lo tanto, en celular, el
+  teclado está abierto), la barra inferior se oculta por completo — siendo `fixed`, el teclado
+  no la empuja y quedaría flotando arriba, tapando lo que se escribe. Ver
+  `client/src/hooks/use-virtual-keyboard-open.ts`.
+- **"Nueva venta" pasa a una sola instancia compartida**: se creó `SaleDialogProvider`
+  (`client/src/hooks/use-sale-dialog.tsx`), montado una sola vez en `AppShell` (no para admin).
+  Inicio, la ficha de la clienta, el botón "Nueva Venta" de Ventas, su auto-apertura desde el
+  carrito y "Retomar" un borrador ahora abren esa misma instancia en vez de cada uno tener su
+  propio diálogo local — el diálogo sobrevive a la navegación entre pantallas (una venta a
+  medio hacer ya no se pierde si la consultora cambia de sección). El vaciado del carrito
+  compartido al cerrar sigue atado solo a las aperturas que vienen de Ventas (`clearCartOnClose`),
+  igual que antes — Inicio y la ficha de clienta nunca tocaban el carrito y siguen sin tocarlo.
+- **"Clientes" → "Clientas"**: se revisó todo `client/src` (strings visibles) y los mensajes de
+  error del backend que se muestran al frontend, case-insensitive. El único lugar que todavía
+  decía "Clientes" era el título del ítem del menú lateral (`AppSidebar.tsx`) — ya corregido a
+  "Clientas". El resto de la app (incluyendo los mensajes de error de `server/`) ya estaba en
+  femenino de prompts anteriores. No se tocó ninguna ruta, tabla ni nombre de variable.
+- **Sesión (10 días, renovación en cada visita)**: implementado con `rolling: true` +
+  `maxAge: 10 días` en `server/session.ts` — no requiere ninguna columna, tabla ni variable de
+  Railway nueva (la tabla `session` y `trust proxy` ya existen y ya están probados en
+  producción), así que no se agregó ninguna entrada en `docs/migracion-deploy-2.md`.
+  **Corrección (antes decía, sin verificar, que el deploy desloguea a todas — es falso, quedó
+  probado con un test real):** el día del deploy **nadie se desloguea**. Una sesión creada
+  ANTES del deploy (con el `maxAge` viejo de 7 días, sin `rolling`) sigue siendo válida —
+  `express-session` guarda el `cookie.originalMaxAge` de cada sesión en la fila de `session`, y
+  por diseño de la librería (`resetMaxAge`/`touch()`, ver
+  `node_modules/express-session/session/session.js`) SIEMPRE renueva por ese valor guardado,
+  nunca por el `maxAge` nuevo del middleware — sin arreglar esto, cualquier sesión de antes del
+  deploy seguiría renovándose de a 7 días (no 10) para siempre, aunque nunca se la desloguee.
+  Arreglado fijando `req.session.cookie.maxAge` en un middleware que corre en cada request
+  (`server/session.ts`, después de `setupSession`) — así la primera visita después del deploy
+  ya migra esa sesión a 10 días. Un detalle de la librería: `connect-pg-simple`'s `touch()`
+  (lo que usa `rolling` cuando nada más cambió) solo pisa la columna `expire`, nunca reescribe
+  el JSON de `sess` — la fila en la base se queda para siempre con `originalMaxAge: 7 días`
+  guardado ahí (inofensivo, nada más lo lee), pero no importa: cada visita futura de esa misma
+  sesión vuelve a pasar por el middleware y recibe 10 días igual, siempre. Probado en
+  `server/tests/session-old-maxage-migration.test.ts`: inserta una fila de `session` real con
+  la forma exacta que dejaba el código viejo, hace una request con esa cookie, y confirma que
+  sigue logueada (200, no 401) y que la cookie renovada ya es de 10 días desde la primera
+  visita.
+- **Test de la cookie de sesión**: `server/tests/session-rolling.test.ts` prueba que el login
+  deja una cookie que vence en 10 días y que una request autenticada posterior (`GET
+  /api/auth/me`) renueva ese vencimiento (`Set-Cookie` en cada response, no solo en el login).
 
 ## Ingreso, registro y suscripción
 
@@ -838,6 +1158,66 @@ Cómo verifico que quedó bien:
 - Ya no aparece ninguna fecha de vencimiento de la prueba.
 ```
 
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **Cómo se cuentan los 10 productos**: solo cuentan los productos con `unidades > 0`. Sumar
+  unidades a un producto que YA tiene stock es libre (no cuenta como "nuevo"). Reponer un
+  producto que está en 0 SÍ cuenta como sumar uno nuevo: si ya hay 10 con stock, aparece el
+  cartel del límite. Así nunca hay más de 10 productos con stock en el plan gratis.
+- **Cuentas sin suscripción activa**: la prueba vencida, la consultora que dejó de pagar y la
+  que canceló pasan TODAS al plan gratis — una sola regla para todas, sin distinción por
+  motivo. Conservan todo y siguen usando la app. Si tienen más de 10 productos con stock,
+  pueden vender lo que tienen, pero no reponer ni sumar productos nuevos hasta bajar de 10 o
+  suscribirse.
+- **Dónde se valida el límite**: en el servidor, no solo en la pantalla, en TODOS los caminos
+  que puedan sumar stock — catálogo (pedido/reposición), carga manual, edición directa de
+  unidades, y cualquier otro camino que toque `product_stock.unidades` al alza.
+- **Excepción al límite**: cancelar o editar una venta que devuelve stock NUNCA queda bloqueado
+  por el límite, aunque la cuenta ya esté en 10 productos — es una corrección (el stock vuelve a
+  donde estaba), no una carga nueva.
+- **Textos exactos aprobados** (reemplazan a los del borrador del prompt):
+  - Stock, con menos de 10: "Prueba gratis: 8 de 10 productos."
+  - Stock, en el límite: "Prueba gratis: llegaste al límite de 10 productos. Para sumar nuevos o
+    reponer los agotados, suscribite."
+  - Suscripción, con menos de 10: "Estás usando la prueba gratis: podés tener hasta 10 productos
+    con stock. Tenés 8."
+  - Suscripción, en el límite: "Estás usando la prueba gratis y llegaste al límite de 10
+    productos. Suscribite para cargar todos los que quieras."
+  - Suscripción, cuenta que pagó y dejó de pagar (expired/canceled): ya no dice "Tu período de
+    prueba o suscripción venció" — dice "Tu suscripción no está activa. Seguís con la prueba
+    gratis: hasta 10 productos con stock."
+- **WhatsApp con "15"**: no se tocó `shared/phone.ts`. En Ingreso, Crear cuenta y Tus datos, si lo
+  escrito tiene forma de teléfono (solo dígitos/espacios/guiones/+) pero no es válido, se avisa
+  ANTES de enviar: "Escribí tu WhatsApp sin el 0 y sin el 15. Por ejemplo: 261 555 1234." — el
+  aviso depende solo del formato, nunca de si la cuenta existe (no rompe el anti-enumeración).
+- **Usuario derivado del email**: se deriva de la parte antes del "@", en minúsculas. Si coincide
+  con la forma de un WhatsApp válido (ej. un email tipo `2615551234@gmail.com`), se le agrega un
+  sufijo numérico — para que el orden de búsqueda del login nunca sea ambiguo. Orden fijo de
+  búsqueda en el login: si el texto tiene "@" → email; si no pero tiene forma de WhatsApp válido
+  → WhatsApp; si no → usuario.
+  - **Ajuste posterior — cuentas viejas con username con forma de WhatsApp**: una cuenta de
+    antes de este prompt puede tener como username, literalmente, un número ("2615551234") —
+    con el orden de arriba, ese string se busca siempre primero como WhatsApp, y si ninguna
+    cuenta tiene ESE WhatsApp, nunca llegaba a probarse como usuario: esa cuenta quedaba sin
+    forma de entrar. Única excepción al "nunca probar los 3": si tiene forma de WhatsApp pero
+    el WhatsApp no matcheó nada, se prueba también como usuario (`WhatsAppMatchesUsernameError`
+    en `server/storage.ts`). Para que esto no vuelva a pasar de acá en adelante, guardar un
+    WhatsApp (en Crear cuenta o en Tus datos) que coincida con el username de OTRA cuenta
+    rechaza con 409 — nunca con el propio.
+- **"Tus datos"**: cambiar el email o el WhatsApp pide la contraseña actual (son las credenciales
+  para entrar y recuperar la cuenta) — solo cuando alguno de esos dos campos realmente cambia.
+  Sin test hasta este ajuste; cubierto ahora en `server/tests/consultant-profile.test.ts` (sin
+  contraseña → 400, incorrecta → 403, correcta → 200 y cambia de verdad, email/WhatsApp repetido
+  de otra cuenta → 409).
+- **Línea chica de Stock y cartel del límite**: estaban en el texto del prompt pero no se habían
+  construido. Ahora: `client/src/pages/Productos.tsx` muestra "Prueba gratis: N de 10
+  productos." (o el texto de límite alcanzado) debajo del resumen del catálogo; un
+  `FreePlanLimitDialog` nuevo (`client/src/components/FreePlanLimitDialog.tsx`, con "Ver
+  planes"/"Ahora no") se dispara ANTES de tocar el servidor — en `AddProductDialog.tsx` al
+  enviar el formulario de un producto nuevo con unidades > 0, y en `LoadOrderDialog.tsx` al
+  tocar "+" sobre un producto que hoy tiene 0 de stock y haría pasar el límite (contando los que
+  ya se eligieron en ese mismo pedido todavía sin confirmar).
+
 ## Toda la app
 
 ### Prompt 15 · Textos y formatos
@@ -889,6 +1269,46 @@ Cómo verifico que quedó bien:
 - Recorro todas las pantallas y no encuentro "tú", "carrito", "KPIs", fechas tipo 2026-10-03 ni "1 ventas".
 - Al escribir un precio, se va viendo con formato de pesos.
 ```
+
+#### Decisiones tomadas (no están en el texto del prompt, anotadas para que no se pierdan)
+
+- **Alcance**: incluye los mensajes de error del servidor que ve la consultora, los toasts, los
+  emails (ej. el de recuperar contraseña) y el panel de admin — no solo las pantallas de
+  consultora. Los textos ya decididos en prompts anteriores (Clientas, Agregar a la venta,
+  Aviso de poco stock, Compra promedio en Reportes, Crear cuenta, el voseo de Login) no se
+  tocaron — se verificaron primero y se dejaron igual.
+- **Fechas futuras** (agrega al punto 6, que solo daba ejemplos de pasado): "mañana", "en 3
+  días" (hasta 7 días) y después "15 de nov." — simétrico al pasado.
+- **`unit: "cents" | "pesos"` obligatorio** en `MoneyInput`: la mayoría de los montos de la app
+  se guardan en centavos, pero el precio y los cupones de suscripción del admin se guardan en
+  pesos enteros (unidad distinta, no un descuido) — el prop evita que alguien mezcle las dos
+  sin que se note en el código.
+- **Parser de montos (`parseMoneyInput`)**: "," siempre es el decimal. "." es separador de
+  miles SOLO si el último grupo tiene exactamente 3 dígitos — si tiene 1 o 2 ("20.5",
+  "1250.50"), es decimal. Así nadie que tipea con punto decimal termina guardando mil veces
+  más. Los montos se muestran sin decimales salvo que tengan centavos de verdad.
+- **Mensaje de login**: "Email, WhatsApp o contraseña incorrectos." — mismo texto para una
+  cuenta inexistente y para una contraseña incorrecta (anti-enumeración, sin cambios de
+  comportamiento ni de timing).
+- **Mayúscula solo en la primera letra**: la regla se extiende a encabezados y etiquetas, no
+  solo botones — excepto nombres propios (Mary Kay, Mercado Pago, WhatsApp, Impulsa).
+- **Infinitivo/sustantivo vs. voseo**: títulos, botones y etiquetas van en infinitivo o con
+  sustantivo ("Iniciar sesión", "Crear cuenta", "Nueva venta"). Las frases que le hablan
+  directamente a la consultora van en voseo ("Entrá con tu email o tu WhatsApp", "Elegí una
+  clienta").
+- **Códigos internos**: se sacan el código de catálogo que puede ser un slug autogenerado
+  (`EditProductDialog` en modo catálogo, `LowStockDialog`) y el id crudo en los errores del
+  servidor (ahora nombran el producto, o dicen "uno de los productos" si no se pudo resolver
+  ninguno). Se queda el campo "Código (opcional)" de un producto manual (lo escribe la propia
+  consultora) y los ids en el panel de admin (sirven para soporte: Mercado Pago, productos del
+  catálogo).
+- **Cupón del admin**: un solo componente con un switch interno entre `MoneyInput`
+  (unit="pesos") y `PercentInput` según el tipo de descuento elegido.
+- **Jerga técnica**: ninguna palabra técnica en lo que ve la consultora, esté o no en la lista
+  del prompt (ej. "delta" → "cantidad").
+- **`PHONE_ERROR_MESSAGE`** (clientas, `shared/schema.ts`) se alineó al mismo formato de
+  ejemplo agrupado que ya usa `CONSULTANT_WHATSAPP_ERROR_MESSAGE` desde el Prompt 9/14 — era un
+  texto viejo que había quedado afuera de esa decisión, no una decisión nueva.
 
 ### Prompt 16 · Velocidad de carga
 

@@ -7,15 +7,22 @@
  * retira la opción de "más de 3 meses" (el prompt fija un único umbral, 2 meses) y agrega
  * "cumplen años este mes", que no existía. */
 
-export type ClientListFilter = "todas" | "pendiente_pago" | "no_compran_hace" | "cumplen_anios";
+// Prompt 10 — "sin_celular" se agrega para el aviso de Inicio "Tenés N clientas sin celular
+// cargado" (botón "Completar"), con el mismo patrón que ya usa Reportes/Inicio para navegar a
+// Clientas con un filtro en la URL (`?filter=...`). A propósito NO es una de las "tres opciones
+// grandes" del selector de Filtros de Clientas (ver FILTER_OPTIONS en Clientas.tsx, que sigue
+// listando solo pendiente_pago/no_compran_hace/cumplen_anios) — solo se llega acá por link,
+// nunca eligiéndolo a mano, para no tocar el diseño ya aprobado del Prompt 9.
+export type ClientListFilter = "todas" | "pendiente_pago" | "no_compran_hace" | "cumplen_anios" | "sin_celular";
 
-export const CLIENT_LIST_FILTERS: ClientListFilter[] = ["todas", "pendiente_pago", "no_compran_hace", "cumplen_anios"];
+export const CLIENT_LIST_FILTERS: ClientListFilter[] = ["todas", "pendiente_pago", "no_compran_hace", "cumplen_anios", "sin_celular"];
 
 export const CLIENT_LIST_FILTER_LABELS: Record<ClientListFilter, string> = {
   todas: "Todas",
   pendiente_pago: "Pendiente de pago",
   no_compran_hace: "Hace tiempo que no compran",
   cumplen_anios: "Cumplen años este mes",
+  sin_celular: "Sin celular cargado",
 };
 
 /** "Hace tiempo que no compran" = al menos una compra Y la última hace más de 2 meses (60
@@ -38,6 +45,11 @@ export function matchesStaleFilter(lastPurchase: string | null, cutoff: string):
 
 export function matchesBalanceFilter(pendingBalance: number): boolean {
   return pendingBalance > 0;
+}
+
+/** Prompt 10 — "sin celular cargado": null o vacío cuentan igual como "sin celular". */
+export function matchesMissingPhoneFilter(phone: string | null): boolean {
+  return !phone;
 }
 
 /** Mes de un cumpleaños guardado ("YYYY-MM-DD", año real o sentinela — nunca importa cuál)

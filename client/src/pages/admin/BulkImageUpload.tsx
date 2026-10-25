@@ -40,6 +40,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { cn } from "@/lib/utils";
+import { pluralize } from "@shared/text";
 import { apiRequest, extractFriendlyErrorMessage, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { ErrorBlock } from "@/components/ErrorBlock";
@@ -216,8 +217,9 @@ function ImageMatchFinder() {
               </div>
             </div>
             <p className="text-xs text-muted-foreground" data-testid="text-match-context">
-              {data.summary.totalProducts} productos en catálogo · {data.summary.withImage} ya tienen imagen ·{" "}
-              {data.summary.availableFiles} imágenes en Storage sin asignar
+              {pluralize(data.summary.totalProducts, "producto", "productos")} en catálogo ·{" "}
+              {pluralize(data.summary.withImage, "ya tiene imagen", "ya tienen imagen")} ·{" "}
+              {pluralize(data.summary.availableFiles, "imagen", "imágenes")} en Storage sin asignar
             </p>
 
             {safeMatches.length > 0 && (
@@ -264,7 +266,7 @@ function ImageMatchFinder() {
 
             {safeMatches.length === 0 && reviewMatches.length === 0 && (
               <p className="text-sm text-muted-foreground">
-                No hay coincidencias pendientes de revisar. {noneCount > 0 ? `${noneCount} productos sin imagen no tienen ningún archivo parecido en Storage.` : ""}
+                No hay coincidencias pendientes de revisar. {noneCount > 0 ? `${pluralize(noneCount, "producto", "productos")} sin imagen ${noneCount === 1 ? "no tiene" : "no tienen"} ningún archivo parecido en Storage.` : ""}
               </p>
             )}
           </div>
@@ -622,10 +624,13 @@ export default function BulkImageUpload() {
             <div className="mt-4 flex flex-wrap items-center justify-between gap-2 text-sm">
               <div className="flex flex-wrap gap-3 text-muted-foreground">
                 <span data-testid="text-total-files">
-                  <strong className="text-foreground">{rows.length}</strong> archivos seleccionados
+                  <strong className="text-foreground">{rows.length}</strong>{" "}
+                  {pluralize(rows.length, "archivo seleccionado", "archivos seleccionados")}
                 </span>
-                <span className="text-emerald-600 dark:text-emerald-400">{validRows.length} válidos</span>
-                {invalidCount > 0 && <span className="text-destructive">{invalidCount} inválidos</span>}
+                <span className="text-emerald-600 dark:text-emerald-400">{pluralize(validRows.length, "válido", "válidos")}</span>
+                {invalidCount > 0 && (
+                  <span className="text-destructive">{pluralize(invalidCount, "inválido", "inválidos")}</span>
+                )}
               </div>
               <Button variant="ghost" size="sm" onClick={clearAll} disabled={isUploading} data-testid="button-clear-all">
                 <Trash2 className="h-4 w-4 mr-1" /> Vaciar todo
@@ -778,17 +783,23 @@ export default function BulkImageUpload() {
             <Card className="shadow-sm bg-muted/40">
               <CardContent className="pt-6 space-y-2 text-sm">
                 <p className="font-medium text-foreground">
-                  {validRows.length} archivos listos para revisar
+                  {pluralize(validRows.length, "archivo listo", "archivos listos")} para revisar
                 </p>
                 <ul className="space-y-1 text-muted-foreground">
-                  <li>✓ {reconocidas.length} reconocidos</li>
-                  {sinCoincidencia.length > 0 && <li>⚠ {sinCoincidencia.length} sin coincidencia</li>}
-                  {ambiguas.length > 0 && <li>⚠ {ambiguas.length} ambiguos</li>}
-                  {invalidCount > 0 && <li>✕ {invalidCount} inválidos (no se van a subir)</li>}
+                  <li>✓ {pluralize(reconocidas.length, "reconocido", "reconocidos")}</li>
+                  {sinCoincidencia.length > 0 && (
+                    <li>⚠ {pluralize(sinCoincidencia.length, "sin coincidencia", "sin coincidencia")}</li>
+                  )}
+                  {ambiguas.length > 0 && <li>⚠ {pluralize(ambiguas.length, "ambiguo", "ambiguos")}</li>}
+                  {invalidCount > 0 && (
+                    <li>✕ {pluralize(invalidCount, "inválido", "inválidos")} (no se {invalidCount === 1 ? "va" : "van"} a subir)</li>
+                  )}
                 </ul>
                 <ul className="space-y-1 text-muted-foreground">
-                  <li>{productosNuevos} productos nuevos</li>
-                  {yaTienenImagen.length > 0 && <li>{yaTienenImagen.length} productos ya tienen imagen</li>}
+                  <li>{pluralize(productosNuevos, "producto nuevo", "productos nuevos")}</li>
+                  {yaTienenImagen.length > 0 && (
+                    <li>{pluralize(yaTienenImagen.length, "producto ya tiene imagen", "productos ya tienen imagen")}</li>
+                  )}
                 </ul>
                 <p className="text-muted-foreground pt-1">
                   Revisá las coincidencias antes de confirmar. Las imágenes no se suben hasta presionar
@@ -825,9 +836,11 @@ export default function BulkImageUpload() {
                 {finished && (
                   <div className="space-y-2 text-sm">
                     <p className="font-medium text-foreground" data-testid="text-upload-summary">
-                      {uploadedCount} imágenes subidas correctamente
-                      {skippedCount > 0 ? ` · ${skippedCount} omitidas (ya tenían imagen)` : ""}
-                      {errorCount > 0 ? ` · ${errorCount} con error` : ""}
+                      {pluralize(uploadedCount, "imagen subida correctamente", "imágenes subidas correctamente")}
+                      {skippedCount > 0
+                        ? ` · ${pluralize(skippedCount, "omitida", "omitidas")} (ya ${skippedCount === 1 ? "tenía" : "tenían"} imagen)`
+                        : ""}
+                      {errorCount > 0 ? ` · ${pluralize(errorCount, "con error", "con error")}` : ""}
                     </p>
                     {hasErrors && (
                       <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 space-y-1">

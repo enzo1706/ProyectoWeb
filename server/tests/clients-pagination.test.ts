@@ -40,7 +40,7 @@ async function login(username: string, consultantIdOverride?: number) {
   const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password: "vitest-test-password-123" }),
+    body: JSON.stringify({ identifier: username, password: "vitest-test-password-123" }),
   });
   const setCookie = loginRes.headers.get("set-cookie");
   if (!setCookie) throw new Error(`Login falló para ${username}: ${loginRes.status} ${await loginRes.text()}`);
@@ -216,7 +216,7 @@ describe("GET /api/clients — modo paginado (page presente)", () => {
   });
 
   it("filter=pendiente_pago excluye clientas sin cuotas pendientes reales (via storage.createSale)", async () => {
-    const product = await storage.createProduct(consultantId, { seccion: "Test", producto: "Producto Saldo 3400", precio: 1000, unidades: 10, puntos: 1 });
+    const product = await storage.createProduct(consultantId, { seccion: "Test", producto: "Producto Saldo 3400", precio: 1000, unidades: 10, puntos: 1 }, false);
     const withBalance = await storage.createClient(consultantId, { name: "Con Saldo 3400", phone: "3400000001" });
     const withoutBalance = await storage.createClient(consultantId, { name: "Con Saldo 3400 Sin Cuota", phone: "3400000002" });
 

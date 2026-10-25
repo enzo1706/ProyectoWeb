@@ -22,7 +22,7 @@ export default function AdminDashboard() {
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold text-foreground">
-            Panel de Administración
+            Panel de administración
           </h1>
           <p className="text-muted-foreground mt-1">
             Gestión centralizada de consultoras y catálogo Mary Kay
@@ -40,7 +40,7 @@ export default function AdminDashboard() {
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         <MetricCard
-          title="Total Consultoras"
+          title="Total consultoras"
           value={isLoading || isError ? "—" : String(stats?.totalConsultants ?? 0)}
           icon={Users}
           subtitle={
@@ -50,13 +50,13 @@ export default function AdminDashboard() {
           }
         />
         <MetricCard
-          title="Productos Activos"
+          title="Productos activos"
           value={isLoading || isError ? "—" : String(stats?.activeProducts ?? 0)}
           icon={Package}
           subtitle="En catálogo global"
         />
         <MetricCard
-          title="Consultoras Activas"
+          title="Consultoras activas"
           value={isLoading || isError ? "—" : String(stats?.activeConsultants ?? 0)}
           icon={UserCheck}
           subtitle="Pueden acceder al sistema"
@@ -67,15 +67,15 @@ export default function AdminDashboard() {
         <Card className="shadow-sm">
           <CardHeader>
             <CardTitle className="text-lg text-foreground">
-              Gestión de Consultoras
+              Gestión de consultoras
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
             <p className="text-sm text-muted-foreground">
-              Registra nuevas consultoras, revisa su estado y controla el acceso al sistema.
+              Registrá nuevas consultoras, revisá su estado y controlá el acceso al sistema.
             </p>
             <Link href="/admin/usuarios">
-              <Button className="w-full sm:w-auto">Ir a Consultoras</Button>
+              <Button className="w-full sm:w-auto">Ir a consultoras</Button>
             </Link>
           </CardContent>
         </Card>
@@ -83,16 +83,16 @@ export default function AdminDashboard() {
         <Card className="shadow-sm">
           <CardHeader>
             <CardTitle className="text-lg text-foreground">
-              Carga de Catálogo
+              Carga de catálogo
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
             <p className="text-sm text-muted-foreground">
-              Sube el catálogo de productos de forma masiva para todas las consultoras.
+              Subí el catálogo de productos de forma masiva para todas las consultoras.
             </p>
             <Link href="/admin/productos">
               <Button variant="outline" className="w-full sm:w-auto border-primary text-primary hover:bg-primary/10">
-                Ir a Catálogo
+                Ir a catálogo
               </Button>
             </Link>
           </CardContent>

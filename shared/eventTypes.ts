@@ -4,26 +4,30 @@ export interface EventTypeDef {
   colorClass: string;
 }
 
-/** Tipos ofrecidos para citas nuevas, en el orden pedido. "entrega" y "demostracion" reusan
- * el mismo valor que ya se guardaba en la base antes de este cambio (solo cambia la etiqueta
- * visible de "Entrega" a "Entrega de productos"), así los registros históricos con esos valores
- * no necesitan ninguna migración de datos. */
+/** Tipos ofrecidos para citas nuevas, en el orden del Prompt 12. "entrega" y "demostracion"
+ * reusan el mismo valor que ya se guardaba en la base antes de ese cambio (solo cambió la
+ * etiqueta visible de "Entrega" a "Entrega de productos"); "seguimiento" (Prompt 12) se
+ * incorpora a la lista ofrecida — antes existía igual en la base (era el tipo por default)
+ * pero el formulario de "Nueva Cita" no lo ofrecía como opción. Ninguno de los dos cambios
+ * necesita migración de datos: el valor guardado en `appointments.type` no cambia. */
 export const FIXED_EVENT_TYPES: EventTypeDef[] = [
   { value: "sesion_belleza", label: "Sesión de belleza", colorClass: "bg-pink-100 text-pink-800 dark:bg-pink-900 dark:text-pink-200" },
-  { value: "capacitacion", label: "Capacitación", colorClass: "bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-200" },
   { value: "entrega", label: "Entrega de productos", colorClass: "bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200" },
   { value: "visita", label: "Visita", colorClass: "bg-teal-100 text-teal-800 dark:bg-teal-900 dark:text-teal-200" },
   { value: "demostracion", label: "Demostración", colorClass: "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200" },
+  { value: "capacitacion", label: "Capacitación", colorClass: "bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-200" },
+  { value: "seguimiento", label: "Seguimiento", colorClass: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200" },
 ];
 
-/** Valores que existían antes de este cambio y ya no se ofrecen para citas nuevas (no están en
- * la lista pedida), pero se siguen reconociendo y mostrando bien en registros ya creados. */
-export const LEGACY_EVENT_TYPES: EventTypeDef[] = [
-  { value: "seguimiento", label: "Seguimiento", colorClass: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200" },
+/** Prompt 12 — "Sacá Venta del filtro": "venta" ya no se ofrece para citas nuevas NI aparece
+ * como opción del filtro de Agenda, pero una cita vieja con ese valor sigue reconociéndose y
+ * mostrándose bien (`isKnownEventType`/`getEventTypeLabel`/`getEventTypeColorClass` la siguen
+ * resolviendo) — nunca se migra ni se oculta una cita ya cargada. */
+export const RETIRED_EVENT_TYPES: EventTypeDef[] = [
   { value: "venta", label: "Venta", colorClass: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" },
 ];
 
-export const KNOWN_EVENT_TYPES: EventTypeDef[] = [...FIXED_EVENT_TYPES, ...LEGACY_EVENT_TYPES];
+export const KNOWN_EVENT_TYPES: EventTypeDef[] = [...FIXED_EVENT_TYPES, ...RETIRED_EVENT_TYPES];
 
 export const CUSTOM_EVENT_TYPE_MAX_LENGTH = 40;
 

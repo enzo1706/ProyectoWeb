@@ -9,6 +9,8 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
+import { MoneyInput } from "@/components/MoneyInput";
+import { PercentInput } from "@/components/PercentInput";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -20,6 +22,8 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useHideMoney } from "@/hooks/use-hide-money";
 import { cn } from "@/lib/utils";
+import { formatDateDisplay, formatDateShort, toDateStr } from "@/lib/date";
+import { formatArgentinaPhoneDisplay } from "@shared/phone";
 import {
   computeSubtotal,
   computeSaleTotals,
@@ -184,7 +188,7 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
       formatVersion: 1,
       step: currentStep,
       clientId: client?.id ?? null,
-      clientName: client ? client.name?.trim() || client.phone : null,
+      clientName: client ? client.name?.trim() || formatArgentinaPhoneDisplay(client.phone) : null,
       clientSkipped,
       date: toDateInputValue(date),
       lines: lines.map((l) => ({
@@ -463,9 +467,9 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
     setLines((prev) => {
       const existing = prev.find((l) => l.productId === line.productId);
       if (existing) {
-        return prev.map((l) =>
-          l.productId === line.productId ? { ...l, quantity: Math.min(l.maxQuantity, l.quantity + line.quantity) } : l,
-        );
+        // Prompt 8, Parte 1: vender sin stock — ya no se limita a `maxQuantity` (el stock al
+        // momento de agregarla), puede seguir sumando aunque falte stock.
+        return prev.map((l) => (l.productId === line.productId ? { ...l, quantity: l.quantity + line.quantity } : l));
       }
       return [...prev, line];
     });
@@ -529,6 +533,11 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
     queryClient.invalidateQueries({ queryKey: ["/api/products/low-stock"] });
     queryClient.invalidateQueries({ queryKey: ["/api/sales/top-products"] });
     queryClient.invalidateQueries({ queryKey: ["/api/clients"] });
+    // Prompt 16 — faltaban: una venta nueva cambia "Vendiste este mes"/cuotas pendientes de
+    // Inicio y los cobros/el día de pedido de Agenda, igual que ya se invalida para un pago o
+    // un pedido (PayInstallmentConfirmDialog/LoadOrderDialog).
+    queryClient.invalidateQueries({ queryKey: ["/api/dashboard/overview"] });
+    queryClient.invalidateQueries({ queryKey: ["/api/agenda/month"] });
     queryClient.invalidateQueries({
       predicate: (query) => typeof query.queryKey[0] === "string" && query.queryKey[0].startsWith("/api/reports"),
     });
@@ -740,8 +749,8 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
                         <User className="h-4 w-4" />
                       </span>
                       <div className="min-w-0">
-                        <p className="truncate text-sm font-medium">{c.name?.trim() || c.phone}</p>
-                        <p className="text-xs text-muted-foreground">{c.phone}</p>
+                        <p className="truncate text-sm font-medium">{c.name?.trim() || formatArgentinaPhoneDisplay(c.phone)}</p>
+                        <p className="text-xs text-muted-foreground">{formatArgentinaPhoneDisplay(c.phone)}</p>
                       </div>
                     </button>
                   ))
@@ -854,69 +863,47 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
                 <CollapsibleContent className="space-y-1 pt-2">
                   <div className="flex items-center justify-between border-b py-3">
                     <Label htmlFor="wizard-discount">Descuento (%)</Label>
-                    <div className="relative w-28">
-                      <Input
-                        id="wizard-discount"
-                        type="number"
-                        min={0}
-                        max={100}
-                        placeholder="0"
-                        className="pr-7 text-right"
-                        value={orderDiscountPct}
-                        onChange={(e) => setOrderDiscountPct(e.target.value)}
-                        data-testid="input-order-discount-value"
-                      />
-                      <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">%</span>
-                    </div>
+                    <PercentInput
+                      id="wizard-discount"
+                      className="w-28"
+                      value={orderDiscountPct ? Number(orderDiscountPct) : null}
+                      onChange={(v) => setOrderDiscountPct(v === null ? "" : String(v))}
+                      data-testid="input-order-discount-value"
+                    />
                   </div>
                   <div className="flex items-center justify-between border-b py-3">
                     <Label htmlFor="wizard-surcharge">Recargo (%)</Label>
-                    <div className="relative w-28">
-                      <Input
-                        id="wizard-surcharge"
-                        type="number"
-                        min={0}
-                        placeholder="0"
-                        className="pr-7 text-right"
-                        value={orderSurchargePct}
-                        onChange={(e) => setOrderSurchargePct(e.target.value)}
-                        data-testid="input-order-surcharge-value"
-                      />
-                      <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">%</span>
-                    </div>
+                    <PercentInput
+                      id="wizard-surcharge"
+                      className="w-28"
+                      value={orderSurchargePct ? Number(orderSurchargePct) : null}
+                      onChange={(v) => setOrderSurchargePct(v === null ? "" : String(v))}
+                      data-testid="input-order-surcharge-value"
+                    />
                   </div>
                   <div className="flex items-center justify-between border-b py-3">
-                    <Label htmlFor="wizard-shipping-charged">Envío que le cobrás ($)</Label>
-                    <div className="relative w-28">
-                      <Input
-                        id="wizard-shipping-charged"
-                        type="number"
-                        min={0}
-                        placeholder="0"
-                        className="pr-7 text-right"
-                        value={shippingCharged !== null ? shippingCharged / 100 : ""}
-                        onChange={(e) => setShippingCharged(e.target.value ? Math.round(Number(e.target.value) * 100) : null)}
-                        data-testid="input-shipping-charged"
-                      />
-                      <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">$</span>
-                    </div>
+                    <Label htmlFor="wizard-shipping-charged">Envío que le cobrás</Label>
+                    <MoneyInput
+                      id="wizard-shipping-charged"
+                      unit="cents"
+                      className="w-28"
+                      value={shippingCharged}
+                      onChange={setShippingCharged}
+                      data-testid="input-shipping-charged"
+                    />
                   </div>
                   <div className="py-3 space-y-1">
                     <div className="flex items-center justify-between">
-                      <Label htmlFor="wizard-shipping-cost">Envío que pagás vos ($)</Label>
-                      <div className="relative w-28">
-                        <Input
-                          id="wizard-shipping-cost"
-                          type="number"
-                          min={0}
-                          placeholder="Sin informar"
-                          className="pr-7 text-right"
-                          value={shippingCostReal !== null ? shippingCostReal / 100 : ""}
-                          onChange={(e) => setShippingCostReal(e.target.value ? Math.round(Number(e.target.value) * 100) : null)}
-                          data-testid="input-shipping-cost-real"
-                        />
-                        <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">$</span>
-                      </div>
+                      <Label htmlFor="wizard-shipping-cost">Envío que pagás vos</Label>
+                      <MoneyInput
+                        id="wizard-shipping-cost"
+                        unit="cents"
+                        className="w-28"
+                        placeholder="Sin informar"
+                        value={shippingCostReal}
+                        onChange={setShippingCostReal}
+                        data-testid="input-shipping-cost-real"
+                      />
                     </div>
                     <p className="text-xs text-muted-foreground">
                       Lo que te cuesta a vos el envío. No se le suma a la clienta.
@@ -1021,9 +1008,7 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
                               <PopoverTrigger asChild>
                                 <Button type="button" variant="outline" className="w-full justify-start font-normal" data-testid="button-custom-due-date">
                                   <CalendarIcon className="mr-2 h-4 w-4" />
-                                  {customDueDate
-                                    ? customDueDate.toLocaleDateString("es-MX", { day: "numeric", month: "long", year: "numeric" })
-                                    : "Elegir una fecha"}
+                                  {customDueDate ? formatDateDisplay(toDateStr(customDueDate)) : "Elegir una fecha"}
                                 </Button>
                               </PopoverTrigger>
                               <PopoverContent className="w-auto p-0">
@@ -1054,7 +1039,7 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
                     <PopoverTrigger asChild>
                       <Button type="button" variant="outline" className="w-full justify-start font-normal" data-testid="button-sale-date">
                         <CalendarIcon className="mr-2 h-4 w-4" />
-                        {date.toLocaleDateString("es-MX", { day: "numeric", month: "long", year: "numeric" })}
+                        {formatDateDisplay(toDateStr(date))}
                       </Button>
                     </PopoverTrigger>
                     <PopoverContent className="w-auto p-0">
@@ -1117,8 +1102,8 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
                                   <User className="h-3.5 w-3.5" />
                                 </span>
                                 <div className="min-w-0">
-                                  <p className="truncate text-sm font-medium">{c.name?.trim() || c.phone}</p>
-                                  <p className="text-xs text-muted-foreground">{c.phone}</p>
+                                  <p className="truncate text-sm font-medium">{c.name?.trim() || formatArgentinaPhoneDisplay(c.phone)}</p>
+                                  <p className="text-xs text-muted-foreground">{formatArgentinaPhoneDisplay(c.phone)}</p>
                                 </div>
                               </button>
                             ))
@@ -1152,7 +1137,7 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
                     {isEditMode
                       ? existingSale!.clientName
                       : client
-                        ? client.name?.trim() || client.phone
+                        ? client.name?.trim() || formatArgentinaPhoneDisplay(client.phone)
                         : "Sin clienta — la cargás después"}
                   </span>
                 </div>
@@ -1187,7 +1172,7 @@ export function NewSaleDialog({ open, onOpenChange, products, existingSale, pres
                   <span className="text-right font-medium" data-testid="text-confirm-payment-status">
                     {!hasAnyPendingInstallment
                       ? "Pagó en el momento"
-                      : `Te debe ${format(pendingDisplayAmount)}${pendingDisplayDate ? ` — vence el ${parseLocalDate(pendingDisplayDate).toLocaleDateString("es-MX", { day: "numeric", month: "short" })}` : ""}`}
+                      : `Te debe ${format(pendingDisplayAmount)}${pendingDisplayDate ? ` — vence el ${formatDateShort(pendingDisplayDate)}` : ""}`}
                   </span>
                 </div>
                 <div className="space-y-1.5">

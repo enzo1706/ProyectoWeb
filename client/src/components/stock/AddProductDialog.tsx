@@ -8,6 +8,7 @@ import type { Product } from "@shared/schema";
 import { createProductSchema } from "@shared/schema";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { MoneyInput } from "@/components/MoneyInput";
 import {
   Dialog,
   DialogContent,
@@ -40,9 +41,15 @@ import { ChevronDown } from "lucide-react";
 import { getProductCategories } from "@/lib/productCategories";
 import { CategorySelect } from "./CategorySelect";
 import { CostInputBlock, EMPTY_COST_INPUT, resolveCostInputForSubmit, type CostInputValue } from "./CostInputBlock";
+import { FreePlanLimitDialog, isFreePlanLimitError } from "@/components/FreePlanLimitDialog";
 
-const manualProductFormSchema = createProductSchema.extend({
-  precio: z.string().min(1, "El precio es obligatorio"),
+interface SubscriptionStatus {
+  isFreePlan: boolean;
+  productsWithStockCount: number | null;
+  freePlanProductLimit: number;
+}
+
+const manualProductFormSchema = createProductSchema.omit({ precio: true }).extend({
   unidades: z.string().optional(),
   puntos: z.string().optional(),
   variante: z.string().optional(),
@@ -62,34 +69,46 @@ export function AddProductDialog({
   const { toast } = useToast();
   const categories = getProductCategories(products);
   const [costInput, setCostInput] = useState<CostInputValue>(EMPTY_COST_INPUT);
+  const [precioCentavos, setPrecioCentavos] = useState<number | null>(null);
   const [moreDataOpen, setMoreDataOpen] = useState(false);
   const [confirmNoCostOpen, setConfirmNoCostOpen] = useState(false);
+  const [freePlanLimitOpen, setFreePlanLimitOpen] = useState(false);
 
   const { data: settings } = useQuery<{ habitualDiscountPercent: number }>({
     queryKey: ["/api/business-settings"],
+    enabled: open,
+  });
+  // Prompt 14 (P30) — mismo queryKey que Subscription.tsx/Dashboard: react-query reusa el
+  // cache, no dispara una consulta de más.
+  const { data: subscriptionStatus } = useQuery<SubscriptionStatus>({
+    queryKey: ["/api/subscription/status"],
     enabled: open,
   });
   const habitualDiscountPercent = Math.round(settings?.habitualDiscountPercent ?? 35);
 
   const form = useForm<ManualProductFormData>({
     resolver: zodResolver(manualProductFormSchema),
-    defaultValues: { seccion: "", linea: "", producto: "", variante: "", precio: "", unidades: "0", puntos: "0", codigo: "" },
+    defaultValues: { seccion: "", linea: "", producto: "", variante: "", unidades: "0", puntos: "0", codigo: "" },
   });
 
   const resetAll = () => {
     form.reset();
     setCostInput(EMPTY_COST_INPUT);
+    setPrecioCentavos(null);
     setMoreDataOpen(false);
   };
 
   const createMutation = useGuardedMutation({
     mutationFn: async (data: ManualProductFormData) => {
+      if (precioCentavos === null || precioCentavos <= 0) {
+        throw new Error("El precio es obligatorio");
+      }
       const res = await apiRequest("POST", "/api/products", {
         seccion: data.seccion,
         linea: data.linea || undefined,
         producto: data.producto,
         variante: data.variante || undefined,
-        precio: Math.round(Number(data.precio) * 100),
+        precio: precioCentavos,
         unidades: data.unidades ? Number(data.unidades) : 0,
         puntos: data.puntos ? Number(data.puntos) : 0,
         codigo: data.codigo || undefined,
@@ -113,11 +132,31 @@ export function AddProductDialog({
       onOpenChange(false);
     },
     onError: (err: Error) => {
+      if (isFreePlanLimitError(err)) {
+        setFreePlanLimitOpen(true);
+        return;
+      }
       toast({ title: "No se pudo agregar el producto", description: err.message, variant: "destructive" });
     },
   });
 
+  // Prompt 14 (P30) — un producto manual nuevo con unidades > 0 SIEMPRE suma uno al conteo de
+  // "productos con stock" (nunca existía antes), así que alcanza con mirar el conteo actual —
+  // a diferencia del catálogo (LoadOrderDialog), donde cada producto puede ya tener stock.
+  const wouldExceedFreePlanLimit = (data: ManualProductFormData) =>
+    !!subscriptionStatus?.isFreePlan &&
+    (subscriptionStatus.productsWithStockCount ?? 0) >= subscriptionStatus.freePlanProductLimit &&
+    Number(data.unidades || 0) > 0;
+
   const submit = (data: ManualProductFormData) => {
+    if (precioCentavos === null || precioCentavos <= 0) {
+      toast({ title: "El precio es obligatorio", variant: "destructive" });
+      return;
+    }
+    if (wouldExceedFreePlanLimit(data)) {
+      setFreePlanLimitOpen(true);
+      return;
+    }
     const costPayload = resolveCostInputForSubmit(costInput);
     if (!costPayload) {
       setConfirmNoCostOpen(true);
@@ -169,19 +208,12 @@ export function AddProductDialog({
                   </FormItem>
                 )}
               />
-              <FormField
-                control={form.control}
-                name="precio"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Precio de venta</FormLabel>
-                    <FormControl>
-                      <Input {...field} type="number" min={0} step="0.01" data-testid="input-manual-precio" />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+              <FormItem>
+                <FormLabel>Precio de venta</FormLabel>
+                <FormControl>
+                  <MoneyInput unit="cents" value={precioCentavos} onChange={setPrecioCentavos} data-testid="input-manual-precio" />
+                </FormControl>
+              </FormItem>
               <FormField
                 control={form.control}
                 name="unidades"
@@ -196,11 +228,7 @@ export function AddProductDialog({
                 )}
               />
 
-              <CostInputBlock
-                precioCentavos={Math.round(Number(form.watch("precio") || 0) * 100)}
-                value={costInput}
-                onChange={setCostInput}
-              />
+              <CostInputBlock precioCentavos={precioCentavos ?? 0} value={costInput} onChange={setCostInput} />
 
               <Collapsible open={moreDataOpen} onOpenChange={setMoreDataOpen}>
                 <CollapsibleTrigger asChild>
@@ -308,6 +336,12 @@ export function AddProductDialog({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <FreePlanLimitDialog
+        open={freePlanLimitOpen}
+        onOpenChange={setFreePlanLimitOpen}
+        limit={subscriptionStatus?.freePlanProductLimit ?? 10}
+      />
     </>
   );
 }
