@@ -81,10 +81,9 @@ confirma que los deploys 2 y 3 se pueden aplicar juntos, en una sola ventana.
 1. **Staging publica `deploy-paquete-1`**: apuntar el servicio de staging a esa rama (en vez de
    `staging`) para esta ronda puntual, o crear un segundo servicio de staging si se prefiere no
    pisar el que ya está probando otra cosa.
-2. **Probar en staging**: no hay checklist dedicado para el paquete 1 en sí (son los Prompts
-   urgentes de precio/cupones/costos) — probar manualmente el flujo de suscripción con cupón, el
-   cálculo de Ingresos Brutos en una venta nueva, y Configuración (días de pedido, % de
-   Ingresos Brutos) contra el dominio de staging.
+2. **Probar en staging**: `docs/pruebas-paquete-1.md` (precio y cupones, suscripción con cupón,
+   Configuración, costo y ganancia en una venta, carga de un pedido) contra el dominio de
+   staging.
 3. **Deploy 1 a producción real**: seguir `docs/migracion-produccion-pendiente.md`, de punta a
    punta — el "Orden del día" del final del documento es la lista exacta, en orden, incluidos el
    backup, la restauración en una base de prueba, los chequeos antes y después.
@@ -98,13 +97,14 @@ confirma que los deploys 2 y 3 se pueden aplicar juntos, en una sola ventana.
 ## 5. Ronda 2 — toda la cadena (Prompts 4 a 16) a producción
 
 1. **Mergear `prompt-16-velocidad` a `staging`** (si no se hizo ya): trae de punta a punta los
-   Prompts 10, 11, 12, 13, 14, 15 y 16 sobre lo que `staging` ya tenía (4, 5, 6, 7 y 9).
+   Prompts 8, 9, 10, 11, 12, 13, 14, 15 y 16 sobre lo que `staging` ya tenía (4, 5, 6 y 7).
 2. **Staging publica la rama `staging`**: con la cadena completa ya mergeada, el servicio de
    staging vuelve a apuntar a esa rama (o se usa el mismo servicio de siempre).
 3. **Probar con el checklist**: `docs/pruebas-prompt-4-5-6-7-y-9.md` (lo que staging ya tenía),
-   `docs/pruebas-prompt-11.md` y `docs/pruebas-prompt-12-a-16.md` (lo nuevo de este tramo) —
-   contra el dominio de staging, nunca `localhost`, porque es la primera vez que algunas cosas
-   (HTTPS real, el teléfono físico para notificaciones del Prompt 8 — ver paso 6) se pueden
+   `docs/pruebas-prompt-11.md` y `docs/pruebas-prompt-8-10-y-12-a-16.md` (lo nuevo de este
+   tramo, Prompt 8 Partes 1 a 3 y Prompt 10 incluidos — la Parte 4 del Prompt 8 todavía no está
+   implementada, ver paso 6) — contra el dominio de staging, nunca `localhost`, porque es la
+   primera vez que algunas cosas (HTTPS real, el teléfono físico para notificaciones) se pueden
    probar en serio.
 4. **Deploys 2 y 3 juntos, en una sola ventana**: seguir `docs/migracion-deploy-2.md` completo y
    después `docs/migracion-deploy-3.md` completo, en ese orden, contra producción real — el
