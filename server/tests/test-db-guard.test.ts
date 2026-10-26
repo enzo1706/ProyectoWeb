@@ -61,9 +61,9 @@ describe("assertTestDatabaseAuthorized", () => {
 });
 
 describe("MemoryStorage no requiere TEST_DATABASE_URL", () => {
-  it("9. resolveStorageMode() da 'memory' sin ninguna variable de Postgres presente", async () => {
+  it("9. resolveStorageMode() da 'memory' con DATABASE_MODE=memory pedido a mano (ya no es el default — ver server/tests/storage-mode.test.ts)", async () => {
     const saved = { DATABASE_MODE: process.env.DATABASE_MODE, DATABASE_URL: process.env.DATABASE_URL, NODE_ENV: process.env.NODE_ENV };
-    delete process.env.DATABASE_MODE;
+    process.env.DATABASE_MODE = "memory";
     delete process.env.DATABASE_URL;
     delete process.env.TEST_DATABASE_URL;
     process.env.NODE_ENV = "test";

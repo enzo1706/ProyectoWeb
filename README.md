@@ -92,8 +92,8 @@ npm run dev             # levanta la app en http://localhost:5000
 |---|---|---|
 | `NODE_ENV` | `development` / `test` / `production`. Controla guards de seguridad reales (ver más abajo) — no es solo informativa. | Sí |
 | `PORT` | Puerto HTTP. Railway lo asigna solo; local default `5000` si no está seteada. | No (default 5000) |
-| `DATABASE_URL` | Conexión a Postgres de desarrollo/producción. En producción es Supabase; en local, tu contenedor Docker de `docker-compose.dev.yml`. **Nunca debe ser la misma base entre tu máquina y producción** (ver advertencia histórica más abajo). | Sí (salvo `DATABASE_MODE=memory`) |
-| `DATABASE_MODE` | `memory` o `postgres`. Fuerza el backend de storage. **Bloqueado a `postgres` en producción** — no se puede arrancar producción en memoria ni por error. | No (se infiere de `DATABASE_URL` si falta) |
+| `DATABASE_URL` | Conexión a Postgres de desarrollo/producción. En producción es Supabase; en local, tu contenedor Docker de `docker-compose.dev.yml`. **Nunca debe ser la misma base entre tu máquina y producción** (ver advertencia histórica más abajo). | Sí (salvo `DATABASE_MODE=memory`, bloqueado en producción/staging) |
+| `DATABASE_MODE` | `memory` o `postgres`. Fuerza el backend de storage. **Bloqueado a `postgres` en producción y en staging (`APP_ENV=staging`)** — no se puede arrancar ninguno de los dos en memoria ni por error. El modo memoria NUNCA es un default: sin esta variable y sin `DATABASE_URL`, el servidor no arranca y lo dice (ver "Consideraciones de seguridad" más abajo). | No (pero hace falta si no hay `DATABASE_URL` y querés memoria a propósito) |
 | `TEST_DATABASE_URL` | Conexión al Postgres DEDICADO de test (contenedor aparte, puerto `55433`). Nunca la misma base que `DATABASE_URL`. | Solo para correr los tests que usan Postgres real |
 | `SESSION_SECRET` | Secreto de firma de las cookies de sesión (`express-session`). El proceso no arranca sin esto. | Sí |
 | `SUPABASE_URL` | URL del proyecto Supabase, usada para subir imágenes de producto a Supabase Storage. | Sí (para el módulo de imágenes) |
@@ -237,7 +237,7 @@ Manifest + set de íconos + metadata para instalarse como app en el celular (`di
 ## Consideraciones de seguridad importantes
 
 - `NODE_ENV=production` no es solo informativo: controla si se crea el admin por defecto, si las cookies son `secure`, y otros comportamientos reales. Confirmar siempre que esté seteado correctamente en el entorno real.
-- `DATABASE_MODE=memory` está bloqueado en producción a nivel de código — no se puede arrancar producción sin Postgres real, ni por error de configuración.
+- `DATABASE_MODE=memory` está bloqueado en producción y en staging (`APP_ENV=staging`) a nivel de código — no se puede arrancar ninguno de los dos sin Postgres real, ni por error de configuración. Tampoco hay default silencioso a memoria: si falta `DATABASE_URL` y no pediste memoria a propósito con `DATABASE_MODE=memory`, el servidor no arranca y lo dice ("Falta DATABASE_URL: el servidor no arranca sin base de datos.") — antes de este fix, sin `DATABASE_URL` y fuera de `NODE_ENV=production`, el servidor arrancaba igual en memoria sin avisar (encontrado de verdad en un contenedor de diagnóstico durante el ensayo de deploy del 2026-10-25).
 - Los tests de Postgres real nunca pueden tocar la base de producción — `test-db-guard.ts` lo hace estructuralmente imposible (ver sección de Base de Datos), no depende de que alguien recuerde configurarlo bien.
 - Ningún log de la aplicación imprime passwords, códigos de recuperación, tokens de sesión, ni el Access Token de Mercado Pago — verificado explícitamente en varias etapas de auditoría.
 
