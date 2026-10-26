@@ -7,6 +7,7 @@ import multer from "multer";
 import { storage, SaleValidationError, SaleRequestConflictError, ProductConflictError, ProductValidationError, AppointmentValidationError, AppointmentConflictError, isBcryptHash, DuplicateEmailError, DuplicateUsernameError, DuplicateWhatsAppError, WhatsAppMatchesUsernameError, FreePlanProductLimitError } from "./storage";
 import { requestPasswordReset, verifyResetCode, resetPassword } from "./auth-reset";
 import { uploadProductImage, deleteProductImage, isValidImageBuffer, listProductImageFiles, extractStoragePath } from "./image-storage";
+import { getVapidPublicKey, sendWebPush, isExpiredSubscriptionStatus } from "./push-vapid";
 import { findProductImageMatches } from "@shared/imageMatching";
 import { matchImportedProducts, type ImportCatalogProduct } from "@shared/importMatching";
 import { isClientListFilter } from "@shared/clientFilters";
@@ -601,6 +602,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // Prompt 8
   app.use("/api/deliveries", requireAuth, requireConsultant);
   app.use("/api/order-reminder", requireAuth, requireConsultant);
+  app.use("/api/push", requireAuth, requireConsultant); // Prompt 8, Parte 4
 
   // Sin requireConsultant: admin recibe 404 explícito ("no aplica"), no el 403 genérico.
   app.get("/api/business-settings", requireAuth, async (req: Request, res: Response) => {
@@ -1701,6 +1703,84 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Error al cerrar el recordatorio" });
+    }
+  });
+
+  /** Prompt 8, Parte 4 — la clave pública no es secreta, el frontend la necesita para
+   * suscribirse (`pushManager.subscribe({ applicationServerKey: ... })`). */
+  app.get("/api/push/vapid-public-key", async (_req: Request, res: Response) => {
+    try {
+      res.json({ publicKey: getVapidPublicKey() });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Los avisos push no están configurados en este entorno." });
+    }
+  });
+
+  /** Prompt 8, Parte 4 — "Activar avisos en este celular". UPSERT por `endpoint`: si el mismo
+   * dispositivo ya estaba suscripto a otra consultora (celular compartido), pasa a ser de la
+   * que lo activa ahora. */
+  app.post("/api/push/subscribe", async (req: Request, res: Response) => {
+    try {
+      const { endpoint, keys } = req.body ?? {};
+      if (typeof endpoint !== "string" || !endpoint || typeof keys?.p256dh !== "string" || typeof keys?.auth !== "string") {
+        return res.status(400).json({ error: "Suscripción inválida." });
+      }
+      await storage.upsertPushSubscription(req.consultantId!, endpoint, keys.p256dh, keys.auth);
+      res.status(204).end();
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "No se pudo activar los avisos en este dispositivo." });
+    }
+  });
+
+  /** Prompt 8, Parte 4 — al cerrar sesión (o si la consultora desactiva los avisos a mano). Sin
+   * `consultantId` en el WHERE a propósito: el endpoint ya es el dato único real, y en un
+   * celular compartido la fila puede ya ser de otra consultora distinta a la de esta sesión —
+   * igual hay que borrarla, es la MISMA suscripción del navegador que se está cerrando. */
+  app.post("/api/push/unsubscribe", async (req: Request, res: Response) => {
+    try {
+      const { endpoint } = req.body ?? {};
+      if (typeof endpoint !== "string" || !endpoint) {
+        return res.status(400).json({ error: "Falta el endpoint." });
+      }
+      await storage.deletePushSubscriptionByEndpoint(endpoint);
+      res.status(204).end();
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "No se pudo desactivar los avisos en este dispositivo." });
+    }
+  });
+
+  /** Prompt 8, Parte 4 — botón "Probar aviso": manda un push de verdad a ESTE dispositivo
+   * (nunca a todos los de la consultora), sin pasar por la reserva de push_notification_log —
+   * es una prueba, no el aviso real del día de pedido. */
+  app.post("/api/push/test", async (req: Request, res: Response) => {
+    try {
+      const { endpoint } = req.body ?? {};
+      if (typeof endpoint !== "string" || !endpoint) {
+        return res.status(400).json({ error: "Falta el endpoint." });
+      }
+      const subscriptions = await storage.getPushSubscriptionsForConsultant(req.consultantId!);
+      const subscription = subscriptions.find((s) => s.endpoint === endpoint);
+      if (!subscription) {
+        return res.status(404).json({ error: "Ese dispositivo no tiene los avisos activados." });
+      }
+      const result = await sendWebPush(subscription, {
+        title: "Aviso de prueba",
+        body: "Si ves esto, los avisos están funcionando en este dispositivo.",
+        url: "/",
+      });
+      if (!result.success) {
+        if (isExpiredSubscriptionStatus(result.statusCode)) {
+          await storage.deletePushSubscriptionByEndpoint(endpoint);
+        }
+        return res.status(502).json({ error: "No se pudo mandar el aviso de prueba. Probá activarlos de nuevo." });
+      }
+      res.status(204).end();
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "No se pudo mandar el aviso de prueba." });
     }
   });
 

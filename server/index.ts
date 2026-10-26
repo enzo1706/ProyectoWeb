@@ -2,6 +2,7 @@ import "./load-env";
 import type { Server } from "http";
 import { createApp, log } from "./app";
 import { resolveStorageMode } from "./storage-mode";
+import { startPushScheduler, stopPushScheduler } from "./push-scheduler";
 
 /** Cierre controlado: deja de aceptar conexiones nuevas, espera a que terminen los
  * requests en curso, y recién ahí cierra el pool de Postgres. Compatible con cómo
@@ -14,6 +15,7 @@ function setupGracefulShutdown(httpServer: Server) {
     if (shuttingDown) return;
     shuttingDown = true;
     log(`${signal} recibido, cerrando el servidor...`);
+    stopPushScheduler();
 
     // Si algo queda colgado (request eterno, pool que no responde), no nos quedamos
     // esperando para siempre — a los 10s se fuerza la salida igual.
@@ -57,6 +59,7 @@ async function main() {
   });
 
   setupGracefulShutdown(httpServer);
+  startPushScheduler();
 }
 
 main();

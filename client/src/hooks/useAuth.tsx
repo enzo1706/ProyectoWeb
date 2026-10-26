@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState, useCallback } from "react";
 import { apiRequest } from "@/lib/queryClient";
 import { markSessionActive, clearSessionActivity } from "@/lib/sessionActivity";
+import { unsubscribeCurrentDevice } from "@/lib/pushNotifications";
 
 export interface AuthUser {
   id: number;
@@ -70,6 +71,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = async () => {
+    // Prompt 8, Parte 4 — ANTES de cerrar sesión: todavía autenticada, puede borrar su propia
+    // suscripción push. Después del logout ya no podría (la ruta exige sesión).
+    await unsubscribeCurrentDevice();
     await apiRequest("POST", "/api/auth/logout");
     setUser(null);
     // Cierre A PROPÓSITO — nunca tiene que mostrarse como "se cerró por inactividad".

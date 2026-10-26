@@ -79,8 +79,22 @@ siguiente.
     siempre es `production` (ver el punto de arriba), esta segunda señal ya alcanza para que
     agregarla ahí por error no tenga ningún efecto. Aun así, antes de cada deploy conviene
     confirmarla ausente en el panel de variables del servicio.
+  - **`VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` / `VAPID_SUBJECT`** (Prompt 8, Parte 4 —
+    avisos push, rama `prompt-8b-avisos`, todavía no mergeada a `staging`): el par de claves
+    se genera UNA vez por entorno con `npx web-push generate-vapid-keys` — **un par distinto
+    para staging y otro para producción**, nunca el mismo (mismo criterio que Mercado Pago
+    TEST vs. real). `VAPID_SUBJECT` es un `mailto:` de contacto, puede repetirse entre
+    entornos. Ver `docs/migracion-deploy-4.md` para el detalle completo.
 - Auto-deploy desde la rama `staging` de este mismo repo (configurable en el servicio de
   Railway, igual que ya está configurado el de producción apuntando a `main`).
+- **Desactivar cualquier opción de "dormir" el servicio sin tráfico** (en el plan actual de
+  Railway, "App Sleeping" — el nombre puede cambiar con el tiempo, confirmar el equivalente
+  vigente al momento de armar esto). Necesario desde el Prompt 8, Parte 4: la tarea programada
+  de avisos push corre DENTRO del proceso del servidor (`server/push-scheduler.ts`, un
+  `setInterval`) — si el servicio se duerme por falta de tráfico, ese proceso deja de correr y
+  nadie lo despierta a las 9:00 (despertarlo necesita tráfico HTTP entrante, que es justo lo
+  que un aviso push NO es). Confirmar esta opción desactivada en staging Y en producción antes
+  de publicar esa parte.
 
 ### Supabase — chequeo del plan (pendiente de confirmar a mano)
 

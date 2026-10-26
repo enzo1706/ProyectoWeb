@@ -8,6 +8,13 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { normalizeArgentinaPhoneDigits } from "@shared/phone";
 import { WHATSAPP_FORMAT_HINT } from "@/lib/phoneHint";
+import {
+  activatePushNotifications,
+  getCurrentSubscriptionEndpoint,
+  isPushSupported,
+  needsIosHomeScreenInstall,
+  sendTestPush,
+} from "@/lib/pushNotifications";
 import type { Consultant } from "@shared/schema";
 import {
   Card,
@@ -213,6 +220,52 @@ const DAYS = Array.from({ length: 31 }, (_, i) => String(i + 1));
 export default function Configuracion() {
   const { toast } = useToast();
   const [showSecondDay, setShowSecondDay] = useState(false);
+
+  // Prompt 8, Parte 4 — "Activar avisos en este celular". Se detecta solo si YA están
+  // activados en este dispositivo (hay una suscripción push guardada por el navegador) —
+  // nunca se pide permiso ni se registra nada hasta que la consultora toca el botón.
+  const [pushActivationStatus, setPushActivationStatus] = useState<"cargando" | "activo" | "inactivo" | "denegado">("cargando");
+  const [isActivatingPush, setIsActivatingPush] = useState(false);
+  const [isTestingPush, setIsTestingPush] = useState(false);
+
+  useEffect(() => {
+    getCurrentSubscriptionEndpoint().then((endpoint) => {
+      setPushActivationStatus(endpoint ? "activo" : "inactivo");
+    });
+  }, []);
+
+  const handleActivatePush = async () => {
+    setIsActivatingPush(true);
+    try {
+      const result = await activatePushNotifications();
+      if (result.status === "activado") {
+        setPushActivationStatus("activo");
+        toast({ title: "Avisos activados en este celular ✓" });
+      } else if (result.status === "permiso-denegado") {
+        setPushActivationStatus("denegado");
+      } else if (result.status === "no-soportado") {
+        toast({ title: "Este navegador no permite avisos push", variant: "destructive" });
+      } else {
+        toast({ title: "No se pudieron activar los avisos", description: result.message, variant: "destructive" });
+      }
+    } finally {
+      setIsActivatingPush(false);
+    }
+  };
+
+  const handleTestPush = async () => {
+    setIsTestingPush(true);
+    try {
+      const result = await sendTestPush();
+      if (result.ok) {
+        toast({ title: "Aviso de prueba mandado — revisá las notificaciones de tu celular" });
+      } else {
+        toast({ title: "No se pudo mandar el aviso de prueba", description: result.message, variant: "destructive" });
+      }
+    } finally {
+      setIsTestingPush(false);
+    }
+  };
 
   const { data: settings, isLoading, isError, error } = useQuery<BusinessSettingsResponse>({
     queryKey: ["/api/business-settings"],
@@ -440,6 +493,60 @@ export default function Configuracion() {
                     Lo calculamos con tus pedidos de los últimos 3 meses. Lo usamos para estimar tu ganancia cuando
                     un producto no tiene el costo cargado.
                   </p>
+                </div>
+
+                <div className="space-y-2 border-t pt-4">
+                  <p className="text-sm font-medium">Avisos en tu celular</p>
+                  <p className="text-xs text-muted-foreground">
+                    El día de pedido te mandamos un aviso como los de WhatsApp, además del recordatorio que ya ves
+                    en Inicio.
+                  </p>
+
+                  {needsIosHomeScreenInstall() ? (
+                    <p className="text-sm" data-testid="text-push-ios-instructions">
+                      Tocá <strong>Compartir</strong> y después <strong>"Agregar a inicio"</strong>. Abrí Impulsa
+                      desde ese ícono y activá los avisos.
+                    </p>
+                  ) : !isPushSupported() ? (
+                    <p className="text-xs text-muted-foreground">
+                      Este navegador no permite avisos push.
+                    </p>
+                  ) : pushActivationStatus === "activo" ? (
+                    <div className="space-y-2">
+                      <p className="text-sm font-medium text-green-600" data-testid="text-push-activated">
+                        Avisos activados en este celular ✓
+                      </p>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={handleTestPush}
+                        disabled={isTestingPush}
+                        data-testid="button-test-push"
+                      >
+                        {isTestingPush ? "Mandando..." : "Probar aviso"}
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={handleActivatePush}
+                        disabled={isActivatingPush || pushActivationStatus === "cargando"}
+                        data-testid="button-activate-push"
+                      >
+                        {isActivatingPush ? "Activando..." : "Activar avisos en este celular"}
+                      </Button>
+                      {pushActivationStatus === "denegado" && (
+                        <p className="text-xs text-muted-foreground" data-testid="text-push-denied">
+                          Rechazaste el permiso de notificaciones. Para activarlo, entrá a la configuración del
+                          navegador para este sitio y habilitá las notificaciones.
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </div>
               </CardContent>
             </Card>

@@ -23,6 +23,8 @@ import {
   orderReminders,
   dashboardNoticeDismissals,
   dashboardNoticeTypes,
+  pushSubscriptions,
+  pushNotificationLog,
   createSaleSchema,
   updateSaleSchema,
   createAppointmentSchema,
@@ -70,6 +72,8 @@ import {
   type OrderReminderItemSnapshot,
   type DashboardNoticeType,
   type DashboardNoticeDismissal,
+  type PushSubscriptionRow,
+  type PushNotificationLogRow,
 } from "@shared/schema";
 import { normalizeEmail } from "@shared/email";
 import {
@@ -1121,6 +1125,23 @@ export interface IStorage {
   /** Prompt 10 — todo lo que necesita Inicio en una sola llamada (ver detalle en
    * DatabaseStorage.getDashboardOverview). */
   getDashboardOverview(consultantId: number, access: DashboardOverviewAccessInfo): Promise<DashboardOverview>;
+  /** Prompt 8, Parte 4 — activar avisos en un dispositivo: UPSERT por `endpoint` (si el mismo
+   * dispositivo ya estaba suscripto a otra consultora, pasa a ser de la que lo activa ahora). */
+  upsertPushSubscription(consultantId: number, endpoint: string, p256dh: string, auth: string): Promise<PushSubscriptionRow>;
+  /** Prompt 8, Parte 4 — cerrar sesión, o una suscripción vencida (404/410 al mandar). */
+  deletePushSubscriptionByEndpoint(endpoint: string): Promise<void>;
+  /** Prompt 8, Parte 4 — todos los dispositivos de una consultora, para mandarle un aviso. */
+  getPushSubscriptionsForConsultant(consultantId: number): Promise<PushSubscriptionRow[]>;
+  /** Prompt 8, Parte 4 — a quién tiene sentido revisarle el día de pedido (tiene al menos un
+   * dispositivo activo). */
+  getConsultantIdsWithPushSubscriptions(): Promise<number[]>;
+  /** Prompt 8, Parte 4 — reserva atómica de un aviso push (consultora + tipo + fecha). `true`
+   * si esta llamada reservó el envío (nadie lo había mandado todavía hoy); `false` si ya
+   * estaba reservado/mandado — en ese caso no hay que mandar nada. */
+  claimPushNotification(consultantId: number, noticeType: string, sentFor: string): Promise<boolean>;
+  /** Prompt 8, Parte 4 — libera la reserva de arriba (todos los envíos fallaron por un error
+   * transitorio) para que la próxima revisión, dentro de la ventana horaria, reintente. */
+  releasePushNotificationClaim(consultantId: number, noticeType: string, sentFor: string): Promise<void>;
   /** Prompt 6, punto 1 — asigna una clienta a una venta creada sin una ("Sin clienta"). Solo
    * de `null` a una clienta real. */
   assignSaleClient(consultantId: number, saleId: number, clientId: number): Promise<Sale | undefined>;
@@ -5339,6 +5360,65 @@ export class DatabaseStorage implements IStorage {
       });
   }
 
+  /** Prompt 8, Parte 4 — UPSERT por `endpoint`: si el dispositivo ya estaba suscripto a otra
+   * consultora (celular compartido), pasa a ser de la que lo activa ahora. */
+  async upsertPushSubscription(consultantId: number, endpoint: string, p256dh: string, auth: string): Promise<PushSubscriptionRow> {
+    const db = await this.getDb();
+    const [row] = await db
+      .insert(pushSubscriptions)
+      .values({ consultantId, endpoint, p256dh, auth })
+      .onConflictDoUpdate({
+        target: [pushSubscriptions.endpoint],
+        set: { consultantId, p256dh, auth },
+      })
+      .returning();
+    return row;
+  }
+
+  async deletePushSubscriptionByEndpoint(endpoint: string): Promise<void> {
+    const db = await this.getDb();
+    await db.delete(pushSubscriptions).where(eq(pushSubscriptions.endpoint, endpoint));
+  }
+
+  async getPushSubscriptionsForConsultant(consultantId: number): Promise<PushSubscriptionRow[]> {
+    const db = await this.getDb();
+    return db.select().from(pushSubscriptions).where(eq(pushSubscriptions.consultantId, consultantId));
+  }
+
+  async getConsultantIdsWithPushSubscriptions(): Promise<number[]> {
+    const db = await this.getDb();
+    const rows = await db.selectDistinct({ consultantId: pushSubscriptions.consultantId }).from(pushSubscriptions);
+    return rows.map((r) => r.consultantId);
+  }
+
+  /** Prompt 8, Parte 4 — la reserva en sí: el `ON CONFLICT DO NOTHING` es lo que garantiza que,
+   * aunque dos instancias revisen casi al mismo tiempo, solo una de las dos inserte la fila y
+   * mande el aviso — Postgres resuelve la carrera, no el código. */
+  async claimPushNotification(consultantId: number, noticeType: string, sentFor: string): Promise<boolean> {
+    const db = await this.getDb();
+    const inserted = await db
+      .insert(pushNotificationLog)
+      .values({ consultantId, noticeType, sentFor })
+      .onConflictDoNothing({
+        target: [pushNotificationLog.consultantId, pushNotificationLog.noticeType, pushNotificationLog.sentFor],
+      })
+      .returning({ id: pushNotificationLog.id });
+    return inserted.length > 0;
+  }
+
+  async releasePushNotificationClaim(consultantId: number, noticeType: string, sentFor: string): Promise<void> {
+    const db = await this.getDb();
+    await db
+      .delete(pushNotificationLog)
+      .where(
+        and(
+          eq(pushNotificationLog.consultantId, consultantId),
+          eq(pushNotificationLog.noticeType, noticeType),
+          eq(pushNotificationLog.sentFor, sentFor),
+        ),
+      );
+  }
+
   /** Prompt 10 — qué avisos de "Para mejorar tu negocio" siguen tapados por "Ocultar" (menos de
    * `DASHBOARD_NOTICE_HIDDEN_MS` desde que se ocultaron). */
   private async getHiddenDashboardNoticeTypes(consultantId: number): Promise<Set<DashboardNoticeType>> {
@@ -5575,6 +5655,10 @@ export class MemoryStorage implements IStorage {
   private nextOrderReminderId = 1;
   private dashboardNoticeDismissalRecords: DashboardNoticeDismissal[] = [];
   private nextDashboardNoticeDismissalId = 1;
+  private pushSubscriptionRecords: PushSubscriptionRow[] = [];
+  private nextPushSubscriptionId = 1;
+  private pushNotificationLogRecords: PushNotificationLogRow[] = [];
+  private nextPushNotificationLogId = 1;
   private nextOrderDiscountLogId = 1;
   private nextDraftId = 1;
   private nextClientNoteId = 1;
@@ -8579,6 +8663,67 @@ export class MemoryStorage implements IStorage {
       noticeType,
       dismissedAt: new Date(),
     });
+  }
+
+  /** Espejo de DatabaseStorage.upsertPushSubscription. */
+  async upsertPushSubscription(consultantId: number, endpoint: string, p256dh: string, auth: string): Promise<PushSubscriptionRow> {
+    const existing = this.pushSubscriptionRecords.find((r) => r.endpoint === endpoint);
+    if (existing) {
+      existing.consultantId = consultantId;
+      existing.p256dh = p256dh;
+      existing.auth = auth;
+      return existing;
+    }
+    const row: PushSubscriptionRow = {
+      id: this.nextPushSubscriptionId++,
+      consultantId,
+      endpoint,
+      p256dh,
+      auth,
+      createdAt: new Date(),
+    };
+    this.pushSubscriptionRecords.push(row);
+    return row;
+  }
+
+  /** Espejo de DatabaseStorage.deletePushSubscriptionByEndpoint. */
+  async deletePushSubscriptionByEndpoint(endpoint: string): Promise<void> {
+    this.pushSubscriptionRecords = this.pushSubscriptionRecords.filter((r) => r.endpoint !== endpoint);
+  }
+
+  /** Espejo de DatabaseStorage.getPushSubscriptionsForConsultant. */
+  async getPushSubscriptionsForConsultant(consultantId: number): Promise<PushSubscriptionRow[]> {
+    return this.pushSubscriptionRecords.filter((r) => r.consultantId === consultantId);
+  }
+
+  /** Espejo de DatabaseStorage.getConsultantIdsWithPushSubscriptions. */
+  async getConsultantIdsWithPushSubscriptions(): Promise<number[]> {
+    return Array.from(new Set(this.pushSubscriptionRecords.map((r) => r.consultantId)));
+  }
+
+  /** Espejo de DatabaseStorage.claimPushNotification — sin ningún `await` entre el chequeo y
+   * la escritura, para que sea atómico de verdad aunque dos ticks "simultáneos" (dos llamadas
+   * disparadas con Promise.all, como en los tests de concurrencia) corran en el mismo proceso. */
+  async claimPushNotification(consultantId: number, noticeType: string, sentFor: string): Promise<boolean> {
+    const existing = this.pushNotificationLogRecords.find(
+      (r) => r.consultantId === consultantId && r.noticeType === noticeType && r.sentFor === sentFor,
+    );
+    if (existing) return false;
+    this.pushNotificationLogRecords.push({
+      id: this.nextPushNotificationLogId++,
+      consultantId,
+      noticeType,
+      sentFor,
+      sentAt: new Date(),
+    });
+    return true;
+  }
+
+  /** Espejo de DatabaseStorage.releasePushNotificationClaim. */
+  async releasePushNotificationClaim(consultantId: number, noticeType: string, sentFor: string): Promise<void> {
+    this.pushNotificationLogRecords = this.pushNotificationLogRecords.filter(
+      (r) => !(r.consultantId === consultantId && r.noticeType === noticeType && r.sentFor === sentFor),
+    );
   }
 
   /** Espejo de DatabaseStorage.getHiddenDashboardNoticeTypes. */

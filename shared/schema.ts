@@ -471,6 +471,55 @@ export const dashboardNoticeDismissals = pgTable("dashboard_notice_dismissals", 
 }));
 
 /**
+ * Prompt 8, Parte 4 — un dispositivo suscripto a notificaciones push (Web Push estándar).
+ * `endpoint` es único de verdad (lo da el navegador, nunca dos dispositivos lo comparten) — es
+ * la clave natural para UPSERT: si el mismo celular se vuelve a suscribir (otra consultora,
+ * mismo dispositivo compartido, o el navegador rota el endpoint), la fila se actualiza en vez
+ * de duplicarse. `p256dh`/`auth` son las dos claves que exige el protocolo para cifrar el
+ * mensaje — nunca se guardan en ningún otro lado. Al cerrar sesión, el cliente borra su propia
+ * fila por `endpoint` (ver POST /api/push/unsubscribe) — así un celular compartido no sigue
+ * recibiendo avisos de una consultora que ya no está logueada ahí.
+ */
+export const pushSubscriptions = pgTable("push_subscriptions", {
+  id: serial("id").primaryKey(),
+  consultantId: integer("consultant_id").notNull().references(() => consultants.id),
+  endpoint: text("endpoint").notNull(),
+  p256dh: text("p256dh").notNull(),
+  auth: text("auth").notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (table) => ({
+  endpointUnique: unique("push_subscriptions_endpoint_unique").on(table.endpoint),
+  consultantIdx: index("push_subscriptions_consultant_idx").on(table.consultantId),
+}));
+
+/**
+ * Prompt 8, Parte 4 — el "ya enviado" de un aviso push, por consultora/tipo/fecha. La
+ * constraint única es la que hace de reserva atómica: la tarea programada intenta un INSERT
+ * con `ON CONFLICT DO NOTHING` antes de mandar nada — si inserta, es la única que manda ese
+ * aviso ese día (sea porque corre una sola instancia, sea porque dos instancias revisaron casi
+ * al mismo tiempo); si no inserta (ya existe), no manda nada más. `noticeType` queda en texto
+ * libre a propósito — hoy solo existe "dia_pedido", pero el modelo tiene que servir para
+ * avisos push futuros (cumpleaños, cuota vencida, etc.) sin volver a tocar el esquema. Que la
+ * fila EXISTA significa "ya resuelto por hoy" (se mandó a algún dispositivo, o no había ningún
+ * dispositivo válido al que mandarle) — si todos los envíos fallaron por un error transitorio
+ * (no por una suscripción vencida), la fila se borra para que la próxima revisión reintente
+ * dentro de la ventana horaria (ver server/push-scheduler.ts).
+ */
+export const pushNotificationLog = pgTable("push_notification_log", {
+  id: serial("id").primaryKey(),
+  consultantId: integer("consultant_id").notNull().references(() => consultants.id),
+  noticeType: text("notice_type").notNull(),
+  sentFor: text("sent_for").notNull(),
+  sentAt: timestamp("sent_at").notNull().defaultNow(),
+}, (table) => ({
+  consultantNoticeSentForUnique: unique("push_notification_log_consultant_notice_sent_for_unique").on(
+    table.consultantId,
+    table.noticeType,
+    table.sentFor,
+  ),
+}));
+
+/**
  * Prompt 9 — un pago real, registrado con fecha y forma de pago. Puede nacer de "Registrar
  * pago" en la ficha (puede cubrir varias cuotas de varias ventas de la misma clienta), de
  * "Marcar como pagada" sobre una cuota puntual, o del cobro en el momento al crear una venta —
@@ -792,6 +841,10 @@ export interface OrderReminderItemSnapshot {
 }
 export type DashboardNoticeDismissal = typeof dashboardNoticeDismissals.$inferSelect;
 export type InsertDashboardNoticeDismissal = typeof dashboardNoticeDismissals.$inferInsert;
+export type PushSubscriptionRow = typeof pushSubscriptions.$inferSelect;
+export type InsertPushSubscription = typeof pushSubscriptions.$inferInsert;
+export type PushNotificationLogRow = typeof pushNotificationLog.$inferSelect;
+export type InsertPushNotificationLog = typeof pushNotificationLog.$inferInsert;
 export type Payment = typeof payments.$inferSelect;
 export type InsertPayment = typeof payments.$inferInsert;
 export type Subscription = typeof subscriptions.$inferSelect;
