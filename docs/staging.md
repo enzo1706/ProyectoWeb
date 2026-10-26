@@ -47,8 +47,16 @@ siguiente.
   propio) — ese dominio HTTPS es justamente lo que el Prompt 8 necesita para las notificaciones
   push.
 - Variables de entorno propias, **nunca compartidas con producción**:
-  - `DATABASE_URL`: apunta a la base de staging (ver sección Supabase abajo), nunca a la de
-    producción.
+  - **`DATABASE_URL` (obligatoria, el servidor no arranca sin ella)**: apunta a la base de
+    staging (ver sección Supabase abajo), nunca a la de producción. Si falta — por olvido o por
+    un typo en el nombre de la variable en el panel de Railway — `resolveStorageMode()`
+    (`server/storage-mode.ts`) hace que el servidor NO arranque, con el log "Falta
+    DATABASE_URL: el servidor no arranca sin base de datos." Antes de este fix (encontrado en
+    el ensayo de deploy del 2026-10-25) esto arrancaba igual, en memoria, sin ningún aviso — un
+    incidente real si pasara en staging o producción: parecería funcionar y el primer reinicio
+    de Railway borraría todo lo cargado desde que arrancó. `DATABASE_MODE=memory` también está
+    bloqueado en este servicio (y en producción) a nivel de código, aunque alguien lo pusiera a
+    mano por error.
   - `NODE_ENV=production`: sí, igual que en producción real — es lo que hace que
     `server/app.ts` sirva los archivos estáticos ya buildeados (`serveStatic`) en vez de correr
     el servidor de desarrollo de Vite. Bajarlo a otro valor rompería el deploy de staging de
