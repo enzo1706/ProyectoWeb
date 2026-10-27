@@ -223,19 +223,35 @@ async function seedAfterDeploy2(username: string): Promise<void> {
   }
   const consultantId = user.consultantId;
 
+  // Dos chequeos de idempotencia INDEPENDIENTES — no uno solo: si una corrida anterior llegó a
+  // crear la clienta pero se cayó antes de crear la venta (pasó de verdad armando este script:
+  // la venta sin clienta exige quedar cobrada entera, y faltaba `paidNow` — ver más abajo), una
+  // corrida posterior tiene que notar que la venta todavía falta y crearla, no asumir que
+  // "ya existe la clienta" significa "ya se hizo todo este paso".
   const { items: clients } = await storage.searchClientsPaginated(consultantId, { page: 1, pageSize: 100 });
-  const alreadyDone = clients.some((c) => c.name === "Clienta Demo Sin Celular");
-  if (alreadyDone) {
-    console.log(`"${username}" ya tiene la clienta sin celular y la venta sin clienta — no se tocó (idempotente).`);
-    return;
+  const clientWithoutPhoneExists = clients.some((c) => c.name === "Clienta Demo Sin Celular");
+  if (clientWithoutPhoneExists) {
+    console.log('"Clienta Demo Sin Celular" ya existe — no se tocó (idempotente).');
+  } else {
+    await storage.createClient(consultantId, { name: "Clienta Demo Sin Celular", phone: null } as never);
+    console.log("Clienta sin celular creada.");
   }
 
-  await storage.createClient(consultantId, { name: "Clienta Demo Sin Celular", phone: null } as never);
-  console.log("Clienta sin celular creada.");
+  const existingSales = await storage.getAllSales(consultantId);
+  const saleWithoutClientExists = existingSales.some((s) => s.clientId === null);
+  if (saleWithoutClientExists) {
+    console.log("Ya hay una venta sin clienta — no se tocó (idempotente).");
+    return;
+  }
 
   const products = await storage.getAllProducts(consultantId);
   const anyProduct = products.find((p) => p.unidades > 0);
   if (anyProduct) {
+    // Prompt 6: una venta sin clienta solo se puede guardar si queda cobrada ENTERA al
+    // crearla (nadie a quien reclamarle después) — `paidNow: true` marca la única cuota como
+    // "pagado" desde el vamos, no alcanza con crearla pendiente y marcarla pagada después
+    // (la validación corre adentro de createSale, antes de que exista la fila — encontrado
+    // corriendo esto de verdad contra una base con el esquema completo, 2026-10-27).
     await storage.createSale(consultantId, {
       date: todayStr(),
       items: [{ productId: anyProduct.id, quantity: 1 }],
@@ -243,6 +259,7 @@ async function seedAfterDeploy2(username: string): Promise<void> {
       orderSurcharge: null,
       paymentMethod: "efectivo",
       installments: [{ amount: anyProduct.precio }],
+      paidNow: true,
     } as never);
     console.log("Venta sin clienta creada.");
   } else {
