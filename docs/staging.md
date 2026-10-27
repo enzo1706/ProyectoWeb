@@ -6,13 +6,32 @@ entorno de staging en Railway/Supabase y para operarlo día a día. Nada de lo d
 todavía contra Railway, Supabase ni Mercado Pago — es documentación y código, a la espera de
 que decidas cuándo levantarlo de verdad.
 
+**Reescrito el 2026-10-26**: staging nunca usa datos reales de producción — ni un `pg_dump` ni
+un branch de Supabase a partir de producción, bajo ningún motivo. Se arma VACÍA, en un
+proyecto de Supabase aparte, y se puebla con el esquema y datos de PRUEBA inventados. Ver "Por
+qué nunca datos reales" más abajo para la regla completa, y la diferencia con el ensayo del
+deploy 1 (que sí toca una copia de datos reales, pero es otra cosa, aparte, temporal y privada
+— ver `docs/migracion-produccion-pendiente.md`).
+
 ## Por qué hace falta staging ahora
 
 El Prompt 8 (notificaciones push) necesita HTTPS real y un teléfono físico para probarse en
-serio — eso no se puede validar en `localhost`. Hasta no tener staging andando, el Prompt 8
-queda pausado (ver `docs/prompts-mejoras.md`).
+serio — eso no se puede validar en `localhost`. Hasta no tener staging andando, esa parte del
+Prompt 8 queda pausada (ver `docs/prompts-mejoras.md`).
 
-## El flujo: prompt → staging → main
+## Por qué nunca datos reales
+
+Staging es un entorno menos protegido que producción (más gente con acceso, menos cuidado
+operativo, pensado para romperse y rehacerse) — poblarlo con un `pg_dump` o un branch de
+Supabase de producción copiaría ahí nombres, teléfonos, cumpleaños y deudas de clientas reales,
+y además obligaría a manejar la connection string de producción en alguna compu para hacer el
+dump. Ninguna de las dos cosas es necesaria: todo lo que hace falta probar (los checklists de
+`docs/pruebas-*.md`) se puede recorrer con datos inventados.
+
+**Regla dura, sin excepciones: la base de staging nunca se origina a partir de datos reales de
+producción, ni completa ni parcial, ni una sola vez "para probar algo puntual".**
+
+## El flujo: cada Ronda trae su propio avance de staging
 
 ```
 prompt-N-xxx  ──(PR + review)──>  staging  ──(probado en staging, OK explícito)──>  main
@@ -28,10 +47,23 @@ prompt-N-xxx  ──(PR + review)──>  staging  ──(probado en staging, OK
    y cualquier prueba manual que necesite HTTPS real (push notifications, el flujo completo de
    Mercado Pago con tarjetas de prueba, etc.).
 4. Recién con eso probado y tu OK explícito, se mergea `staging` a `main` y se publica a
-   producción — mismo runbook que ya se usa hoy (`docs/migracion-deploy-2.md` y el paquete 1),
-   sin cambios.
+   producción.
 5. Si algo se rompe en staging, se corrige en la rama del Prompt y se vuelve a mergear a
    `staging` — `main` nunca recibe código que no pasó por staging primero.
+
+**La base de staging avanza en el MISMO orden que producción, una ronda a la vez** — así
+staging sirve, además, como ensayo de cada deploy (ver `docs/LEEME-proximos-pasos.md` para el
+plan completo):
+
+| Ronda | Servicio de staging publica | Antes de publicar, aplicar a la base de staging |
+|---|---|---|
+| 1 | `deploy-paquete-1` | Esquema de `20c8d83` (vacío) → `migracion-produccion-pendiente.md` → `seed:staging` (`SEED_STEP=baseline`) |
+| 2 | `staging` (la cadena completa) | `migracion-deploy-2.md` → `migracion-deploy-3.md` → `seed:staging` (`SEED_STEP=after-deploy2`) |
+| 3 | `prompt-8b-avisos` | `migracion-deploy-4.md` |
+
+Cada fila es la rehearsal real del deploy correspondiente: el mismo documento de migración, en
+el mismo orden, con los mismos chequeos — si algo fuera a romperse aplicándolo contra
+producción, se rompe primero acá.
 
 **Regla dura, sin excepciones:** nadie (yo incluido) hace `git push origin main`, `railway up`
 contra el servicio de producción, ni toca la base o las variables de entorno de producción sin
@@ -71,6 +103,11 @@ siguiente.
   - `RESEND_API_KEY` / `EMAIL_FROM`: si se quiere probar el flujo de recuperación de
     contraseña en staging, o una clave de test de Resend si existe, o dejarlas sin setear
     (el envío de mail simplemente no va a andar, sin romper el resto de la app).
+  - `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` / `VAPID_SUBJECT` (Prompt 8, Parte 4 — avisos
+    push): el par de claves se genera UNA vez por entorno con `npx web-push generate-vapid-keys`
+    — **un par distinto para staging y otro para producción**, nunca el mismo. `VAPID_SUBJECT`
+    es un `mailto:` de contacto, puede repetirse entre entornos. Ver
+    `docs/migracion-deploy-4.md` para el detalle completo.
   - **`TEST_DATABASE_URL`: NUNCA tiene que existir en ningún servicio de Railway, ni en
     staging ni en producción.** Es exclusiva de los tests que corren en la máquina local
     (`vitest`, que fija `NODE_ENV=test` antes de usarla). `storage.ts`/`session.ts`/`app.ts`
@@ -79,14 +116,8 @@ siguiente.
     siempre es `production` (ver el punto de arriba), esta segunda señal ya alcanza para que
     agregarla ahí por error no tenga ningún efecto. Aun así, antes de cada deploy conviene
     confirmarla ausente en el panel de variables del servicio.
-  - **`VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` / `VAPID_SUBJECT`** (Prompt 8, Parte 4 —
-    avisos push, rama `prompt-8b-avisos`, todavía no mergeada a `staging`): el par de claves
-    se genera UNA vez por entorno con `npx web-push generate-vapid-keys` — **un par distinto
-    para staging y otro para producción**, nunca el mismo (mismo criterio que Mercado Pago
-    TEST vs. real). `VAPID_SUBJECT` es un `mailto:` de contacto, puede repetirse entre
-    entornos. Ver `docs/migracion-deploy-4.md` para el detalle completo.
-- Auto-deploy desde la rama `staging` de este mismo repo (configurable en el servicio de
-  Railway, igual que ya está configurado el de producción apuntando a `main`).
+- Auto-deploy desde la rama correspondiente de este mismo repo según la Ronda (ver la tabla de
+  arriba), configurable en el servicio de Railway.
 - **Desactivar cualquier opción de "dormir" el servicio sin tráfico** (en el plan actual de
   Railway, "App Sleeping" — el nombre puede cambiar con el tiempo, confirmar el equivalente
   vigente al momento de armar esto). Necesario desde el Prompt 8, Parte 4: la tarea programada
@@ -96,35 +127,37 @@ siguiente.
   que un aviso push NO es). Confirmar esta opción desactivada en staging Y en producción antes
   de publicar esa parte.
 
-### Supabase — chequeo del plan (pendiente de confirmar a mano)
+### Supabase — cómo se arma la base de staging (vacía, nunca con datos reales)
 
-No tengo acceso al dashboard de Supabase desde acá, así que este chequeo lo tenés que hacer
-vos — pero dejo clara la lógica para que sea un chequeo de 2 minutos, no una investigación:
+No tengo acceso al dashboard de Supabase desde acá, así que la parte de crear el proyecto la
+tenés que hacer vos — pero el procedimiento es siempre el mismo, sin importar el plan de
+Supabase (Free o Pro): un proyecto **nuevo y separado**, que arranca vacío.
 
-1. Entrá a tu proyecto de Supabase → **Settings → Billing** (o el ícono del plan arriba a la
-   izquierda) y confirmá en qué plan está la base de **producción**.
-2. **Si está en el plan Free**: Supabase Free no tiene "branching" (bases paralelas a partir de
-   producción) ni backups automáticos restaurables con un clic. En ese caso, staging usa una
-   base de Supabase **separada** (otro proyecto, también Free, no cuesta nada extra) poblada a
-   partir de un `pg_dump` de producción:
+1. Creá un proyecto de Supabase aparte, exclusivo para staging — nunca el mismo proyecto que
+   producción, nunca un "branch" de Supabase a partir de producción (esa función de Supabase Pro
+   SÍ copia datos reales — no se usa en este plan, por la regla de "Por qué nunca datos reales"
+   de más arriba).
+2. Tomá el `DATABASE_URL` de ese proyecto nuevo (vacío, sin ninguna tabla todavía).
+3. Materializá el esquema de `20c8d83` (el commit que está corriendo en producción real HOY)
+   contra esa base, con el código de ESE commit exacto — nunca con `shared/schema.ts` de la
+   rama que se esté usando para publicar, que ya espera columnas que esta base todavía no
+   tiene:
    ```bash
-   # Backup completo de producción (correr una sola vez para armar staging, y cada vez que
-   # quieras refrescar los datos de staging con datos reales recientes — nunca al revés).
-   pg_dump "$PRODUCTION_DATABASE_URL" --no-owner --no-privileges -Fc -f prod-backup.dump
-
-   # Restaurar ese backup en el proyecto de Supabase de STAGING (nunca contra producción).
-   pg_restore --no-owner --no-privileges -d "$STAGING_DATABASE_URL" --clean --if-exists prod-backup.dump
+   git worktree add /tmp/staging-20c8d83 20c8d83
+   cd /tmp/staging-20c8d83
+   DATABASE_URL="<la de staging>" npx drizzle-kit push --config drizzle.config.ts --force
+   cd -  # volver a la rama de trabajo real
+   git worktree remove /tmp/staging-20c8d83
    ```
-   Mismo criterio que ya se usa en `docs/migracion-deploy-2.md` para migrar producción: nunca
-   se opera en vivo, siempre sobre una copia.
-3. **Si está en el plan Pro (o superior)**: Supabase sí ofrece branching real (una base nueva,
-   aislada, creada a partir de un snapshot de producción, con su propia connection string) —
-   en ese caso usá esa función en vez del `pg_dump` manual de arriba; es más rápido y Supabase
-   la mantiene actualizada por vos. El resto de este documento (variables de entorno, flujo,
-   seed) no cambia, solo cambia cómo se originan los datos de la base de staging.
-4. Cualquiera sea el plan: la base de staging **nunca** debe ser la misma instancia que la de
-   producción, ni siquiera "por ahora" — <strong>ver `server/db.ts`</strong>, que ya tiene un
-   aviso en el código justamente porque esto pasó una vez de verdad (Etapa I-C.1).
+   (`drizzle-kit push` nunca se usa contra producción — ver la advertencia en
+   `docs/migracion-produccion-pendiente.md` — pero staging sí puede, es una base de desarrollo
+   a todos los efectos.)
+4. A partir de ahí, seguí la tabla de Rondas de más arriba: aplicar el documento de migración
+   de esa Ronda (SQL puro, igual que contra producción) y correr `seed:staging` con el
+   `SEED_STEP` que corresponda.
+5. Cualquiera sea el plan de Supabase: la base de staging **nunca** debe ser la misma instancia
+   que la de producción, ni siquiera "por ahora" — <strong>ver `server/db.ts`</strong>, que ya
+   tiene un aviso en el código justamente porque esto pasó una vez de verdad (Etapa I-C.1).
 
 ## Usuarios de prueba de Mercado Pago
 
@@ -167,10 +200,15 @@ Fuentes (Mercado Pago Developers, Argentina):
 
 ## Seed de staging
 
-`script/seed-staging.ts` crea una cuenta de consultora de prueba para poder entrar a la app
-recién desplegada en staging sin usar una cuenta ni datos reales. Es el único script de este
-plan que puede escribir en una base — por eso tiene **tres** guardas explícitas, las tres
-obligatorias (ninguna alcanza por sí sola), y se niega a correr si falta cualquiera:
+`script/seed-staging.ts` crea una cuenta de consultora de prueba, y la puebla con datos de
+prueba INVENTADOS que alcanzan para recorrer los checklists de `docs/pruebas-*.md`: clientas
+con y sin celular, y con cumpleaños; productos con y sin stock, y sin costo; ventas a cuotas
+(con una vencida, una pagada y una con pago parcial); una venta sin clienta; un día de pedido
+configurado; y una segunda cuenta en el plan gratis, cerca del límite de 10 productos.
+
+Es el único script de este plan que puede escribir en una base — por eso tiene **tres**
+guardas explícitas, las tres obligatorias (ninguna alcanza por sí sola), y se niega a correr si
+falta cualquiera:
 
 - `APP_ENV` tiene que ser exactamente `staging` (la variable propia de este plan — ver arriba
   por qué no se usa `NODE_ENV` para esto).
@@ -183,10 +221,37 @@ obligatorias (ninguna alcanza por sí sola), y se niega a correr si falta cualqu
   otra base (por un `DATABASE_URL` mal copiado, por ejemplo), esa base no va a tener la fila y
   el script se va a negar igual, aunque las dos variables de entorno estén bien puestas.
 
+### Por qué dos pasos (`SEED_STEP`), no uno solo
+
+El script corre con el código y el `shared/schema.ts` VIGENTES en la rama desde la que se
+invoca — por eso no puede correr ANTES de `migracion-produccion-pendiente.md`: el código de
+esa rama ya espera esas columnas, y sin ellas hasta una consulta sin nada que ver con lo nuevo
+rompería (ver "por qué esto es urgente" en `docs/migracion-produccion-pendiente.md`). Por eso
+entra DESPUÉS de cada migración de la Ronda, nunca antes:
+
+```bash
+# Ronda 1 — después de migracion-produccion-pendiente.md, antes de publicar deploy-paquete-1.
+APP_ENV=staging SEED_CONFIRM=yes SEED_USERNAME=consultora_staging SEED_PASSWORD="algo-largo-y-random" npm run seed:staging
+
+# Ronda 2 — después de migracion-deploy-2.md (+ migracion-deploy-3.md), antes de publicar staging.
+# Agrega lo que recién se vuelve posible ahí: clienta sin celular, venta sin clienta.
+APP_ENV=staging SEED_CONFIRM=yes SEED_STEP=after-deploy2 SEED_USERNAME=consultora_staging npm run seed:staging
+```
+
+Es idempotente: cada paso revisa si ya corrió (por nombre fijo de los datos que crea) antes de
+escribir nada — correrlo de nuevo por error no duplica ni rompe lo que ya había.
+
+Verificado el 2026-10-26 contra una base descartable: esquema de `20c8d83` →
+`migracion-produccion-pendiente.md` → `seed:staging` (baseline) generó exactamente lo
+esperado — una venta vencida, una pagada, una a 3 cuotas con la primera pagada y el resto
+pendiente (una de ellas también vencida), 3 productos (con costo / sin costo / sin stock), una
+clienta con cumpleaños este mes, el día de pedido configurado, y una segunda cuenta con 9 de 10
+productos del plan gratis. Corrido una segunda vez, no duplicó nada.
+
 ### Marcar la base de staging (una sola vez, a mano)
 
-Al armar el entorno de staging (sea con `pg_restore` o con un branch de Supabase, ver arriba),
-antes de poder usar `seed:staging` por primera vez, correr esto UNA sola vez contra esa base:
+Al armar el entorno de staging (ver sección Supabase arriba), antes de poder usar
+`seed:staging` por primera vez, correr esto UNA sola vez contra esa base:
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS ops;
@@ -236,21 +301,12 @@ regla real para producción es más simple y no depende de ningún filtro:
 **`drizzle-kit push` (con o sin `--force`) nunca se corre contra producción, bajo ningún
 motivo** — ni `docs/migracion-produccion-pendiente.md` ni `docs/migracion-deploy-2.md` lo usan
 en ningún paso (confirmado leyendo los dos: son SQL puro de punta a punta), y tiene que seguir
-así. `db:push` es una herramienta de desarrollo/test/staging, nunca de producción.
+así. `db:push` es una herramienta de desarrollo/staging, nunca de producción.
 
-Si alguna vez se recrea la base de staging desde cero (otro `pg_restore`, otro branch de
-Supabase), hay que volver a correr este SQL — es intencional: una base "nueva" no debería
-heredar el marcador de la vieja sin que alguien confirme a mano que la nueva sigue siendo de
-staging y no, por error, una restauración apuntada al lugar equivocado.
-
-```bash
-APP_ENV=staging SEED_CONFIRM=yes SEED_USERNAME=consultora_staging SEED_PASSWORD="algo-largo-y-random" npm run seed:staging
-```
-
-Es idempotente: si la cuenta ya existe, no crea otra ni rompe nada, solo avisa. Una vez
-logueado con esa cuenta en staging, para cargarle un catálogo de productos de prueba alcanza
-con usar el botón que ya existe en la app: Stock → "Cargar catálogo de prueba" (no hace falta
-que el script lo haga también — es un click, y así se prueba ese botón de paso).
+Si alguna vez se recrea la base de staging desde cero (otro proyecto de Supabase, por ejemplo
+tras un incidente), hay que volver a correr este SQL — es intencional: una base "nueva" no
+debería heredar el marcador de la vieja sin que alguien confirme a mano que la nueva sigue
+siendo de staging y no, por error, algo apuntado al lugar equivocado.
 
 ## Checklist antes de promover staging → main
 
@@ -266,7 +322,9 @@ que el script lo haga también — es un click, y así se prueba ese botón de p
       este chequeo si se agrega otro módulo nativo más adelante.
 - [ ] El Prompt correspondiente pasó su checklist de pruebas (`docs/pruebas-prompt-*.md`)
       contra staging, no solo contra `localhost`.
-- [ ] Si el Prompt toca notificaciones push: probado con HTTPS real y un teléfono físico.
+- [ ] Si el Prompt toca notificaciones push: probado con HTTPS real y un teléfono físico, y
+      confirmado que el servicio de staging no tiene activada ninguna opción de "dormir" sin
+      tráfico (ver la nota en "Infraestructura de staging" arriba).
 - [ ] Si el Prompt toca pagos/suscripciones: probado con las cuentas y tarjetas de prueba de
       Mercado Pago de esta sección, con al menos un caso aprobado y uno rechazado.
 - [ ] Sin errores en la consola del navegador ni en los logs de Railway del servicio de

@@ -275,9 +275,15 @@ Sí, de dos formas distintas — reviso el código, no es una suposición:
 
 ## Orden del día del deploy (para el programador, paso a paso)
 
+**Nota — esto no es staging**: la base de prueba de los puntos 2 y 3 es TEMPORAL y PRIVADA,
+exclusiva de este chequeo puntual — nunca la base de staging (`docs/staging.md`), que arranca
+vacía y nunca toca datos reales. Esta base de prueba (y su backup) se borran al terminar el
+chequeo del punto 4 — no queda viva "por si hace falta después".
+
 1. Elegir un horario de poco uso (de madrugada, hora Argentina).
 2. **Backup de producción** (Supabase → Database → Backups, o `pg_dump`).
-3. **Restaurar el backup en una base de prueba** (nunca producción).
+3. **Restaurar el backup en una base de prueba TEMPORAL Y PRIVADA** (nunca producción, nunca
+   la base de staging).
 4. Contra esa base restaurada, en este orden:
    a. Correr las consultas de "Chequeos de datos" de arriba (incluida la de verdad de base, la
       primera). Guardar los resultados.
@@ -311,6 +317,10 @@ Sí, de dos formas distintas — reviso el código, no es una suposición:
 10. Si algo falla: revertir el deploy del código en Railway al commit anterior (`20c8d83`) — la
     base ya migrada sigue funcionando con ese código, según "Plan de vuelta atrás" arriba. No
     hace falta deshacer la migración.
+11. **Borrar la base de prueba temporal del punto 3 y el archivo del backup del punto 2** — ya
+    cumplieron su función (los chequeos del punto 4), no quedan vivos "por si hace falta
+    después". Esto es distinto de la base de staging (`docs/staging.md`), que sigue existiendo
+    entre rondas pero nunca tuvo datos reales adentro.
 
 ### Nota de conexión para los scripts de datos
 

@@ -17,6 +17,13 @@ Linux limpio (`node:22-slim`, Postgres aparte en otro contenedor, sin nada más 
 flake es de esta máquina de desarrollo cargada (muchos procesos de Docker/build corridos en la
 misma sesión), no un problema real ni portable — no bloquea nada del deploy.
 
+**Actualizado el 2026-10-26**: staging deja de armarse con un `pg_dump`/branch de Supabase a
+partir de producción — nunca usa datos reales (ver `docs/staging.md`, "Por qué nunca datos
+reales"). Se arma vacía y avanza en el MISMO orden que producción, una Ronda a la vez — el
+paso 3 de abajo ya refleja esto. El ensayo con datos reales (restaurar un backup en una base
+temporal para los chequeos del deploy 1) sigue existiendo, pero es otra cosa, aparte: se borra
+al terminar, incluido el archivo del backup — ver `docs/migracion-produccion-pendiente.md`.
+
 ## 1. Resend — arreglar "Recuperar contraseña" (independiente de todo lo demás)
 
 - **Seguir**: la sección "Arreglar Recuperar contraseña" de
@@ -66,54 +73,66 @@ misma sesión), no un problema real ni portable — no bloquea nada del deploy.
 
 ## 3. Armar staging
 
-- **Seguir**: `docs/staging.md`, de punta a punta (infraestructura de Railway/Supabase, el
-  marcador `ops.staging_marker`, las cuentas de prueba de Mercado Pago, `seed:staging`, y el
-  nuevo ítem del checklist sobre verificar `sharp` en un contenedor Linux limpio antes del
-  primer deploy que lo incluya — Prompt 16).
-- **Qué es**: levantar el servicio de staging en Railway apuntando a la rama `staging`, con su
-  propia base (restaurada con `pg_restore` o un branch de Supabase, según el plan vigente), sus
-  propias variables (`APP_ENV=staging`, credenciales TEST de Mercado Pago, etc.).
-  `TEST_DATABASE_URL` nunca va en las variables de ese servicio.
-- **Cuándo frenar y avisar**: si el plan de Supabase resultó distinto al asumido en
-  `docs/staging.md` (Free vs Pro cambia cómo se origina la base de staging), si falta algún dato
-  para crear las cuentas de prueba de Mercado Pago, o si la verificación de `sharp` en Linux
-  falla (no debería — ya se probó en `node:22-slim`, pero confirmalo en el entorno real de
-  Railway antes de seguir).
+- **Seguir**: `docs/staging.md`, de punta a punta (infraestructura de Railway, cómo se arma la
+  base de staging VACÍA en un proyecto de Supabase aparte, las cuentas de prueba de Mercado
+  Pago, `seed:staging`, y el ítem del checklist sobre verificar `sharp` en un contenedor Linux
+  limpio antes del primer deploy que lo incluya — Prompt 16).
+- **Qué es**: levantar el servicio de staging en Railway, con una base propia que arranca
+  VACÍA (nunca con un `pg_dump`/branch a partir de producción — ver "Por qué nunca datos
+  reales" en `docs/staging.md`) y avanza una Ronda a la vez: esquema de `20c8d83` →
+  `migracion-produccion-pendiente.md` → `seed:staging` → publica `deploy-paquete-1` (Ronda 1);
+  después `migracion-deploy-2.md` + `migracion-deploy-3.md` → `seed:staging` otra vez
+  (`SEED_STEP=after-deploy2`) → publica `staging` (Ronda 2); después `migracion-deploy-4.md` →
+  publica `prompt-8b-avisos` (Ronda 3, más abajo). Sus propias variables
+  (`APP_ENV=staging`, credenciales TEST de Mercado Pago, etc.). `TEST_DATABASE_URL` nunca va en
+  las variables de ese servicio.
+- **Cuándo frenar y avisar**: si falta algún dato para crear las cuentas de prueba de Mercado
+  Pago, o si la verificación de `sharp` en Linux falla (no debería — ya se probó en
+  `node:22-slim`, pero confirmalo en el entorno real de Railway antes de seguir).
 - **Qué NO hacer**: no mergear `staging` a `main` todavía. No correr `seed:staging` sin el
-  marcador puesto. No usar `pg_dump`/`pg_restore` contra producción salvo específicamente para
-  ARMAR esta copia de staging (nunca al revés).
+  marcador puesto. **No usar nunca un `pg_dump`/`pg_restore`/branch de Supabase a partir de
+  producción para armar o refrescar la base de staging** — staging se arma vacía y se puebla
+  con `seed:staging`, siempre.
 
 ## 4. Ronda 1 — paquete 1 (Prompts U/1/2/3) a producción
 
 1. **Staging publica `deploy-paquete-1`**: apuntar el servicio de staging a esa rama (en vez de
    `staging`) para esta ronda puntual, o crear un segundo servicio de staging si se prefiere no
-   pisar el que ya está probando otra cosa.
+   pisar el que ya está probando otra cosa. La base de staging, en este punto, ya tiene el
+   esquema de `20c8d83` + `migracion-produccion-pendiente.md` + `seed:staging` aplicados (ver
+   paso 3).
 2. **Probar en staging**: `docs/pruebas-paquete-1.md` (precio y cupones, suscripción con cupón,
    Configuración, costo y ganancia en una venta, carga de un pedido) contra el dominio de
    staging.
 3. **Deploy 1 a producción real**: seguir `docs/migracion-produccion-pendiente.md`, de punta a
    punta — el "Orden del día" del final del documento es la lista exacta, en orden, incluidos el
-   backup, la restauración en una base de prueba, los chequeos antes y después.
+   backup, la restauración en una base de prueba TEMPORAL Y PRIVADA (distinta de staging —
+   ver la nota al principio de ese documento), los chequeos antes y después, y el borrado de
+   esa base y el archivo del backup al terminar.
 - **Cuándo frenar y avisar**: cualquiera de los chequeos de datos de ese documento devuelve
   filas (hay instrucciones explícitas de PARAR para cada caso); el deploy del código falla por
   cualquier motivo (hay plan de vuelta atrás documentado, no hace falta deshacer la migración).
 - **Qué NO hacer**: **no correr `drizzle-kit push` ni `db:push` contra producción, con o sin
   `--force`, bajo ningún motivo** — ese documento es SQL explícito a propósito. No aplicar las
-  migraciones de datos del Prompt 2 sin mandar antes los resultados en modo lectura.
+  migraciones de datos del Prompt 2 sin mandar antes los resultados en modo lectura. No dejar
+  viva la base de prueba temporal del deploy 1 (ni su backup) una vez terminado el chequeo.
 
 ## 5. Ronda 2 — toda la cadena (Prompts 4 a 16) a producción
 
 1. **Mergear `prompt-16-velocidad` a `staging`** (si no se hizo ya): trae de punta a punta los
    Prompts 8, 9, 10, 11, 12, 13, 14, 15 y 16 sobre lo que `staging` ya tenía (4, 5, 6 y 7).
-2. **Staging publica la rama `staging`**: con la cadena completa ya mergeada, el servicio de
+2. **Base de staging**: aplicar `migracion-deploy-2.md` + `migracion-deploy-3.md` (en ese
+   orden) sobre la base de staging que ya tenía la Ronda 1, y correr
+   `seed:staging` con `SEED_STEP=after-deploy2` (agrega la clienta sin celular y la venta sin
+   clienta, recién posibles desde este punto — ver `docs/staging.md`).
+3. **Staging publica la rama `staging`**: con la cadena completa ya mergeada, el servicio de
    staging vuelve a apuntar a esa rama (o se usa el mismo servicio de siempre).
-3. **Probar con el checklist**: `docs/pruebas-prompt-4-5-6-7-y-9.md` (lo que staging ya tenía),
+4. **Probar con el checklist**: `docs/pruebas-prompt-4-5-6-7-y-9.md` (lo que staging ya tenía),
    `docs/pruebas-prompt-11.md` y `docs/pruebas-prompt-8-10-y-12-a-16.md` (lo nuevo de este
    tramo, Prompt 8 Partes 1 a 3 y Prompt 10 incluidos — la Parte 4 del Prompt 8 todavía no está
-   implementada, ver paso 6) — contra el dominio de staging, nunca `localhost`, porque es la
-   primera vez que algunas cosas (HTTPS real, el teléfono físico para notificaciones) se pueden
-   probar en serio.
-4. **Deploys 2 y 3 juntos, en una sola ventana**: seguir `docs/migracion-deploy-2.md` completo y
+   mergeada, ver paso 6) — contra el dominio de staging, nunca `localhost`, porque es la
+   primera vez que algunas cosas (HTTPS real) se pueden probar en serio.
+5. **Deploys 2 y 3 juntos, en una sola ventana**: seguir `docs/migracion-deploy-2.md` completo y
    después `docs/migracion-deploy-3.md` completo, en ese orden, contra producción real — el
    ensayo del 2026-10-25 confirmó que esto es seguro (mismo resultado que aplicar los dos a mano
    y comparar contra el código con `drizzle-kit push`: "No changes detected"). Los dos
@@ -121,30 +140,42 @@ misma sesión), no un problema real ni portable — no bloquea nada del deploy.
    fuera de cualquier transacción — no agruparlos con el resto del SQL. El backfill de
    miniaturas (`script/backfill-thumbnails.ts`) es OPCIONAL y queda para después, a mano — no
    es parte de esta ventana.
-5. **Publicar el código** de los Prompts 4 a 16 en Railway (el mismo commit de `staging` que ya
+6. **Publicar el código** de los Prompts 4 a 16 en Railway (el mismo commit de `staging` que ya
    se probó).
-- **Cuándo frenar y avisar**: cualquier ítem de los tres checklists del punto 3 que no coincida
+- **Cuándo frenar y avisar**: cualquier ítem de los tres checklists del punto 4 que no coincida
   con lo descripto; cualquier chequeo de datos de `migracion-deploy-2.md` o
   `migracion-deploy-3.md` con resultado inesperado (en particular el "chequeo posterior" de
   `amount_paid` del Prompt 9, y el de `quantity_delivered` del Prompt 8 — los dos tienen que dar
   0 filas).
 - **Qué NO hacer**: nunca `drizzle-kit push`/`db:push` contra producción. No mergear `staging` a
-  `main` ni publicar código hasta que los tres checklists del punto 3 estén aprobados. No correr
+  `main` ni publicar código hasta que los tres checklists del punto 4 estén aprobados. No correr
   el backfill de miniaturas contra producción ni contra el Storage real sin decidirlo aparte,
   a mano.
 
-## 6. Con staging andando — Prompt 8, Parte 4 (notificaciones push)
+## 6. Ronda 3 — Prompt 8, Parte 4 (notificaciones push)
 
 - **Qué es**: la parte del Prompt 8 que quedó pausada en `docs/prompts-mejoras.md` porque
   necesita HTTPS real y un teléfono físico para probarse — ninguna de las dos cosas existe en
   `localhost`. Con staging ya levantado (paso 3), esto se puede retomar.
+1. **Base de staging**: aplicar `migracion-deploy-4.md` sobre la base de staging que ya tenía
+   la Ronda 2 (dos tablas nuevas, `push_subscriptions` y `push_notification_log` — ver ese
+   documento).
+2. **Staging publica `prompt-8b-avisos`**: el servicio de staging apunta a esa rama para esta
+   ronda puntual.
+3. **Probar con el checklist**: `docs/migracion-deploy-4.md` tiene su propia sección de cómo
+   probarlo (Chrome de escritorio para lo que se puede, y qué queda para un teléfono físico con
+   staging — iPhone agregado a inicio, Android, el aviso real del día de pedido sin haber
+   entrado a la app).
 - **Cuándo frenar y avisar**: si el navegador del teléfono de prueba no pide permiso de
   notificaciones, o si el push nunca llega — revisar antes si es un problema del Service Worker,
-  de las claves VAPID, o del navegador/SO del teléfono usado.
+  de las claves VAPID, o del navegador/SO del teléfono usado. Si el servicio de staging tiene
+  activada alguna opción de "dormir" sin tráfico (ver `docs/staging.md`) — en ese caso la tarea
+  programada no corre y el aviso nunca sale, aunque todo el resto esté bien.
 - **Qué NO hacer**: no intentar probar esto contra `localhost` con un túnel improvisado — usar
-  el dominio real de staging, que ya tiene HTTPS por Railway.
+  el dominio real de staging, que ya tiene HTTPS por Railway. No mergear `prompt-8b-avisos` a
+  `staging` hasta tener el OK explícito de esta ronda.
 
-## Regla de ramas mientras se prueba (pasos 3 y 5)
+## Regla de ramas mientras se prueba (pasos 3, 5 y 6)
 
 - **Mientras el programador prueba staging, la rama `staging` queda CONGELADA** — no se le
   agrega ningún Prompt nuevo. Solo entran arreglos puntuales de lo que el programador encuentre
@@ -155,13 +186,13 @@ misma sesión), no un problema real ni portable — no bloquea nada del deploy.
 - **Si el arreglo es de algo de los Prompts 4 a 16**: va directo a `staging` (o a la rama del
   Prompt correspondiente, después mergeada a `staging` con el mismo método ya usado — merge,
   nunca rebase).
-- **Los Prompts nuevos** (ej. el Prompt 8, Parte 4, o cualquiera después del 16) se desarrollan
+- **Los Prompts nuevos** (ej. el Prompt 8 Parte 4, o cualquiera después del 16) se desarrollan
   en su propia rama a partir de `staging` (ya con todo lo anterior mergeado), pero se mergean a
-  `staging` recién después de la Ronda 2 — no antes.
+  `staging` recién después de la Ronda correspondiente — no antes.
 
 ## Qué rama pushear en cada paso
 
-Todo esto ya está pusheado: `staging-plan`, `staging`, `deploy-paquete-1`, y las ramas de Prompt
-(`prompt-11-reportes` ... `prompt-16-velocidad`, a medida que se cierran). **`main` no se
-pushea** hasta que se decida explícitamente publicar un deploy — regla fija, con OK explícito en
-el momento, no de una conversación anterior.
+Todo esto ya está pusheado: `staging-plan`, `staging`, `deploy-paquete-1`, `prompt-8b-avisos`,
+y las ramas de Prompt (`prompt-11-reportes` ... `prompt-16-velocidad`, a medida que se
+cierran). **`main` no se pushea** hasta que se decida explícitamente publicar un deploy — regla
+fija, con OK explícito en el momento, no de una conversación anterior.
